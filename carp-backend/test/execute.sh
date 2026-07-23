@@ -9,7 +9,8 @@
 # Usage: run from the carp-backend/ directory:  bash test/execute.sh
 set -u
 
-CORE_HEADERS="${CARP_CORE_HEADERS:-../../../carp/core/}"
+CORE_HEADERS="${CARP_CORE_HEADERS:-${CARP_DIR:+$CARP_DIR/core/}}"
+CORE_HEADERS="${CORE_HEADERS:-../../../carp/core/}"
 OUT_C="test/execution-out.c"
 OUT_BIN="test/execution-out"
 EXPECTED="${1:-64}"   # expected process exit code (Int.pow 2 6 == 64)

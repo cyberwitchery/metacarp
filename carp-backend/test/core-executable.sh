@@ -8,5 +8,5 @@ executable="${TMPDIR:-/tmp}/carp-core-pow"
 cd "$backend_dir"
 carp -b test/core-declarations.carp
 ./out/core-backend-checkpoint "$generated_c"
-clang "$generated_c" -I ../../../carp/core -o "$executable"
+clang "$generated_c" -I "${CARP_DIR:-../../../carp}/core" -o "$executable"
 "$executable"

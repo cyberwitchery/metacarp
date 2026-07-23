@@ -18,7 +18,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
 compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
-carp_root=${CARP_ROOT:-"$repo_root/../../carp"}
+carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 out_root=${CARP_SELF_SUITE_OUT:-"${TMPDIR:-/tmp}/carp-self-suite"}
 

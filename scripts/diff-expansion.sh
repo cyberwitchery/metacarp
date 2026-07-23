@@ -10,8 +10,8 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
 compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
-reference=${CARP_REFERENCE:-"$HOME/.local/bin/carp"}
-carp_root=${CARP_ROOT:-"$repo_root/../../carp"}
+reference=${CARP_REFERENCE:-"$(command -v carp || echo "$HOME/.local/bin/carp")"}
+carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 out_root=${CARP_DIFF_OUT:-"${TMPDIR:-/tmp}/carp-expansion-diff"}
 

@@ -52,32 +52,34 @@ cache (`~/.cache/carp/libs/...`) on first use:
 (load "git@github.com:carpentry-org/strbuf@0.2.0")
 ```
 
+The examples below assume `CARP_DIR` points at a checkout of the reference
+Carp repository (its `core/` is the standard library and runtime headers).
+
 Compile a standalone program (no standard library) to C:
 
 ```sh
 ./out/carp-compiler examples/hello.carp \
-  | clang -x c -I ../../carp/core -o /tmp/carp-hello -
+  | clang -x c -I "$CARP_DIR/core" -o /tmp/carp-hello -
 /tmp/carp-hello        # prints: OK
 ```
 
 Compile and run a program that uses the standard library:
 
 ```sh
-./out/carp-compiler -x -c ../../carp/core examples/squares.carp
+./out/carp-compiler -x -c "$CARP_DIR/core" examples/squares.carp
 # sum of squares of the even numbers in 1..10 = 220
 ```
 
 ## Self-hosting
 
-The bootstrap chain, from the repository root (with the reference Carp
-repository checked out as a sibling at `../../carp`):
+The bootstrap chain, from the repository root:
 
 ```sh
-carp -b --optimize main.carp                                   # gen 1
-./out/carp-compiler -c ../../carp/core -o self.c main.carp     # gen 1 emits itself
-clang -O2 -o self-cc self.c -I ../../carp/core                 # link gen 2
-./self-cc -c ../../carp/core -o self2.c main.carp              # gen 2 emits itself
-cmp self.c self2.c                                             # fixed point
+carp -b --optimize main.carp                                    # gen 1
+./out/carp-compiler -c "$CARP_DIR/core" -o self.c main.carp     # gen 1 emits itself
+clang -O2 -o self-cc self.c -I "$CARP_DIR/core"                 # link gen 2
+./self-cc -c "$CARP_DIR/core" -o self2.c main.carp              # gen 2 emits itself
+cmp self.c self2.c                                              # fixed point
 ```
 
 Each generation compiles the compiler in roughly six minutes on an M-class
@@ -88,8 +90,9 @@ Two harnesses keep the self-host honest:
 
 - `scripts/run-carp-suite-self.sh` runs the reference repository's own test
   suite (examples, produces-output diffs, `test/*.carp`, error-rejection
-  tests, bench builds) through this compiler — with `CARP_COMPILER` you can
-  point it at a gen-2 binary.
+  tests, bench builds) through this compiler. It finds the reference checkout
+  through `CARP_ROOT` or `CARP_DIR`, and `CARP_COMPILER` can point it at a
+  gen-2 binary.
 - `scripts/diff-expansion.sh` compiles and runs a front-end corpus (macros,
   quasiquote, gensym, dynamic evaluation) under both the reference compiler
   and this one and requires identical observable output.
