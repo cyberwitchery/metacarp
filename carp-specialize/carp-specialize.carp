@@ -1,0 +1,2492 @@
+(load "../carp-ir/carp-ir.carp")
+(load "../carp-infer/carp-infer.carp")
+(load "../carp-types/carp-types.carp")
+(load "../carp-primitives/carp-primitives.carp")
+(load "../carp-c-abi/carp-c-abi.carp")
+
+(deftype Specialization
+  [reference CoreRef
+   signature (Box MonoType)
+   symbol String])
+
+(deftype SpecializedCall
+  [id Int
+   reference CoreRef
+   signature (Box MonoType)
+   symbol String
+   value Bool])
+
+(deftype SpecializedMatchBranch
+  [pattern CorePattern
+   bindings (Array CoreRef)
+   body (Box SpecializedExpr)])
+
+(deftype SpecializedExpr
+  (IntLit [Int (Box MonoType) Int])
+  (ByteLit [Int (Box MonoType) Byte])
+  (LongLit [Int (Box MonoType) Long])
+  (FloatLit [Int (Box MonoType) Float])
+  (DoubleLit [Int (Box MonoType) Double])
+  (CharLit [Int (Box MonoType) Char])
+  (StringLit [Int (Box MonoType) String])
+  (PatternLit [Int (Box MonoType) String])
+  (BoolLit [Int (Box MonoType) Bool])
+  (UnitLit [Int (Box MonoType)])
+  (ArrayLit [Int (Box MonoType) (Array (Box SpecializedExpr))])
+  (StaticArrayLit [Int (Box MonoType) (Array (Box SpecializedExpr))])
+  (Reference [Int (Box MonoType) CoreRef])
+  (GlobalValue [Int (Box MonoType) CoreRef (Box MonoType) String Bool])
+  (Call [Int (Box MonoType) (Box SpecializedExpr) (Array (Box SpecializedExpr))])
+  (GlobalCall
+    [Int
+     (Box MonoType)
+     CoreRef
+     (Box MonoType)
+     String
+     (Array (Box SpecializedExpr))])
+  (Do [Int (Box MonoType) (Array (Box SpecializedExpr))])
+  (If
+    [Int
+     (Box MonoType)
+     (Box SpecializedExpr)
+     (Box SpecializedExpr)
+     (Box SpecializedExpr)])
+  (Let [Int (Box MonoType) CoreRef (Box SpecializedExpr) (Box SpecializedExpr)])
+  (Set [Int (Box MonoType) CoreRef (Box SpecializedExpr)])
+  (While [Int (Box MonoType) (Box SpecializedExpr) (Box SpecializedExpr)])
+  (Break [Int (Box MonoType)])
+  (Lambda [Int (Box MonoType) (Array CoreRef) (Box SpecializedExpr)])
+  (Match
+    [Int
+     (Box MonoType)
+     Bool
+     (Box SpecializedExpr)
+     (Array SpecializedMatchBranch)])
+  (Annotation [Int (Box MonoType) (Box SpecializedExpr) (Box CoreType)]))
+
+(deftype SpecializedBody
+  [specialization Specialization
+   parameters (Array CoreRef)
+   body (Box SpecializedExpr)
+   value Bool])
+
+(deftype SpecializedBuiltinSource
+  [signature (Box CoreType)
+   payload CoreBuiltinPayload])
+
+(deftype SpecializedPrimitive
+  [specialization Specialization
+   lowering PrimitiveLowering
+   dependencies (Array SpecializedCall)
+   source (Maybe SpecializedBuiltinSource)])
+
+(deftype SpecializationModule
+  [instances (Array Specialization)
+   bodies (Array SpecializedBody)
+   primitives (Array SpecializedPrimitive)
+   roots (Array (Box SpecializedExpr))
+   constructors (Array CoreConstructorDeclaration)
+   system-includes (Array String)])
+
+(deftype SpecializeError [message String])
+
+(deftype SpecializationRequest [call CallSite
+                                origin String])
+
+;; id→position index over the current scheme environment; primed by every
+;; public entry (see prime-schemes!) so scheme lookups are O(1) instead of a
+;; full environment scan per call site.
+(def *scheme-id-index* (the (Array Int) []))
+
+;; per-trace-position memo of node types with the module substitution applied,
+;; filled lazily on first touch (normalization is instance-independent, so a
+;; node touched by many instances pays the full-substitution apply once; nodes
+;; never materialized pay nothing). Reset per public entry (see prime-trace!).
+;; Unfilled slots hold a Unit placeholder; *normalized-filled* is the truth.
+(def *normalized-node-types* (the (Array (Box MonoType)) []))
+(def *normalized-filled* (the (Array Bool) []))
+;; expr-id → trace position for the owner named by *trace-owner-key*;
+;; expression ids repeat across owners, so the index is per-owner and is
+;; rebuilt when the owner changes (once per materialized instance).
+(def *trace-positions* (the (Array Int) []))
+(def *trace-owner-key* -1000000002)
+
+(defmodule Specialize
+  (doc expression-id "returns the stable, owner-scoped ID retained on a
+specialized expression.")
+  (defn expression-id [expression]
+    (match-ref expression
+      (SpecializedExpr.IntLit id _ _) @id
+      (SpecializedExpr.ByteLit id _ _) @id
+      (SpecializedExpr.LongLit id _ _) @id
+      (SpecializedExpr.FloatLit id _ _) @id
+      (SpecializedExpr.DoubleLit id _ _) @id
+      (SpecializedExpr.CharLit id _ _) @id
+      (SpecializedExpr.StringLit id _ _) @id
+      (SpecializedExpr.PatternLit id _ _) @id
+      (SpecializedExpr.BoolLit id _ _) @id
+      (SpecializedExpr.UnitLit id _) @id
+      (SpecializedExpr.ArrayLit id _ _) @id
+      (SpecializedExpr.StaticArrayLit id _ _) @id
+      (SpecializedExpr.Reference id _ _) @id
+      (SpecializedExpr.GlobalValue id _ _ _ _ _) @id
+      (SpecializedExpr.Call id _ _ _) @id
+      (SpecializedExpr.GlobalCall id _ _ _ _ _) @id
+      (SpecializedExpr.Do id _ _) @id
+      (SpecializedExpr.If id _ _ _ _) @id
+      (SpecializedExpr.Let id _ _ _ _) @id
+      (SpecializedExpr.Set id _ _ _) @id
+      (SpecializedExpr.While id _ _ _) @id
+      (SpecializedExpr.Break id _) @id
+      (SpecializedExpr.Lambda id _ _ _) @id
+      (SpecializedExpr.Match id _ _ _ _) @id
+      (SpecializedExpr.Annotation id _ _ _) @id))
+
+  (doc expression-type "returns the concrete type retained on a specialized
+expression.")
+  (defn expression-type [expression]
+    (match-ref expression
+      (SpecializedExpr.IntLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.ByteLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.LongLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.FloatLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.DoubleLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.CharLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.StringLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.PatternLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.BoolLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.UnitLit _ type) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.ArrayLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.StaticArrayLit _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Reference _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.GlobalValue _ type _ _ _ _)
+        (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Call _ type _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.GlobalCall _ type _ _ _ _)
+        (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Do _ type _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.If _ type _ _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Let _ type _ _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Set _ type _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.While _ type _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Break _ type) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Lambda _ type _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Match _ type _ _ _) (MonoType.copy (Box.peek type))
+      (SpecializedExpr.Annotation _ type _ _) (MonoType.copy (Box.peek type))))
+
+  (private slot-subst-lookup)
+  (hidden slot-subst-lookup)
+  (defn slot-subst-lookup [subst name]
+    (let-do [result (MonoType.Unit)
+             n (Array.length subst)]
+      (for [i 0 n]
+        (when (String.= (Pair.a (Array.unsafe-nth subst i)) name)
+          (set! result (MonoType.copy (Pair.b (Array.unsafe-nth subst i))))))
+      result))
+
+  (private concretize-slot-type)
+  (hidden concretize-slot-type)
+  (sig concretize-slot-type
+       (Fn [(Ref CoreType) (Ref (Array (Pair String MonoType)))] MonoType))
+  (defn concretize-slot-type [core-type subst]
+    (match-ref core-type
+      (CoreType.Integer) (MonoType.Integer)
+      (CoreType.String) (MonoType.String)
+      (CoreType.Boolean) (MonoType.Boolean)
+      (CoreType.Unit) (MonoType.Unit)
+      (CoreType.Variable name) (slot-subst-lookup subst name)
+      (CoreType.Named name arguments)
+        (let-do [margs (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &margs
+                              (Box.init
+                                (concretize-slot-type (Box.peek (Array.unsafe-nth arguments
+                                                                                  i))
+                                                      subst))))
+          (MonoType.Named (String.copy name) margs))
+      (CoreType.Reference inner _)
+        (MonoType.Reference (Box.init (concretize-slot-type (Box.peek inner)
+                                                            subst))
+                            (MonoLifetime.Static))
+      (CoreType.Function arguments return-type)
+        (let-do [margs (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &margs
+                              (Box.init
+                                (concretize-slot-type (Box.peek (Array.unsafe-nth arguments
+                                                                                  i))
+                                                      subst))))
+          (MonoType.Function margs
+                             (Box.init
+                               (concretize-slot-type (Box.peek return-type)
+                                                     subst))))))
+
+  (private collect-unbound-slots!)
+  (hidden collect-unbound-slots!)
+  (sig collect-unbound-slots!
+       (Fn
+         [(Ref CorePattern)
+          (Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          (Ref (Array MonoType))]
+         ()))
+  (defn collect-unbound-slots! [pattern scrutinee-type constructors acc]
+    (match-ref pattern
+      (CorePattern.Ignore) (Array.push-back! acc (MonoType.copy scrutinee-type))
+      (CorePattern.Bind _) ()
+      (CorePattern.Constructor reference children)
+        (let-do [found false
+                 n (Array.length constructors)]
+          (for [i 0 n]
+            (let [declaration (Array.unsafe-nth constructors i)]
+              (when-do (and (not found)
+                            (CoreIR.same-ref? (CoreConstructorDeclaration.reference declaration)
+                                              reference))
+                (set! found true)
+                (let-do [subst (the (Array (Pair String MonoType)) [])]
+                  (match-ref (Box.peek (CoreConstructorDeclaration.result declaration))
+                    (CoreType.Named _ result-arguments)
+                      (match-ref scrutinee-type
+                        (MonoType.Named _ mono-arguments)
+                          (let [pairs (Int.min (Array.length result-arguments)
+                                               (Array.length mono-arguments))]
+                            (for [j 0 pairs]
+                              (match-ref (Box.peek (Array.unsafe-nth result-arguments
+                                                                     j))
+                                (CoreType.Variable variable)
+                                  (Array.push-back! &subst
+                                                    (Pair.init (String.copy variable)
+                                                               (MonoType.copy (Box.peek (Array.unsafe-nth mono-arguments
+                                                                                                          j)))))
+                                _ ())))
+                        _ ())
+                    _ ())
+                  (let [fields (CoreConstructorDeclaration.arguments declaration)
+                        pairs (Int.min (Array.length fields)
+                                       (Array.length children))]
+                    (for [j 0 pairs]
+                      (let [field-mono (concretize-slot-type (Box.peek (Array.unsafe-nth fields
+                                                                                         j))
+                                                             &subst)]
+                        (collect-unbound-slots! (Box.peek (Array.unsafe-nth children
+                                                                            j))
+                                                &field-mono
+                                                constructors
+                                                acc))))))))
+          ())))
+
+  (doc unbound-slot-types "the mono types of every `Ignore` slot in a match
+pattern, in depth-first pre-order — the payloads a by-value match would drop
+without binding. A root-level `Ignore` reports the whole scrutinee type.
+Callers pair this with `bind-unbound-slots`, which visits the same slots in
+the same order.")
+  (defn unbound-slot-types [pattern scrutinee-type constructors]
+    (let-do [acc (the (Array MonoType) [])]
+      (collect-unbound-slots! pattern scrutinee-type constructors &acc)
+      acc))
+
+  (private collect-bound-slots!)
+  (hidden collect-bound-slots!)
+  (sig collect-bound-slots!
+       (Fn
+         [(Ref CorePattern)
+          (Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          (Ref (Array (Pair CoreRef MonoType)))]
+         ()))
+  (defn collect-bound-slots! [pattern scrutinee-type constructors acc]
+    (match-ref pattern
+      (CorePattern.Ignore) ()
+      (CorePattern.Bind reference)
+        (Array.push-back! acc
+                          (Pair.init (CoreRef.copy reference)
+                                     (MonoType.copy scrutinee-type)))
+      (CorePattern.Constructor reference children)
+        (let-do [found false
+                 n (Array.length constructors)]
+          (for [i 0 n]
+            (let [declaration (Array.unsafe-nth constructors i)]
+              (when-do (and (not found)
+                            (CoreIR.same-ref? (CoreConstructorDeclaration.reference declaration)
+                                              reference))
+                (set! found true)
+                (let-do [subst (the (Array (Pair String MonoType)) [])]
+                  (match-ref (Box.peek (CoreConstructorDeclaration.result declaration))
+                    (CoreType.Named _ result-arguments)
+                      (match-ref scrutinee-type
+                        (MonoType.Named _ mono-arguments)
+                          (let [pairs (Int.min (Array.length result-arguments)
+                                               (Array.length mono-arguments))]
+                            (for [j 0 pairs]
+                              (match-ref (Box.peek (Array.unsafe-nth result-arguments
+                                                                     j))
+                                (CoreType.Variable variable)
+                                  (Array.push-back! &subst
+                                                    (Pair.init (String.copy variable)
+                                                               (MonoType.copy (Box.peek (Array.unsafe-nth mono-arguments
+                                                                                                          j)))))
+                                _ ())))
+                        _ ())
+                    _ ())
+                  (let [fields (CoreConstructorDeclaration.arguments declaration)
+                        pairs (Int.min (Array.length fields)
+                                       (Array.length children))]
+                    (for [j 0 pairs]
+                      (let [field-mono (concretize-slot-type (Box.peek (Array.unsafe-nth fields
+                                                                                         j))
+                                                             &subst)]
+                        (collect-bound-slots! (Box.peek (Array.unsafe-nth children
+                                                                          j))
+                                              &field-mono
+                                              constructors
+                                              acc))))))))
+          ())))
+
+  (doc bound-slot-types "the `(binder, mono type)` pair of every `Bind` slot
+in a match pattern, in depth-first pre-order, typed from the constructor
+declarations and the scrutinee's concrete type. Unlike searching the branch
+body for references, this types bindings that are never used — the ones a
+by-value match must still delete.")
+  (defn bound-slot-types [pattern scrutinee-type constructors]
+    (let-do [acc (the (Array (Pair CoreRef MonoType)) [])]
+      (collect-bound-slots! pattern scrutinee-type constructors &acc)
+      acc))
+
+  (doc bind-unbound-slots "rewrites `pattern`, replacing each `Ignore` slot
+(in the same depth-first pre-order as `unbound-slot-types`) whose `mask`
+entry is true with a `Bind` of the same-index reference in `refs`; masked-out
+slots stay `Ignore` (nothing to delete — binding them would only emit unused
+locals). `cursor` is a one-element counter array the recursion advances.")
+  (sig bind-unbound-slots
+       (Fn
+         [(Ref CorePattern)
+          (Ref (Array CoreRef))
+          (Ref (Array Bool))
+          (Ref (Array Int))]
+         CorePattern))
+  (defn bind-unbound-slots [pattern refs mask cursor]
+    (match-ref pattern
+      (CorePattern.Ignore)
+        (let-do [index @(Array.unsafe-nth cursor 0)]
+          (Array.aset! cursor 0 (Int.inc index))
+          (if @(Array.unsafe-nth mask index)
+            (CorePattern.Bind (CoreRef.copy (Array.unsafe-nth refs index)))
+            (CorePattern.Ignore)))
+      (CorePattern.Bind reference)
+        (CorePattern.Bind (CoreRef.copy reference))
+      (CorePattern.Constructor reference children)
+        (let-do [rewritten (the (Array (Box CorePattern)) [])]
+          (for [i 0 (Array.length children)]
+            (Array.push-back! &rewritten
+                              (Box.init
+                                (bind-unbound-slots (Box.peek (Array.unsafe-nth children
+                                                                                i))
+                                                    refs
+                                                    mask
+                                                    cursor))))
+          (CorePattern.Constructor (CoreRef.copy reference) rewritten))))
+
+  (private has-definition?)
+  (hidden has-definition?)
+  (private collect-global-values!)
+  (hidden collect-global-values!)
+  (private collect-global-values-from-expressions!)
+  (hidden collect-global-values-from-expressions!)
+  (private collect-global-values-from-branches!)
+  (hidden collect-global-values-from-branches!)
+  (private global-values-in)
+  (hidden global-values-in)
+  (private expression-type-for)
+  (hidden expression-type-for)
+  (private same-owner?)
+  (hidden same-owner?)
+  (private function-for)
+  (hidden function-for)
+  (private value-for)
+  (hidden value-for)
+  (defn has-definition? [functions reference]
+    (let-do [found false
+             n (Array.length functions)]
+      (for [i 0 n]
+        (let [function (Array.unsafe-nth functions i)]
+          (when (CoreIR.same-ref? (CoreFunction.reference function) reference)
+            (set! found true))))
+      found))
+
+  (private has-value?)
+  (hidden has-value?)
+  (defn has-value? [values reference]
+    (let-do [found false
+             n (Array.length values)]
+      (for [i 0 n]
+        (let [value (Array.unsafe-nth values i)]
+          (when (CoreIR.same-ref? (CoreValue.reference value) reference)
+            (set! found true))))
+      found))
+
+  (private has-builtin?)
+  (hidden has-builtin?)
+  (defn has-builtin? [builtins reference]
+    (let-do [found false
+             n (Array.length builtins)]
+      (for [i 0 n]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (when (CoreIR.same-ref? (CoreBuiltin.reference builtin) reference)
+            (set! found true))))
+      found))
+
+  (private interface?)
+  (hidden interface?)
+  (defn interface? [interfaces reference]
+    (let-do [found false
+             n (Array.length interfaces)]
+      (for [i 0 n]
+        (let [interface (Array.unsafe-nth interfaces i)]
+          (when (CoreIR.same-ref? (CoreInterface.reference interface) reference)
+            (set! found true))))
+      found))
+
+  (private contains-instance?)
+  (hidden contains-instance?)
+  (private concrete-signature?)
+  (hidden concrete-signature?)
+  (defn concrete-signature? [signature] (Type.concrete? signature))
+
+  (defn contains-instance? [instances reference signature]
+    (let-do [found false
+             n (Array.length instances)]
+      (for [i 0 n]
+        (let [instance (Array.unsafe-nth instances i)]
+          (when (and
+              (CoreIR.same-ref? (Specialization.reference instance) reference)
+              (Type.same-representation?
+                (Box.peek (Specialization.signature instance))
+                signature))
+            (set! found true))))
+      found))
+
+  (private symbol-for)
+  (hidden symbol-for)
+  (private builtin-source-for)
+  (hidden builtin-source-for)
+  (defn builtin-source-for [core reference]
+    (let-do [result (the (Maybe SpecializedBuiltinSource) (Maybe.Nothing))
+             sources (CoreModule.builtin-sources core)
+             n (Array.length sources)]
+      (for [i 0 n]
+        (let [source (Array.unsafe-nth sources i)]
+          (when (CoreIR.same-ref? (CoreBuiltinSource.reference source) reference)
+            (set! result
+                  (Maybe.Just
+                    (SpecializedBuiltinSource.init @(CoreBuiltinSource.signature source)
+                                                   @(CoreBuiltinSource.payload source)))))))
+      result))
+
+  (defn symbol-for [core reference signature]
+    (match (builtin-source-for core reference)
+      (Maybe.Just source)
+        (match-ref (SpecializedBuiltinSource.payload &source)
+          (CoreBuiltinPayload.External external-name)
+            (match-ref external-name
+              (Maybe.Just name) (String.copy name)
+              (Maybe.Nothing) (CAbi.runtime-symbol (CoreRef.name reference)))
+          (CoreBuiltinPayload.Template _ _)
+            (CAbi.mangle (CoreRef.name reference) signature))
+      (Maybe.Nothing) (CAbi.mangle (CoreRef.name reference) signature)))
+
+  (private scheme-for-linear)
+  (hidden scheme-for-linear)
+  (defn scheme-for-linear [environment reference]
+    (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
+             n (Array.length environment)]
+      (for [i 0 n]
+        (let [binding (Array.unsafe-nth environment i)]
+          (when (CoreIR.same-ref? (SchemeBinding.reference binding) reference)
+            (set! result (Maybe.Just @(SchemeBinding.scheme binding))))))
+      result))
+
+  (private prime-schemes!)
+  (hidden prime-schemes!)
+  (doc prime-schemes! "builds the id→position index over a scheme environment;
+called at every public entry before `scheme-for` runs. Ids can repeat across
+categories, so the index keeps the LAST position per id (matching the linear
+scan) and `scheme-for` verifies the hit, falling back to the scan on
+mismatch.")
+  (defn prime-schemes! [environment]
+    (let-do [max-id 0
+             n (Array.length environment)]
+      (for [i 0 n]
+        (let [id @(CoreRef.id
+                (SchemeBinding.reference (Array.unsafe-nth environment i)))]
+          (when (Int.> id max-id) (set! max-id id))))
+      (let-do [index (Array.replicate (Int.inc max-id) &-1)]
+        (for [i 0 n]
+          (let [id @(CoreRef.id
+                  (SchemeBinding.reference (Array.unsafe-nth environment i)))]
+            (when (Int.>= id 0) (Array.aset! &index id i))))
+        (set! *scheme-id-index* index))))
+
+  (private prime-trace!)
+  (hidden prime-trace!)
+  (doc prime-trace! "resets the lazy normalized-node-type memo to match the
+trace's length; slots fill on first touch in `expression-type-for`.")
+  (defn prime-trace! [inferred]
+    (let-do [n (Array.length (InferredModule.node-types inferred))
+             placeholder (Box.init (MonoType.Unit))]
+      (set! *normalized-node-types* (Array.replicate n &placeholder))
+      (set! *normalized-filled* (Array.replicate n &false))
+      (set! *trace-owner-key* -1000000002)))
+
+  (private scheme-for)
+  (hidden scheme-for)
+  (defn scheme-for [environment reference]
+    (let [id @(CoreRef.id reference)]
+      (if (or (Int.< id 0) (Int.>= id (Array.length &*scheme-id-index*)))
+        (Maybe.Nothing)
+        (let [at @(Array.unsafe-nth &*scheme-id-index* id)]
+          (if (or (Int.< at 0) (Int.>= at (Array.length environment)))
+            (Maybe.Nothing)
+            (let [binding (Array.unsafe-nth environment at)]
+              (if (CoreIR.same-ref? (SchemeBinding.reference binding) reference)
+                (Maybe.Just @(SchemeBinding.scheme binding))
+                (scheme-for-linear environment reference))))))))
+
+  (private implementation-for)
+  (hidden implementation-for)
+  (private copy-call-owner)
+  (hidden copy-call-owner)
+  (defn implementation-for [core inferred call]
+    (let-do [interface (CallSite.reference call)
+             signature (Box.peek (CallSite.type call))
+             result (the (Result CallSite SpecializeError)
+                         (Result.Error
+                           (SpecializeError.init
+                             (String.concat
+                               &[@"no implementation matches interface "
+                                 (String.copy (CoreRef.name interface))
+                                 @" at "
+                                 (Type.name signature)]))))
+             implementations (CoreModule.implementations core)
+             environment (InferredModule.environment inferred)
+             found false
+             found-name (String.copy "")
+             found-type (String.copy "")
+             found-reference (CoreRef.init -1 (String.copy "") true)
+             found-specificity 1000000
+             n (Array.length implementations)]
+      (for [i 0 n]
+        (let [candidate (Array.unsafe-nth implementations i)]
+          (when (CoreIR.same-ref? (CoreImplementation.interface candidate)
+                                  interface)
+            (match (scheme-for environment
+                               (CoreImplementation.implementation candidate))
+              (Maybe.Just scheme)
+                (let [empty (Type.empty-substitution)]
+                  (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
+                                            signature
+                                            &empty)
+                    (Result.Success substitution)
+                      (let [implementation-type (Type.apply &substitution
+                                                            (Box.peek (TypeScheme.body &scheme)))
+                            ;; the most specific implementation (fewest free type
+                            ;; variables in its declared type) wins; only a tie at
+                            ;; the same specificity is a genuine ambiguity.
+                            candidate-specificity (Array.length
+                              &(Type.free-variables (Box.peek (TypeScheme.body &scheme))))]
+                        ;; free call-site variables (overload interfaces pin
+                        ;; them only through dispatch) resolve through the
+                        ;; unifier before the equivalence check.
+                        (when (Type.same-representation? &implementation-type
+                                                         &(Type.apply &substitution
+                                                                      signature))
+                          (cond
+                            (or (not found)
+                                (Int.< candidate-specificity found-specificity))
+                              (do
+                                (set! found true)
+                                (set! found-specificity candidate-specificity)
+                                (set! found-name
+                                      @(CoreRef.name
+                                        (CoreImplementation.implementation candidate)))
+                                (set! found-reference
+                                      @(CoreImplementation.implementation candidate))
+                                (set! found-type
+                                      (Type.name (Box.peek (TypeScheme.body &scheme))))
+                                (set! result
+                                      (Result.Success
+                                        (CallSite.init @(CallSite.id call)
+                                                       @(CoreImplementation.implementation candidate)
+                                                       (Box.init implementation-type)
+                                                       (copy-call-owner call)))))
+                            (Int.= candidate-specificity found-specificity)
+                              (do
+                                (set! found-name
+                                      @(CoreRef.name
+                                        (CoreImplementation.implementation candidate)))
+                                (set! found-reference
+                                      @(CoreImplementation.implementation candidate))
+                                (set! found-type
+                                      (Type.name (Box.peek (TypeScheme.body &scheme))))
+                                (set! result
+                                      (Result.Success
+                                        (CallSite.init @(CallSite.id call)
+                                                       @(CoreImplementation.implementation candidate)
+                                                       (Box.init implementation-type)
+                                                       (copy-call-owner call)))))
+                            ())))
+                    (Result.Error _) ()))
+              (Maybe.Nothing) ()))))
+      result))
+
+  (sig collect-global-values-from-expressions!
+       (Fn
+         [(Ref (Array (Box CoreExpr)))
+          (Ref InferredModule)
+          (Ref (Maybe CoreRef))
+          (Ref (Array CallSite))]
+         (Result Unit SpecializeError)))
+  (defn collect-global-values-from-expressions! [expressions
+                                                 inferred
+                                                 owner
+                                                 sites]
+    (let-do [result (the (Result Unit SpecializeError) (Result.Success ()))
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success _)
+            (set! result
+                  (collect-global-values!
+                    (Box.peek (Array.unsafe-nth expressions i))
+                    inferred
+                    owner
+                    sites))
+          (Result.Error _) ()))
+      result))
+
+  (sig collect-global-values-from-branches!
+       (Fn
+         [(Ref (Array CoreMatchBranch))
+          (Ref InferredModule)
+          (Ref (Maybe CoreRef))
+          (Ref (Array CallSite))]
+         (Result Unit SpecializeError)))
+  (defn collect-global-values-from-branches! [branches inferred owner sites]
+    (let-do [result (the (Result Unit SpecializeError) (Result.Success ()))
+             n (Array.length branches)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success _)
+            (set! result
+                  (collect-global-values!
+                    (Box.peek
+                      (CoreMatchBranch.body (Array.unsafe-nth branches i)))
+                    inferred
+                    owner
+                    sites))
+          (Result.Error _) ()))
+      result))
+
+  (sig collect-global-values!
+       (Fn
+         [(Ref CoreExpr)
+          (Ref InferredModule)
+          (Ref (Maybe CoreRef))
+          (Ref (Array CallSite))]
+         (Result Unit SpecializeError)))
+  (defn collect-global-values! [expression inferred owner sites]
+    (match-ref expression
+      (CoreExpr.ArrayLit _ expressions)
+        (collect-global-values-from-expressions! expressions
+                                                 inferred
+                                                 owner
+                                                 sites)
+      (CoreExpr.StaticArrayLit _ expressions)
+        (collect-global-values-from-expressions! expressions
+                                                 inferred
+                                                 owner
+                                                 sites)
+      (CoreExpr.Reference expression-id reference)
+        (if @(CoreRef.global reference)
+          (let [empty (Type.empty-substitution)]
+            (match (expression-type-for inferred owner @expression-id &empty)
+              (Result.Success type)
+                (do
+                  (Array.push-back! sites
+                                    (CallSite.init @expression-id
+                                                   (CoreRef.copy reference)
+                                                   (Box.init type)
+                                                   (match-ref owner
+                                                     (Maybe.Just found)
+                                                       (Maybe.Just (CoreRef.copy found))
+                                                     (Maybe.Nothing)
+                                                       (Maybe.Nothing))))
+                  (Result.Success ()))
+              (Result.Error error) (Result.Error error)))
+          (Result.Success ()))
+      (CoreExpr.Call _ callee arguments)
+        (let [callee-result (match-ref (Box.peek callee)
+                (CoreExpr.Reference _ reference)
+                  (if @(CoreRef.global reference)
+                    (Result.Success ())
+                    (collect-global-values! (Box.peek callee)
+                                            inferred
+                                            owner
+                                            sites))
+                _
+                  (collect-global-values! (Box.peek callee) inferred owner sites))]
+          (match callee-result
+            (Result.Success _)
+              (collect-global-values-from-expressions! arguments
+                                                       inferred
+                                                       owner
+                                                       sites)
+            (Result.Error error) (Result.Error error)))
+      (CoreExpr.Do _ expressions)
+        (collect-global-values-from-expressions! expressions
+                                                 inferred
+                                                 owner
+                                                 sites)
+      (CoreExpr.If _ condition then-branch else-branch)
+        (match (collect-global-values! (Box.peek condition) inferred owner sites)
+          (Result.Success _)
+            (match (collect-global-values! (Box.peek then-branch)
+                                           inferred
+                                           owner
+                                           sites)
+              (Result.Success _)
+                (collect-global-values! (Box.peek else-branch)
+                                        inferred
+                                        owner
+                                        sites)
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error))
+      (CoreExpr.Let _ _ value body)
+        (match (collect-global-values! (Box.peek value) inferred owner sites)
+          (Result.Success _)
+            (collect-global-values! (Box.peek body) inferred owner sites)
+          (Result.Error error) (Result.Error error))
+      (CoreExpr.Set _ _ value)
+        (collect-global-values! (Box.peek value) inferred owner sites)
+      (CoreExpr.While _ condition body)
+        (match (collect-global-values! (Box.peek condition) inferred owner sites)
+          (Result.Success _)
+            (collect-global-values! (Box.peek body) inferred owner sites)
+          (Result.Error error) (Result.Error error))
+      (CoreExpr.Lambda _ _ body)
+        (collect-global-values! (Box.peek body) inferred owner sites)
+      (CoreExpr.Match _ _ scrutinee branches)
+        (match (collect-global-values! (Box.peek scrutinee) inferred owner sites)
+          (Result.Success _)
+            (collect-global-values-from-branches! branches inferred owner sites)
+          (Result.Error error) (Result.Error error))
+      (CoreExpr.Annotation _ inner _)
+        (collect-global-values! (Box.peek inner) inferred owner sites)
+      _ (Result.Success ())))
+
+  (defn global-values-in [expression inferred owner]
+    (let-do [sites (the (Array CallSite) [])]
+      (match (collect-global-values! expression inferred owner &sites)
+        (Result.Success _) (Result.Success sites)
+        (Result.Error error) (Result.Error error))))
+
+  (private calls-for-function)
+  (hidden calls-for-function)
+  (private calls-for-value)
+  (hidden calls-for-value)
+  (private call-owned-by?)
+  (hidden call-owned-by?)
+  (private root-call?)
+  (hidden root-call?)
+  (defn call-owned-by? [call reference]
+    (match-ref (CallSite.owner call)
+      (Maybe.Just owner) (CoreIR.same-ref? owner reference)
+      (Maybe.Nothing) false))
+
+  (defn root-call? [call]
+    (match-ref (CallSite.owner call) (Maybe.Just _) false (Maybe.Nothing) true))
+
+  (defn calls-for-function [core inferred reference]
+    (let-do [result (the (Array CallSite) [])
+             calls (InferredModule.calls inferred)
+             n (Array.length calls)]
+      (for [i 0 n]
+        (let [call (Array.unsafe-nth calls i)]
+          (when (call-owned-by? call reference)
+            (set! result (Array.push-back result @call)))))
+      result))
+
+  (defn calls-for-value [core inferred reference]
+    (let-do [result (the (Array CallSite) [])
+             calls (InferredModule.calls inferred)
+             n (Array.length calls)]
+      (for [i 0 n]
+        (let [call (Array.unsafe-nth calls i)]
+          (when (call-owned-by? call reference)
+            (set! result (Array.push-back result @call)))))
+      result))
+
+  (private root-calls)
+  (hidden root-calls)
+  (defn root-calls [core inferred]
+    (let-do [result (the (Array CallSite) [])
+             calls (InferredModule.calls inferred)
+             n (Array.length calls)]
+      (for [i 0 n]
+        (let [call (Array.unsafe-nth calls i)]
+          (when (root-call? call) (set! result (Array.push-back result @call)))))
+      result))
+
+  (defn copy-call-owner [call]
+    (match-ref (CallSite.owner call)
+      (Maybe.Just owner) (Maybe.Just (CoreRef.copy owner))
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (private normalize-call)
+  (hidden normalize-call)
+  (defn normalize-call [inferred call]
+    (CallSite.init @(CallSite.id call)
+                   (CoreRef.copy (CallSite.reference call))
+                   (Box.init
+                     (Type.apply (InferredModule.substitution inferred)
+                                 (Box.peek (CallSite.type call))))
+                   (copy-call-owner call)))
+
+  (doc entry-request "seeds the `main` function as a specialization demand so it
+is emitted as the program entry point, the way the reference compiler treats
+`main`. Nullary and monomorphic, so its inferred scheme body is its concrete
+type. Empty when the program defines no `main`.")
+  (private entry-request)
+  (hidden entry-request)
+  (defn entry-request [core inferred]
+    (let-do [result (the (Array SpecializationRequest) [])
+             functions (CoreModule.functions core)
+             n (Array.length functions)]
+      (for [i 0 n]
+        (let [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
+          (when (String.= (CoreRef.name reference) "main")
+            (match (scheme-for (InferredModule.environment inferred) reference)
+              (Maybe.Just scheme)
+                (set! result
+                      (Array.push-back result
+                                       (SpecializationRequest.init
+                                         (CallSite.init -1
+                                                        (CoreRef.copy reference)
+                                                        (Box.init
+                                                          (Type.apply (InferredModule.substitution inferred)
+                                                                      (Box.peek (TypeScheme.body &scheme))))
+                                                        (Maybe.Nothing))
+                                         (String.copy "<entry>"))))
+              (Maybe.Nothing) ()))))
+      result))
+
+  (private root-requests)
+  (hidden root-requests)
+  (defn root-requests [core inferred]
+    (let-do [result (the (Array SpecializationRequest) [])
+             calls (root-calls core inferred)
+             n (Array.length &calls)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (SpecializationRequest.init @(Array.unsafe-nth &calls
+                                                                              i)
+                                                           (String.copy "<root>")))))
+      (let-do [entries (entry-request core inferred)]
+        (for [i 0 (Array.length &entries)]
+          (set! result (Array.push-back result @(Array.unsafe-nth &entries i)))))
+      ;; every top-level `def` is part of the program even when nothing reads
+      ;; it: its initializer runs at startup, so it must be specialized.
+      (let-do [values (CoreModule.values core)
+               value-count (Array.length values)]
+        (for [i 0 value-count]
+          (let [value (Array.unsafe-nth values i)
+                value-reference (CoreValue.reference value)]
+            (match (scheme-for (InferredModule.environment inferred)
+                               value-reference)
+              (Maybe.Just scheme)
+                (set! result
+                      (Array.push-back result
+                                       (SpecializationRequest.init
+                                         (CallSite.init -1
+                                                        (CoreRef.copy value-reference)
+                                                        (Box.init
+                                                          (MonoType.copy (Box.peek (TypeScheme.body &scheme))))
+                                                        (Maybe.Nothing))
+                                         (String.copy "<global>"))))
+              (Maybe.Nothing) ()))))
+      (let-do [sites (the (Array CallSite) [])
+               owner (the (Maybe CoreRef) (Maybe.Nothing))]
+        (match (collect-global-values-from-expressions! (CoreModule.expressions core)
+                                                        inferred
+                                                        &owner
+                                                        &sites)
+          (Result.Success _)
+            (do
+              (let [site-count (Array.length &sites)]
+                (for [i 0 site-count]
+                  (set! result
+                        (Array.push-back result
+                                         (SpecializationRequest.init @(Array.unsafe-nth &sites
+                                                                                        i)
+                                                                     (String.copy "<root>"))))))
+              (Result.Success result))
+          (Result.Error error) (Result.Error error)))))
+
+  (private contextual-specialize-error)
+  (hidden contextual-specialize-error)
+  (defn contextual-specialize-error [origin message]
+    (String.concat
+      &[(String.copy message) @" while specializing " (String.copy origin)]))
+
+  (private dependencies-for)
+  (hidden dependencies-for)
+  (private primitive-dependencies-for)
+  (hidden primitive-dependencies-for)
+  (private copy-template-dependency)
+  (hidden copy-template-dependency)
+  (private copy-callsite)
+  (hidden copy-callsite)
+  (private str-callsite)
+  (hidden str-callsite)
+  (private str-template-dependency)
+  (hidden str-template-dependency)
+  (private array-delete-template-dependencies)
+  (hidden array-delete-template-dependencies)
+  (private pair-copy-template-dependencies)
+  (hidden pair-copy-template-dependencies)
+
+  (defn copy-callsite [interface lifetime element]
+    (CallSite.init -1
+                   (CoreRef.copy interface)
+                   (Box.init
+                     (Type.function
+                       [(Box.init
+                          (Type.reference (MonoType.copy element)
+                                          (MonoLifetime.copy lifetime)))]
+                       (MonoType.copy element)))
+                   (Maybe.Nothing)))
+
+  (defn str-callsite [interface lifetime element by-ref]
+    (CallSite.init -1
+                   (CoreRef.copy interface)
+                   (Box.init
+                     (Type.function
+                       [(Box.init
+                          (if by-ref
+                            (Type.reference (MonoType.copy element)
+                                            (MonoLifetime.copy lifetime))
+                            (MonoType.copy element)))]
+                       (MonoType.String)))
+                   (Maybe.Nothing)))
+
+  (defn copy-template-dependency [interface signature]
+    (match-ref signature
+      (MonoType.Function arguments _)
+        (if (Int.= 1 (Array.length arguments))
+          (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+            (MonoType.Reference container lifetime)
+              (match-ref (Box.peek container)
+                (MonoType.Named _ type-arguments)
+                  (if (Int.= 1 (Array.length type-arguments))
+                    (let [element (MonoType.copy
+                            (Box.peek (Array.unsafe-nth type-arguments 0)))]
+                      (Result.Success
+                        (copy-callsite interface lifetime &element)))
+                    (Result.Error
+                      (SpecializeError.init
+                        @"copy template container must have one type argument")))
+                _
+                  (Result.Error
+                    (SpecializeError.init
+                      @"copy template argument must reference a named container")))
+            _
+              (Result.Error
+                (SpecializeError.init
+                  @"copy template argument must be a reference")))
+          (Result.Error
+            (SpecializeError.init @"copy template must have one argument")))
+      _
+        (Result.Error
+          (SpecializeError.init @"copy template must have a function signature"))))
+
+  ;; the element's `str` implementation may take its argument by value
+  ;; (primitives) or by reference (managed types). The reference only calls by
+  ;; value when the member type is blittable (StructUtils.memberStrCallingConvention);
+  ;; probing value-first without that guard would move a String element out of a
+  ;; borrowed array (StringCopy.prn takes its argument by value).
+  (doc blit-implemented? "whether the element type implements `blit` — the
+reference's test for whether a member's `str`/`prn` may be called BY VALUE
+(StructUtils.memberStrCallingConvention). A blittable value is copied, not
+moved, so passing it by value out of a borrowed container is safe. `blit` is a
+Core interface, looked up the same way the reference looks it up.")
+  (private blit-implemented?)
+  (hidden blit-implemented?)
+  (defn blit-implemented? [core inferred element]
+    (let-do [interfaces (CoreModule.interfaces core)
+             found (the (Maybe CoreRef) (Maybe.Nothing))]
+      (for [i 0 (Array.length interfaces)]
+        (let [reference (CoreInterface.reference (Array.unsafe-nth interfaces i))]
+          (when (String.= (CoreRef.name reference) "blit")
+            (set! found (Maybe.Just (CoreRef.copy reference))))))
+      (match found
+        (Maybe.Nothing) false
+        (Maybe.Just blit-ref)
+          (let [site (CallSite.init -1
+                                    blit-ref
+                                    (Box.init
+                                      (Type.function [(Box.init (MonoType.copy element))]
+                                                     (MonoType.copy element)))
+                                    (Maybe.Nothing))]
+            (match (implementation-for core inferred &site)
+              (Result.Success _) true
+              (Result.Error _) false)))))
+
+  ;; fallback for builds without Core (no `blit` interface to probe).
+  (private blittable-element?)
+  (hidden blittable-element?)
+  (defn blittable-element? [mono]
+    (match-ref mono
+      (MonoType.Named name args)
+        (and (Int.= 0 (Array.length args))
+             (let-do [names [@"Int"
+                             @"Long"
+                             @"Bool"
+                             @"Float"
+                             @"Double"
+                             @"Byte"
+                             @"Char"
+                             @"Int8"
+                             @"Int16"
+                             @"Int32"
+                             @"Int64"
+                             @"Uint8"
+                             @"Uint16"
+                             @"Uint32"
+                             @"Uint64"]
+                      found false]
+               (for [i 0 (Array.length &names)]
+                 (when (String.= (Array.unsafe-nth &names i) name)
+                   (set! found true)))
+               found))
+      _ false))
+
+  (doc element-render-callsite "how a container renders one element. The
+reference looks the member function up and gracefully falls back when it is
+absent (StructUtils/ArrayTemplates); mirror that here — prefer the requested
+interface (`prn`, so strings show as literals), fall back to `str` for element
+types that implement only `str` (a `Ptr`, say), and pick the by-value convention
+only for blittable elements, since a by-value call on a managed element would
+move it out of the borrowed container.")
+  (private element-render-callsite)
+  (hidden element-render-callsite)
+  (defn element-render-callsite [core inferred interface lifetime element]
+    (let [str-interface (PrimitiveRegistry.reference 1 "str")
+          candidates (if (or
+              (blit-implemented? core inferred element)
+              (blittable-element? element))
+            [(str-callsite interface lifetime element false)
+             (str-callsite interface lifetime element true)
+             (str-callsite &str-interface lifetime element false)
+             (str-callsite &str-interface lifetime element true)]
+            [(str-callsite interface lifetime element true)
+             (str-callsite &str-interface lifetime element true)])]
+      (let-do [chosen (the (Maybe CallSite) (Maybe.Nothing))]
+        (for [i 0 (Array.length &candidates)]
+          (when (match-ref &chosen (Maybe.Nothing) true _ false)
+            (match (implementation-for core
+                                       inferred
+                                       (Array.unsafe-nth &candidates i))
+              (Result.Success _)
+                (set! chosen (Maybe.Just @(Array.unsafe-nth &candidates i)))
+              (Result.Error _) ())))
+        ;; nothing matched: keep the by-reference form of the requested
+        ;; interface so the error names the interface actually asked for.
+        (match chosen
+          (Maybe.Just site) site
+          (Maybe.Nothing) (str-callsite interface lifetime element true)))))
+
+  (defn str-template-dependency [core inferred interface signature]
+    (match-ref signature
+      (MonoType.Function arguments _)
+        (if (Int.= 1 (Array.length arguments))
+          (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+            (MonoType.Reference container lifetime)
+              (match-ref (Box.peek container)
+                (MonoType.Named _ type-arguments)
+                  (if (Int.= 1 (Array.length type-arguments))
+                    (let [element (MonoType.copy
+                            (Box.peek (Array.unsafe-nth type-arguments 0)))]
+                      (Result.Success
+                        (element-render-callsite core
+                                                 inferred
+                                                 interface
+                                                 lifetime
+                                                 &element)))
+                    (Result.Error
+                      (SpecializeError.init
+                        @"str template container must have one type argument")))
+                _
+                  (Result.Error
+                    (SpecializeError.init
+                      @"str template argument must reference a named container")))
+            _
+              (Result.Error
+                (SpecializeError.init
+                  @"str template argument must be a reference")))
+          (Result.Error
+            (SpecializeError.init @"str template must have one argument")))
+      _
+        (Result.Error
+          (SpecializeError.init @"str template must have a function signature"))))
+
+  ;; `Array.delete` takes its array BY VALUE, so the element type sits directly
+  ;; in the container argument. Elements without a `delete` implementation are
+  ;; unmanaged and need no dependency at all.
+  (defn array-delete-template-dependencies [core inferred interface signature]
+    (match-ref signature
+      (MonoType.Function arguments _)
+        (if (Int.= 1 (Array.length arguments))
+          (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+            (MonoType.Named _ type-arguments)
+              (if (Int.= 1 (Array.length type-arguments))
+                (let [element (MonoType.copy
+                        (Box.peek (Array.unsafe-nth type-arguments 0)))
+                      site (CallSite.init -1
+                                          (CoreRef.copy interface)
+                                          (Box.init
+                                            (Type.function [(Box.init (MonoType.copy &element))]
+                                                           (MonoType.Unit)))
+                                          (Maybe.Nothing))]
+                  (match (implementation-for core inferred &site)
+                    (Result.Success _) (Result.Success [site])
+                    (Result.Error _) (Result.Success (the (Array CallSite) []))))
+                (Result.Error
+                  (SpecializeError.init
+                    @"array delete template container must have one type argument")))
+            _
+              (Result.Error
+                (SpecializeError.init
+                  @"array delete template argument must be a named container")))
+          (Result.Error
+            (SpecializeError.init
+              @"array delete template must have one argument")))
+      _
+        (Result.Error
+          (SpecializeError.init
+            @"array delete template must have a function signature"))))
+
+  (defn pair-copy-template-dependencies [interface signature]
+    (match-ref signature
+      (MonoType.Function arguments _)
+        (if (Int.= 1 (Array.length arguments))
+          (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+            (MonoType.Reference container lifetime)
+              (match-ref (Box.peek container)
+                (MonoType.Named name type-arguments)
+                  (if (and (= name "Pair")
+                           (Int.= 2 (Array.length type-arguments)))
+                    (let [first (MonoType.copy
+                            (Box.peek (Array.unsafe-nth type-arguments 0)))
+                          second (MonoType.copy
+                            (Box.peek (Array.unsafe-nth type-arguments 1)))]
+                      (Result.Success
+                        [(copy-callsite interface lifetime &first)
+                         (copy-callsite interface lifetime &second)]))
+                    (Result.Error
+                      (SpecializeError.init
+                        @"pair copy template expects Pair with two type arguments")))
+                _
+                  (Result.Error
+                    (SpecializeError.init
+                      @"pair copy template argument must reference Pair")))
+            _
+              (Result.Error
+                (SpecializeError.init
+                  @"pair copy template argument must be a reference")))
+          (Result.Error
+            (SpecializeError.init @"pair copy template must have one argument")))
+      _
+        (Result.Error
+          (SpecializeError.init
+            @"pair copy template must have a function signature"))))
+
+  (defn primitive-dependencies-for [core inferred reference signature]
+    (match (PrimitiveRegistry.lowering-for reference)
+      (Maybe.Just lowering)
+        (match-ref &lowering
+          (PrimitiveLowering.Intrinsic) (Result.Success [])
+          (PrimitiveLowering.ParameterizedTemplate template)
+            (match-ref template
+              (PrimitiveTemplate.ArrayCopy copy-interface)
+              (match (copy-template-dependency copy-interface signature)
+                (Result.Success dependency) (Result.Success [dependency])
+                (Result.Error error) (Result.Error error))
+              (PrimitiveTemplate.ArrayStr str-interface)
+              (match (str-template-dependency core
+                                              inferred
+                                              str-interface
+                                              signature)
+                (Result.Success dependency) (Result.Success [dependency])
+                (Result.Error error) (Result.Error error))
+              (PrimitiveTemplate.ArrayDelete delete-interface)
+              (array-delete-template-dependencies core
+                                                  inferred
+                                                  delete-interface
+                                                  signature)
+              ;; `(Box a)` has the same by-value one-type-argument shape as
+              ;; `(Array a)`, so the element-delete demand is computed the same
+              ;; way.
+              (PrimitiveTemplate.BoxDelete delete-interface)
+              (array-delete-template-dependencies core
+                                                  inferred
+                                                  delete-interface
+                                                  signature)
+              (PrimitiveTemplate.BoxStr str-interface)
+              (match (str-template-dependency core
+                                              inferred
+                                              str-interface
+                                              signature)
+                (Result.Success dependency) (Result.Success [dependency])
+                (Result.Error error) (Result.Error error))
+              (PrimitiveTemplate.BoxCopy copy-interface)
+              (match (copy-template-dependency copy-interface signature)
+                (Result.Success dependency) (Result.Success [dependency])
+                (Result.Error error) (Result.Error error))
+              (PrimitiveTemplate.PairCopy copy-interface)
+              (pair-copy-template-dependencies copy-interface signature)
+              (PrimitiveTemplate.PointerCopy)
+              (Result.Success [])
+              (PrimitiveTemplate.FunctionCopy _)
+              (Result.Success [])
+              (PrimitiveTemplate.FunctionStr)
+              (Result.Success [])
+              (PrimitiveTemplate.IntComparison _)
+              (Result.Success [])
+              (PrimitiveTemplate.CollectionLength)
+              (Result.Success [])))
+      (Maybe.Nothing) (Result.Success [])))
+
+  (defn dependencies-for [core inferred reference signature]
+    (if (has-builtin? (CoreModule.builtins core) reference)
+      (primitive-dependencies-for core inferred reference signature)
+      (match (scheme-for (InferredModule.environment inferred) reference)
+        (Maybe.Just scheme)
+          (let [empty (Type.empty-substitution)]
+            (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
+                                      signature
+                                      &empty)
+              (Result.Success instance-substitution)
+                (let-do [result (the
+                           (Result (Array CallSite) SpecializeError)
+                           (Result.Success []))
+                         raw-calls (if (has-value? (CoreModule.values core)
+                                                   reference)
+                           (calls-for-value core inferred reference)
+                           (calls-for-function core inferred reference))
+                         owner (the (Maybe CoreRef)
+                                    (Maybe.Just (CoreRef.copy reference)))
+                         global-values (match (value-for (CoreModule.values core)
+                                                         reference)
+                           (Maybe.Just value)
+                             (global-values-in (Box.peek (CoreValue.body &value))
+                                               inferred
+                                               &owner)
+                           (Maybe.Nothing)
+                             (match (function-for (CoreModule.functions core)
+                                                  reference)
+                               (Maybe.Just function)
+                                 (global-values-in (Box.peek (CoreFunction.body &function))
+                                                   inferred
+                                                   &owner)
+                               (Maybe.Nothing) (Result.Success [])))]
+                  (match global-values
+                    (Result.Success sites)
+                      (let [site-count (Array.length &sites)]
+                        (for [i 0 site-count]
+                          (Array.push-back! &raw-calls
+                                            @(Array.unsafe-nth &sites i))))
+                    (Result.Error error) (set! result (Result.Error error)))
+                  (let [n (Array.length &raw-calls)]
+                    (for [i 0 n]
+                      (match-ref &result
+                        (Result.Success calls)
+                          (let [normalized (normalize-call inferred
+                                                           (Array.unsafe-nth &raw-calls
+                                                                             i))
+                                signature (Type.apply &instance-substitution
+                                                      (Box.peek (CallSite.type &normalized)))]
+                            (set! result
+                                  (Result.Success
+                                    (Array.push-back @calls
+                                                     (CallSite.init @(CallSite.id &normalized)
+                                                                    @(CallSite.reference &normalized)
+                                                                    (Box.init signature)
+                                                                    (copy-call-owner &normalized))))))
+                        (Result.Error _) ())))
+                  result)
+              (Result.Error error)
+                (Result.Error (SpecializeError.init @(TypeError.message &error)))))
+        (Maybe.Nothing)
+          (Result.Error
+            (SpecializeError.init @"missing inferred function scheme")))))
+
+  (private instance-for)
+  (hidden instance-for)
+  (defn instance-for [instances reference signature]
+    (let-do [result (the (Maybe Specialization) (Maybe.Nothing))
+             n (Array.length instances)]
+      (for [i 0 n]
+        (let [instance (Array.unsafe-nth instances i)]
+          (when (and
+              (CoreIR.same-ref? (Specialization.reference instance) reference)
+              (Type.same-representation?
+                (Box.peek (Specialization.signature instance))
+                signature))
+            (set! result (Maybe.Just @instance)))))
+      result))
+
+  (private concrete-call)
+  (hidden concrete-call)
+  (defn concrete-call [core inferred call]
+    (let [reference (CallSite.reference call)
+          signature (Box.peek (CallSite.type call))]
+      (if (interface? (CoreModule.interfaces core) reference)
+        (implementation-for core inferred call)
+        (Result.Success @call))))
+
+  (private materialize-calls)
+  (hidden materialize-calls)
+  (private materialize-root-calls)
+  (hidden materialize-root-calls)
+  (defn materialize-calls [core inferred instances reference signature]
+    (match (dependencies-for core inferred reference signature)
+      (Result.Success dependencies)
+        (let-do [result (the
+                   (Result (Array SpecializedCall) SpecializeError)
+                   (Result.Success []))
+                 n (Array.length &dependencies)]
+          (for [i 0 n]
+            (match-ref &result
+              (Result.Success calls)
+                (match (concrete-call core
+                                      inferred
+                                      (Array.unsafe-nth &dependencies i))
+                  (Result.Success concrete)
+                  (when (concrete-signature? (Box.peek (CallSite.type &concrete)))
+                    (match (instance-for instances
+                                         (CallSite.reference &concrete)
+                                         (Box.peek (CallSite.type &concrete)))
+                      (Maybe.Just target)
+                        (set! result
+                              (Result.Success
+                                (Array.push-back @calls
+                                                 (SpecializedCall.init @(CallSite.id &concrete)
+                                                                       @(CallSite.reference &concrete)
+                                                                       @(CallSite.type &concrete)
+                                                                       @(Specialization.symbol &target)
+                                                                       (has-value? (CoreModule.values core)
+                                                                                   (CallSite.reference &concrete))))))
+                      (Maybe.Nothing)
+                        (set! result
+                              (Result.Error
+                                (SpecializeError.init
+                                  @"materialized call has no reachable instance")))))
+                  ;; an unresolvable dispatch on a still-generic dependency is
+                  ;; skipped like any non-concrete dependency; only a concrete
+                  ;; call without an implementation is a real error.
+                  (Result.Error error)
+                  (when (concrete-signature?
+                      (Box.peek
+                        (CallSite.type (Array.unsafe-nth &dependencies i))))
+                    (set! result (Result.Error error))))
+              (Result.Error _) ()))
+          result)
+      (Result.Error error) (Result.Error error)))
+
+  (defn materialize-root-calls [core inferred instances]
+    (let-do [result (the
+               (Result (Array SpecializedCall) SpecializeError)
+               (Result.Success []))
+             raw-calls (root-calls core inferred)
+             owner (the (Maybe CoreRef) (Maybe.Nothing))
+             global-values (let-do [sites (the (Array CallSite) [])]
+               (match (collect-global-values-from-expressions! (CoreModule.expressions core)
+                                                               inferred
+                                                               &owner
+                                                               &sites)
+                 (Result.Success _) (Result.Success sites)
+                 (Result.Error error) (Result.Error error)))
+             ignored-global-values (match global-values
+               (Result.Success sites)
+                 (let [site-count (Array.length &sites)]
+                   (for [i 0 site-count]
+                     (Array.push-back! &raw-calls @(Array.unsafe-nth &sites i))))
+               (Result.Error error) (set! result (Result.Error error)))
+             n (Array.length &raw-calls)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success calls)
+            (let [normalized (normalize-call inferred
+                                             (Array.unsafe-nth &raw-calls i))]
+              (match (concrete-call core inferred &normalized)
+                (Result.Success concrete)
+                  (when (concrete-signature? (Box.peek (CallSite.type &concrete)))
+                    (match (instance-for instances
+                                         (CallSite.reference &concrete)
+                                         (Box.peek (CallSite.type &concrete)))
+                      (Maybe.Just target)
+                        (set! result
+                              (Result.Success
+                                (Array.push-back @calls
+                                                 (SpecializedCall.init @(CallSite.id &concrete)
+                                                                       @(CallSite.reference &concrete)
+                                                                       @(CallSite.type &concrete)
+                                                                       @(Specialization.symbol &target)
+                                                                       (has-value? (CoreModule.values core)
+                                                                                   (CallSite.reference &concrete))))))
+                      (Maybe.Nothing)
+                        (set! result
+                              (Result.Error
+                                (SpecializeError.init
+                                  @"materialized root call has no reachable instance")))))
+                (Result.Error error)
+                  (when (concrete-signature? (Box.peek (CallSite.type &normalized)))
+                    (set! result (Result.Error error)))))
+          (Result.Error _) ()))
+      result))
+
+  (defn function-for [functions reference]
+    (let-do [result (the (Maybe CoreFunction) (Maybe.Nothing))
+             n (Array.length functions)]
+      (for [i 0 n]
+        (let [function (Array.unsafe-nth functions i)]
+          (when (CoreIR.same-ref? (CoreFunction.reference function) reference)
+            (set! result (Maybe.Just @function)))))
+      result))
+
+  (defn value-for [values reference]
+    (let-do [result (the (Maybe CoreValue) (Maybe.Nothing))
+             n (Array.length values)]
+      (for [i 0 n]
+        (let [value (Array.unsafe-nth values i)]
+          (when (CoreIR.same-ref? (CoreValue.reference value) reference)
+            (set! result (Maybe.Just @value)))))
+      result))
+
+  (private rewrite-expression)
+  (hidden rewrite-expression)
+  (private rewrite-expressions)
+  (hidden rewrite-expressions)
+  (private rewrite-branches)
+  (hidden rewrite-branches)
+  (private specialized-call-for)
+  (hidden specialized-call-for)
+  (private specialized-call-maybe)
+  (hidden specialized-call-maybe)
+  (private rewrite-body)
+  (hidden rewrite-body)
+  (defn specialized-call-for [calls call-id]
+    (let-do [result (the (Result SpecializedCall SpecializeError)
+                         (Result.Error
+                           (SpecializeError.init
+                             @"specialized body contains an untyped global call")))
+             found false
+             n (Array.length calls)]
+      (for [i 0 n]
+        (let [call (Array.unsafe-nth calls i)]
+          (when (Int.= @(SpecializedCall.id call) call-id)
+            (if found
+              (set! result
+                    (Result.Error
+                      (SpecializeError.init @"duplicate specialized call ID")))
+              (do (set! found true) (set! result (Result.Success @call)))))))
+      result))
+
+  (private min-local-in-pattern)
+  (hidden min-local-in-pattern)
+  (private min-local-in-expr)
+  (hidden min-local-in-expr)
+  (private min-local-in-exprs)
+  (hidden min-local-in-exprs)
+  (sig min-local-in-pattern (Fn [(Ref CorePattern) Int] Int))
+  (sig min-local-in-expr (Fn [(Ref SpecializedExpr) Int] Int))
+  (sig min-local-in-exprs (Fn [(Ref (Array (Box SpecializedExpr))) Int] Int))
+  (defn min-local-in-pattern [pattern m]
+    (match-ref pattern
+      (CorePattern.Bind reference) (Int.min m @(CoreRef.id reference))
+      (CorePattern.Constructor _ children)
+        (let-do [current m]
+          (for [i 0 (Array.length children)]
+            (set! current
+                  (min-local-in-pattern (Box.peek (Array.unsafe-nth children i))
+                                        current)))
+          current)
+      _ m))
+
+  (defn min-local-in-exprs [expressions m]
+    (let-do [current m]
+      (for [i 0 (Array.length expressions)]
+        (set! current
+              (min-local-in-expr
+                (Box.peek (Array.unsafe-nth expressions i))
+                current)))
+      current))
+
+  (defn min-local-in-expr [expr m]
+    (match-ref expr
+      (SpecializedExpr.Reference _ _ reference)
+        (if @(CoreRef.global reference) m (Int.min m @(CoreRef.id reference)))
+      (SpecializedExpr.GlobalCall _ _ _ _ _ args) (min-local-in-exprs args m)
+      (SpecializedExpr.Call _ _ callee args)
+        (min-local-in-exprs args (min-local-in-expr (Box.peek callee) m))
+      (SpecializedExpr.Do _ _ es) (min-local-in-exprs es m)
+      (SpecializedExpr.If _ _ c t e)
+        (min-local-in-expr (Box.peek e)
+                           (min-local-in-expr (Box.peek t)
+                                              (min-local-in-expr (Box.peek c) m)))
+      (SpecializedExpr.Let _ _ binder value body)
+        (min-local-in-expr (Box.peek body)
+                           (min-local-in-expr (Box.peek value)
+                                              (Int.min m @(CoreRef.id binder))))
+      (SpecializedExpr.Set _ _ binder value)
+        (min-local-in-expr (Box.peek value) (Int.min m @(CoreRef.id binder)))
+      (SpecializedExpr.While _ _ c body)
+        (min-local-in-expr (Box.peek body) (min-local-in-expr (Box.peek c) m))
+      (SpecializedExpr.Lambda _ _ parameters body)
+        (let-do [current m]
+          (for [i 0 (Array.length parameters)]
+            (set! current
+                  (Int.min current @(CoreRef.id (Array.unsafe-nth parameters i)))))
+          (min-local-in-expr (Box.peek body) current))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (let-do [current (min-local-in-expr (Box.peek scrutinee) m)]
+          (for [i 0 (Array.length branches)]
+            (let-do [branch (Array.unsafe-nth branches i)]
+              (set! current
+                    (min-local-in-pattern (SpecializedMatchBranch.pattern branch)
+                                          current))
+              (let [bindings (SpecializedMatchBranch.bindings branch)]
+                (for [j 0 (Array.length bindings)]
+                  (set! current
+                        (Int.min current
+                                 @(CoreRef.id (Array.unsafe-nth bindings j))))))
+              (set! current
+                    (min-local-in-expr
+                      (Box.peek (SpecializedMatchBranch.body branch))
+                      current))))
+          current)
+      (SpecializedExpr.Annotation _ _ inner _)
+        (min-local-in-expr (Box.peek inner) m)
+      (SpecializedExpr.ArrayLit _ _ es) (min-local-in-exprs es m)
+      (SpecializedExpr.StaticArrayLit _ _ es) (min-local-in-exprs es m)
+      _ m))
+
+  (doc max-global-id "the highest global reference id among the module's
+specialized instances. Backend passes that mint fresh globals (lifted
+lambdas) allocate above this watermark.")
+  (defn max-global-id [specialized]
+    (let-do [m -1
+             instances (SpecializationModule.instances specialized)]
+      (for [i 0 (Array.length instances)]
+        (let [id @(CoreRef.id
+                (Specialization.reference (Array.unsafe-nth instances i)))]
+          (when (Int.> id m) (set! m id))))
+      m))
+
+  (doc min-local-id "the lowest local binder id anywhere in the specialized
+module (bodies and roots), clamped below the resolver's local range start.
+Passes that synthesize local temporaries (backend cleanup/echo temps, ref
+lifting) allocate downward from one below this watermark instead of from
+hardcoded ranges.")
+  (defn min-local-id [specialized]
+    (let-do [m -1048576
+             bodies (SpecializationModule.bodies specialized)
+             roots (SpecializationModule.roots specialized)]
+      (for [i 0 (Array.length bodies)]
+        (let-do [body (Array.unsafe-nth bodies i)]
+          (let [parameters (SpecializedBody.parameters body)]
+            (for [j 0 (Array.length parameters)]
+              (set! m (Int.min m @(CoreRef.id (Array.unsafe-nth parameters j))))))
+          (set! m (min-local-in-expr (Box.peek (SpecializedBody.body body)) m))))
+      (for [i 0 (Array.length roots)]
+        (set! m (min-local-in-expr (Box.peek (Array.unsafe-nth roots i)) m)))
+      m))
+
+  (defn specialized-call-maybe [calls expression-id]
+    (let-do [result (the (Maybe SpecializedCall) (Maybe.Nothing))
+             n (Array.length calls)]
+      (for [i 0 n]
+        (let [call (Array.unsafe-nth calls i)]
+          (when (Int.= @(SpecializedCall.id call) expression-id)
+            (set! result (Maybe.Just @call)))))
+      result))
+
+  (defn same-owner? [left right]
+    (match-ref left
+      (Maybe.Just left-owner)
+        (match-ref right
+          (Maybe.Just right-owner) (CoreIR.same-ref? left-owner right-owner)
+          (Maybe.Nothing) false)
+      (Maybe.Nothing)
+        (match-ref right (Maybe.Just _) false (Maybe.Nothing) true)))
+
+  (private expression-type-missing)
+  (hidden expression-type-missing)
+  (defn expression-type-missing [owner expression-id]
+    (Result.Error
+      (SpecializeError.init
+        (String.concat
+          &[@"specialized expression has no inferred type (expr "
+            (Int.str expression-id)
+            @" in "
+            (match-ref owner
+              (Maybe.Just owner-ref) (String.copy (CoreRef.name owner-ref))
+              (Maybe.Nothing) @"<root>")
+            @")"]))))
+
+  (private expression-type-for-linear)
+  (hidden expression-type-for-linear)
+  (defn expression-type-for-linear [inferred
+                                    owner
+                                    expression-id
+                                    instance-substitution]
+    (let-do [result (the (Maybe MonoType) (Maybe.Nothing))
+             node-types (InferredModule.node-types inferred)
+             n (Array.length node-types)]
+      (for [i 0 n]
+        (let [node-type (Array.unsafe-nth node-types i)]
+          (when (Int.= @(InferredNodeType.id node-type) expression-id)
+            (when (same-owner? (InferredNodeType.owner node-type) owner)
+              (let [normalized (Type.apply (InferredModule.substitution inferred)
+                                           (Box.peek (InferredNodeType.type node-type)))]
+                (set! result
+                      (Maybe.Just (Type.apply instance-substitution &normalized))))))))
+      (match result
+        (Maybe.Just found) (Result.Success found)
+        (Maybe.Nothing) (expression-type-missing owner expression-id))))
+
+  (private owner-trace-key)
+  (hidden owner-trace-key)
+  (defn owner-trace-key [owner]
+    (match-ref owner
+      (Maybe.Just reference) @(CoreRef.id reference)
+      (Maybe.Nothing) -1000000001))
+
+  (private prime-trace-owner!)
+  (hidden prime-trace-owner!)
+  (doc prime-trace-owner! "rebuilds the expr-id→trace-position index for one
+owner; runs when materialization switches owners (once per instance), so the
+per-expression trace scan becomes an array lookup.")
+  (defn prime-trace-owner! [inferred owner]
+    (let-do [node-types (InferredModule.node-types inferred)
+             n (Array.length node-types)
+             max-id 0]
+      (for [i 0 n]
+        (let [node-type (Array.unsafe-nth node-types i)]
+          (when (same-owner? (InferredNodeType.owner node-type) owner)
+            (when (Int.> @(InferredNodeType.id node-type) max-id)
+              (set! max-id @(InferredNodeType.id node-type))))))
+      (let-do [positions (Array.replicate (Int.inc max-id) &-1)]
+        (for [i 0 n]
+          (let [node-type (Array.unsafe-nth node-types i)]
+            (when (same-owner? (InferredNodeType.owner node-type) owner)
+              (let [id @(InferredNodeType.id node-type)]
+                (when (Int.>= id 0) (Array.aset! &positions id i))))))
+        (set! *trace-positions* positions)
+        (set! *trace-owner-key* (owner-trace-key owner)))))
+
+  (defn expression-type-for [inferred owner expression-id instance-substitution]
+    (if (Int.= 0 (Array.length &*normalized-node-types*))
+      (expression-type-for-linear inferred
+                                  owner
+                                  expression-id
+                                  instance-substitution)
+      (do
+        (unless (Int.= (owner-trace-key owner) *trace-owner-key*)
+          (prime-trace-owner! inferred owner))
+        (if (or (Int.< expression-id 0)
+                (Int.>= expression-id (Array.length &*trace-positions*)))
+          (expression-type-missing owner expression-id)
+          (let [at @(Array.unsafe-nth &*trace-positions* expression-id)]
+            (if (or (Int.< at 0)
+                    (Int.>= at (Array.length &*normalized-node-types*)))
+              (expression-type-missing owner expression-id)
+              (let [node-type (Array.unsafe-nth (InferredModule.node-types inferred)
+                                                at)]
+                (if (and
+                    (Int.= @(InferredNodeType.id node-type) expression-id)
+                    (same-owner? (InferredNodeType.owner node-type) owner))
+                  (do
+                    (unless-do @(Array.unsafe-nth &*normalized-filled* at)
+                      (Array.aset! &*normalized-node-types*
+                                   at
+                                   (Box.init
+                                     (Type.apply (InferredModule.substitution inferred)
+                                                 (Box.peek (InferredNodeType.type node-type)))))
+                      (Array.aset! &*normalized-filled* at true))
+                    (Result.Success
+                      (Type.apply instance-substitution
+                                  (Box.peek
+                                    (Array.unsafe-nth &*normalized-node-types*
+                                                      at)))))
+                  (expression-type-for-linear inferred
+                                              owner
+                                              expression-id
+                                              instance-substitution)))))))))
+
+  (defn rewrite-expressions [expressions
+                             calls
+                             inferred
+                             owner
+                             instance-substitution]
+    (let-do [result (the
+               (Result (Array (Box SpecializedExpr)) SpecializeError)
+               (Result.Success []))
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success rewritten)
+            (match (rewrite-expression
+                (Box.peek (Array.unsafe-nth expressions i))
+                calls
+                inferred
+                owner
+                instance-substitution)
+              (Result.Success expression)
+                (set! result
+                      (Result.Success
+                        (Array.push-back @rewritten (Box.init expression))))
+              (Result.Error error) (set! result (Result.Error error)))
+          (Result.Error _) ()))
+      result))
+
+  (defn rewrite-branches [branches calls inferred owner instance-substitution]
+    (let-do [result (the
+               (Result (Array SpecializedMatchBranch) SpecializeError)
+               (Result.Success []))
+             n (Array.length branches)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success rewritten)
+            (let [branch (Array.unsafe-nth branches i)]
+              (match (rewrite-expression (Box.peek (CoreMatchBranch.body branch))
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success body)
+                  (set! result
+                        (Result.Success
+                          (Array.push-back @rewritten
+                                           (SpecializedMatchBranch.init @(CoreMatchBranch.pattern branch)
+                                                                        @(CoreMatchBranch.bindings branch)
+                                                                        (Box.init body)))))
+                (Result.Error error) (set! result (Result.Error error))))
+          (Result.Error _) ()))
+      result))
+
+  (defn rewrite-expression [expression
+                            calls
+                            inferred
+                            owner
+                            instance-substitution]
+    (let [expression-id (CoreIR.expression-id expression)]
+      (match (expression-type-for inferred
+                                  owner
+                                  expression-id
+                                  instance-substitution)
+        (Result.Success node-type)
+          (match-ref expression
+            (CoreExpr.IntLit _ value)
+              (Result.Success
+                (SpecializedExpr.IntLit expression-id
+                                        (Box.init (MonoType.copy &node-type))
+                                        @value))
+            (CoreExpr.ByteLit _ value)
+              (Result.Success
+                (SpecializedExpr.ByteLit expression-id
+                                         (Box.init (MonoType.copy &node-type))
+                                         @value))
+            (CoreExpr.LongLit _ value)
+              (Result.Success
+                (SpecializedExpr.LongLit expression-id
+                                         (Box.init (MonoType.copy &node-type))
+                                         @value))
+            (CoreExpr.FloatLit _ value)
+              (Result.Success
+                (SpecializedExpr.FloatLit expression-id
+                                          (Box.init (MonoType.copy &node-type))
+                                          @value))
+            (CoreExpr.DoubleLit _ value)
+              (Result.Success
+                (SpecializedExpr.DoubleLit expression-id
+                                           (Box.init (MonoType.copy &node-type))
+                                           @value))
+            (CoreExpr.CharLit _ value)
+              (Result.Success
+                (SpecializedExpr.CharLit expression-id
+                                         (Box.init (MonoType.copy &node-type))
+                                         @value))
+            (CoreExpr.StringLit _ value)
+              (Result.Success
+                (SpecializedExpr.StringLit expression-id
+                                           (Box.init (MonoType.copy &node-type))
+                                           (String.copy value)))
+            (CoreExpr.PatternLit _ value)
+              (Result.Success
+                (SpecializedExpr.PatternLit expression-id
+                                            (Box.init (MonoType.copy &node-type))
+                                            (String.copy value)))
+            (CoreExpr.BoolLit _ value)
+              (Result.Success
+                (SpecializedExpr.BoolLit expression-id
+                                         (Box.init (MonoType.copy &node-type))
+                                         @value))
+            (CoreExpr.UnitLit _)
+              (Result.Success
+                (SpecializedExpr.UnitLit expression-id
+                                         (Box.init (MonoType.copy &node-type))))
+            (CoreExpr.ArrayLit _ expressions)
+              (match (rewrite-expressions expressions
+                                          calls
+                                          inferred
+                                          owner
+                                          instance-substitution)
+                (Result.Success rewritten)
+                  (Result.Success
+                    (SpecializedExpr.ArrayLit expression-id
+                                              (Box.init (MonoType.copy &node-type))
+                                              rewritten))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.StaticArrayLit _ expressions)
+              (match (rewrite-expressions expressions
+                                          calls
+                                          inferred
+                                          owner
+                                          instance-substitution)
+                (Result.Success rewritten)
+                  (Result.Success
+                    (SpecializedExpr.StaticArrayLit expression-id
+                                                    (Box.init (MonoType.copy &node-type))
+                                                    rewritten))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Reference _ reference)
+              (if @(CoreRef.global reference)
+                (match (specialized-call-maybe calls expression-id)
+                  (Maybe.Just target)
+                    (Result.Success
+                      (SpecializedExpr.GlobalValue expression-id
+                                                   (Box.init (MonoType.copy &node-type))
+                                                   @(SpecializedCall.reference &target)
+                                                   @(SpecializedCall.signature &target)
+                                                   @(SpecializedCall.symbol &target)
+                                                   @(SpecializedCall.value &target)))
+                  (Maybe.Nothing)
+                    (Result.Success
+                      (SpecializedExpr.Reference expression-id
+                                                 (Box.init (MonoType.copy &node-type))
+                                                 (CoreRef.copy reference))))
+                (Result.Success
+                  (SpecializedExpr.Reference expression-id
+                                             (Box.init (MonoType.copy &node-type))
+                                             (CoreRef.copy reference))))
+            (CoreExpr.Call call-id callee arguments)
+              (match (rewrite-expression (Box.peek callee)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten-callee)
+                  (match (rewrite-expressions arguments
+                                              calls
+                                              inferred
+                                              owner
+                                              instance-substitution)
+                    (Result.Success rewritten-arguments)
+                      (match-ref (Box.peek callee)
+                        (CoreExpr.Reference _ reference)
+                          (if @(CoreRef.global reference)
+                            (match (specialized-call-for calls @call-id)
+                              (Result.Success target)
+                              ;; a call through a function-typed `def` global is a
+                              ;; closure invocation of the stored Lambda, not a
+                              ;; direct C call (the reference stores it in a global
+                              ;; and dispatches through the callback pointer).
+                              (if @(SpecializedCall.value &target)
+                                (Result.Success
+                                  (SpecializedExpr.Call expression-id
+                                                        (Box.init (MonoType.copy &node-type))
+                                                        (Box.init
+                                                          (SpecializedExpr.GlobalValue (CoreIR.expression-id (Box.peek callee))
+                                                                                       @(SpecializedCall.signature &target)
+                                                                                       @(SpecializedCall.reference &target)
+                                                                                       @(SpecializedCall.signature &target)
+                                                                                       @(SpecializedCall.symbol &target)
+                                                                                       true))
+                                                        rewritten-arguments))
+                                (Result.Success
+                                  (SpecializedExpr.GlobalCall expression-id
+                                                              (Box.init (MonoType.copy &node-type))
+                                                              @(SpecializedCall.reference &target)
+                                                              @(SpecializedCall.signature &target)
+                                                              @(SpecializedCall.symbol &target)
+                                                              rewritten-arguments)))
+                              (Result.Error _)
+                              (let [callee-type-name (match (expression-type-for inferred
+                                                                                 owner
+                                                                                 (CoreIR.expression-id (Box.peek callee))
+                                                                                 instance-substitution)
+                                      (Result.Success callee-type)
+                                        (Type.name &callee-type)
+                                      (Result.Error _) @"<unknown>")
+                                    owner-name (match-ref owner
+                                      (Maybe.Just owner-reference)
+                                        (String.copy (CoreRef.name owner-reference))
+                                      (Maybe.Nothing) @"<root>")]
+                                (Result.Error
+                                  (SpecializeError.init
+                                    (String.concat
+                                      &[@"specialized body contains an untyped global call to "
+                                        (String.copy (CoreRef.name reference))
+                                        @" in "
+                                        owner-name
+                                        @" (expr "
+                                        (Int.str expression-id)
+                                        @", callee expr "
+                                        (Int.str (CoreIR.expression-id (Box.peek callee)))
+                                        @") with callee "
+                                        callee-type-name
+                                        @" and result "
+                                        (Type.name &node-type)
+                                        @"; argument types: "
+                                        (String.join
+                                          ", "
+                                          &(Array.copy-map
+                                            &(fn [argument]
+                                              (Type.name
+                                                &(Specialize.expression-type
+                                                  (Box.peek argument))))
+                                            &rewritten-arguments))])))))
+                            (Result.Success
+                              (SpecializedExpr.Call expression-id
+                                                    (Box.init (MonoType.copy &node-type))
+                                                    (Box.init rewritten-callee)
+                                                    rewritten-arguments)))
+                        _
+                          (Result.Success
+                            (SpecializedExpr.Call expression-id
+                                                  (Box.init (MonoType.copy &node-type))
+                                                  (Box.init rewritten-callee)
+                                                  rewritten-arguments)))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Do _ expressions)
+              (match (rewrite-expressions expressions
+                                          calls
+                                          inferred
+                                          owner
+                                          instance-substitution)
+                (Result.Success rewritten)
+                  (Result.Success
+                    (SpecializedExpr.Do expression-id
+                                        (Box.init (MonoType.copy &node-type))
+                                        rewritten))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.If _ condition then-branch else-branch)
+              (match (rewrite-expression (Box.peek condition)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten-condition)
+                  (match (rewrite-expression (Box.peek then-branch)
+                                             calls
+                                             inferred
+                                             owner
+                                             instance-substitution)
+                    (Result.Success rewritten-then)
+                      (match (rewrite-expression (Box.peek else-branch)
+                                                 calls
+                                                 inferred
+                                                 owner
+                                                 instance-substitution)
+                        (Result.Success rewritten-else)
+                          (Result.Success
+                            (SpecializedExpr.If expression-id
+                                                (Box.init (MonoType.copy &node-type))
+                                                (Box.init rewritten-condition)
+                                                (Box.init rewritten-then)
+                                                (Box.init rewritten-else)))
+                        (Result.Error error) (Result.Error error))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Let _ reference value body)
+              (match (rewrite-expression (Box.peek value)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten-value)
+                  (match (rewrite-expression (Box.peek body)
+                                             calls
+                                             inferred
+                                             owner
+                                             instance-substitution)
+                    (Result.Success rewritten-body)
+                      (Result.Success
+                        (SpecializedExpr.Let expression-id
+                                             (Box.init (MonoType.copy &node-type))
+                                             (CoreRef.copy reference)
+                                             (Box.init rewritten-value)
+                                             (Box.init rewritten-body)))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Set _ reference value)
+              (match (rewrite-expression (Box.peek value)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten)
+                  (Result.Success
+                    (SpecializedExpr.Set expression-id
+                                         (Box.init (MonoType.copy &node-type))
+                                         (CoreRef.copy reference)
+                                         (Box.init rewritten)))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.While _ condition body)
+              (match (rewrite-expression (Box.peek condition)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten-condition)
+                  (match (rewrite-expression (Box.peek body)
+                                             calls
+                                             inferred
+                                             owner
+                                             instance-substitution)
+                    (Result.Success rewritten-body)
+                      (Result.Success
+                        (SpecializedExpr.While expression-id
+                                               (Box.init (MonoType.copy &node-type))
+                                               (Box.init rewritten-condition)
+                                               (Box.init rewritten-body)))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Break _)
+              (Result.Success
+                (SpecializedExpr.Break expression-id
+                                       (Box.init (MonoType.copy &node-type))))
+            (CoreExpr.Lambda _ parameters body)
+              (match (rewrite-expression (Box.peek body)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten)
+                  (Result.Success
+                    (SpecializedExpr.Lambda expression-id
+                                            (Box.init (MonoType.copy &node-type))
+                                            (Array.copy parameters)
+                                            (Box.init rewritten)))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Match _ by-reference scrutinee branches)
+              (match (rewrite-expression (Box.peek scrutinee)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten-scrutinee)
+                  (match (rewrite-branches branches
+                                           calls
+                                           inferred
+                                           owner
+                                           instance-substitution)
+                    (Result.Success rewritten-branches)
+                      (Result.Success
+                        (SpecializedExpr.Match expression-id
+                                               (Box.init (MonoType.copy &node-type))
+                                               @by-reference
+                                               (Box.init rewritten-scrutinee)
+                                               rewritten-branches))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (CoreExpr.Annotation _ inner annotation)
+              (match (rewrite-expression (Box.peek inner)
+                                         calls
+                                         inferred
+                                         owner
+                                         instance-substitution)
+                (Result.Success rewritten)
+                  (Result.Success
+                    (SpecializedExpr.Annotation expression-id
+                                                (Box.init (MonoType.copy &node-type))
+                                                (Box.init rewritten)
+                                                (Box.init (CoreType.copy (Box.peek annotation)))))
+                (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error))))
+
+  (defn rewrite-body [body calls inferred owner signature]
+    (match (scheme-for (InferredModule.environment inferred) owner)
+      (Maybe.Just scheme)
+        (let [empty (Type.empty-substitution)]
+          (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
+                                    signature
+                                    &empty)
+            (Result.Success instance-substitution)
+              (rewrite-expression body
+                                  calls
+                                  inferred
+                                  &(Maybe.Just (CoreRef.copy owner))
+                                  &instance-substitution)
+            (Result.Error error)
+              (Result.Error (SpecializeError.init @(TypeError.message &error)))))
+      (Maybe.Nothing)
+        (Result.Error
+          (SpecializeError.init @"missing scheme for specialized body"))))
+
+  (private materialize-output)
+  (hidden materialize-output)
+  (defn materialize-output [core inferred instances]
+    (let-do [result (the
+               (Result SpecializationModule SpecializeError)
+               (Result.Success
+                 (SpecializationModule.init (Array.copy instances)
+                                            []
+                                            []
+                                            []
+                                            @(CoreModule.constructors core)
+                                            @(CoreModule.system-includes core))))
+             functions (CoreModule.functions core)
+             values (CoreModule.values core)
+             builtins (CoreModule.builtins core)
+             n (Array.length instances)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success output)
+            (let [instance (Array.unsafe-nth instances i)
+                  reference (Specialization.reference instance)
+                  signature (Box.peek (Specialization.signature instance))]
+              (match (function-for functions reference)
+                (Maybe.Just function)
+                  (match (materialize-calls core
+                                            inferred
+                                            instances
+                                            reference
+                                            signature)
+                    (Result.Success calls)
+                      (match (rewrite-body (Box.peek (CoreFunction.body &function))
+                                           &calls
+                                           inferred
+                                           reference
+                                           signature)
+                        (Result.Success body)
+                          (set! result
+                                (Result.Success
+                                  (SpecializationModule.init @(SpecializationModule.instances output)
+                                                             (Array.push-back @(SpecializationModule.bodies output)
+                                                                              (SpecializedBody.init @instance
+                                                                                                    @(CoreFunction.parameters &function)
+                                                                                                    (Box.init body)
+                                                                                                    false))
+                                                             @(SpecializationModule.primitives output)
+                                                             @(SpecializationModule.roots output)
+                                                             @(SpecializationModule.constructors output)
+                                                             @(SpecializationModule.system-includes output))))
+                        (Result.Error error) (set! result (Result.Error error)))
+                    (Result.Error error) (set! result (Result.Error error)))
+                (Maybe.Nothing)
+                  (match (value-for values reference)
+                    (Maybe.Just value)
+                      (match (materialize-calls core
+                                                inferred
+                                                instances
+                                                reference
+                                                signature)
+                        (Result.Success calls)
+                          (match (rewrite-body (Box.peek (CoreValue.body &value))
+                                               &calls
+                                               inferred
+                                               reference
+                                               signature)
+                            (Result.Success body)
+                              (set! result
+                                    (Result.Success
+                                      (SpecializationModule.init @(SpecializationModule.instances output)
+                                                                 (Array.push-back @(SpecializationModule.bodies output)
+                                                                                  (SpecializedBody.init @instance
+                                                                                                        []
+                                                                                                        (Box.init body)
+                                                                                                        true))
+                                                                 @(SpecializationModule.primitives output)
+                                                                 @(SpecializationModule.roots output)
+                                                                 @(SpecializationModule.constructors output)
+                                                                 @(SpecializationModule.system-includes output))))
+                            (Result.Error error)
+                              (set! result (Result.Error error)))
+                        (Result.Error error) (set! result (Result.Error error)))
+                    (Maybe.Nothing)
+                      (when (has-builtin? builtins reference)
+                        (let [lowering (match (PrimitiveRegistry.lowering-for reference)
+                                (Maybe.Just found) found
+                                (Maybe.Nothing) (PrimitiveLowering.Intrinsic))]
+                          (match (materialize-calls core
+                                                    inferred
+                                                    instances
+                                                    reference
+                                                    signature)
+                            (Result.Success dependencies)
+                              (set! result
+                                    (Result.Success
+                                      (SpecializationModule.init @(SpecializationModule.instances output)
+                                                                 @(SpecializationModule.bodies output)
+                                                                 (Array.push-back
+                                                                   @(SpecializationModule.primitives output)
+                                                                   (SpecializedPrimitive.init @instance
+                                                                                              lowering
+                                                                                              dependencies
+                                                                                              (builtin-source-for core
+                                                                                                                  reference)))
+                                                                 @(SpecializationModule.roots output)
+                                                                 @(SpecializationModule.constructors output)
+                                                                 @(SpecializationModule.system-includes output))))
+                            (Result.Error error)
+                              (set! result (Result.Error error))))))))
+          (Result.Error _) ()))
+      (match result
+        (Result.Success output)
+          (match (materialize-root-calls core inferred instances)
+            (Result.Success calls)
+              (let [empty (Type.empty-substitution)
+                    owner (the (Maybe CoreRef) (Maybe.Nothing))]
+                (match (rewrite-expressions (CoreModule.expressions core)
+                                            &calls
+                                            inferred
+                                            &owner
+                                            &empty)
+                  (Result.Success roots)
+                    (Result.Success
+                      (SpecializationModule.init
+                        @(SpecializationModule.instances &output)
+                        @(SpecializationModule.bodies &output)
+                        @(SpecializationModule.primitives &output)
+                        roots
+                        @(SpecializationModule.constructors &output)
+                        @(SpecializationModule.system-includes &output)))
+                  (Result.Error error) (Result.Error error)))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))))
+
+  (doc module "starts from top-level global calls, creates one instance per
+function/signature pair, and traverses the global calls recorded in each newly
+specialized function body.")
+  (doc delete-request "builds a specialization request that demands the concrete
+`delete` implementation for `type`, routed through the same interface selection
+as ordinary calls. Used by the driver to close a specialized module over the
+deleters its ownership plan requires.")
+  (defn delete-request [type]
+    (SpecializationRequest.init
+      (CallSite.init -1
+                     (PrimitiveRegistry.delete-reference)
+                     (Box.init
+                       (MonoType.Function [(Box.init (MonoType.copy type))]
+                                          (Box.init (MonoType.Unit))))
+                     (Maybe.Nothing))
+      (String.copy "ownership delete")))
+
+  (private name-in?)
+  (hidden name-in?)
+  (defn name-in? [names name]
+    (let-do [found false
+             n (Array.length names)]
+      (for [i 0 n]
+        (when (String.= (Array.unsafe-nth names i) name) (set! found true)))
+      found))
+
+  (doc named-requests "builds a specialization demand for every function whose
+qualified name appears in `names` and whose inferred scheme is concrete. The
+driver seeds these for definitions in the compiled file itself, so they are
+ownership- and borrow-checked even when nothing calls them, the way the
+reference compiler checks every definition.")
+  (private named-request-for!)
+  (hidden named-request-for!)
+  (defn named-request-for! [inferred reference names result]
+    (when (name-in? names (CoreRef.name reference))
+      (match (scheme-for (InferredModule.environment inferred) reference)
+        (Maybe.Just scheme)
+          (let [signature (Type.apply (InferredModule.substitution inferred)
+                                      (Box.peek (TypeScheme.body &scheme)))]
+            (when (concrete-signature? &signature)
+              (Array.push-back! result
+                                (SpecializationRequest.init
+                                  (CallSite.init -1
+                                                 (CoreRef.copy reference)
+                                                 (Box.init signature)
+                                                 (Maybe.Nothing))
+                                  (String.copy "<definition>")))))
+        (Maybe.Nothing) ())))
+
+  (defn named-requests [core inferred names]
+    (let-do [ignored-index (prime-schemes! (InferredModule.environment inferred))
+             ignored-trace (prime-trace! inferred)
+             result (the (Array SpecializationRequest) [])
+             functions (CoreModule.functions core)
+             builtins (CoreModule.builtins core)
+             n (Array.length functions)
+             m (Array.length builtins)]
+      (for [i 0 n]
+        (named-request-for! inferred
+                            (CoreFunction.reference (Array.unsafe-nth functions
+                                                                      i))
+                            names
+                            &result))
+      ;; registered builtins (e.g. `IO.println`) are demandable by name too —
+      ;; the echo plan needs their specialized symbol.
+      (for [i 0 m]
+        (named-request-for! inferred
+                            (CoreBuiltin.reference (Array.unsafe-nth builtins i))
+                            names
+                            &result))
+      result))
+
+  (doc echo-request "builds the specialization demand for rendering a
+top-level result of `type` through the `str` interface, the way the reference
+echoes top-level expression results into `main`. Derived strs take their
+argument by reference, scalar strs by value, so the by-reference form is
+probed first. Returns the request paired with by-ref?, or Nothing when no str
+implementation exists for the type.")
+  (defn echo-request [core inferred type]
+    (let [ignored-index (prime-schemes! (InferredModule.environment inferred))
+          ignored-trace (prime-trace! inferred)
+          by-ref (CallSite.init -1
+                                (PrimitiveRegistry.str-reference)
+                                (Box.init
+                                  (MonoType.Function
+                                    [(Box.init
+                                       (MonoType.Reference (Box.init (MonoType.copy type))
+                                                           (MonoLifetime.Static)))]
+                                    (Box.init (MonoType.String))))
+                                (Maybe.Nothing))]
+      (match (implementation-for core inferred &by-ref)
+        (Result.Success _)
+          (Maybe.Just
+            (Pair.init
+              (SpecializationRequest.init by-ref (String.copy "<echo>"))
+              true))
+        (Result.Error _)
+          (let [by-value (CallSite.init -1
+                                        (PrimitiveRegistry.str-reference)
+                                        (Box.init
+                                          (MonoType.Function [(Box.init (MonoType.copy type))]
+                                                             (Box.init (MonoType.String))))
+                                        (Maybe.Nothing))]
+            (match (implementation-for core inferred &by-value)
+              (Result.Success _)
+                (Maybe.Just
+                  (Pair.init
+                    (SpecializationRequest.init by-value (String.copy "<echo>"))
+                    false))
+              (Result.Error _)
+                (the (Maybe (Pair SpecializationRequest Bool)) (Maybe.Nothing)))))))
+
+  (doc module-with "specializes the reachable program plus `extra-requests`
+(e.g. ownership delete demands), sharing one worklist so introduced calls use
+the same interface selection and instance deduplication as user calls.")
+  (defn module-with [core inferred extra-requests]
+    (let-do [ignored-index (prime-schemes! (InferredModule.environment inferred))
+             ignored-trace (prime-trace! inferred)
+             instances (the (Array Specialization) [])
+             failed false
+             failure (String.copy "")
+             functions (CoreModule.functions core)
+             values (CoreModule.values core)
+             builtins (CoreModule.builtins core)
+             interfaces (CoreModule.interfaces core)
+             queue-result (root-requests core inferred)
+             queue (match-ref &queue-result
+               (Result.Success found) (Array.copy found)
+               (Result.Error _) [])
+             cursor 0]
+      (match-ref &queue-result
+        (Result.Success _) ()
+        (Result.Error error)
+          (do
+            (set! failed true)
+            (set! failure (String.copy (SpecializeError.message error)))))
+      (let-do [extra-count (Array.length extra-requests)]
+        (for [i 0 extra-count]
+          (set! queue
+                (Array.push-back queue @(Array.unsafe-nth extra-requests i)))))
+      (while-do (Int.< cursor (Array.length &queue))
+        (unless-do failed
+          (let [request (Array.unsafe-nth &queue cursor)
+                origin (String.copy (SpecializationRequest.origin request))
+                call (normalize-call inferred
+                                     (SpecializationRequest.call request))
+                reference (CoreRef.copy (CallSite.reference &call))
+                signature (MonoType.copy (Box.peek (CallSite.type &call)))]
+            ;; interface dispatch runs before the concreteness gate: a call
+            ;; whose free variables are pinned by the unique matching
+            ;; implementation (overload interfaces declare no linking
+            ;; signature) resolves through the dispatch substitution.
+            (if (interface? interfaces &reference)
+              (match (implementation-for core inferred &call)
+                (Result.Success implementation)
+                  (when (concrete-signature?
+                      (Box.peek (CallSite.type &implementation)))
+                    (set! queue
+                          (Array.push-back queue
+                                           (SpecializationRequest.init implementation
+                                                                       (String.copy &origin)))))
+                (Result.Error error)
+                  (when-do (concrete-signature? &signature)
+                    (set! failed true)
+                    (set! failure
+                          (contextual-specialize-error &origin
+                                                       (SpecializeError.message &error)))))
+              (when (concrete-signature? &signature)
+                (if (or (has-definition? functions &reference)
+                        (or (has-value? values &reference)
+                            (has-builtin? builtins &reference)))
+                  (unless-do (contains-instance? &instances
+                                                 &reference
+                                                 &signature)
+                    (match (dependencies-for core inferred &reference &signature)
+                      (Result.Success dependencies)
+                        (let-do [symbol (symbol-for core &reference &signature)]
+                          (set! instances
+                                (Array.push-back instances
+                                                 (Specialization.init (CoreRef.copy &reference)
+                                                                      (Box.init (MonoType.copy &signature))
+                                                                      symbol)))
+                          (let [n (Array.length &dependencies)]
+                            (for [i 0 n]
+                              (set! queue
+                                    (Array.push-back queue
+                                                     (SpecializationRequest.init @(Array.unsafe-nth &dependencies
+                                                                                                    i)
+                                                                                 (String.concat
+                                                                                   &[(String.copy (CoreRef.name &reference))
+                                                                                     @" at "
+                                                                                     (Type.name &signature)])))))))
+                      (Result.Error error)
+                        (do
+                          (set! failed true)
+                          (set! failure
+                                (contextual-specialize-error &origin
+                                                             (SpecializeError.message &error))))))
+
+                  (do
+                    (set! failed true)
+                    (set! failure
+                          (contextual-specialize-error &origin
+                                                       "call has no function or builtin definition"))))))))
+        (set! cursor (Int.inc cursor)))
+      (if failed
+        (Result.Error (SpecializeError.init failure))
+        (materialize-output core inferred &instances))))
+
+  (doc module "specializes the reachable program from its roots.")
+  (defn module [core inferred]
+    (module-with core inferred &(the (Array SpecializationRequest) []))))

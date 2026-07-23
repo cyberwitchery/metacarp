@@ -1,0 +1,1308 @@
+(doc MonoType "is a monomorphic type used by inference and specialization.
+Variables are inference variables identified by an integer; function arguments
+and results are boxed only to represent recursive type structure.")
+(deftype MonoLifetime
+  (Variable [Int])
+  (Static []))
+
+(deftype MonoType
+  (Variable [Int])
+  (Integer [])
+  (String [])
+  (Boolean [])
+  (Unit [])
+  (Named [String (Array (Box MonoType))])
+  (Reference [(Box MonoType) MonoLifetime])
+  (Function [(Array (Box MonoType)) (Box MonoType)]))
+
+(deftype TypeBinding [variable Int
+                      value (Box MonoType)])
+
+(deftype LifetimeBinding [variable Int
+                          value MonoLifetime])
+
+(deftype TypeSubstitution
+  [bindings (Array TypeBinding)
+   lifetime-bindings (Array LifetimeBinding)
+   constructor-bindings (Array (Pair String String))])
+
+(deftype TypeSolver
+  [bindings (Array TypeBinding)
+   indexes (Array Int)
+   lifetime-bindings (Array LifetimeBinding)
+   lifetime-indexes (Array Int)
+   constructor-bindings (Array (Pair String String))])
+
+(deftype TypeScheme
+  [variables (Array Int)
+   lifetime-variables (Array Int)
+   body (Box MonoType)])
+
+(deftype TypeError [message String])
+
+(defmodule Type
+  (doc variable "creates an inference variable.")
+  (defn variable [id] (MonoType.Variable id))
+
+  (doc integer "creates the built-in Int type.")
+  (defn integer [] (MonoType.Integer))
+
+  (doc string "creates the built-in String type.")
+  (defn string [] (MonoType.String))
+
+  (doc boolean "creates the built-in Bool type.")
+  (defn boolean [] (MonoType.Boolean))
+
+  (doc unit "creates the built-in unit type.")
+  (defn unit [] (MonoType.Unit))
+
+  (doc named "creates a nominal type application.")
+  (defn named [name arguments] (MonoType.Named (String.copy name) arguments))
+
+  (doc lifetime "creates an inferred lifetime identity.")
+  (defn lifetime [id] (MonoLifetime.Variable id))
+
+  (doc reference "creates a borrowed reference type with an explicit lifetime.")
+  (defn reference [inner lifetime]
+    (MonoType.Reference (Box.init inner) lifetime))
+
+  (doc function "creates a function type from argument and result types.")
+  (defn function [arguments result]
+    (MonoType.Function arguments (Box.init result)))
+
+  (doc empty-substitution "creates an empty type substitution.")
+  (defn empty-substitution [] (TypeSubstitution.init [] [] []))
+
+  (doc constructor-variable? "whether a nominal head names a type-constructor
+VARIABLE rather than a concrete type: `(f a)` in an interface like fmap uses
+lowercase `f` as a variable over type constructors, following the same
+lowercase convention as ordinary type variables.")
+  (defn constructor-variable? [name]
+    (and (Int.> (String.length name) 0)
+         (let [c (String.char-at name 0)] (and (Char.>= c \a) (Char.<= c \z)))))
+
+  (private constructor-binding-in)
+  (hidden constructor-binding-in)
+  (sig constructor-binding-in
+       (Fn [(Ref (Array (Pair String String))) (Ref String)] (Maybe String)))
+  (defn constructor-binding-in [bindings name]
+    (let-do [result (the (Maybe String) (Maybe.Nothing))
+             n (Array.length bindings)]
+      (for [i 0 n]
+        (when (String.= (Pair.a (Array.unsafe-nth bindings i)) name)
+          (set! result
+                (Maybe.Just (String.copy (Pair.b (Array.unsafe-nth bindings i)))))))
+      result))
+
+  (private resolve-constructor-in)
+  (hidden resolve-constructor-in)
+  (sig resolve-constructor-in
+       (Fn [(Ref (Array (Pair String String))) (Ref String)] String))
+  (defn resolve-constructor-in [bindings name]
+    (match (constructor-binding-in bindings name)
+      (Maybe.Just bound) (resolve-constructor-in bindings &bound)
+      (Maybe.Nothing) (String.copy name)))
+
+  (private binding-for)
+  (hidden binding-for)
+  (defn binding-for [substitution variable]
+    (let-do [result (the (Maybe MonoType) (Maybe.Nothing))
+             found false
+             bindings (TypeSubstitution.bindings substitution)
+             n (Array.length bindings)]
+      (for [i 0 n]
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when-do (and (not found)
+                        (Int.= @(TypeBinding.variable binding) variable))
+            (set! found true)
+            (set! result
+                  (Maybe.Just
+                    (MonoType.copy (Box.peek (TypeBinding.value binding))))))))
+      result))
+
+  (private lifetime-binding-for)
+  (hidden lifetime-binding-for)
+  (defn lifetime-binding-for [substitution variable]
+    (let-do [result (the (Maybe MonoLifetime) (Maybe.Nothing))
+             found false
+             bindings (TypeSubstitution.lifetime-bindings substitution)
+             n (Array.length bindings)]
+      (for [i 0 n]
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when-do (and (not found)
+                        (Int.= @(LifetimeBinding.variable binding) variable))
+            (set! found true)
+            (set! result
+                  (Maybe.Just
+                    (MonoLifetime.copy (LifetimeBinding.value binding)))))))
+      result))
+
+  (private apply-lifetime)
+  (hidden apply-lifetime)
+  (defn apply-lifetime [substitution lifetime]
+    (match-ref lifetime
+      (MonoLifetime.Variable variable)
+        (match (lifetime-binding-for substitution @variable)
+          (Maybe.Just value) (apply-lifetime substitution &value)
+          (Maybe.Nothing) (MonoLifetime.Variable @variable))
+      (MonoLifetime.Static) (MonoLifetime.Static)))
+
+  (private apply-arguments)
+  (hidden apply-arguments)
+  (private apply-internal)
+  (hidden apply-internal)
+  (defn apply-arguments [substitution arguments]
+    (let-do [result (the (Array (Box MonoType)) [])
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (apply-internal substitution
+                                                 (Box.peek (Array.unsafe-nth arguments
+                                                                             i)))))))
+      result))
+
+  (defn apply-internal [substitution type]
+    (match-ref type
+      (MonoType.Variable variable)
+        (match (binding-for substitution @variable)
+          (Maybe.Just value) (apply-internal substitution &value)
+          (Maybe.Nothing) (MonoType.Variable @variable))
+      (MonoType.Integer) (MonoType.Integer)
+      (MonoType.String) (MonoType.String)
+      (MonoType.Boolean) (MonoType.Boolean)
+      (MonoType.Unit) (MonoType.Unit)
+      (MonoType.Named name arguments)
+        (MonoType.Named
+          (resolve-constructor-in
+            (TypeSubstitution.constructor-bindings substitution)
+            name)
+          (apply-arguments substitution arguments))
+      (MonoType.Reference inner lifetime)
+        (MonoType.Reference
+          (Box.init (apply-internal substitution (Box.peek inner)))
+          (apply-lifetime substitution lifetime))
+      (MonoType.Function arguments result)
+        (MonoType.Function (apply-arguments substitution arguments)
+                           (Box.init
+                             (apply-internal substitution (Box.peek result))))))
+
+  (doc apply "applies a substitution recursively to a type. An empty
+substitution (the common case: instance substitutions of monomorphic
+functions) short-circuits to a plain copy, skipping per-node lookups.")
+  (defn apply [substitution type]
+    (if (and (Int.= 0 (Array.length (TypeSubstitution.bindings substitution)))
+             (and (Int.= 0 (Array.length (TypeSubstitution.lifetime-bindings substitution)))
+                  (Int.= 0 (Array.length (TypeSubstitution.constructor-bindings substitution)))))
+      (MonoType.copy type)
+      (apply-internal substitution type)))
+
+  (private freshen-constructors-walk)
+  (hidden freshen-constructors-walk)
+  (sig freshen-constructors-walk
+       (Fn
+         [(Ref MonoType) (Ref (Array (Pair String String))) (Ref (Array Int))]
+         MonoType))
+  (defn freshen-constructors-walk [type mapping counter]
+    (match-ref type
+      (MonoType.Named name arguments)
+        (let-do [head (if (constructor-variable? name)
+                   (match (constructor-binding-in mapping name)
+                     (Maybe.Just bound) bound
+                     (Maybe.Nothing)
+                       (let-do [fresh (String.concat
+                                  &[@"ctv"
+                                    (Int.str @(Array.unsafe-nth counter 0))])]
+                         (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
+                           (Maybe.Just _)
+                             (IO.errorln &(fmt "freshen ctor-var %s" name))
+                           (Maybe.Nothing) ())
+                         (Array.aset! counter
+                                      0
+                                      (Int.inc @(Array.unsafe-nth counter 0)))
+                         (Array.push-back! mapping
+                                           (Pair.init (String.copy name)
+                                                      (String.copy &fresh)))
+                         fresh))
+                   (String.copy name))
+                 result (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &result
+                              (Box.init
+                                (freshen-constructors-walk
+                                  (Box.peek (Array.unsafe-nth arguments i))
+                                  mapping
+                                  counter))))
+          (MonoType.Named head result))
+      (MonoType.Reference inner lifetime)
+        (MonoType.Reference
+          (Box.init (freshen-constructors-walk (Box.peek inner) mapping counter))
+          (MonoLifetime.copy lifetime))
+      (MonoType.Function arguments fn-result)
+        (let-do [result (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &result
+                              (Box.init
+                                (freshen-constructors-walk
+                                  (Box.peek (Array.unsafe-nth arguments i))
+                                  mapping
+                                  counter))))
+          (MonoType.Function result
+                             (Box.init
+                               (freshen-constructors-walk (Box.peek fn-result)
+                                                          mapping
+                                                          counter))))
+      _ (MonoType.copy type)))
+
+  (doc freshen-constructors "renames each distinct constructor variable
+(lowercase nominal head) in a type to a fresh one, so two instantiations of a
+scheme like fmap's do not share `f`. The counter cell supplies and receives
+the fresh-name serial.")
+  (defn freshen-constructors [type counter]
+    (let-do [mapping (the (Array (Pair String String)) [])]
+      (freshen-constructors-walk type &mapping counter)))
+
+  (private occurs-under?)
+  (hidden occurs-under?)
+  (defn occurs-under? [variable type substitution]
+    (match-ref type
+      (MonoType.Variable candidate)
+        (if (Int.= variable @candidate)
+          true
+          (match (binding-for substitution @candidate)
+            (Maybe.Just value) (occurs-under? variable &value substitution)
+            (Maybe.Nothing) false))
+      (MonoType.Integer) false
+      (MonoType.String) false
+      (MonoType.Boolean) false
+      (MonoType.Unit) false
+      (MonoType.Named _ arguments)
+        (let-do [found false
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (when (occurs-under? variable
+                                 (Box.peek (Array.unsafe-nth arguments i))
+                                 substitution)
+              (set! found true)))
+          found)
+      (MonoType.Reference inner _)
+        (occurs-under? variable (Box.peek inner) substitution)
+      (MonoType.Function arguments result)
+        (let-do [found (occurs-under? variable (Box.peek result) substitution)
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (when (occurs-under? variable
+                                 (Box.peek (Array.unsafe-nth arguments i))
+                                 substitution)
+              (set! found true)))
+          found)))
+
+  (private add-binding)
+  (hidden add-binding)
+  (sig add-binding
+       (Fn [(Ref TypeSubstitution) Int (Ref MonoType)] TypeSubstitution))
+  (defn add-binding [substitution variable type]
+    (TypeSubstitution.init
+      (Array.push-back
+        @(TypeSubstitution.bindings substitution)
+        (TypeBinding.init variable (Box.init (MonoType.copy type))))
+      @(TypeSubstitution.lifetime-bindings substitution)
+      @(TypeSubstitution.constructor-bindings substitution)))
+
+  (private add-lifetime-binding)
+  (hidden add-lifetime-binding)
+  (defn add-lifetime-binding [substitution variable lifetime]
+    (TypeSubstitution.init
+      (Array.copy (TypeSubstitution.bindings substitution))
+      (Array.push-back
+        @(TypeSubstitution.lifetime-bindings substitution)
+        (LifetimeBinding.init variable (MonoLifetime.copy lifetime)))
+      @(TypeSubstitution.constructor-bindings substitution)))
+
+  (doc extend-lifetime-substitution "adds one lifetime-variable mapping.")
+  (defn extend-lifetime-substitution [substitution variable lifetime]
+    (add-lifetime-binding substitution variable lifetime))
+
+  (private bind-constructor-owned)
+  (hidden bind-constructor-owned)
+  (defn bind-constructor-owned [substitution variable target]
+    (TypeSubstitution.init
+      (Array.copy (TypeSubstitution.bindings &substitution))
+      (Array.copy (TypeSubstitution.lifetime-bindings &substitution))
+      (Array.push-back
+        @(TypeSubstitution.constructor-bindings &substitution)
+        (Pair.init (String.copy variable) (String.copy target)))))
+
+  (private unify-lifetimes-owned)
+  (hidden unify-lifetimes-owned)
+  (defn unify-lifetimes-owned [left right substitution]
+    (let [resolved-left (apply-lifetime &substitution left)
+          resolved-right (apply-lifetime &substitution right)]
+      (match-ref &resolved-left
+        (MonoLifetime.Variable left-variable)
+          (match-ref &resolved-right
+            (MonoLifetime.Variable right-variable)
+              (if (Int.= @left-variable @right-variable)
+                (Result.Success substitution)
+                (Result.Success
+                  (add-lifetime-binding &substitution
+                                        @left-variable
+                                        &resolved-right)))
+            (MonoLifetime.Static)
+              (Result.Success
+                (add-lifetime-binding &substitution
+                                      @left-variable
+                                      &resolved-right)))
+        (MonoLifetime.Static)
+          (match-ref &resolved-right
+            (MonoLifetime.Variable right-variable)
+              (Result.Success
+                (add-lifetime-binding &substitution
+                                      @right-variable
+                                      &resolved-left))
+            (MonoLifetime.Static) (Result.Success substitution)))))
+
+  (private bind-owned)
+  (hidden bind-owned)
+  (sig bind-owned
+       (Fn [Int (Ref MonoType) TypeSubstitution]
+           (Result TypeSubstitution TypeError)))
+  (defn bind-owned [variable type substitution]
+    (match-ref type
+      (MonoType.Variable candidate)
+        (if (Int.= variable @candidate)
+          (Result.Success substitution)
+          (Result.Success (add-binding &substitution variable type)))
+      _
+        (if (occurs-under? variable type &substitution)
+          (Result.Error (TypeError.init @"occurs check failed"))
+          (Result.Success (add-binding &substitution variable type)))))
+
+  (doc extend-substitution "adds one variable-to-type mapping to a
+substitution. It is primarily used to instantiate a type scheme.")
+  (defn extend-substitution [substitution variable type]
+    (add-binding substitution variable type))
+
+  (private unify-functions-owned)
+  (hidden unify-functions-owned)
+  (private unify-arguments-owned)
+  (hidden unify-arguments-owned)
+  (private unify-arguments-at)
+  (hidden unify-arguments-at)
+  (private unify-owned)
+  (hidden unify-owned)
+  (private unify-concrete-owned)
+  (hidden unify-concrete-owned)
+  (sig unify-owned
+       (Fn
+         [(Ref MonoType) (Ref MonoType) TypeSubstitution]
+         (Result TypeSubstitution TypeError)))
+  (private type-kind)
+  (hidden type-kind)
+  (defn type-kind [type]
+    (match-ref type
+      (MonoType.Variable id) (String.concat &[@"?" (Int.str @id)])
+      (MonoType.Integer) @"Int"
+      (MonoType.String) @"String"
+      (MonoType.Boolean) @"Bool"
+      (MonoType.Unit) @"unit"
+      (MonoType.Named name arguments)
+        (if (Int.= 0 (Array.length arguments))
+          (String.copy name)
+          (String.concat
+            &[@"("
+              (String.copy name)
+              @" "
+              (type-kind (Box.peek (Array.unsafe-nth arguments 0)))
+              @")"]))
+      (MonoType.Reference inner _)
+        (String.concat &[@"(Ref " (type-kind (Box.peek inner)) @")"])
+      (MonoType.Function _ result)
+        (String.concat &[@"(Fn -> " (type-kind (Box.peek result)) @")"])))
+  (sig unify-arguments-owned
+       (Fn
+         [(Ref (Array (Box MonoType)))
+          (Ref (Array (Box MonoType)))
+          TypeSubstitution]
+         (Result TypeSubstitution TypeError)))
+  (defn unify-arguments-owned [left-arguments right-arguments substitution]
+    (if (/= (Array.length left-arguments) (Array.length right-arguments))
+      (Result.Error (TypeError.init @"type constructor arity mismatch"))
+      (unify-arguments-at left-arguments right-arguments 0 substitution)))
+
+  (sig unify-arguments-at
+       (Fn
+         [(Ref (Array (Box MonoType)))
+          (Ref (Array (Box MonoType)))
+          Int
+          TypeSubstitution]
+         (Result TypeSubstitution TypeError)))
+  (defn unify-arguments-at [left-arguments right-arguments index substitution]
+    (if (Int.= index (Array.length left-arguments))
+      (Result.Success substitution)
+      (match (the (Result TypeSubstitution TypeError)
+                  (unify-owned
+                    (Box.peek (Array.unsafe-nth left-arguments index))
+                    (Box.peek (Array.unsafe-nth right-arguments index))
+                    substitution))
+        (Result.Success next-substitution)
+          (unify-arguments-at left-arguments
+                              right-arguments
+                              (Int.inc index)
+                              next-substitution)
+        (Result.Error error) (Result.Error error))))
+
+  (sig unify-functions-owned
+       (Fn
+         [(Ref (Array (Box MonoType)))
+          (Ref MonoType)
+          (Ref (Array (Box MonoType)))
+          (Ref MonoType)
+          TypeSubstitution]
+         (Result TypeSubstitution TypeError)))
+  (defn unify-functions-owned [left-arguments
+                               left-result
+                               right-arguments
+                               right-result
+                               substitution]
+    (if (/= (Array.length left-arguments) (Array.length right-arguments))
+      (Result.Error (TypeError.init @"function arity mismatch"))
+      (match (unify-arguments-at left-arguments right-arguments 0 substitution)
+        (Result.Success current) (unify-owned left-result right-result current)
+        (Result.Error error) (Result.Error error))))
+
+  (defn unify-owned [left right substitution]
+    (match-ref left
+      (MonoType.Variable variable)
+        (match (binding-for &substitution @variable)
+          (Maybe.Just bound) (unify-owned &bound right substitution)
+          (Maybe.Nothing)
+            (match-ref right
+              (MonoType.Variable right-variable)
+                (match (binding-for &substitution @right-variable)
+                  (Maybe.Just right-bound)
+                    (unify-owned left &right-bound substitution)
+                  (Maybe.Nothing) (bind-owned @variable right substitution))
+              _ (bind-owned @variable right substitution)))
+      _
+        (match-ref right
+          (MonoType.Variable variable)
+            (match (binding-for &substitution @variable)
+              (Maybe.Just bound) (unify-owned left &bound substitution)
+              (Maybe.Nothing) (bind-owned @variable left substitution))
+          _ (unify-concrete-owned left right substitution))))
+
+  (sig unify-concrete-owned
+       (Fn
+         [(Ref MonoType) (Ref MonoType) TypeSubstitution]
+         (Result TypeSubstitution TypeError)))
+  (defn unify-concrete-owned [left right substitution]
+    (match-ref left
+      (MonoType.Integer)
+        (match-ref right
+          (MonoType.Integer) (Result.Success substitution)
+          _ (Result.Error (TypeError.init @"cannot unify Int with this type")))
+      (MonoType.String)
+        (match-ref right
+          (MonoType.String) (Result.Success substitution)
+          _
+            (Result.Error (TypeError.init @"cannot unify String with this type")))
+      (MonoType.Boolean)
+        (match-ref right
+          (MonoType.Boolean) (Result.Success substitution)
+          _
+            (Result.Error
+              (TypeError.init
+                (String.concat &[@"cannot unify Bool with " (type-kind right)]))))
+      (MonoType.Unit)
+        (match-ref right
+          (MonoType.Unit) (Result.Success substitution)
+          _ (Result.Error (TypeError.init @"cannot unify unit with this type")))
+      (MonoType.Named left-name left-arguments)
+        (match-ref right
+          (MonoType.Named right-name right-arguments)
+          ;; a lowercase head is a constructor VARIABLE: `(f a)` unifies with
+          ;; `(MyBox Int)` by binding f := MyBox (same arity), then the
+          ;; arguments. Heads resolve through earlier constructor bindings.
+          (let [l (resolve-constructor-in
+                  (TypeSubstitution.constructor-bindings &substitution)
+                  left-name)
+                r (resolve-constructor-in
+                  (TypeSubstitution.constructor-bindings &substitution)
+                  right-name)]
+            (cond
+              (String.= &l &r)
+                (unify-arguments-owned left-arguments
+                                       right-arguments
+                                       substitution)
+              (and (constructor-variable? &l)
+                   (Int.= (Array.length left-arguments)
+                          (Array.length right-arguments)))
+                (unify-arguments-owned left-arguments
+                                       right-arguments
+                                       (bind-constructor-owned substitution
+                                                               &l
+                                                               &r))
+              (and (constructor-variable? &r)
+                   (Int.= (Array.length left-arguments)
+                          (Array.length right-arguments)))
+                (unify-arguments-owned left-arguments
+                                       right-arguments
+                                       (bind-constructor-owned substitution
+                                                               &r
+                                                               &l))
+              (Result.Error
+                (TypeError.init
+                  (String.concat
+                    &[@"cannot unify "
+                      (String.copy &l)
+                      @" with "
+                      (String.copy &r)])))))
+          _
+          (Result.Error
+            (TypeError.init
+              (String.concat
+                &[@"cannot unify "
+                  (String.copy left-name)
+                  @" with "
+                  (type-kind right)]))))
+      (MonoType.Reference left-inner left-lifetime)
+        (match-ref right
+          (MonoType.Reference right-inner right-lifetime)
+            (match (unify-owned (Box.peek left-inner)
+                                (Box.peek right-inner)
+                                substitution)
+              (Result.Success inner-substitution)
+                (unify-lifetimes-owned left-lifetime
+                                       right-lifetime
+                                       inner-substitution)
+              (Result.Error error) (Result.Error error))
+          _
+            (Result.Error
+              (TypeError.init
+                (String.concat
+                  &[@"cannot unify reference with " (type-kind right)]))))
+      (MonoType.Function left-arguments left-result)
+        (match-ref right
+          (MonoType.Function right-arguments right-result)
+            (unify-functions-owned left-arguments
+                                   (Box.peek left-result)
+                                   right-arguments
+                                   (Box.peek right-result)
+                                   substitution)
+          _
+            (Result.Error
+              (TypeError.init @"cannot unify a function with this type")))
+      (MonoType.Variable _)
+        (Result.Error
+          (TypeError.init @"internal error: unresolved left type variable"))))
+
+  (doc unify "unifies two types under a substitution, including an occurs
+check for recursive types.")
+  (sig unify
+       (Fn
+         [(Ref MonoType) (Ref MonoType) (Ref TypeSubstitution)]
+         (Result TypeSubstitution TypeError)))
+  (defn unify [left right substitution]
+    (unify-owned left right (TypeSubstitution.copy substitution)))
+
+  (doc unify-strict "unifies two types without implicit place-to-reference
+  borrowing. This is used when comparing declarations rather than expressions.")
+  (sig unify-strict
+       (Fn
+         [(Ref MonoType) (Ref MonoType) (Ref TypeSubstitution)]
+         (Result TypeSubstitution TypeError)))
+  (defn unify-strict [left right substitution]
+    (unify-owned left right (TypeSubstitution.copy substitution)))
+
+  (doc solver "creates an empty mutable solver. Variable bindings are indexed
+by non-negative inference-variable ID; negative declaration variables fall back
+to the small linear binding table.")
+  (defn solver [] (TypeSolver.init [] [] [] [] []))
+
+  (private solver-binding-for)
+  (hidden solver-binding-for)
+  (private solver-binding-index!)
+  (hidden solver-binding-index!)
+  (defn solver-binding-index! [solver variable]
+    (let [indexes (TypeSolver.indexes solver)]
+      (if (and (Int.>= variable 0) (Int.< variable (Array.length indexes)))
+        (let [index @(Array.unsafe-nth indexes variable)]
+          (if (Int.>= index 0)
+            (match-ref (Box.peek
+                (TypeBinding.value
+                  (Array.unsafe-nth (TypeSolver.bindings solver) index)))
+              (MonoType.Variable next-variable)
+                (let [resolved (solver-binding-index! solver @next-variable)]
+                  (if (Int.>= resolved 0)
+                    (do
+                      (Array.aset! (TypeSolver.indexes solver) variable resolved)
+                      resolved)
+                    index))
+              _ index)
+            -1))
+        -1)))
+
+  (defn solver-binding-for [solver variable]
+    (let [indexes (TypeSolver.indexes solver)]
+      (if (and (Int.>= variable 0) (Int.< variable (Array.length indexes)))
+        (let [index (solver-binding-index! solver variable)]
+          (if (Int.>= index 0)
+            (Maybe.Just
+              (Pointer.address
+                (Box.peek
+                  (TypeBinding.value
+                    (Array.unsafe-nth (TypeSolver.bindings solver) index)))))
+            (Maybe.Nothing)))
+        (let-do [result (the (Maybe (Ptr MonoType)) (Maybe.Nothing))
+                 found false
+                 bindings (TypeSolver.bindings solver)
+                 n (Array.length bindings)]
+          (for [i 0 n]
+            (let [binding (Array.unsafe-nth bindings i)]
+              (when-do (and (not found)
+                            (Int.= @(TypeBinding.variable binding) variable))
+                (set! found true)
+                (set! result
+                      (Maybe.Just
+                        (Pointer.address (Box.peek (TypeBinding.value binding))))))))
+          result))))
+
+  (private solver-add-binding!)
+  (hidden solver-add-binding!)
+  (defn solver-add-binding! [solver variable type]
+    (let-do [binding-index (Array.length (TypeSolver.bindings solver))]
+      (Array.push-back! (TypeSolver.bindings solver)
+                        (TypeBinding.init variable
+                                          (Box.init (MonoType.copy type))))
+      (when-do (Int.>= variable 0)
+        (while-do (Int.<= (Array.length (TypeSolver.indexes solver)) variable)
+          (Array.push-back! (TypeSolver.indexes solver) -1))
+        (Array.aset! (TypeSolver.indexes solver) variable binding-index))))
+
+  (private solver-occurs?)
+  (hidden solver-occurs?)
+  (defn solver-occurs? [solver variable type]
+    (match-ref type
+      (MonoType.Variable candidate)
+        (if (Int.= variable @candidate)
+          true
+          (match (solver-binding-for solver @candidate)
+            (Maybe.Just bound)
+              (solver-occurs? solver variable (Pointer.to-ref bound))
+            (Maybe.Nothing) false))
+      (MonoType.Integer) false
+      (MonoType.String) false
+      (MonoType.Boolean) false
+      (MonoType.Unit) false
+      (MonoType.Named _ arguments)
+        (let-do [found false
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (when (solver-occurs? solver
+                                  variable
+                                  (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)
+      (MonoType.Reference inner _)
+        (solver-occurs? solver variable (Box.peek inner))
+      (MonoType.Function arguments result)
+        (let-do [found (solver-occurs? solver variable (Box.peek result))
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (when (solver-occurs? solver
+                                  variable
+                                  (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)))
+
+  (private solver-bind!)
+  (hidden solver-bind!)
+  (defn solver-bind! [solver variable type]
+    (match-ref type
+      (MonoType.Variable candidate)
+        (if (Int.= variable @candidate)
+          (Result.Success ())
+          (do (solver-add-binding! solver variable type) (Result.Success ())))
+      _
+        (if (solver-occurs? solver variable type)
+          (Result.Error (TypeError.init @"occurs check failed"))
+          (do (solver-add-binding! solver variable type) (Result.Success ())))))
+
+  (private solver-lifetime-binding-for)
+  (hidden solver-lifetime-binding-for)
+  (defn solver-lifetime-binding-for [solver variable]
+    (let-do [result (the (Maybe MonoLifetime) (Maybe.Nothing))
+             found false
+             bindings (TypeSolver.lifetime-bindings solver)
+             n (Array.length bindings)]
+      (for [i 0 n]
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when-do (and (not found)
+                        (Int.= @(LifetimeBinding.variable binding) variable))
+            (set! found true)
+            (set! result
+                  (Maybe.Just
+                    (MonoLifetime.copy (LifetimeBinding.value binding)))))))
+      result))
+
+  (private solver-apply-lifetime)
+  (hidden solver-apply-lifetime)
+  (defn solver-apply-lifetime [solver lifetime]
+    (match-ref lifetime
+      (MonoLifetime.Variable variable)
+        (match (solver-lifetime-binding-for solver @variable)
+          (Maybe.Just value) (solver-apply-lifetime solver &value)
+          (Maybe.Nothing) (MonoLifetime.Variable @variable))
+      (MonoLifetime.Static) (MonoLifetime.Static)))
+
+  (private solver-bind-lifetime!)
+  (hidden solver-bind-lifetime!)
+  (defn solver-bind-lifetime! [solver variable lifetime]
+    (Array.push-back! (TypeSolver.lifetime-bindings solver)
+                      (LifetimeBinding.init variable
+                                            (MonoLifetime.copy lifetime))))
+
+  (private solver-unify-lifetimes!)
+  (hidden solver-unify-lifetimes!)
+  (defn solver-unify-lifetimes! [solver left right]
+    (let [resolved-left (solver-apply-lifetime solver left)
+          resolved-right (solver-apply-lifetime solver right)]
+      (match-ref &resolved-left
+        (MonoLifetime.Variable left-variable)
+          (match-ref &resolved-right
+            (MonoLifetime.Variable right-variable)
+              (if (Int.= @left-variable @right-variable)
+                (Result.Success ())
+                (do
+                  (solver-bind-lifetime! solver @left-variable &resolved-right)
+                  (Result.Success ())))
+            (MonoLifetime.Static)
+              (do
+                (solver-bind-lifetime! solver @left-variable &resolved-right)
+                (Result.Success ())))
+        (MonoLifetime.Static)
+          (match-ref &resolved-right
+            (MonoLifetime.Variable right-variable)
+              (do
+                (solver-bind-lifetime! solver @right-variable &resolved-left)
+                (Result.Success ()))
+            (MonoLifetime.Static) (Result.Success ())))))
+
+  (private solver-unify-internal!)
+  (hidden solver-unify-internal!)
+  (private solver-unify-concrete!)
+  (hidden solver-unify-concrete!)
+  (private solver-unify-arguments!)
+  (hidden solver-unify-arguments!)
+  (defn solver-unify-arguments! [solver left-arguments right-arguments]
+    (if (/= (Array.length left-arguments) (Array.length right-arguments))
+      (Result.Error (TypeError.init @"type constructor arity mismatch"))
+      (let-do [result (the (Result Unit TypeError) (Result.Success ()))
+               n (Array.length left-arguments)]
+        (for [i 0 n]
+          (match-ref &result
+            (Result.Success _)
+              (set! result
+                    (solver-unify-internal! solver
+                                            (Box.peek (Array.unsafe-nth left-arguments
+                                                                        i))
+                                            (Box.peek (Array.unsafe-nth right-arguments
+                                                                        i))))
+            (Result.Error _) ()))
+        result)))
+
+  (private solver-unify-functions!)
+  (hidden solver-unify-functions!)
+  (defn solver-unify-functions! [solver
+                                 left-arguments
+                                 left-result
+                                 right-arguments
+                                 right-result]
+    (match (solver-unify-arguments! solver left-arguments right-arguments)
+      (Result.Success _)
+        (solver-unify-internal! solver left-result right-result)
+      (Result.Error error) (Result.Error error)))
+
+  (defn solver-unify-internal! [solver left right]
+    (match-ref left
+      (MonoType.Variable variable)
+        (match (solver-binding-for solver @variable)
+          (Maybe.Just bound)
+            (solver-unify-internal! solver (Pointer.to-ref bound) right)
+          (Maybe.Nothing)
+            (match-ref right
+              (MonoType.Variable right-variable)
+                (match (solver-binding-for solver @right-variable)
+                  (Maybe.Just right-bound)
+                    (solver-unify-internal! solver
+                                            left
+                                            (Pointer.to-ref right-bound))
+                  (Maybe.Nothing) (solver-bind! solver @variable right))
+              _ (solver-bind! solver @variable right)))
+      _
+        (match-ref right
+          (MonoType.Variable variable)
+            (match (solver-binding-for solver @variable)
+              (Maybe.Just bound)
+                (solver-unify-internal! solver left (Pointer.to-ref bound))
+              (Maybe.Nothing) (solver-bind! solver @variable left))
+          _ (solver-unify-concrete! solver left right))))
+
+  (defn solver-unify-concrete! [solver left right]
+    (match-ref left
+      (MonoType.Integer)
+        (match-ref right
+          (MonoType.Integer) (Result.Success ())
+          _ (Result.Error (TypeError.init @"cannot unify Int with this type")))
+      (MonoType.String)
+        (match-ref right
+          (MonoType.String) (Result.Success ())
+          _
+            (Result.Error
+              (TypeError.init
+                (String.concat &[@"cannot unify String with " (type-kind right)]))))
+      (MonoType.Boolean)
+        (match-ref right
+          (MonoType.Boolean) (Result.Success ())
+          _
+            (Result.Error
+              (TypeError.init
+                (String.concat &[@"cannot unify Bool with " (type-kind right)]))))
+      (MonoType.Unit)
+        (match-ref right
+          (MonoType.Unit) (Result.Success ())
+          _ (Result.Error (TypeError.init @"cannot unify unit with this type")))
+      (MonoType.Named left-name left-arguments)
+        (match-ref right
+          (MonoType.Named right-name right-arguments)
+          ;; constructor variables (lowercase heads) bind to concrete heads
+          ;; of the same arity, mirroring the substitution engine.
+          (let [l (resolve-constructor-in (TypeSolver.constructor-bindings solver)
+                                          left-name)
+                r (resolve-constructor-in (TypeSolver.constructor-bindings solver)
+                                          right-name)]
+            (cond
+              (String.= &l &r)
+                (solver-unify-arguments! solver left-arguments right-arguments)
+              (and (constructor-variable? &l)
+                   (Int.= (Array.length left-arguments)
+                          (Array.length right-arguments)))
+                (do
+                  (Array.push-back! (TypeSolver.constructor-bindings solver)
+                                    (Pair.init (String.copy &l) (String.copy &r)))
+                  (solver-unify-arguments! solver left-arguments right-arguments))
+              (and (constructor-variable? &r)
+                   (Int.= (Array.length left-arguments)
+                          (Array.length right-arguments)))
+                (do
+                  (Array.push-back! (TypeSolver.constructor-bindings solver)
+                                    (Pair.init (String.copy &r) (String.copy &l)))
+                  (solver-unify-arguments! solver left-arguments right-arguments))
+              (Result.Error
+                (TypeError.init
+                  (String.concat
+                    &[@"cannot unify "
+                      (String.copy &l)
+                      @" with "
+                      (String.copy &r)])))))
+          _
+          (Result.Error
+            (TypeError.init
+              (String.concat
+                &[@"cannot unify "
+                  (String.copy left-name)
+                  @" with "
+                  (type-kind right)]))))
+      (MonoType.Reference left-inner left-lifetime)
+        (match-ref right
+          (MonoType.Reference right-inner right-lifetime)
+            (match (solver-unify-internal! solver
+                                           (Box.peek left-inner)
+                                           (Box.peek right-inner))
+              (Result.Success _)
+                (solver-unify-lifetimes! solver left-lifetime right-lifetime)
+              (Result.Error error) (Result.Error error))
+          _
+            (Result.Error
+              (TypeError.init
+                (String.concat
+                  &[@"cannot unify reference with " (type-kind right)]))))
+      (MonoType.Function left-arguments left-result)
+        (match-ref right
+          (MonoType.Function right-arguments right-result)
+            (solver-unify-functions! solver
+                                     left-arguments
+                                     (Box.peek left-result)
+                                     right-arguments
+                                     (Box.peek right-result))
+          _
+            (Result.Error
+              (TypeError.init @"cannot unify a function with this type")))
+      (MonoType.Variable _)
+        (Result.Error
+          (TypeError.init @"internal error: unresolved left type variable"))))
+
+  (doc solver-unify! "adds expression-compatible constraints to a mutable
+solver without copying its accumulated substitution.")
+  (sig solver-unify!
+       (Fn
+         [(Ref TypeSolver) (Ref MonoType) (Ref MonoType)]
+         (Result Unit TypeError)))
+  (defn solver-unify! [solver left right]
+    (solver-unify-internal! solver left right))
+
+  (doc solver-unify-at! "adds constraints through a non-owning solver pointer.
+The caller must keep the solver alive for the complete operation.")
+  (sig solver-unify-at!
+       (Fn
+         [(Ptr TypeSolver) (Ref MonoType) (Ref MonoType)]
+         (Result Unit TypeError)))
+  (defn solver-unify-at! [solver left right]
+    (solver-unify! (Pointer.to-ref solver) left right))
+
+  (doc solver-unify-strict! "adds constraints without implicit borrowing.")
+  (sig solver-unify-strict!
+       (Fn
+         [(Ref TypeSolver) (Ref MonoType) (Ref MonoType)]
+         (Result Unit TypeError)))
+  (defn solver-unify-strict! [solver left right]
+    (solver-unify-internal! solver left right))
+
+  (private solver-apply-arguments)
+  (hidden solver-apply-arguments)
+  (private solver-apply-internal)
+  (hidden solver-apply-internal)
+  (defn solver-apply-arguments [solver arguments]
+    (let-do [result (the (Array (Box MonoType)) [])
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (solver-apply-internal solver
+                                                        (Box.peek (Array.unsafe-nth arguments
+                                                                                    i)))))))
+      result))
+
+  (defn solver-apply-internal [solver type]
+    (match-ref type
+      (MonoType.Variable variable)
+        (match (solver-binding-for solver @variable)
+          (Maybe.Just value)
+            (solver-apply-internal solver (Pointer.to-ref value))
+          (Maybe.Nothing) (MonoType.Variable @variable))
+      (MonoType.Integer) (MonoType.Integer)
+      (MonoType.String) (MonoType.String)
+      (MonoType.Boolean) (MonoType.Boolean)
+      (MonoType.Unit) (MonoType.Unit)
+      (MonoType.Named name arguments)
+        (MonoType.Named
+          (resolve-constructor-in (TypeSolver.constructor-bindings solver) name)
+          (solver-apply-arguments solver arguments))
+      (MonoType.Reference inner lifetime)
+        (MonoType.Reference
+          (Box.init (solver-apply-internal solver (Box.peek inner)))
+          (solver-apply-lifetime solver lifetime))
+      (MonoType.Function arguments result)
+        (MonoType.Function
+          (solver-apply-arguments solver arguments)
+          (Box.init (solver-apply-internal solver (Box.peek result))))))
+
+  (doc solver-apply "normalizes a type through a mutable solver.")
+  (sig solver-apply (Fn [(Ref TypeSolver) (Ref MonoType)] MonoType))
+  (defn solver-apply [solver type] (solver-apply-internal solver type))
+
+  (doc solver-apply-at "normalizes through a non-owning solver pointer.")
+  (sig solver-apply-at (Fn [(Ptr TypeSolver) (Ref MonoType)] MonoType))
+  (defn solver-apply-at [solver type]
+    (solver-apply (Pointer.to-ref solver) type))
+
+  (doc solver-snapshot "copies a solver's accumulated bindings into an
+immutable substitution.")
+  (sig solver-snapshot (Fn [(Ref TypeSolver)] TypeSubstitution))
+  (defn solver-snapshot [solver]
+    (TypeSubstitution.init
+      (Array.copy (TypeSolver.bindings solver))
+      (Array.copy (TypeSolver.lifetime-bindings solver))
+      (Array.copy (TypeSolver.constructor-bindings solver))))
+
+  (doc solver-snapshot-at "copies bindings through a non-owning solver pointer.")
+  (sig solver-snapshot-at (Fn [(Ptr TypeSolver)] TypeSubstitution))
+  (defn solver-snapshot-at [solver] (solver-snapshot (Pointer.to-ref solver)))
+
+  (private variable-in?)
+  (hidden variable-in?)
+  (defn variable-in? [variables variable]
+    (let-do [found false
+             n (Array.length variables)]
+      (for [i 0 n]
+        (when (Int.= @(Array.unsafe-nth variables i) variable) (set! found true)))
+      found))
+
+  (private add-variable)
+  (hidden add-variable)
+  (defn add-variable [variables variable]
+    (if (variable-in? variables variable)
+      (Array.copy variables)
+      (Array.push-back (Array.copy variables) variable)))
+
+  (doc contains-variable? "checks whether an inference-variable identifier is
+present in an array.")
+  (defn contains-variable? [variables variable]
+    (variable-in? variables variable))
+
+  (doc append-variable "adds an inference-variable identifier if absent.")
+  (defn append-variable [variables variable] (add-variable variables variable))
+
+  (private free-arguments)
+  (hidden free-arguments)
+  (private free-variables-internal)
+  (hidden free-variables-internal)
+  (defn free-arguments [arguments]
+    (let-do [result (the (Array Int) [])
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (let [variables (free-variables-internal
+                (Box.peek (Array.unsafe-nth arguments i)))
+              m (Array.length &variables)]
+          (for [j 0 m]
+            (set! result (add-variable &result @(Array.unsafe-nth &variables j))))))
+      result))
+
+  (defn free-variables-internal [type]
+    (match-ref type
+      (MonoType.Variable variable) [@variable]
+      (MonoType.Integer) []
+      (MonoType.String) []
+      (MonoType.Boolean) []
+      (MonoType.Unit) []
+      (MonoType.Named _ arguments) (free-arguments arguments)
+      (MonoType.Reference inner _) (free-variables-internal (Box.peek inner))
+      (MonoType.Function arguments result)
+        (let-do [variables (free-arguments arguments)
+                 result-variables (free-variables-internal (Box.peek result))
+                 n (Array.length &result-variables)]
+          (for [i 0 n]
+            (set! variables
+                  (add-variable &variables
+                                @(Array.unsafe-nth &result-variables i))))
+          variables)))
+
+  (doc free-variables "returns the unique free inference variables in a type.")
+  (defn free-variables [type] (free-variables-internal type))
+
+  (private has-constructor-variable?)
+  (hidden has-constructor-variable?)
+  (sig has-constructor-variable? (Fn [(Ref MonoType)] Bool))
+  (defn has-constructor-variable? [type]
+    (match-ref type
+      (MonoType.Named name arguments)
+        (let-do [found (constructor-variable? name)]
+          (for [i 0 (Array.length arguments)]
+            (when (has-constructor-variable?
+                (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)
+      (MonoType.Reference inner _) (has-constructor-variable? (Box.peek inner))
+      (MonoType.Function arguments result)
+        (let-do [found (has-constructor-variable? (Box.peek result))]
+          (for [i 0 (Array.length arguments)]
+            (when (has-constructor-variable?
+                (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)
+      _ false))
+
+  (doc concrete? "whether a type carries no inference variables and no
+unresolved constructor variables — the gate for materializing a C instance.")
+  (defn concrete? [type]
+    (let [vars (the (Array Int) (free-variables type))]
+      (and (Int.= 0 (Array.length &vars)) (not (has-constructor-variable? type)))))
+
+  (private free-lifetimes-internal)
+  (hidden free-lifetimes-internal)
+  (defn free-lifetimes-internal [type]
+    (match-ref type
+      (MonoType.Variable _) []
+      (MonoType.Integer) []
+      (MonoType.String) []
+      (MonoType.Boolean) []
+      (MonoType.Unit) []
+      (MonoType.Named _ arguments)
+        (let-do [result (the (Array Int) [])
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (let [found (free-lifetimes-internal
+                    (Box.peek (Array.unsafe-nth arguments i)))
+                  m (Array.length &found)]
+              (for [j 0 m]
+                (set! result (add-variable &result @(Array.unsafe-nth &found j))))))
+          result)
+      (MonoType.Reference inner lifetime)
+        (let [nested (free-lifetimes-internal (Box.peek inner))]
+          (match-ref lifetime
+            (MonoLifetime.Variable variable) (add-variable &nested @variable)
+            (MonoLifetime.Static) nested))
+      (MonoType.Function arguments result)
+        (let-do [found (free-lifetimes-internal (Box.peek result))
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (let [argument-lifetimes (free-lifetimes-internal
+                    (Box.peek (Array.unsafe-nth arguments i)))
+                  m (Array.length &argument-lifetimes)]
+              (for [j 0 m]
+                (set! found
+                      (add-variable &found
+                                    @(Array.unsafe-nth &argument-lifetimes j))))))
+          found)))
+
+  (doc free-lifetimes "returns unique inferred lifetime identities in a type.")
+  (defn free-lifetimes [type] (free-lifetimes-internal type))
+
+  (doc same-lifetime? "compares two monomorphic lifetime identities.")
+  (defn same-lifetime? [left right]
+    (match-ref left
+      (MonoLifetime.Variable left-id)
+        (match-ref right
+          (MonoLifetime.Variable right-id) (Int.= @left-id @right-id)
+          _ false)
+      (MonoLifetime.Static) (match-ref right (MonoLifetime.Static) true _ false)))
+
+  (doc same-representation? "compares runtime type structure while ignoring
+lifetime identities. Specialization and ABI layout use this relation.")
+  (defn same-representation? [left right]
+    (match-ref left
+      (MonoType.Variable left-id)
+        (match-ref right
+          (MonoType.Variable right-id) (Int.= @left-id @right-id)
+          _ false)
+      (MonoType.Integer) (match-ref right (MonoType.Integer) true _ false)
+      (MonoType.String) (match-ref right (MonoType.String) true _ false)
+      (MonoType.Boolean) (match-ref right (MonoType.Boolean) true _ false)
+      (MonoType.Unit) (match-ref right (MonoType.Unit) true _ false)
+      (MonoType.Named left-name left-arguments)
+        (match-ref right
+          (MonoType.Named right-name right-arguments)
+            (if (or (/= left-name right-name)
+                    (/= (Array.length left-arguments)
+                        (Array.length right-arguments)))
+              false
+              (let-do [same true
+                       n (Array.length left-arguments)]
+                (for [i 0 n]
+                  (unless-do (same-representation?
+                      (Box.peek (Array.unsafe-nth left-arguments i))
+                      (Box.peek (Array.unsafe-nth right-arguments i)))
+                    (set! same false)))
+                same))
+          _ false)
+      (MonoType.Reference left-inner _)
+        (match-ref right
+          (MonoType.Reference right-inner _)
+            (same-representation? (Box.peek left-inner) (Box.peek right-inner))
+          _ false)
+      (MonoType.Function left-arguments left-result)
+        (match-ref right
+          (MonoType.Function right-arguments right-result)
+            (if (/= (Array.length left-arguments) (Array.length right-arguments))
+              false
+              (let-do [same (same-representation? (Box.peek left-result)
+                                                  (Box.peek right-result))
+                       n (Array.length left-arguments)]
+                (for [i 0 n]
+                  (unless-do (same-representation?
+                      (Box.peek (Array.unsafe-nth left-arguments i))
+                      (Box.peek (Array.unsafe-nth right-arguments i)))
+                    (set! same false)))
+                same))
+          _ false)))
+
+  (doc same? "compares two types structurally.")
+  (defn same? [left right]
+    (match-ref left
+      (MonoType.Variable left-id)
+        (match-ref right
+          (MonoType.Variable right-id) (Int.= @left-id @right-id)
+          _ false)
+      (MonoType.Integer) (match-ref right (MonoType.Integer) true _ false)
+      (MonoType.String) (match-ref right (MonoType.String) true _ false)
+      (MonoType.Boolean) (match-ref right (MonoType.Boolean) true _ false)
+      (MonoType.Unit) (match-ref right (MonoType.Unit) true _ false)
+      (MonoType.Named left-name left-arguments)
+        (match-ref right
+          (MonoType.Named right-name right-arguments)
+            (if (or (/= left-name right-name)
+                    (/= (Array.length left-arguments)
+                        (Array.length right-arguments)))
+              false
+              (let-do [same true
+                       n (Array.length left-arguments)]
+                (for [i 0 n]
+                  (unless-do (same?
+                      (Box.peek (Array.unsafe-nth left-arguments i))
+                      (Box.peek (Array.unsafe-nth right-arguments i)))
+                    (set! same false)))
+                same))
+          _ false)
+      (MonoType.Reference left-inner left-lifetime)
+        (match-ref right
+          (MonoType.Reference right-inner right-lifetime)
+            (and
+              (same-lifetime? left-lifetime right-lifetime)
+              (same? (Box.peek left-inner) (Box.peek right-inner)))
+          _ false)
+      (MonoType.Function left-arguments left-result)
+        (match-ref right
+          (MonoType.Function right-arguments right-result)
+            (if (/= (Array.length left-arguments) (Array.length right-arguments))
+              false
+              (let-do [same (same? (Box.peek left-result)
+                                   (Box.peek right-result))
+                       n (Array.length left-arguments)]
+                (for [i 0 n]
+                  (unless-do (same?
+                      (Box.peek (Array.unsafe-nth left-arguments i))
+                      (Box.peek (Array.unsafe-nth right-arguments i)))
+                    (set! same false)))
+                same))
+          _ false)))
+
+  (private arguments-name)
+  (hidden arguments-name)
+  (private name-internal)
+  (hidden name-internal)
+  (defn arguments-name [arguments]
+    (let-do [parts (the (Array String) [])
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (set! parts
+              (Array.push-back parts
+                               (name-internal
+                                 (Box.peek (Array.unsafe-nth arguments i))))))
+      (String.join "_" &parts)))
+
+  (defn name-internal [type]
+    (match-ref type
+      (MonoType.Variable variable) (String.append "v" &(Int.str @variable))
+      (MonoType.Integer) @"Int"
+      (MonoType.String) @"String"
+      (MonoType.Boolean) @"Bool"
+      (MonoType.Unit) @"Unit"
+      (MonoType.Named name arguments)
+        (let [arguments-name (arguments-name arguments)]
+          (if (String.empty? &arguments-name)
+            (String.copy name)
+            (String.concat
+              &[(String.copy name) @"_" (String.copy &arguments-name)])))
+      (MonoType.Reference inner _)
+        (String.concat &[@"Ref" (name-internal (Box.peek inner))])
+      (MonoType.Function arguments result)
+        (let [arguments-name (arguments-name arguments)
+              result-name (name-internal (Box.peek result))]
+          (String.concat &[@"Fn" arguments-name result-name]))))
+
+  (doc name "renders a deterministic, identifier-safe type name for generated
+specialization symbols.")
+  (defn name [type] (name-internal type)))

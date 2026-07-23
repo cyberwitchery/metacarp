@@ -1,0 +1,431 @@
+(load "../carp-resolve.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn resolve-source [source]
+  (match (Surface.parse source)
+    (Result.Success surface) (Resolve.module &surface)
+    (Result.Error _)
+      (Result.Error
+        (ResolveError.init @"parse error"
+                           (SurfaceSpan.init (Info.init 0 0 0) (Info.init 0 0 0))))))
+
+(defn builtin-named? [module name]
+  (let-do [found false
+           builtins (CoreModule.builtins module)
+           n (Array.length builtins)]
+    (for [i 0 n]
+      (let [builtin (Array.unsafe-nth builtins i)]
+        (when (= (CoreRef.name (CoreBuiltin.reference builtin)) name)
+          (set! found true))))
+    found))
+
+(defn polymorphic-result-builtin-named? [module name]
+  (let-do [found false
+           builtins (CoreModule.builtins module)
+           n (Array.length builtins)]
+    (for [i 0 n]
+      (let [builtin (Array.unsafe-nth builtins i)]
+        (when (= (CoreRef.name (CoreBuiltin.reference builtin)) name)
+          (match-ref (Box.peek (CoreBuiltin.signature builtin))
+            (CoreType.Function arguments result)
+              (when (and (Int.= (Array.length arguments) 1)
+                         (match-ref (Box.peek result)
+                           (CoreType.Variable _) true
+                           _ false))
+                (set! found true))
+            _ ()))))
+    found))
+
+(defn resolves-core-control-and-lexical-forms? []
+  (match (resolve-source "(defn choose [b x] (if b x x))
+(let [x (the Int 1)] (if true ((fn [y] y) x) x))") (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.functions &module)))
+        (Int.= 1 (Array.length (CoreModule.expressions &module)))) (Result.Error _)
+      false))
+
+(defn resolves-two-branch-if? []
+  (match (resolve-source "(if true 1)")
+    (Result.Success module)
+      (Int.= 1 (Array.length (CoreModule.expressions &module)))
+    (Result.Error _) false))
+
+(defn resolves-interface-and-builtin-declarations? []
+  (match (resolve-source "(definterface add (Fn [a a] a))
+(register int-add (Fn [Int Int] Int))
+(implements add int-add)
+(add 1 2)") (Result.Success module)
+      (and
+        (Int.= 5 (Array.length (CoreModule.interfaces &module)))
+        (and (builtin-named? &module "int-add")
+             (and
+               (Int.= 42 (Array.length (CoreModule.implementations &module)))
+               (Int.= 1 (Array.length (CoreModule.expressions &module)))))) (Result.Error _)
+      false))
+
+(defn resolves-module-scoped-declarations? []
+  (match (resolve-source "(definterface add (Fn [a a] a))
+(defmodule Int
+  (register + (λ [Int Int] Int) \"CARP_INT_PLUS\")
+  (implements add +))
+(add 1 2)
+(Int.+ 1 2)") (Result.Success module)
+      (and
+        (Int.= 5 (Array.length (CoreModule.interfaces &module)))
+        (and (builtin-named? &module "Int.+")
+             (and
+               (Int.= 42 (Array.length (CoreModule.implementations &module)))
+               (Int.= 2 (Array.length (CoreModule.expressions &module)))))) (Result.Error _)
+      false))
+
+(defn resolves-module-local-function-body? []
+  (match (resolve-source "(defmodule Int
+  (register + (Fn [Int Int] Int))
+  (defn double [x] (+ x x)))
+(Int.double 2)") (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.functions &module)))
+        (and (builtin-named? &module "Int.+")
+             (Int.= 1 (Array.length (CoreModule.expressions &module))))) (Result.Error _)
+      false))
+
+(defn resolves-def-sig-and-register-type? []
+  (match (resolve-source "(register-type Blob)
+(sig answer Int)
+(def answer 42)
+answer") (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.type-declarations &module)))
+        (and
+          (Int.= 1 (Array.length (CoreModule.signatures &module)))
+          (and
+            (Int.= 1 (Array.length (CoreModule.values &module)))
+            (Int.= 1 (Array.length (CoreModule.expressions &module)))))) (Result.Error _)
+      false))
+
+(defn resolves-signature-metadata? []
+  (match (resolve-source
+      "(defmodule UnitRef (meta-set! = \"sig\" (Fn [&Unit &Unit] Bool)) (defn = [a b] true))")
+    (Result.Success module)
+      (Int.= 1 (Array.length (CoreModule.signatures &module)))
+    (Result.Error _) false))
+
+(defn resolves-nominal-reference-and-unit-types? []
+  (match (resolve-source "(register-type Byte)
+(register consume (Fn [(Ref (Array Byte) r)] () static) \"consume\")
+()") (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.type-declarations &module)))
+        (and (builtin-named? &module "consume")
+             (Int.= 1 (Array.length (CoreModule.expressions &module))))) (Result.Error _)
+      false))
+
+(defn resolves-use-all-imports? [] (match (resolve-source "(defmodule Int
+  (register + (Fn [Int Int] Int)))
+(use-all Int)
+(+ 1 2)") (Result.Success module)
+      (and (builtin-named? &module "Int.+")
+           (Int.= 1 (Array.length (CoreModule.expressions &module)))) (Result.Error _)
+      false))
+
+(defn resolver-ignores-compiler-directives? []
+  (match (resolve-source "(system-include \"assert.h\")
+(meta-set! foo \"doc\" \"bar\")
+(defn id [x] x)
+(id 1)") (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.functions &module)))
+        (and
+          (Int.= 1 (Array.length (CoreModule.expressions &module)))
+          (and
+            (Int.= 1 (Array.length (CoreModule.system-includes &module)))
+            (=
+              (Array.unsafe-nth (CoreModule.system-includes &module) 0)
+              "assert.h")))) (Result.Error _) false))
+
+(defn resolves-deftemplate-as-builtin? []
+  (match (resolve-source
+      "(deftemplate id (Fn [Int] Int) \"$a $NAME(int x)\" \"$DECL { return x; }\")
+(id 1)")
+    (Result.Success module)
+      (and (builtin-named? &module "id")
+           (and
+             (Int.= 1 (Array.length (CoreModule.expressions &module)))
+             (let-do [sources (CoreModule.builtin-sources &module)
+                      found false]
+               (for [i 0 (Array.length sources)]
+                 (match-ref (CoreBuiltinSource.payload (Array.unsafe-nth sources
+                                                                         i))
+                   (CoreBuiltinPayload.Template declaration body)
+                     (when (and (= declaration "$a $NAME(int x)")
+                                (= body "$DECL { return x; }"))
+                       (set! found true))
+                   _ ()))
+               found)))
+    (Result.Error _) false))
+
+(defn resolves-register-external-name? []
+  (match (resolve-source "(register inc (Fn [Int] Int) \"external_inc\")
+(inc 1)") (Result.Success module)
+      (let-do [sources (CoreModule.builtin-sources &module)
+               found false]
+        (for [i 0 (Array.length sources)]
+          (match-ref (CoreBuiltinSource.payload (Array.unsafe-nth sources i))
+            (CoreBuiltinPayload.External external-name)
+              (match-ref external-name
+                (Maybe.Just name)
+                  (when (= name "external_inc") (set! found true))
+                (Maybe.Nothing) ())
+            _ ()))
+        found) (Result.Error _) false))
+
+(defn resolves-registers-under-top-level-if? [] (match (resolve-source "(if true
+  (do (Unsafe.preproc (Unsafe.emit-c \"a\")) (register addr (Fn [] ())))
+  (do (Unsafe.preproc (Unsafe.emit-c \"b\")) (register addr (Fn [] ()))))
+(addr)") (Result.Success module) (builtin-named? &module "addr") (Result.Error _)
+      false))
+
+(defn resolves-system-exit-template-polymorphic? []
+  (match (resolve-source "(defmodule System
+  (deftemplate exit (Fn [Int] a) \"$a $NAME(int code)\" \"$DECL { exit(code); }\"))
+(System.exit 1)") (Result.Success module)
+      (and
+        (polymorphic-result-builtin-named? &module "System.exit")
+        (Int.= 1 (Array.length (CoreModule.expressions &module)))) (Result.Error _)
+      false))
+
+(defn resolves-private-values? []
+  (match (resolve-source
+      "(defmodule Random (def- s 1.0) (defn seed [] (set! s 2.0)))")
+    (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.values &module)))
+        (Int.= 1 (Array.length (CoreModule.functions &module))))
+    (Result.Error _) false))
+
+(defn resolves-expanded-private-values? []
+  (match (resolve-source
+      "(defmodule Random (do (meta-set! s \"private\" true) (meta-set! s \"hidden\" true) (def s 1.0)) (defn seed [] (set! s 2.0)))")
+    (Result.Success module)
+      (and
+        (Int.= 1 (Array.length (CoreModule.values &module)))
+        (Int.= 1 (Array.length (CoreModule.functions &module))))
+    (Result.Error _) false))
+
+(defn resolves-record-constructors? []
+  (match (resolve-source "(deftype (Bucket a b) [entries (Array (Pair a b))])
+(defmodule Bucket (defn empty [] (Bucket.init [])) (defn replace [b entries] (set-entries b entries)) (defn replace! [b entries] (set-entries! b entries)) (defn update [b f] (update-entries b f)))") (Result.Success module)
+      (and (builtin-named? &module "Bucket.init")
+           (and
+             (builtin-named? &module "Bucket.set-entries")
+             (and
+               (builtin-named? &module "Bucket.set-entries!")
+               (and
+                 (builtin-named? &module "Bucket.update-entries")
+                 (Int.= 4 (Array.length (CoreModule.functions &module))))))) (Result.Error _)
+      false))
+
+(defn resolves-constructors-in-declaration-groups? []
+  (match (resolve-source
+      "(do (deftype (Tuple2 a b) [a a b b]) (defmodule Tuple2 (defn make [x y] (init x y))))")
+    (Result.Success module)
+      (and (builtin-named? &module "Tuple2.init")
+           (Int.= 1 (Array.length (CoreModule.functions &module))))
+    (Result.Error _) false))
+
+(defn resolves-interface-inside-implementation? []
+  (match (resolve-source "(definterface = (Fn [a a] Bool))
+(defmodule Box (defn = [a b] (= a b)) (implements = =))") (Result.Success module)
+      (let [function (Array.unsafe-nth (CoreModule.functions &module) 0)]
+        (match-ref (Box.peek (CoreFunction.body function))
+          (CoreExpr.Call _ callee _)
+            (match-ref (Box.peek callee)
+              (CoreExpr.Reference _ reference) (= (CoreRef.name reference) "=")
+              _ false)
+          _ false)) (Result.Error _) false))
+
+(defn resolves-unquote-call-sugar? []
+  (match (resolve-source "(defn apply [f x] (~f x))")
+    (Result.Success module)
+      (Int.= 1 (Array.length (CoreModule.functions &module)))
+    (Result.Error _) false))
+
+(defn resolves-array-pop-back-mut? []
+  (match (resolve-source "(defn pop-last [xs] (Array.pop-back! xs))")
+    (Result.Success module)
+      (and
+        (builtin-named? &module "Array.pop-back!")
+        (Int.= 1 (Array.length (CoreModule.functions &module))))
+    (Result.Error _) false))
+
+(defn resolves-array-copy? []
+  (match (resolve-source "(defn duplicate [xs] (Array.copy xs))")
+    (Result.Success module)
+      (and (builtin-named? &module "Array.copy")
+           (Int.= 1 (Array.length (CoreModule.functions &module))))
+    (Result.Error _) false))
+
+(defn resolves-dotted-gensym-pattern-locals? []
+  (match (resolve-source "(deftype (Maybe a) (Just [a]) (Nothing))
+(match (Maybe.Just 1) (Maybe.Just zip.1000) zip.1000 _ 0)") (Result.Success module)
+      (Int.= 1 (Array.length (CoreModule.expressions &module))) (Result.Error _)
+      false))
+
+(defn retains-nominal-constructor-layouts? []
+  (match (resolve-source "(deftype Signal (Red) (Green))
+(Signal.Green)") (Result.Success module)
+      (let [constructors (CoreModule.constructors &module)]
+        (and (Int.= 2 (Array.length constructors))
+             (and
+               (Int.= 0
+                      @(CoreConstructorDeclaration.tag (Array.unsafe-nth constructors
+                                                                         0)))
+               (Int.= 1
+                      @(CoreConstructorDeclaration.tag (Array.unsafe-nth constructors
+                                                                         1)))))) (Result.Error _)
+      false))
+
+(defn retains-nested-constructor-patterns? []
+  (match (resolve-source "(deftype Inner (Value [Int]) (Empty))
+(deftype Outer (Wrap [Inner]) (Other))
+(defn code [outer] (match outer (Outer.Wrap (Inner.Value value)) value (Outer.Other) 0))") (Result.Success module)
+      (let [function (Array.unsafe-nth (CoreModule.functions &module) 0)]
+        (match-ref (Box.peek (CoreFunction.body function))
+          (CoreExpr.Match _ _ _ branches)
+            (let [branch (Array.unsafe-nth branches 0)]
+              (match-ref (CoreMatchBranch.pattern branch)
+                (CorePattern.Constructor outer children)
+                  (and (= (CoreRef.name outer) "Outer.Wrap")
+                       (and (Int.= 1 (Array.length children))
+                            (match-ref (Box.peek (Array.unsafe-nth children 0))
+                              (CorePattern.Constructor inner inner-children)
+                                (and (= (CoreRef.name inner) "Inner.Value")
+                                     (and (Int.= 1 (Array.length inner-children))
+                                          (match-ref (Box.peek (Array.unsafe-nth inner-children
+                                                                                 0))
+                                            (CorePattern.Bind _) true
+                                            _ false)))
+                              _ false)))
+                _ false))
+          _ false)) (Result.Error _) false))
+
+(deftest t
+  (match (resolve-source "(defn identity [x] x)
+(identity 1)
+(identity \"ok\")") (Result.Success module)
+      (do
+        (ignore
+          (assert-equal t
+            1
+            (Array.length (CoreModule.functions &module))
+            "resolver retains the function definition"))
+        (assert-equal t
+          2
+          (Array.length (CoreModule.expressions &module))
+          "resolver retains top-level calls")) (Result.Error _)
+      (assert-true t false "resolver accepts polymorphic identity"))
+
+  (assert-true t
+    (Result.error? &(resolve-source "missing"))
+    "resolver rejects unknown bindings")
+
+  (assert-true t
+    (resolves-core-control-and-lexical-forms?)
+    "resolver accepts if, let, fn, and the")
+
+  (assert-true t
+    (resolves-two-branch-if?)
+    "resolver lowers two-branch if to unit else")
+
+  (assert-true t
+    (resolves-interface-and-builtin-declarations?)
+    "resolver accepts definterface, register, and implements")
+
+  (assert-true t
+    (resolves-module-scoped-declarations?)
+    "resolver qualifies declarations inside defmodule")
+
+  (assert-true t
+    (resolves-module-local-function-body?)
+    "resolver prefers module-local globals inside defmodule bodies")
+
+  (assert-true t
+    (resolves-def-sig-and-register-type?)
+    "resolver accepts def, sig, and register-type")
+
+  (assert-true t
+    (resolves-signature-metadata?)
+    "resolver reads signatures from expanded metadata")
+
+  (assert-true t
+    (resolves-nominal-reference-and-unit-types?)
+    "resolver accepts nominal, reference, and unit types")
+
+  (assert-true t
+    (resolves-use-all-imports?)
+    "resolver resolves unqualified names through use-all imports")
+
+  (assert-true t
+    (resolver-ignores-compiler-directives?)
+    "resolver ignores compiler metadata directives")
+
+  (assert-true t
+    (resolves-deftemplate-as-builtin?)
+    "resolver retains deftemplate declaration and body payloads")
+
+  (assert-true t
+    (resolves-register-external-name?)
+    "resolver retains register external C names")
+
+  (assert-true t
+    (resolves-registers-under-top-level-if?)
+    "resolver collects register declarations under top-level if branches")
+
+  (assert-true t
+    (resolves-system-exit-template-polymorphic?)
+    "resolver preserves a deftemplate's polymorphic return type")
+
+  (assert-true t
+    (resolves-private-values?)
+    "resolver treats def- as a private value declaration")
+
+  (assert-true t
+    (resolves-expanded-private-values?)
+    "resolver splices top-level macro-expanded declaration groups")
+
+  (assert-true t
+    (resolves-record-constructors?)
+    "resolver harvests record constructors from deftype")
+
+  (assert-true t
+    (resolves-constructors-in-declaration-groups?)
+    "constructor harvesting splices top-level declaration groups")
+
+  (assert-true t
+    (resolves-interface-inside-implementation?)
+    "an implementation body resolves its interface name")
+
+  (assert-true t
+    (resolves-unquote-call-sugar?)
+    "resolver lowers runtime unquote call sugar")
+
+  (assert-true t
+    (resolves-array-pop-back-mut?)
+    "resolver includes Array.pop-back! intrinsic")
+
+  (assert-true t (resolves-array-copy?) "resolver includes Array.copy intrinsic")
+
+  (assert-true t
+    (resolves-dotted-gensym-pattern-locals?)
+    "resolver binds dotted gensyms in patterns")
+
+  (assert-true t
+    (retains-nominal-constructor-layouts?)
+    "resolver retains nominal constructor tags and layouts")
+
+  (assert-true t
+    (retains-nested-constructor-patterns?)
+    "resolver retains recursive constructor pattern structure"))

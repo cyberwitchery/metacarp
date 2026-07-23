@@ -1,0 +1,173 @@
+# carp-compiler
+
+A self-hosting compiler for [Carp](https://github.com/carp-lang/Carp), written
+in Carp. It reads Carp source and emits a C translation unit, driving the whole
+pipeline — module loading, macro expansion, name resolution, type inference,
+interface specialization, ownership and borrow checking, and C code generation —
+in Carp itself.
+
+> **Status: self-hosting.** The compiler compiles itself, and the result
+> compiles the compiler again to byte-identical C — a fixed point. Both
+> generations pass the reference compiler's test suite (154 entries: examples,
+> output tests, error-rejection tests, benches). It is still not a drop-in
+> replacement for the reference compiler (see [Limitations](#limitations)).
+
+## Build
+
+Requires the reference [Carp](https://github.com/carp-lang/Carp) compiler and a
+C compiler (`clang`). Building bootstraps the ~29k lines of compiler source
+through reference Carp, which takes about ninety seconds:
+
+```sh
+carp -b --optimize main.carp
+```
+
+This produces `./out/carp-compiler`.
+
+## Usage
+
+```
+carp-compiler [options] <source.carp>
+
+  -b, --build           compile to an executable instead of C (needs --core)
+  -x, --execute         compile to an executable and run it (needs --core)
+  -c, --core <dir>      compile against the Carp standard library in <dir>
+  -o, --output <file>   output path — the C file, or the executable under -b
+  --no-core             skip the implicit Core load; the source's own
+                        (load "X.carp") directives still resolve in --core
+  -h, --help            show this help and exit
+  -v, --version         show version and exit
+```
+
+With no `-b`/`-x`, the C translation unit is written to standard output (or
+`-o`). Diagnostics go to standard error and name the rejecting compiler phase.
+`-b`/`-x` require `--core`, because linking needs the runtime headers the
+standard library ships with.
+
+`(load ...)` resolves like the reference compiler's: relative to the loading
+file, then the Core directory — and git references install into the shared
+cache (`~/.cache/carp/libs/...`) on first use:
+
+```clojure
+(load "git@github.com:carpentry-org/strbuf@0.2.0")
+```
+
+Compile a standalone program (no standard library) to C:
+
+```sh
+./out/carp-compiler examples/hello.carp \
+  | clang -x c -I ../../carp/core -o /tmp/carp-hello -
+/tmp/carp-hello        # prints: OK
+```
+
+Compile and run a program that uses the standard library:
+
+```sh
+./out/carp-compiler -x -c ../../carp/core examples/squares.carp
+# sum of squares of the even numbers in 1..10 = 220
+```
+
+## Self-hosting
+
+The bootstrap chain, from the repository root (with the reference Carp
+repository checked out as a sibling at `../../carp`):
+
+```sh
+carp -b --optimize main.carp                                   # gen 1
+./out/carp-compiler -c ../../carp/core -o self.c main.carp     # gen 1 emits itself
+clang -O2 -o self-cc self.c -I ../../carp/core                 # link gen 2
+./self-cc -c ../../carp/core -o self2.c main.carp              # gen 2 emits itself
+cmp self.c self2.c                                             # fixed point
+```
+
+Each generation compiles the compiler in roughly six minutes on an M-class
+laptop, at a peak resident set within ten percent of the reference-built
+binary's.
+
+Two harnesses keep the self-host honest:
+
+- `scripts/run-carp-suite-self.sh` runs the reference repository's own test
+  suite (examples, produces-output diffs, `test/*.carp`, error-rejection
+  tests, bench builds) through this compiler — with `CARP_COMPILER` you can
+  point it at a gen-2 binary.
+- `scripts/diff-expansion.sh` compiles and runs a front-end corpus (macros,
+  quasiquote, gensym, dynamic evaluation) under both the reference compiler
+  and this one and requires identical observable output.
+
+## Examples
+
+The programs in `examples/` double as checkpoints. The standalone ones need no
+standard library:
+
+| example                    | shows                                                        |
+| -------------------------- | ------------------------------------------------------------ |
+| `simple.carp`              | functions, `if`, a registered C primitive                    |
+| `hello.carp`               | `deftemplate` inline C; prints `OK`                          |
+| `nominal.carp`             | `deftype` sum type, `match` with a wildcard field            |
+| `polymorphic-nominal.carp` | one polymorphic type specialized at two instances            |
+| `nested-pattern.carp`      | nested constructor patterns                                  |
+| `signature-nominal.carp`   | layout discovery from a signature, no reachable constructor  |
+| `squares.carp`             | the full standard library (needs `--core`)                   |
+
+## How it works
+
+Source flows through fifteen phase libraries, each with its own directory,
+data model, and tests:
+
+```
+source registry
+  -> carp-module      module loading, load-order and git-reference resolution
+  -> carp-surface     lossless surface parsing
+  -> carp-expand      macro expansion (with carp-ct-env / carp-ct-eval)
+  -> carp-resolve     name resolution into the core IR (carp-ir)
+  -> carp-infer       Hindley–Milner type inference (carp-types)
+  -> carp-specialize  interface selection and monomorphization
+  -> carp-ownership   ownership planning and flow-sensitive borrow checking
+  -> carp-backend     lowering and C emission (carp-c-abi for mangling)
+  -> one C translation unit
+```
+
+Supporting libraries: `carp-primitives` (the declarative primitive registry) and
+`carp-graph` (strongly-connected-component ordering). Each phase reports failures
+tagged with its own name.
+
+Ownership is real: the compiler derives `delete`/`copy` for managed `deftype`s
+(concrete and generic), runs a sound flow-sensitive borrow check (escape, move,
+borrow-after-move, branch joins), and emits the corresponding C cleanup. The
+delete plan covers let scopes, unconsumed parameters, discarded intermediates,
+`set!` overwrites, by-value `match` bindings (used or not), and the payloads a
+wildcard pattern drops — with deep deleters and copiers for nested containers.
+Escaping closures heap-allocate their environments.
+
+The reusable entry point is `CarpCompiler.compile-source`, or
+`CarpCompiler.compile-sources` when the caller already holds an in-memory source
+registry.
+
+## Limitations
+
+- The host architecture and OS are stamped for the build machine
+  (`aarch64`/`darwin`) in the `--core` path.
+- Delete placement is scope-based, not liveness-based: values die at scope or
+  branch exit rather than after their last use, so peak memory can exceed the
+  reference compiler's on the same program.
+- A binding consumed on one control-flow path and reassigned later leaks the
+  reassigned value (the plan is any-path conservative; it never double-frees).
+- Error messages are deliberately this compiler's own; only rejection behavior
+  matches the reference, not diagnostic text.
+
+## Dependencies
+
+Two pinned Carpentry packages, loaded as git references:
+
+```clojure
+(load "git@github.com:carpentry-org/carp-reader@0.3.8")
+(load "git@github.com:carpentry-org/strbuf@0.2.0")
+```
+
+(Until carp-reader 0.3.8 is tagged, `carp-surface` temporarily loads the
+reader from a sibling checkout — see the note at the top of
+`carp-surface/carp-surface.carp`.)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

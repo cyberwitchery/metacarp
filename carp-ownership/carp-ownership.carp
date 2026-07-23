@@ -1,0 +1,1676 @@
+(load "../carp-specialize/carp-specialize.carp")
+
+(doc OwnershipSite "identifies one expression inside a concrete specialization
+context. Expression IDs alone are not globally unique: polymorphic instances
+of one definition deliberately retain the same IDs.")
+(deftype OwnershipSite [context Int
+                        expression Int])
+
+(doc OwnershipContext "defines the namespace used by OwnershipSite. A
+definition context includes its concrete signature so separate polymorphic
+instances cannot collide. All ownerless roots share one context and one dense
+source ID space; specialization may leave holes in it.")
+(deftype OwnershipContext
+  (Definition [CoreRef (Box MonoType) String Int])
+  (Roots [Int]))
+
+(deftype OwnershipResource
+  (Binding [CoreRef])
+  (Temporary [Int])
+  (Result []))
+
+(doc OwnershipAction "is the backend-neutral output vocabulary for the future
+linear ownership planner. Copy is intentionally absent: Carp copies are
+explicit calls which create a new temporary. The planner inserts moves,
+borrows, and deletes.")
+(deftype OwnershipAction
+  (Move [OwnershipSite OwnershipResource OwnershipResource (Box MonoType)])
+  (Borrow [OwnershipSite OwnershipResource])
+  (Delete [OwnershipSite OwnershipResource (Box MonoType)]))
+
+(doc OwnershipRequirement "records concrete interface work introduced by
+ownership planning. Delete requirements are returned to specialization before
+backend lowering.")
+(deftype OwnershipRequirement (DeleteFunction [(Box MonoType)]))
+
+(doc OwnershipPlan "is a side table over SpecializedExpr. It does not copy or
+rewrite the specialized expression tree.")
+(deftype OwnershipPlan
+  [contexts (Array OwnershipContext)
+   actions (Array OwnershipAction)
+   requirements (Array OwnershipRequirement)])
+
+(deftype OwnershipError [message String])
+
+(doc BorrowOrigin "is where a reference's borrow comes from: `Static` (a global
+or literal), `External` (an unknown-but-outliving source, e.g. a call result
+that shares no tracked binding), `Local` (borrows into the local owners it
+lists, which die at scope exit, so the borrow must not escape and must not
+outlive a move of any of them), `Param` (borrows into the function parameters
+it lists — returning one is fine, but it must not outlive a move of any of
+them), or `None` (the expression is not a borrow).")
+(deftype BorrowOrigin
+  (Static [])
+  (External [])
+  (Local [(Array CoreRef)])
+  (Param [(Array CoreRef)])
+  (None []))
+
+(doc BorrowState "is the flow-sensitive borrow-checking state at a program
+point: the owned locals that have been moved so far, and the current borrow
+origin of every reference binding in scope (which `set!` can change).")
+(deftype BorrowState
+  [moved (Array CoreRef)
+   origins (Array (Pair CoreRef BorrowOrigin))])
+
+(doc OwnershipClass "is the memory-ownership category of a concrete type:
+`Owned` values must be deleted, `Borrowed` values are references into memory
+someone else owns, and `Unmanaged` values are plain data with no cleanup.")
+(deftype OwnershipClass
+  (Unmanaged [])
+  (Owned [])
+  (Borrowed []))
+
+(doc OwnershipTypeFacts "declares, by structural ABI type key, which concrete
+types own memory (have a declared `delete`) and which a valid `blit` forces back
+to unmanaged. Classification consults these facts; it never inspects a type's
+spelling.")
+(deftype OwnershipTypeFacts
+  [owned (Array String)
+   unmanaged-override (Array String)])
+
+(defmodule OwnershipClassify
+  (private has-key?)
+  (hidden has-key?)
+  (defn has-key? [keys key]
+    (let-do [found false
+             n (Array.length keys)]
+      (for [i 0 n]
+        (when (String.= (Array.unsafe-nth keys i) key) (set! found true)))
+      found))
+
+  (doc classify "decides whether a concrete type owns memory (`Owned`), is a
+borrow (`Borrowed`), or is plain data (`Unmanaged`). Ownership is derived from a
+declared `delete` recorded in `facts`, never from the type's name. A valid
+`blit` recorded as an unmanaged override forces a type back to `Unmanaged`. Any
+type with no declared delete stays `Unmanaged`.")
+  (defn classify [type facts]
+    (match-ref type
+      (MonoType.Reference _ _)
+      (OwnershipClass.Borrowed)
+      ;; `Array` and `Box` are heap-managed builtins: each owns its allocation,
+      ;; so a concrete instance always owns memory regardless of declared
+      ;; deletes. `StaticArray` is stack-allocated and stays unmanaged.
+      (MonoType.Named name arguments)
+      (if (and
+          (or (String.= name "Array") (String.= name "Box"))
+          (Int.> (Array.length arguments) 0))
+        (OwnershipClass.Owned)
+        (let [key (CAbi.type-key type)]
+          (cond
+            (has-key? (OwnershipTypeFacts.unmanaged-override facts) &key)
+              (OwnershipClass.Unmanaged)
+            (has-key? (OwnershipTypeFacts.owned facts) &key)
+              (OwnershipClass.Owned)
+            (OwnershipClass.Unmanaged))))
+      _
+      (let [key (CAbi.type-key type)]
+        (cond
+          (has-key? (OwnershipTypeFacts.unmanaged-override facts) &key)
+            (OwnershipClass.Unmanaged)
+          (has-key? (OwnershipTypeFacts.owned facts) &key)
+            (OwnershipClass.Owned)
+          (OwnershipClass.Unmanaged)))))
+
+  (private signature-arg0)
+  (hidden signature-arg0)
+  (defn signature-arg0 [core reference]
+    (let-do [result (the (Maybe CoreType) (Maybe.Nothing))
+             builtins (CoreModule.builtins core)
+             signatures (CoreModule.signatures core)
+             n (Array.length builtins)
+             m (Array.length signatures)]
+      (for [i 0 n]
+        (let [b (Array.unsafe-nth builtins i)]
+          (when (CoreIR.same-ref? (CoreBuiltin.reference b) reference)
+            (match-ref (Box.peek (CoreBuiltin.signature b))
+              (CoreType.Function arguments _)
+                (when (Int.> (Array.length arguments) 0)
+                  (set! result
+                        (Maybe.Just
+                          (CoreType.copy
+                            (Box.peek (Array.unsafe-nth arguments 0))))))
+              _ ()))))
+      (for [i 0 m]
+        (let [sg (Array.unsafe-nth signatures i)]
+          (when (CoreIR.same-ref? (CoreSignature.reference sg) reference)
+            (match-ref (Box.peek (CoreSignature.signature sg))
+              (CoreType.Function arguments _)
+                (when (Int.> (Array.length arguments) 0)
+                  (set! result
+                        (Maybe.Just
+                          (CoreType.copy
+                            (Box.peek (Array.unsafe-nth arguments 0))))))
+              _ ()))))
+      result))
+
+  (private resolved->mono)
+  (hidden resolved->mono)
+  (private map-resolved->mono)
+  (hidden map-resolved->mono)
+  (sig resolved->mono (Fn [(Ref CoreType)] MonoType))
+  (sig map-resolved->mono
+       (Fn [(Ref (Array (Box CoreType)))] (Array (Box MonoType))))
+  (defn map-resolved->mono [args]
+    (let-do [result (the (Array (Box MonoType)) [])
+             n (Array.length args)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (resolved->mono (Box.peek (Array.unsafe-nth args
+                                                                             i)))))))
+      result))
+
+  (doc resolved->mono "converts a concrete resolved type to a MonoType so a
+generic-instance deleter's argument type can be keyed for ownership facts.")
+  (defn resolved->mono [core-type]
+    (match-ref core-type
+      (CoreType.Integer) (MonoType.Integer)
+      (CoreType.String) (MonoType.String)
+      (CoreType.Boolean) (MonoType.Boolean)
+      (CoreType.Unit) (MonoType.Unit)
+      (CoreType.Named n args)
+        (MonoType.Named (String.copy n) (map-resolved->mono args))
+      (CoreType.Reference inner _)
+        (MonoType.Reference
+          (Box.init (resolved->mono (Box.peek inner)))
+          (MonoLifetime.Static))
+      (CoreType.Function args ret)
+        (MonoType.Function (map-resolved->mono args)
+                           (Box.init (resolved->mono (Box.peek ret))))
+      (CoreType.Variable _) (MonoType.Variable 0)))
+
+  (private deleted-type-key)
+  (hidden deleted-type-key)
+  (defn deleted-type-key [core-type]
+    (match-ref core-type
+      (CoreType.String) (Maybe.Just (CAbi.type-key &(MonoType.String)))
+      (CoreType.Named name arguments)
+        (if (Int.= 0 (Array.length arguments))
+          (Maybe.Just (CAbi.type-key &(MonoType.Named (String.copy name) [])))
+          (Maybe.Just (CAbi.type-key &(resolved->mono core-type))))
+      _ (Maybe.Nothing)))
+
+  (doc facts-from-module "derives the ownership fact table from a resolved core
+module by finding every implementation of the built-in `delete` interface and
+keying the concrete type each one deletes. Generic and non-nominal delete
+targets are skipped for now.")
+  (defn facts-from-module [core]
+    (let-do [owned (the (Array String) [])
+             delete-ref (PrimitiveRegistry.delete-reference)
+             impls (CoreModule.implementations core)
+             n (Array.length impls)]
+      (for [i 0 n]
+        (let [im (Array.unsafe-nth impls i)]
+          (when (CoreIR.same-ref? (CoreImplementation.interface im) &delete-ref)
+            (match (signature-arg0 core (CoreImplementation.implementation im))
+              (Maybe.Just arg0)
+                (match (deleted-type-key &arg0)
+                  (Maybe.Just key)
+                    (unless (has-key? &owned &key)
+                      (set! owned (Array.push-back owned key)))
+                  (Maybe.Nothing) ())
+              (Maybe.Nothing) ()))))
+      (OwnershipTypeFacts.init owned []))))
+
+(defmodule Ownership
+  (private invalid-id)
+  (hidden invalid-id)
+  (private mark-id!)
+  (hidden mark-id!)
+  (private validate-expression)
+  (hidden validate-expression)
+  (private validate-expressions)
+  (hidden validate-expressions)
+  (private validate-branches)
+  (hidden validate-branches)
+
+  (sig validate-expression
+       (Fn
+         [(Ref SpecializedExpr) (Ref (Array Bool)) (Ref String)]
+         (Result () OwnershipError)))
+  (sig validate-expressions
+       (Fn
+         [(Ref (Array (Box SpecializedExpr))) (Ref (Array Bool)) (Ref String)]
+         (Result () OwnershipError)))
+  (sig validate-branches
+       (Fn
+         [(Ref (Array SpecializedMatchBranch)) (Ref (Array Bool)) (Ref String)]
+         (Result () OwnershipError)))
+  (sig collect-context-deletes
+       (Fn
+         [(Ref SpecializedExpr)
+          (Ref OwnershipTypeFacts)
+          Int
+          (Ref (Array CoreConstructorDeclaration))]
+         (Array OwnershipAction)))
+
+  (defn invalid-id [context id reason]
+    (OwnershipError.init
+      (String.concat
+        &[@"invalid specialized expression ID in "
+          (String.copy context)
+          @": "
+          (Int.str id)
+          @" "
+          (String.copy reason)])))
+
+  (defn mark-id! [seen context id]
+    (if (Int.< id 0)
+      (Result.Error (invalid-id context id "is negative"))
+      (do
+        (while-do (Int.<= (Array.length seen) id) (Array.push-back! seen false))
+        (if @(Array.unsafe-nth seen id)
+          (Result.Error (invalid-id context id "is duplicated"))
+          (do (Array.aset! seen id true) (Result.Success ()))))))
+
+  (defn validate-expressions [expressions seen context]
+    (let-do [result (the (Result () OwnershipError) (Result.Success ()))
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success _)
+            (set! result
+                  (validate-expression
+                    (Box.peek (Array.unsafe-nth expressions i))
+                    seen
+                    context))
+          (Result.Error _) ()))
+      result))
+
+  (defn validate-branches [branches seen context]
+    (let-do [result (the (Result () OwnershipError) (Result.Success ()))
+             n (Array.length branches)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success _)
+            (set! result
+                  (validate-expression
+                    (Box.peek
+                      (SpecializedMatchBranch.body (Array.unsafe-nth branches i)))
+                    seen
+                    context))
+          (Result.Error _) ()))
+      result))
+
+  (defn validate-expression [expression seen context]
+    (let [actual (Specialize.expression-id expression)]
+      (match (mark-id! seen context actual)
+        (Result.Success _)
+          (match-ref expression
+            (SpecializedExpr.ArrayLit _ _ expressions)
+              (validate-expressions expressions seen context)
+            (SpecializedExpr.StaticArrayLit _ _ expressions)
+              (validate-expressions expressions seen context)
+            (SpecializedExpr.Call _ _ callee arguments)
+              (match (validate-expression (Box.peek callee) seen context)
+                (Result.Success _) (validate-expressions arguments seen context)
+                (Result.Error error) (Result.Error error))
+            (SpecializedExpr.GlobalCall _ _ _ _ _ arguments)
+              (validate-expressions arguments seen context)
+            (SpecializedExpr.Do _ _ expressions)
+              (validate-expressions expressions seen context)
+            (SpecializedExpr.If _ _ condition then-branch else-branch)
+              (match (validate-expression (Box.peek condition) seen context)
+                (Result.Success _)
+                  (match (validate-expression (Box.peek then-branch)
+                                              seen
+                                              context)
+                    (Result.Success _)
+                      (validate-expression (Box.peek else-branch) seen context)
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (SpecializedExpr.Let _ _ _ value body)
+              (match (validate-expression (Box.peek value) seen context)
+                (Result.Success _)
+                  (validate-expression (Box.peek body) seen context)
+                (Result.Error error) (Result.Error error))
+            (SpecializedExpr.Set _ _ _ value)
+              (validate-expression (Box.peek value) seen context)
+            (SpecializedExpr.While _ _ condition body)
+              (match (validate-expression (Box.peek condition) seen context)
+                (Result.Success _)
+                  (validate-expression (Box.peek body) seen context)
+                (Result.Error error) (Result.Error error))
+            (SpecializedExpr.Lambda _ _ _ body)
+              (validate-expression (Box.peek body) seen context)
+            (SpecializedExpr.Match _ _ _ scrutinee branches)
+              (match (validate-expression (Box.peek scrutinee) seen context)
+                (Result.Success _) (validate-branches branches seen context)
+                (Result.Error error) (Result.Error error))
+            (SpecializedExpr.Annotation _ _ inner _)
+              (validate-expression (Box.peek inner) seen context)
+            _ (Result.Success ()))
+        (Result.Error error) (Result.Error error))))
+
+  (private append-actions)
+  (hidden append-actions)
+  (sig append-actions
+       (Fn
+         [(Array OwnershipAction) (Array OwnershipAction)]
+         (Array OwnershipAction)))
+  (defn append-actions [left right]
+    (let-do [result left
+             n (Array.length &right)]
+      (for [i 0 n]
+        (set! result (Array.push-back result @(Array.unsafe-nth &right i))))
+      result))
+
+  (private owned-type?)
+  (hidden owned-type?)
+  (defn owned-type? [type facts]
+    (match (OwnershipClassify.classify type facts)
+      (OwnershipClass.Owned) true
+      _ false))
+
+  (private consumed-in-any?)
+  (hidden consumed-in-any?)
+  (private consumed-in-branches?)
+  (hidden consumed-in-branches?)
+  ;; public: the backend asks this about its own hoisted temporaries, which are
+  ;; created after the ownership plan and so carry no planned actions.
+  (sig consumed? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (sig consumed-in-any?
+       (Fn [(Ref CoreRef) (Ref (Array (Box SpecializedExpr)))] Bool))
+  (sig consumed-in-branches?
+       (Fn [(Ref CoreRef) (Ref (Array SpecializedMatchBranch))] Bool))
+
+  (defn consumed-in-any? [binder es]
+    (let-do [found false
+             n (Array.length es)]
+      (for [i 0 n]
+        (when (consumed? binder (Box.peek (Array.unsafe-nth es i)))
+          (set! found true)))
+      found))
+
+  (defn consumed-in-branches? [binder branches]
+    (let-do [found false
+             n (Array.length branches)]
+      (for [i 0 n]
+        (when (consumed? binder
+                         (Box.peek
+                           (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                          i))))
+          (set! found true)))
+      found))
+
+  (private captured?)
+  (hidden captured?)
+  (private captured-in-any?)
+  (hidden captured-in-any?)
+  (private captured-in-branches?)
+  (hidden captured-in-branches?)
+
+  (sig captured? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (doc captured? "reports whether `binder` occurs free anywhere in a lambda
+body — including under a borrow. A lambda captures by copying the value into its
+environment, which then owns it (the reference does the same: Emit.hs assigns
+each captured variable into the heap environment), so ANY occurrence is a move
+out of the enclosing scope, not just the ones `consumed?` counts.")
+  (defn captured? [binder expr]
+    (match-ref expr
+      (SpecializedExpr.Reference _ _ r) (CoreIR.same-ref? r binder)
+      (SpecializedExpr.GlobalCall _ _ _ _ _ args) (captured-in-any? binder args)
+      (SpecializedExpr.Call _ _ callee args)
+        (or (captured? binder (Box.peek callee)) (captured-in-any? binder args))
+      (SpecializedExpr.Let _ _ _ value body)
+        (or (captured? binder (Box.peek value))
+            (captured? binder (Box.peek body)))
+      (SpecializedExpr.Do _ _ es) (captured-in-any? binder es)
+      (SpecializedExpr.If _ _ c t e)
+        (or (captured? binder (Box.peek c))
+            (or (captured? binder (Box.peek t)) (captured? binder (Box.peek e))))
+      (SpecializedExpr.While _ _ c b)
+        (or (captured? binder (Box.peek c)) (captured? binder (Box.peek b)))
+      (SpecializedExpr.Set _ _ _ value) (captured? binder (Box.peek value))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (or (captured? binder (Box.peek scrutinee))
+            (captured-in-branches? binder branches))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (captured? binder (Box.peek inner))
+      (SpecializedExpr.ArrayLit _ _ es) (captured-in-any? binder es)
+      (SpecializedExpr.StaticArrayLit _ _ es) (captured-in-any? binder es)
+      (SpecializedExpr.Lambda _ _ _ b) (captured? binder (Box.peek b))
+      _ false))
+
+  (defn captured-in-any? [binder es]
+    (let-do [found false
+             n (Array.length es)]
+      (for [i 0 n]
+        (when (captured? binder (Box.peek (Array.unsafe-nth es i)))
+          (set! found true)))
+      found))
+
+  (defn captured-in-branches? [binder branches]
+    (let-do [found false
+             n (Array.length branches)]
+      (for [i 0 n]
+        (when (captured? binder
+                         (Box.peek
+                           (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                          i))))
+          (set! found true)))
+      found))
+
+  (doc consumed? "reports whether `binder` is moved (its ownership transferred)
+somewhere in `expr`: a bare reference to it in any value position (a call
+argument, a `let` value, a tail result) transfers ownership, while the operand
+of `&` (a reference expression) is only a borrow. A consumed owner must not be
+deleted; an owner that is never consumed must be.")
+  (defn consumed? [binder expr]
+    (match-ref expr
+      (SpecializedExpr.Reference _ _ r)
+      (CoreIR.same-ref? r binder)
+      (SpecializedExpr.GlobalCall _ _ callee _ _ args)
+      (if (and
+          (CoreIR.same-ref? callee &(PrimitiveRegistry.ref-reference))
+          (Int.= 1 (Array.length args)))
+        (let [operand (Box.peek (Array.unsafe-nth args 0))]
+          (match-ref operand
+            (SpecializedExpr.Reference _ _ _) false
+            _ (consumed? binder operand)))
+        (consumed-in-any? binder args))
+      (SpecializedExpr.Call _ _ callee args)
+      (or (consumed? binder (Box.peek callee)) (consumed-in-any? binder args))
+      (SpecializedExpr.Let _ _ _ value body)
+      (or (consumed? binder (Box.peek value)) (consumed? binder (Box.peek body)))
+      (SpecializedExpr.Do _ _ es)
+      (consumed-in-any? binder es)
+      (SpecializedExpr.If _ _ c t e)
+      (or (consumed? binder (Box.peek c))
+          (or (consumed? binder (Box.peek t)) (consumed? binder (Box.peek e))))
+      (SpecializedExpr.While _ _ c b)
+      (or (consumed? binder (Box.peek c)) (consumed? binder (Box.peek b)))
+      (SpecializedExpr.Set _ _ _ value)
+      (consumed? binder (Box.peek value))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+      (or (consumed? binder (Box.peek scrutinee))
+          (consumed-in-branches? binder branches))
+      (SpecializedExpr.Annotation _ _ inner _)
+      (consumed? binder (Box.peek inner))
+      (SpecializedExpr.ArrayLit _ _ es)
+      (consumed-in-any? binder es)
+      (SpecializedExpr.StaticArrayLit _ _ es)
+      (consumed-in-any? binder es)
+      ;; a lambda captures by copying the binder into its environment, which
+      ;; then owns it — any free occurrence is a move, borrow or not.
+      (SpecializedExpr.Lambda _ _ _ b)
+      (captured? binder (Box.peek b))
+      _
+      false))
+
+  (doc owned-reference-in? "whether `expr` mentions `binder` anywhere with an
+owned (managed) node type. Pairs with `consumed?`: a consuming use only moves
+ownership when the value is actually owned — unmanaged captures are copied.")
+  (private owned-reference-in?)
+  (hidden owned-reference-in?)
+  (private owned-reference-in-any?)
+  (hidden owned-reference-in-any?)
+  (private owned-reference-in-branches?)
+  (hidden owned-reference-in-branches?)
+  (sig owned-reference-in?
+       (Fn [(Ref SpecializedExpr) (Ref CoreRef) (Ref OwnershipTypeFacts)] Bool))
+  (sig owned-reference-in-any?
+       (Fn
+         [(Ref (Array (Box SpecializedExpr)))
+          (Ref CoreRef)
+          (Ref OwnershipTypeFacts)]
+         Bool))
+  (sig owned-reference-in-branches?
+       (Fn
+         [(Ref (Array SpecializedMatchBranch))
+          (Ref CoreRef)
+          (Ref OwnershipTypeFacts)]
+         Bool))
+  (defn owned-reference-in? [expr binder facts]
+    (match-ref expr
+      (SpecializedExpr.Reference _ node-type r)
+        (and (CoreIR.same-ref? r binder)
+             (owned-type? (Box.peek node-type) facts))
+      (SpecializedExpr.GlobalCall _ _ _ _ _ args)
+        (owned-reference-in-any? args binder facts)
+      (SpecializedExpr.Call _ _ callee args)
+        (or
+          (owned-reference-in? (Box.peek callee) binder facts)
+          (owned-reference-in-any? args binder facts))
+      (SpecializedExpr.Let _ _ _ value body)
+        (or
+          (owned-reference-in? (Box.peek value) binder facts)
+          (owned-reference-in? (Box.peek body) binder facts))
+      (SpecializedExpr.Do _ _ es) (owned-reference-in-any? es binder facts)
+      (SpecializedExpr.If _ _ c t e)
+        (or
+          (owned-reference-in? (Box.peek c) binder facts)
+          (or
+            (owned-reference-in? (Box.peek t) binder facts)
+            (owned-reference-in? (Box.peek e) binder facts)))
+      (SpecializedExpr.While _ _ c b)
+        (or
+          (owned-reference-in? (Box.peek c) binder facts)
+          (owned-reference-in? (Box.peek b) binder facts))
+      (SpecializedExpr.Set _ _ _ value)
+        (owned-reference-in? (Box.peek value) binder facts)
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (or
+          (owned-reference-in? (Box.peek scrutinee) binder facts)
+          (owned-reference-in-branches? branches binder facts))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (owned-reference-in? (Box.peek inner) binder facts)
+      (SpecializedExpr.ArrayLit _ _ es)
+        (owned-reference-in-any? es binder facts)
+      (SpecializedExpr.StaticArrayLit _ _ es)
+        (owned-reference-in-any? es binder facts)
+      (SpecializedExpr.Lambda _ _ _ b)
+        (owned-reference-in? (Box.peek b) binder facts)
+      _ false))
+
+  (defn owned-reference-in-any? [es binder facts]
+    (let-do [found false
+             n (Array.length es)]
+      (for [i 0 n]
+        (when (owned-reference-in? (Box.peek (Array.unsafe-nth es i))
+                                   binder
+                                   facts)
+          (set! found true)))
+      found))
+
+  (defn owned-reference-in-branches? [branches binder facts]
+    (let-do [found false
+             n (Array.length branches)]
+      (for [i 0 n]
+        (when (owned-reference-in?
+            (Box.peek
+              (SpecializedMatchBranch.body (Array.unsafe-nth branches i)))
+            binder
+            facts)
+          (set! found true)))
+      found))
+
+  (private make-delete-action)
+  (hidden make-delete-action)
+  (private contains-ref?)
+  (hidden contains-ref?)
+  (defn contains-ref? [refs target]
+    (let-do [found false
+             n (Array.length refs)]
+      (for [i 0 n]
+        (when (CoreIR.same-ref? (Array.unsafe-nth refs i) target)
+          (set! found true)))
+      found))
+
+  (private ref-type?)
+  (hidden ref-type?)
+  (defn ref-type? [type] (match-ref type (MonoType.Reference _ _) true _ false))
+
+  (private same-lt?)
+  (hidden same-lt?)
+  (defn same-lt? [left right]
+    (match-ref left
+      (MonoLifetime.Variable left-id)
+        (match-ref right
+          (MonoLifetime.Variable right-id) (Int.= @left-id @right-id)
+          _ false)
+      (MonoLifetime.Static) (match-ref right (MonoLifetime.Static) true _ false)))
+
+  ;; every lifetime VARIABLE carried by a reference anywhere inside a type;
+  ;; static lifetimes are omitted (they constrain nothing).
+  (private collect-ref-lifetimes!)
+  (hidden collect-ref-lifetimes!)
+  (sig collect-ref-lifetimes!
+       (Fn [(Ref MonoType) (Ref (Array MonoLifetime))] ()))
+  (defn collect-ref-lifetimes! [type acc]
+    (match-ref type
+      (MonoType.Reference inner lt)
+        (do
+          (match-ref lt
+            (MonoLifetime.Variable _) (Array.push-back! acc @lt)
+            _ ())
+          (collect-ref-lifetimes! (Box.peek inner) acc))
+      (MonoType.Named _ args)
+        (for [i 0 (Array.length args)]
+          (collect-ref-lifetimes! (Box.peek (Array.unsafe-nth args i)) acc))
+      (MonoType.Function args ret)
+        (do
+          (for [i 0 (Array.length args)]
+            (collect-ref-lifetimes! (Box.peek (Array.unsafe-nth args i)) acc))
+          (collect-ref-lifetimes! (Box.peek ret) acc))
+      _ ()))
+
+  (private any-lifetime-shared?)
+  (hidden any-lifetime-shared?)
+  (defn any-lifetime-shared? [left right]
+    (let-do [found false]
+      (for [i 0 (Array.length left)]
+        (for [j 0 (Array.length right)]
+          (when (same-lt? (Array.unsafe-nth left i) (Array.unsafe-nth right j))
+            (set! found true))))
+      found))
+
+  (private external?)
+  (hidden external?)
+  (defn external? [origin]
+    (match-ref origin (BorrowOrigin.External) true _ false))
+
+  (private static?)
+  (hidden static?)
+  (defn static? [origin] (match-ref origin (BorrowOrigin.Static) true _ false))
+
+  (private origin-locals)
+  (hidden origin-locals)
+  (defn origin-locals [origin]
+    (match-ref origin
+      (BorrowOrigin.Local locals) @locals
+      _ (the (Array CoreRef) [])))
+
+  ;; a `Local` origin's list already includes any parameters folded into it by
+  ;; a join, so only the pure `Param` variant reports here.
+  (private origin-params)
+  (hidden origin-params)
+  (defn origin-params [origin]
+    (match-ref origin
+      (BorrowOrigin.Param params) @params
+      _ (the (Array CoreRef) [])))
+
+  ;; every binding an origin borrows from, local or parameter — the set a
+  ;; use-after-move check must test against the moved set.
+  (private origin-owners)
+  (hidden origin-owners)
+  (defn origin-owners [origin]
+    (match-ref origin
+      (BorrowOrigin.Local locals) @locals
+      (BorrowOrigin.Param params) @params
+      _ (the (Array CoreRef) [])))
+
+  (private union-refs)
+  (hidden union-refs)
+  (defn union-refs [left right]
+    (let-do [result (Array.copy left)
+             n (Array.length right)]
+      (for [i 0 n]
+        (let [x (Array.unsafe-nth right i)]
+          (unless (contains-ref? &result x)
+            (set! result (Array.push-back result (CoreRef.copy x))))))
+      result))
+
+  (private single-local)
+  (hidden single-local)
+  (defn single-local [x] (BorrowOrigin.Local [(CoreRef.copy x)]))
+
+  (private temporary-origin)
+  (hidden temporary-origin)
+  (doc temporary-origin "the origin of a borrow whose operand is not a named
+binding. String and pattern literals live in static storage, so borrowing one is
+`Static`; every other temporary (an array literal, a call result, a computed
+value) lives in the current frame, so the borrow is frame-`Local` — it names no
+binder, but it must not outlive the frame.")
+  (defn temporary-origin [operand]
+    (match-ref operand
+      (SpecializedExpr.StringLit _ _ _) (BorrowOrigin.Static)
+      (SpecializedExpr.PatternLit _ _ _) (BorrowOrigin.Static)
+      _ (BorrowOrigin.Local [])))
+
+  (private join-origin)
+  (hidden join-origin)
+  (defn join-origin [left right]
+    (let [ll (origin-locals left)
+          rl (origin-locals right)
+          lp (origin-params left)
+          rp (origin-params right)]
+      (cond
+        ;; any local participation makes the join Local (escape-relevant), even
+        ;; a binder-less temporary (`Local []`); the param refs ride along so
+        ;; use-after-move still sees them.
+        (or
+          (match-ref left (BorrowOrigin.Local _) true _ false)
+          (match-ref right (BorrowOrigin.Local _) true _ false))
+        (BorrowOrigin.Local
+          (union-refs &(union-refs &ll &rl) &(union-refs &lp &rp)))
+        (or (Int.> (Array.length &lp) 0) (Int.> (Array.length &rp) 0))
+        (BorrowOrigin.Param (union-refs &lp &rp))
+        (or (external? left) (external? right))
+        (BorrowOrigin.External)
+        (or (static? left) (static? right))
+        (BorrowOrigin.Static)
+        (BorrowOrigin.None))))
+
+  (private origins-lookup)
+  (hidden origins-lookup)
+  (defn origins-lookup [origins binder]
+    (let-do [result (BorrowOrigin.None)
+             n (Array.length origins)]
+      (for [i 0 n]
+        (when (CoreIR.same-ref? (Pair.a (Array.unsafe-nth origins i)) binder)
+          (set! result @(Pair.b (Array.unsafe-nth origins i)))))
+      result))
+
+  (private origins-has?)
+  (hidden origins-has?)
+  (defn origins-has? [origins binder]
+    (let-do [found false
+             n (Array.length origins)]
+      (for [i 0 n]
+        (when (CoreIR.same-ref? (Pair.a (Array.unsafe-nth origins i)) binder)
+          (set! found true)))
+      found))
+
+  (private state-origin)
+  (hidden state-origin)
+  (defn state-origin [state binder]
+    (origins-lookup (BorrowState.origins state) binder))
+
+  (private state-set-origin)
+  (hidden state-set-origin)
+  (private state-unmove)
+  (hidden state-unmove)
+  ;; a `set!` stores a fresh value in the binding, so a previous move out of it
+  ;; no longer poisons later uses: the binding is re-initialized.
+  (defn state-unmove [state binder]
+    (let-do [moved (the (Array CoreRef) [])
+             old (BorrowState.moved state)
+             n (Array.length old)]
+      (for [i 0 n]
+        (unless (CoreIR.same-ref? (Array.unsafe-nth old i) binder)
+          (set! moved (Array.push-back moved @(Array.unsafe-nth old i)))))
+      (BorrowState.init moved @(BorrowState.origins state))))
+
+  (defn state-set-origin [state binder origin]
+    (let-do [origins (the (Array (Pair CoreRef BorrowOrigin)) [])
+             old (BorrowState.origins state)
+             n (Array.length old)]
+      (for [i 0 n]
+        (unless (CoreIR.same-ref? (Pair.a (Array.unsafe-nth old i)) binder)
+          (set! origins (Array.push-back origins @(Array.unsafe-nth old i)))))
+      (set! origins
+            (Array.push-back origins (Pair.init (CoreRef.copy binder) origin)))
+      (BorrowState.init @(BorrowState.moved state) origins)))
+
+  ;; a match branch re-binds its pattern bindings from the scrutinee on every
+  ;; entry, so like a loop-re-entered let binder they must not inherit a
+  ;; previous pass's moved marks.
+  (private state-unmove-all)
+  (hidden state-unmove-all)
+  (defn state-unmove-all [state bindings]
+    (let-do [current @state
+             n (Array.length bindings)]
+      (for [i 0 n]
+        (set! current (state-unmove &current (Array.unsafe-nth bindings i))))
+      current))
+
+  (private state-mark-moved)
+  (hidden state-mark-moved)
+  (defn state-mark-moved [state local]
+    (if (contains-ref? (BorrowState.moved state) local)
+      @state
+      (BorrowState.init
+        (Array.push-back @(BorrowState.moved state) (CoreRef.copy local))
+        @(BorrowState.origins state))))
+
+  (private join-origins)
+  (hidden join-origins)
+  (defn join-origins [left right]
+    (let-do [result (the (Array (Pair CoreRef BorrowOrigin)) [])
+             ln (Array.length left)
+             rn (Array.length right)]
+      (for [i 0 ln]
+        (let [pair (Array.unsafe-nth left i)
+              binder (Pair.a pair)
+              lo @(Pair.b pair)
+              ro (origins-lookup right binder)]
+          (set! result
+                (Array.push-back result
+                                 (Pair.init (CoreRef.copy binder)
+                                            (join-origin &lo &ro))))))
+      (for [i 0 rn]
+        (let [binder (Pair.a (Array.unsafe-nth right i))]
+          (unless (origins-has? left binder)
+            (set! result (Array.push-back result @(Array.unsafe-nth right i))))))
+      result))
+
+  (private state-join)
+  (hidden state-join)
+  (defn state-join [left right]
+    (BorrowState.init
+      (union-refs (BorrowState.moved left) (BorrowState.moved right))
+      (join-origins (BorrowState.origins left) (BorrowState.origins right))))
+
+  (private is-ref-call?)
+  (hidden is-ref-call?)
+  (defn is-ref-call? [callee args]
+    (and
+      (CoreIR.same-ref? callee &(PrimitiveRegistry.ref-reference))
+      (Int.= 1 (Array.length args))))
+
+  (private check-escape!)
+  (hidden check-escape!)
+  ;; any frame-Local origin escapes, including one that names no binder: a
+  ;; borrow of an unnamed temporary (`&[1 2 3]`) is just as dead on return as a
+  ;; borrow of a named local.
+  (defn check-escape! [origin flags]
+    (when (match-ref origin (BorrowOrigin.Local _) true _ false)
+      (Array.aset! flags 0 true)))
+
+  (private check-use-after-move!)
+  (hidden check-use-after-move!)
+  (defn check-use-after-move! [origin state flags]
+    (let-do [owners (origin-owners origin)
+             n (Array.length &owners)]
+      (for [i 0 n]
+        (when (contains-ref? (BorrowState.moved state)
+                             (Array.unsafe-nth &owners i))
+          (do
+            (match (IO.getenv "CARP_DEBUG_OWNERSHIP")
+              (Maybe.Just _)
+                (IO.errorln
+                  &(fmt "  borrow-after-move: owner %s (id %d)"
+                        (CoreRef.name (Array.unsafe-nth &owners i))
+                        @(CoreRef.id (Array.unsafe-nth &owners i))))
+              (Maybe.Nothing) ())
+            (Array.aset! flags 1 true))))))
+
+  (sig origin-of
+       (Fn
+         [(Ref SpecializedExpr) (Ref BorrowState) (Ref (Array CoreRef))]
+         BorrowOrigin))
+  (sig call-result-origin
+       (Fn
+         [(Ref MonoType)
+          (Ref (Array (Box SpecializedExpr)))
+          (Ref BorrowState)
+          (Ref (Array CoreRef))]
+         BorrowOrigin))
+  (sig analyze
+       (Fn
+         [(Ref SpecializedExpr)
+          (Ref BorrowState)
+          (Ref (Array CoreRef))
+          (Ref OwnershipTypeFacts)
+          (Ref (Array Bool))
+          Bool]
+         BorrowState))
+  (sig analyze-call-args
+       (Fn
+         [(Ref (Box MonoType))
+          (Ref (Array (Box SpecializedExpr)))
+          (Ref BorrowState)
+          (Ref (Array CoreRef))
+          (Ref OwnershipTypeFacts)
+          (Ref (Array Bool))]
+         BorrowState))
+
+  (sig lambda-captured-origin
+       (Fn [(Ref SpecializedExpr) (Ref BorrowState)] BorrowOrigin))
+  (sig check-capture-moves!
+       (Fn
+         [(Ref SpecializedExpr)
+          (Ref BorrowState)
+          (Ref (Array CoreRef))
+          (Ref OwnershipTypeFacts)
+          (Ref (Array Bool))]
+         ()))
+
+  (private origin-of)
+  (hidden origin-of)
+  (private call-result-origin)
+  (hidden call-result-origin)
+  (private lambda-captured-origin)
+  (hidden lambda-captured-origin)
+  (private analyze)
+  (hidden analyze)
+  (private analyze-call-args)
+  (hidden analyze-call-args)
+
+  (defn call-result-origin [signature args state parameters]
+    (match-ref signature
+      (MonoType.Function arg-types result-type)
+        (let-do [result-lts (the (Array MonoLifetime) [])]
+          (collect-ref-lifetimes! (Box.peek result-type) &result-lts)
+          (if (Int.= 0 (Array.length &result-lts))
+            ;; no lifetime-variable reference anywhere in the result: a direct
+            ;; static-lifetime reference result is a Static borrow, anything
+            ;; else is not a borrow at all.
+            (match-ref (Box.peek result-type)
+              (MonoType.Reference _ result-lt)
+                (match-ref result-lt
+                  (MonoLifetime.Static) (BorrowOrigin.Static)
+                  _ (BorrowOrigin.None))
+              _ (BorrowOrigin.None))
+            ;; the result borrows from every argument whose type shares one of
+            ;; the result's lifetime variables — whether the reference sits
+            ;; directly in the argument type or inside a struct it carries.
+            (let-do [origin (BorrowOrigin.None)
+                     n (Int.min (Array.length arg-types) (Array.length args))]
+              (for [i 0 n]
+                (let-do [arg-lts (the (Array MonoLifetime) [])]
+                  (collect-ref-lifetimes!
+                    (Box.peek (Array.unsafe-nth arg-types i))
+                    &arg-lts)
+                  (when (any-lifetime-shared? &arg-lts &result-lts)
+                    (set! origin
+                          (join-origin &origin
+                                       &(origin-of (Box.peek (Array.unsafe-nth args
+                                                                               i))
+                                                   state
+                                                   parameters))))))
+              origin)))
+      _ (BorrowOrigin.None)))
+
+  (defn origin-of [expr state parameters]
+    (match-ref expr
+      (SpecializedExpr.GlobalCall _ _ callee signature _ args)
+      (if (is-ref-call? callee args)
+        (let [operand (Box.peek (Array.unsafe-nth args 0))]
+          (match-ref operand
+            (SpecializedExpr.Reference _ _ x)
+            (cond
+              @(CoreRef.global x) (BorrowOrigin.Static)
+              (contains-ref? parameters x)
+                (BorrowOrigin.Param [(CoreRef.copy x)])
+              (single-local x))
+            ;; `&<temporary>` — an array literal, a call result, anything
+            ;; that is not a named binding. The temporary lives in this frame
+            ;; and dies with the enclosing statement, so the borrow is Local
+            ;; even though no binder names it: returning it escapes.
+            _
+            (temporary-origin operand)))
+        (call-result-origin (Box.peek signature) args state parameters))
+      (SpecializedExpr.Reference _ node-type binder)
+      (match-ref (Box.peek node-type)
+        (MonoType.Reference _ _)
+        (cond
+          @(CoreRef.global binder) (BorrowOrigin.Static)
+          (contains-ref? parameters binder) (BorrowOrigin.External)
+          (state-origin state binder))
+        ;; a closure value carries the origins of the borrows it captured;
+        ;; ref-containing structs bound to a local do too.
+        _
+        (if (or @(CoreRef.global binder) (contains-ref? parameters binder))
+          (BorrowOrigin.None)
+          (state-origin state binder)))
+      ;; a lambda's environment holds copies of its captures; any borrows those
+      ;; copies contain still point at the enclosing frame's bindings.
+      (SpecializedExpr.Lambda _ _ _ body)
+      (lambda-captured-origin (Box.peek body) state)
+      _
+      (BorrowOrigin.None)))
+
+  (defn lambda-captured-origin [body state]
+    (let-do [origin (BorrowOrigin.None)
+             origins (BorrowState.origins state)
+             n (Array.length origins)]
+      (for [i 0 n]
+        (let [pair (Array.unsafe-nth origins i)]
+          (when (captured? (Pair.a pair) body)
+            (set! origin (join-origin &origin (Pair.b pair))))))
+      origin))
+
+  (private borrowish?)
+  (hidden borrowish?)
+  (defn borrowish? [origin]
+    (match-ref origin
+      (BorrowOrigin.Local _) true
+      (BorrowOrigin.Param _) true
+      _ false))
+
+  (doc syntactic-borrow-origin "the locals and parameters a value expression
+syntactically borrows from, ignoring signature lifetimes. Unification can erase
+a result lifetime to static (e.g. when the receiving binding was initialized
+from a string literal), so a lifetime-precise origin of Static/None for a
+reference-typed value is not trustworthy; this walk recovers the borrow
+sources from the expression itself.")
+  (private syntactic-borrow-origin)
+  (hidden syntactic-borrow-origin)
+  (sig syntactic-borrow-origin
+       (Fn
+         [(Ref SpecializedExpr) (Ref BorrowState) (Ref (Array CoreRef))]
+         BorrowOrigin))
+  (defn syntactic-borrow-origin [expr state parameters]
+    (match-ref expr
+      (SpecializedExpr.GlobalCall _ _ callee _ _ args)
+        (if (is-ref-call? callee args)
+          (origin-of expr state parameters)
+          (let-do [origin (BorrowOrigin.None)
+                   n (Array.length args)]
+            (for [i 0 n]
+              (let [arg (Box.peek (Array.unsafe-nth args i))]
+                (when (ref-type? &(Specialize.expression-type arg))
+                  (set! origin
+                        (join-origin &origin
+                                     &(syntactic-borrow-origin arg
+                                                               state
+                                                               parameters))))))
+            origin))
+      (SpecializedExpr.Call _ _ callee args)
+        (let-do [origin (syntactic-borrow-origin (Box.peek callee)
+                                                 state
+                                                 parameters)
+                 n (Array.length args)]
+          (for [i 0 n]
+            (let [arg (Box.peek (Array.unsafe-nth args i))]
+              (when (ref-type? &(Specialize.expression-type arg))
+                (set! origin
+                      (join-origin &origin
+                                   &(syntactic-borrow-origin arg
+                                                             state
+                                                             parameters))))))
+          origin)
+      (SpecializedExpr.Reference _ _ _) (origin-of expr state parameters)
+      (SpecializedExpr.Let _ _ _ _ body)
+        (syntactic-borrow-origin (Box.peek body) state parameters)
+      (SpecializedExpr.Do _ _ es)
+        (let [n (Array.length es)]
+          (if (Int.> n 0)
+            (syntactic-borrow-origin
+              (Box.peek (Array.unsafe-nth es (Int.dec n)))
+              state
+              parameters)
+            (BorrowOrigin.None)))
+      (SpecializedExpr.If _ _ _ t e)
+        (join-origin
+          &(syntactic-borrow-origin (Box.peek t) state parameters)
+          &(syntactic-borrow-origin (Box.peek e) state parameters))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (syntactic-borrow-origin (Box.peek inner) state parameters)
+      _ (BorrowOrigin.None)))
+
+  (doc binding-value-origin "the borrow origin recorded for a binding: the
+lifetime-precise origin when it names owners, otherwise — for reference-typed
+values only — the syntactic borrow sources of the value expression.")
+  (private binding-value-origin)
+  (hidden binding-value-origin)
+  (defn binding-value-origin [value state parameters]
+    (let [precise (origin-of value state parameters)]
+      (cond
+        (borrowish? &precise) precise
+        (ref-type? &(Specialize.expression-type value))
+          (let [fallback (syntactic-borrow-origin value state parameters)]
+            (if (borrowish? &fallback) fallback precise))
+        precise)))
+
+  (defn analyze-call-args [signature args state parameters facts flags]
+    (match-ref (Box.peek signature)
+      (MonoType.Function arg-types _)
+        (let-do [current @state
+                 pending (the (Array CoreRef) [])
+                 n (Array.length args)]
+          (for [i 0 n]
+            (do
+              (set! current
+                    (analyze (Box.peek (Array.unsafe-nth args i))
+                             &current
+                             parameters
+                             facts
+                             flags
+                             false))
+              (let [arg (Box.peek (Array.unsafe-nth args i))]
+                (if (and (Int.< i (Array.length arg-types))
+                         (ref-type? (Box.peek (Array.unsafe-nth arg-types i))))
+                  (check-use-after-move! &(origin-of arg &current parameters)
+                                         &current
+                                         flags)
+                  (match-ref arg
+                    ;; owned params are consumed exactly like owned locals: a
+                    ;; by-value pass moves them, and later borrows must notice.
+                    (SpecializedExpr.Reference _ node-type x)
+                    (when (and (owned-type? (Box.peek node-type) facts)
+                               (not @(CoreRef.global x)))
+                      (Array.push-back! &pending (CoreRef.copy x)))
+                    _
+                    ())))))
+          ;; a by-value argument is consumed by the CALL itself, which happens
+          ;; only after every argument expression has been evaluated. Marking
+          ;; the move mid-loop would poison borrows used by later arguments.
+          (for [i 0 (Array.length &pending)]
+            (set! current
+                  (state-mark-moved &current (Array.unsafe-nth &pending i))))
+          current)
+      _ @state))
+
+  (defn analyze [expr state parameters facts flags tail?]
+    (match-ref expr
+      (SpecializedExpr.Let _ _ binder value body)
+        (let [after-value (analyze (Box.peek value)
+                                   state
+                                   parameters
+                                   facts
+                                   flags
+                                   false)
+              vo (binding-value-origin (Box.peek value) &after-value parameters)
+              ;; unmove first: a loop re-enters the binding with a fresh value,
+              ;; so the previous iteration's scope-death mark must not linger.
+              bound (state-set-origin &(state-unmove &after-value binder)
+                                      binder
+                                      vo)
+              after-body (analyze (Box.peek body)
+                                  &bound
+                                  parameters
+                                  facts
+                                  flags
+                                  tail?)]
+          ;; the binding dies at scope exit: any borrow into it still held by
+          ;; an outer binding is dangling from here on.
+          (state-mark-moved &after-body binder))
+      (SpecializedExpr.Do _ _ es)
+        (let-do [current @state
+                 n (Array.length es)]
+          (for [i 0 n]
+            (set! current
+                  (analyze (Box.peek (Array.unsafe-nth es i))
+                           &current
+                           parameters
+                           facts
+                           flags
+                           (and tail? (Int.= i (Int.dec n))))))
+          current)
+      (SpecializedExpr.If _ _ c t e)
+        (let [after-c (analyze (Box.peek c) state parameters facts flags false)
+              st (analyze (Box.peek t) &after-c parameters facts flags tail?)
+              se (analyze (Box.peek e) &after-c parameters facts flags tail?)]
+          (state-join &st &se))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (let-do [after-s (analyze (Box.peek scrutinee)
+                                  state
+                                  parameters
+                                  facts
+                                  flags
+                                  false)
+                 joined @&after-s
+                 seen false
+                 n (Array.length branches)]
+          ;; a by-value match gives the scrutinee away: constructor patterns
+          ;; bind its fields, so the value must not be used afterwards. A
+          ;; `match-ref` scrutinee is reference-typed, which is never owned,
+          ;; so it is naturally exempt.
+          (match-ref (Box.peek scrutinee)
+            (SpecializedExpr.Reference _ node-type sbinder)
+              (when-do (and (owned-type? (Box.peek node-type) facts)
+                            (not @(CoreRef.global sbinder)))
+                (set! after-s (state-mark-moved &after-s sbinder))
+                (set! joined @&after-s))
+            _ ())
+          (for [i 0 n]
+            (let [branch (Array.unsafe-nth branches i)
+                  entry (state-unmove-all &after-s
+                                          (SpecializedMatchBranch.bindings branch))
+                  branch-state (analyze
+                    (Box.peek (SpecializedMatchBranch.body branch))
+                    &entry
+                    parameters
+                    facts
+                    flags
+                    tail?)]
+              (if seen
+                (set! joined (state-join &joined &branch-state))
+                (do (set! joined @&branch-state) (set! seen true)))))
+          joined)
+      (SpecializedExpr.While _ _ c body)
+        (let [after-c (analyze (Box.peek c) state parameters facts flags false)
+              once (analyze (Box.peek body)
+                            &after-c
+                            parameters
+                            facts
+                            flags
+                            false)
+              merged (state-join &after-c &once)
+              twice (analyze (Box.peek body)
+                             &merged
+                             parameters
+                             facts
+                             flags
+                             false)]
+          (state-join &after-c &twice))
+      (SpecializedExpr.Set _ _ binder value)
+        (let [after-value (analyze (Box.peek value)
+                                   state
+                                   parameters
+                                   facts
+                                   flags
+                                   false)
+              vo (binding-value-origin (Box.peek value) &after-value parameters)
+              reinitialized (state-unmove &after-value binder)]
+          (state-set-origin &reinitialized binder vo))
+      (SpecializedExpr.GlobalCall _ _ callee signature _ args)
+        (if (is-ref-call? callee args)
+          (let-do [current (analyze (Box.peek (Array.unsafe-nth args 0))
+                                    state
+                                    parameters
+                                    facts
+                                    flags
+                                    false)]
+            (check-use-after-move! &(origin-of expr &current parameters)
+                                   &current
+                                   flags)
+            (when tail?
+              (check-escape! &(origin-of expr &current parameters) flags))
+            current)
+          (let-do [current (analyze-call-args signature
+                                              args
+                                              state
+                                              parameters
+                                              facts
+                                              flags)]
+            (when tail?
+              (check-escape! &(origin-of expr &current parameters) flags))
+            current))
+      (SpecializedExpr.Call _ _ callee args)
+        (let-do [current (analyze (Box.peek callee)
+                                  state
+                                  parameters
+                                  facts
+                                  flags
+                                  false)
+                 n (Array.length args)]
+          ;; invoking a closure uses every borrow its environment captured;
+          ;; if any captured borrow's owner has been moved, this call dangles.
+          (check-use-after-move!
+            &(origin-of (Box.peek callee) &current parameters)
+            &current
+            flags)
+          (for [i 0 n]
+            (set! current
+                  (analyze (Box.peek (Array.unsafe-nth args i))
+                           &current
+                           parameters
+                           facts
+                           flags
+                           false)))
+          current)
+      (SpecializedExpr.Reference _ _ _)
+        (do
+          (when tail? (check-escape! &(origin-of expr state parameters) flags))
+          @state)
+      (SpecializedExpr.Annotation _ _ inner _)
+        (analyze (Box.peek inner) state parameters facts flags tail?)
+      (SpecializedExpr.ArrayLit _ _ es)
+        (let-do [current @state
+                 n (Array.length es)]
+          (for [i 0 n]
+            (set! current
+                  (analyze (Box.peek (Array.unsafe-nth es i))
+                           &current
+                           parameters
+                           facts
+                           flags
+                           false)))
+          current)
+      (SpecializedExpr.StaticArrayLit _ _ es)
+        (let-do [current @state
+                 n (Array.length es)]
+          (for [i 0 n]
+            (set! current
+                  (analyze (Box.peek (Array.unsafe-nth es i))
+                           &current
+                           parameters
+                           facts
+                           flags
+                           false)))
+          current)
+      (SpecializedExpr.Lambda _ _ _ body)
+        (do
+          ;; a capture lives in the closure environment; a consuming use inside
+          ;; the body would move it out of that environment, which must be
+          ;; rejected because the closure can run more than once.
+          (check-capture-moves! (Box.peek body) state parameters facts flags)
+          (analyze (Box.peek body) state parameters facts flags false))
+      _ @state))
+
+  (private check-capture-moves!)
+  (hidden check-capture-moves!)
+  (defn check-capture-moves! [body state parameters facts flags]
+    (let-do [origins (BorrowState.origins state)
+             n (Array.length origins)]
+      (for [i 0 n]
+        (let [binder (Pair.a (Array.unsafe-nth origins i))]
+          (when (and (consumed? binder body)
+                     (owned-reference-in? body binder facts))
+            (Array.aset! flags 2 true))))
+      (for [i 0 (Array.length parameters)]
+        (let [p (Array.unsafe-nth parameters i)]
+          (when (and (consumed? p body) (owned-reference-in? body p facts))
+            (Array.aset! flags 2 true))))))
+
+  (doc check-borrows "runs the sound flow-sensitive borrow check over one
+definition body. Returns a three-element flag array: index 0 is set if a borrow
+into a local escapes the body, index 1 if a borrow is used after its owner is
+moved, index 2 if a lambda moves a captured value out of its environment.")
+  (defn check-borrows [body parameters facts]
+    (let-do [flags [false false false]
+             state (BorrowState.init [] [])]
+      (ignore (analyze body &state parameters facts &flags true))
+      flags))
+
+  (defn make-delete-action [context id reference type]
+    (OwnershipAction.Delete (OwnershipSite.init context id)
+                            (OwnershipResource.Binding reference)
+                            (Box.init type)))
+
+  (private make-temporary-delete)
+  (hidden make-temporary-delete)
+  (defn make-temporary-delete [context id type]
+    (OwnershipAction.Delete (OwnershipSite.init context id)
+                            (OwnershipResource.Temporary id)
+                            (Box.init type)))
+
+  (private make-move-action)
+  (hidden make-move-action)
+  (defn make-move-action [context id from to type]
+    (OwnershipAction.Move (OwnershipSite.init context id)
+                          (OwnershipResource.Binding from)
+                          (OwnershipResource.Binding to)
+                          (Box.init type)))
+
+  (private collect-into!)
+  (hidden collect-into!)
+  (defn collect-into! [expr facts context constructors acc]
+    (match-ref expr
+      (SpecializedExpr.Let id _ binder value body)
+        (do
+          (collect-into! (Box.peek value) facts context constructors acc)
+          (collect-into! (Box.peek body) facts context constructors acc)
+          (let [value-type (Specialize.expression-type (Box.peek value))]
+            (when-do (owned-type? &value-type facts)
+              (match-ref (Box.peek value)
+                (SpecializedExpr.Reference _ _ target)
+                  (Array.push-back! acc
+                                    (make-move-action context
+                                                      @id
+                                                      (CoreRef.copy target)
+                                                      (CoreRef.copy binder)
+                                                      (MonoType.copy &value-type)))
+                _ ())
+              (unless (consumed? binder (Box.peek body))
+                (Array.push-back! acc
+                                  (make-delete-action context
+                                                      @id
+                                                      (CoreRef.copy binder)
+                                                      (MonoType.copy &value-type)))))))
+      (SpecializedExpr.Do _ _ es)
+        (let-do [n (Array.length es)]
+          (for [i 0 n]
+            (let-do [el (Box.peek (Array.unsafe-nth es i))]
+              (collect-into! el facts context constructors acc)
+              (when (Int.< i (Int.dec n))
+                (let [el-type (Specialize.expression-type el)]
+                  (when (owned-type? &el-type facts)
+                    (Array.push-back! acc
+                                      (make-temporary-delete context
+                                                             (Specialize.expression-id el)
+                                                             (MonoType.copy &el-type)))))))))
+      (SpecializedExpr.If _ _ c t e)
+        (do
+          (collect-into! (Box.peek c) facts context constructors acc)
+          (collect-into! (Box.peek t) facts context constructors acc)
+          (collect-into! (Box.peek e) facts context constructors acc))
+      (SpecializedExpr.Call _ _ callee args)
+        (do
+          (collect-into! (Box.peek callee) facts context constructors acc)
+          (for [i 0 (Array.length args)]
+            (collect-into! (Box.peek (Array.unsafe-nth args i))
+                           facts context constructors acc)))
+      (SpecializedExpr.GlobalCall _ _ _ _ _ args)
+        (for [i 0 (Array.length args)]
+          (collect-into! (Box.peek (Array.unsafe-nth args i)) facts context constructors acc))
+      (SpecializedExpr.While _ _ c body)
+        (do
+          (collect-into! (Box.peek c) facts context constructors acc)
+          (collect-into! (Box.peek body) facts context constructors acc))
+      (SpecializedExpr.Set id _ target value)
+        (do
+          (collect-into! (Box.peek value) facts context constructors acc)
+          ;; overwriting an owned binding drops its previous value: schedule a
+          ;; delete of the old value at the set site unless the new value's
+          ;; expression consumes the binding (rebind-through idioms).
+          (let [value-type (Specialize.expression-type (Box.peek value))]
+            (when (and (owned-type? &value-type facts)
+                       (not (consumed? target (Box.peek value))))
+              (Array.push-back! acc
+                                (make-delete-action context
+                                                    @id
+                                                    (CoreRef.copy target)
+                                                    (MonoType.copy &value-type))))))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (collect-into! (Box.peek inner) facts context constructors acc)
+      (SpecializedExpr.ArrayLit _ _ es)
+        (for [i 0 (Array.length es)]
+          (collect-into! (Box.peek (Array.unsafe-nth es i)) facts context constructors acc))
+      (SpecializedExpr.StaticArrayLit _ _ es)
+        (for [i 0 (Array.length es)]
+          (collect-into! (Box.peek (Array.unsafe-nth es i)) facts context constructors acc))
+      (SpecializedExpr.Match _ _ by-reference scrutinee branches)
+        (do
+          (collect-into! (Box.peek scrutinee) facts context constructors acc)
+          (for [i 0 (Array.length branches)]
+            (let-do [branch (Array.unsafe-nth branches i)
+                     body (Box.peek (SpecializedMatchBranch.body branch))]
+              (collect-into! body facts context constructors acc)
+              ;; a by-value match moves each payload into its binding; a
+              ;; binding the branch body does not consume must be deleted at
+              ;; branch exit — including bindings the body never mentions
+              ;; (setter-displaced fields), which is why the types come from
+              ;; the pattern, not from body references. `match-ref` bindings
+              ;; only borrow — never delete.
+              (unless-do @by-reference
+                (let [scrutinee-type (Specialize.expression-type (Box.peek scrutinee))
+                      bound (Specialize.bound-slot-types
+                              (SpecializedMatchBranch.pattern branch)
+                              &scrutinee-type
+                              constructors)]
+                  (for [j 0 (Array.length &bound)]
+                    (let [slot (Array.unsafe-nth &bound j)
+                          binder (Pair.a slot)
+                          slot-type (Pair.b slot)]
+                      (when (and (owned-type? slot-type facts)
+                                 (not (consumed? binder body)))
+                        (Array.push-back! acc
+                                          (make-delete-action context
+                                                              (Specialize.expression-id body)
+                                                              (CoreRef.copy binder)
+                                                              (MonoType.copy slot-type)))))))
+                ;; unbound (`_`) slots drop their payloads at the match: demand
+                ;; a deleter for each owned one so the backend can free them
+                ;; (Temporary resource: requirement-only, no scope delete).
+                (let [scrutinee-type (Specialize.expression-type (Box.peek scrutinee))
+                      slots (Specialize.unbound-slot-types
+                              (SpecializedMatchBranch.pattern branch)
+                              &scrutinee-type
+                              constructors)]
+                  (for [j 0 (Array.length &slots)]
+                    (let [slot (Array.unsafe-nth &slots j)]
+                      (when (owned-type? slot facts)
+                        (Array.push-back! acc
+                                          (make-temporary-delete context
+                                                                 (Specialize.expression-id body)
+                                                                 (MonoType.copy slot)))))))))))
+      (SpecializedExpr.Lambda _ _ _ body)
+        (collect-into! (Box.peek body) facts context constructors acc)
+      _ ()))
+
+  (private collect-context-deletes)
+  (hidden collect-context-deletes)
+  (defn collect-context-deletes [expr facts context constructors]
+    (let-do [acc (the (Array OwnershipAction) [])]
+      (collect-into! expr facts context constructors &acc)
+      acc))
+
+  (private collect-param-deletes)
+  (hidden collect-param-deletes)
+  (doc collect-param-deletes "schedules a delete for every owned parameter the
+body does not consume (move out or into a call). A function receives ownership
+of its owned arguments and must release any it neither returns nor passes on.")
+  (defn collect-param-deletes [parameters signature body facts context]
+    (match-ref signature
+      (MonoType.Function arg-types _)
+        (let-do [result (the (Array OwnershipAction) [])
+                 n (Int.min (Array.length parameters) (Array.length arg-types))]
+          (for [i 0 n]
+            (let [param (Array.unsafe-nth parameters i)
+                  param-type (Box.peek (Array.unsafe-nth arg-types i))]
+              (when (and (owned-type? param-type facts)
+                         (not (consumed? param body)))
+                (set! result
+                      (Array.push-back result
+                                       (make-delete-action context
+                                                           (Specialize.expression-id body)
+                                                           (CoreRef.copy param)
+                                                           (MonoType.copy param-type)))))))
+          result)
+      _ (the (Array OwnershipAction) [])))
+
+  (private collect-roots-deletes)
+  (hidden collect-roots-deletes)
+  (defn collect-roots-deletes [expressions facts context constructors]
+    (let-do [result (the (Array OwnershipAction) [])
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (let-do [root (Box.peek (Array.unsafe-nth expressions i))
+                 root-type (Specialize.expression-type root)]
+          (set! result
+                (append-actions result
+                                (collect-context-deletes root facts context constructors)))
+          (when (owned-type? &root-type facts)
+            (set! result
+                  (Array.push-back result
+                                   (make-temporary-delete context
+                                                          (Specialize.expression-id root)
+                                                          (MonoType.copy &root-type)))))))
+      result))
+
+  (private delete-requirements)
+  (hidden delete-requirements)
+  (doc delete-requirements "reports one `DeleteFunction` requirement per
+distinct concrete type deleted by the plan, so the driver can materialize the
+matching `delete` interface implementations before backend lowering.")
+  (defn delete-requirements [actions]
+    (let-do [result (the (Array OwnershipRequirement) [])
+             keys (the (Array String) [])
+             n (Array.length actions)]
+      (for [i 0 n]
+        (match-ref (Array.unsafe-nth actions i)
+          (OwnershipAction.Delete _ _ type)
+            (let-do [key (CAbi.type-key (Box.peek type))
+                     seen false
+                     m (Array.length &keys)]
+              (for [j 0 m]
+                (when (String.= (Array.unsafe-nth &keys j) &key)
+                  (set! seen true)))
+              (unless-do seen
+                (set! keys (Array.push-back keys @&key))
+                (set! result
+                      (Array.push-back result
+                                       (OwnershipRequirement.DeleteFunction
+                                         (Box.init (MonoType.copy (Box.peek type))))))))
+          _ ()))
+      result))
+
+  (doc prepare "validates the stable expression-ID contract, creates the
+specialization-aware namespaces, and plans ownership deletes for owned values
+that are not moved out of their scope. Types are classified from `facts`.")
+  (defn prepare [specialized facts]
+    (let-do [contexts (the (Array OwnershipContext) [])
+             actions (the (Array OwnershipAction) [])
+             result (the (Result OwnershipPlan OwnershipError)
+                         (Result.Success (OwnershipPlan.init [] [] [])))
+             bodies (SpecializationModule.bodies specialized)
+             body-count (Array.length bodies)]
+      (for [i 0 body-count]
+        (match-ref &result
+          (Result.Success _)
+            (let [body (Array.unsafe-nth bodies i)
+                  instance (SpecializedBody.specialization body)
+                  seen (the (Array Bool) [])
+                  label (String.concat
+                    &[@"definition "
+                      (String.copy
+                        (CoreRef.name (Specialization.reference instance)))
+                      @":"
+                      (Type.name (Box.peek (Specialization.signature instance)))])]
+              (match (validate-expression (Box.peek (SpecializedBody.body body))
+                                          &seen
+                                          &label)
+                (Result.Success _)
+                  (let [flags (check-borrows (Box.peek (SpecializedBody.body body))
+                                             (SpecializedBody.parameters body)
+                                             facts)]
+                    (cond
+                      @(Array.unsafe-nth &flags 0)
+                        (set! result
+                              (Result.Error
+                                (OwnershipError.init
+                                  (String.concat
+                                    &[@"a reference to a local value escapes "
+                                      (String.copy
+                                        (CoreRef.name (Specialization.reference instance)))]))))
+                      @(Array.unsafe-nth &flags 1)
+                        (set! result
+                              (Result.Error
+                                (OwnershipError.init
+                                  (String.concat
+                                    &[@"a borrow is used after its owner is moved in "
+                                      (String.copy
+                                        (CoreRef.name (Specialization.reference instance)))]))))
+                      @(Array.unsafe-nth &flags 2)
+                        (set! result
+                              (Result.Error
+                                (OwnershipError.init
+                                  (String.concat
+                                    &[@"a captured value is moved out of a lambda in "
+                                      (String.copy
+                                        (CoreRef.name (Specialization.reference instance)))]))))
+                      (do
+                        (set! contexts
+                              (Array.push-back contexts
+                                               (OwnershipContext.Definition
+                                                 (CoreRef.copy (Specialization.reference instance))
+                                                 (Box.init
+                                                   (MonoType.copy
+                                                     (Box.peek (Specialization.signature instance))))
+                                                 (String.copy (Specialization.symbol instance))
+                                                 (Array.length &seen))))
+                        (set! actions
+                              (append-actions
+                                (append-actions actions
+                                                (collect-context-deletes (Box.peek (SpecializedBody.body body))
+                                                                         facts
+                                                                         i
+                                                                         (SpecializationModule.constructors specialized)))
+                                (collect-param-deletes (SpecializedBody.parameters body)
+                                                       (Box.peek (Specialization.signature instance))
+                                                       (Box.peek (SpecializedBody.body body))
+                                                       facts
+                                                       i))))))
+                (Result.Error error) (set! result (Result.Error error))))
+          (Result.Error _) ()))
+      (match-ref &result
+        (Result.Success _)
+          (let [root-label (String.copy "roots")
+                seen (the (Array Bool) [])]
+            (match (validate-expressions (SpecializationModule.roots specialized)
+                                         &seen
+                                         &root-label)
+              (Result.Success _)
+                (let [all-actions (append-actions actions
+                                                  (collect-roots-deletes (SpecializationModule.roots specialized)
+                                                                         facts
+                                                                         body-count
+                                                                         (SpecializationModule.constructors specialized)))
+                      reqs (delete-requirements &all-actions)]
+                  (set! result
+                        (Result.Success
+                          (OwnershipPlan.init
+                            (Array.push-back contexts
+                                             (OwnershipContext.Roots (Array.length &seen)))
+                            all-actions
+                            reqs))))
+              (Result.Error error) (set! result (Result.Error error))))
+        (Result.Error _) ())
+      result)))

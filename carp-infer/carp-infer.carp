@@ -1,0 +1,2069 @@
+(load "../carp-ir/carp-ir.carp")
+(load "../carp-types/carp-types.carp")
+(load "../carp-graph/carp-graph.carp")
+
+(deftype SchemeBinding [reference CoreRef
+                        scheme TypeScheme])
+
+(deftype InferGlobalEnvironment
+  [bindings (Array SchemeBinding)
+   indexes (Array Int)
+   variables (Array Int)])
+
+(deftype InferEnvironment
+  [globals (Ptr InferGlobalEnvironment)
+   locals (Array SchemeBinding)
+   variables (Array Int)
+   owner (Maybe CoreRef)])
+
+(deftype CallSite
+  [id Int
+   reference CoreRef
+   type (Box MonoType)
+   owner (Maybe CoreRef)])
+
+(deftype InferredNodeType [id Int
+                           owner (Maybe CoreRef)
+                           type (Box MonoType)])
+
+; `Infer.module` owns the solver and trace for the complete inference phase.
+; InferState's pointers are non-owning and must never escape that function; the
+; final module receives owned snapshots of all three mutable stores.
+(deftype InferenceTrace
+  [calls (Array CallSite)
+   node-types (Array InferredNodeType)])
+
+(deftype InferState
+  [next-variable Int
+   solver (Ptr TypeSolver)
+   trace (Ptr InferenceTrace)])
+
+(deftype FreshType [type (Box MonoType)
+                    state InferState])
+
+(deftype FreshLifetime [lifetime MonoLifetime
+                        state InferState])
+
+(deftype ConvertedType [type (Box MonoType)
+                        variables (Array String)])
+
+(deftype ConvertedLifetime [lifetime MonoLifetime
+                            variables (Array String)])
+
+(deftype ConvertedArguments
+  [types (Array (Box MonoType))
+   variables (Array String)])
+
+(deftype InferredExpression [type (Box MonoType)
+                             state InferState])
+
+(deftype InferredArguments [types (Array (Box MonoType))
+                            state InferState])
+
+(deftype InferredFunction [scheme TypeScheme
+                           state InferState])
+
+(deftype InferredFunctionBody
+  [reference CoreRef
+   type (Box MonoType)
+   state InferState])
+
+(deftype InferredModule
+  [environment (Array SchemeBinding)
+   expression-types (Array (Box MonoType))
+   calls (Array CallSite)
+   node-types (Array InferredNodeType)
+   substitution TypeSubstitution])
+
+(deftype InferError [message String])
+
+(defmodule Infer
+  (private state-copy)
+  (hidden state-copy)
+  (defn state-copy [state]
+    (InferState.init @(InferState.next-variable state)
+                     @(InferState.solver state)
+                     @(InferState.trace state)))
+
+  (private fresh)
+  (hidden fresh)
+  (defn fresh [state]
+    (let [variable @(InferState.next-variable state)
+          next-state (InferState.init (Int.inc variable)
+                                      @(InferState.solver state)
+                                      @(InferState.trace state))]
+      (FreshType.init (Box.init (Type.variable variable)) next-state)))
+
+  (private fresh-lifetime)
+  (hidden fresh-lifetime)
+  (defn fresh-lifetime [state]
+    (let [variable @(InferState.next-variable state)
+          next-state (InferState.init (Int.inc variable)
+                                      @(InferState.solver state)
+                                      @(InferState.trace state))]
+      (FreshLifetime.init (Type.lifetime variable) next-state)))
+
+  (private declaration-variable-index)
+  (hidden declaration-variable-index)
+  (defn declaration-variable-index [variables name]
+    (let-do [result -1
+             n (Array.length variables)]
+      (for [i 0 n]
+        (when (= @(Array.unsafe-nth variables i) (String.copy &name))
+          (set! result i)))
+      result))
+
+  (private convert-declaration-type)
+  (hidden convert-declaration-type)
+  (private convert-declaration-arguments)
+  (hidden convert-declaration-arguments)
+  (private convert-declaration-lifetime)
+  (hidden convert-declaration-lifetime)
+  (defn convert-declaration-lifetime [lifetime variables]
+    (match-ref lifetime
+      (CoreLifetime.Static)
+        (ConvertedLifetime.init (MonoLifetime.Static) (Array.copy variables))
+      (CoreLifetime.Inferred id)
+        (let [key (String.concat &[@"inferred:" (Int.str @id)])
+              index (declaration-variable-index variables (String.copy &key))]
+          (if (Int.>= index 0)
+            (ConvertedLifetime.init (MonoLifetime.Variable (Int.- -1 index))
+                                    (Array.copy variables))
+            (ConvertedLifetime.init
+              (MonoLifetime.Variable (Int.- -1 (Array.length variables)))
+              (Array.push-back (Array.copy variables) key))))
+      (CoreLifetime.Named name)
+        (let [key (String.concat &[@"named:" (String.copy name)])
+              index (declaration-variable-index variables (String.copy &key))]
+          (if (Int.>= index 0)
+            (ConvertedLifetime.init (MonoLifetime.Variable (Int.- -1 index))
+                                    (Array.copy variables))
+            (ConvertedLifetime.init
+              (MonoLifetime.Variable (Int.- -1 (Array.length variables)))
+              (Array.push-back (Array.copy variables) key))))))
+
+  (defn convert-declaration-arguments [arguments variables]
+    (let-do [types (the (Array (Box MonoType)) [])
+             names (Array.copy variables)
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (let-do [converted (convert-declaration-type
+                   (Box.peek (Array.unsafe-nth arguments i))
+                   &names)]
+          (set! types
+                (Array.push-back types
+                                 (Box.init
+                                   (MonoType.copy
+                                     (Box.peek (ConvertedType.type &converted))))))
+          (set! names (Array.copy (ConvertedType.variables &converted)))))
+      (ConvertedArguments.init types names)))
+
+  (defn convert-declaration-type [signature variables]
+    (match-ref signature
+      (CoreType.Integer)
+        (ConvertedType.init (Box.init (Type.integer)) (Array.copy variables))
+      (CoreType.String)
+        (ConvertedType.init (Box.init (Type.string)) (Array.copy variables))
+      (CoreType.Boolean)
+        (ConvertedType.init (Box.init (Type.boolean)) (Array.copy variables))
+      (CoreType.Unit)
+        (ConvertedType.init (Box.init (Type.unit)) (Array.copy variables))
+      (CoreType.Variable name)
+        (let [key (String.concat &[@"type:" (String.copy name)])
+              index (declaration-variable-index variables (String.copy &key))]
+          (if (Int.>= index 0)
+            (ConvertedType.init
+              (Box.init (Type.variable (Int.- -1 index)))
+              (Array.copy variables))
+            (ConvertedType.init
+              (Box.init (Type.variable (Int.- -1 (Array.length variables))))
+              (Array.push-back (Array.copy variables) key))))
+      (CoreType.Named name arguments)
+        (let [converted-arguments (convert-declaration-arguments arguments
+                                                                 variables)]
+          (ConvertedType.init
+            (Box.init
+              (Type.named name
+                          (Array.copy
+                            (ConvertedArguments.types &converted-arguments))))
+            @(ConvertedArguments.variables &converted-arguments)))
+      (CoreType.Reference inner lifetime)
+        (let [converted-inner (convert-declaration-type (Box.peek inner)
+                                                        variables)
+              converted-lifetime (convert-declaration-lifetime lifetime
+                                                               (ConvertedType.variables &converted-inner))]
+          (ConvertedType.init
+            (Box.init
+              (Type.reference
+                (MonoType.copy (Box.peek (ConvertedType.type &converted-inner)))
+                @(ConvertedLifetime.lifetime &converted-lifetime)))
+            @(ConvertedLifetime.variables &converted-lifetime)))
+      (CoreType.Function arguments result)
+        (let [converted-arguments (convert-declaration-arguments arguments
+                                                                 variables)
+              converted-result (convert-declaration-type (Box.peek result)
+                                                         (ConvertedArguments.variables &converted-arguments))]
+          (ConvertedType.init
+            (Box.init
+              (Type.function
+                (Array.copy (ConvertedArguments.types &converted-arguments))
+                (MonoType.copy (Box.peek (ConvertedType.type &converted-result)))))
+            @(ConvertedType.variables &converted-result)))))
+
+  (private declaration-scheme)
+  (hidden declaration-scheme)
+  (defn declaration-scheme [signature]
+    (let-do [variables (the (Array String) [])
+             converted (convert-declaration-type signature &variables)
+             quantified (Type.free-variables
+               (Box.peek (ConvertedType.type &converted)))]
+      (TypeScheme.init quantified
+                       (Type.free-lifetimes
+                         (Box.peek (ConvertedType.type &converted)))
+                       (Box.init
+                         (MonoType.copy
+                           (Box.peek (ConvertedType.type &converted)))))))
+
+  (private binding-for)
+  (hidden binding-for)
+  (defn binding-for [environment reference]
+    (if @(CoreRef.global reference)
+      (let [global-environment (Pointer.to-ref @(InferEnvironment.globals environment))
+            id @(CoreRef.id reference)
+            indexes (InferGlobalEnvironment.indexes global-environment)]
+        (if (and (Int.>= id 0) (Int.< id (Array.length indexes)))
+          (let [index @(Array.unsafe-nth indexes id)]
+            (if (Int.>= index 0)
+              (Maybe.Just
+                (TypeScheme.copy
+                  (SchemeBinding.scheme
+                    (Array.unsafe-nth
+                      (InferGlobalEnvironment.bindings global-environment)
+                      index))))
+              (Maybe.Nothing)))
+          (Maybe.Nothing)))
+      (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
+               found false
+               bindings (InferEnvironment.locals environment)
+               i (Int.dec (Array.length bindings))]
+        (while-do (and (not found) (Int.>= i 0))
+          (let-do [binding (Array.unsafe-nth bindings i)]
+            (when-do (CoreIR.same-ref? (SchemeBinding.reference binding)
+                                       reference)
+              (set! found true)
+              (set! result
+                    (Maybe.Just (TypeScheme.copy (SchemeBinding.scheme binding)))))
+            (set! i (Int.dec i))))
+        result)))
+
+  (private extend-environment)
+  (hidden extend-environment)
+  (private extend-environment!)
+  (hidden extend-environment!)
+  (private free-scheme)
+  (hidden free-scheme)
+  (private copy-owner)
+  (hidden copy-owner)
+  (private environment-with-owner)
+  (hidden environment-with-owner)
+  (defn copy-owner [owner]
+    (match-ref owner
+      (Maybe.Just reference) (Maybe.Just (CoreRef.copy reference))
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (defn environment-with-owner [environment reference]
+    (InferEnvironment.init @(InferEnvironment.globals environment)
+                           (Array.copy (InferEnvironment.locals environment))
+                           (Array.copy (InferEnvironment.variables environment))
+                           (Maybe.Just (CoreRef.copy reference))))
+
+  (defn extend-environment [environment reference scheme]
+    (let-do [result (InferEnvironment.copy environment)]
+      (extend-environment! &result reference scheme)
+      result))
+
+  (defn extend-environment! [environment reference scheme]
+    (let [free-variables (free-scheme scheme)]
+      (if @(CoreRef.global reference)
+        (let-do [global-environment (Pointer.to-ref @(InferEnvironment.globals environment))
+                 id @(CoreRef.id reference)
+                 indexes (InferGlobalEnvironment.indexes global-environment)]
+          (while-do (Int.<= (Array.length indexes) id)
+            (Array.push-back! indexes -1))
+          (let [existing @(Array.unsafe-nth indexes id)]
+            (if (Int.>= existing 0)
+              (Array.aset!
+                (InferGlobalEnvironment.bindings global-environment)
+                existing
+                (SchemeBinding.init (CoreRef.copy reference)
+                                    (TypeScheme.copy scheme)))
+              (let-do [index (Array.length
+                         (InferGlobalEnvironment.bindings global-environment))]
+                (Array.push-back!
+                  (InferGlobalEnvironment.bindings global-environment)
+                  (SchemeBinding.init (CoreRef.copy reference)
+                                      (TypeScheme.copy scheme)))
+                (Array.aset! indexes id index))))
+          (for [i 0 (Array.length &free-variables)]
+            (let [variable @(Array.unsafe-nth &free-variables i)]
+              (unless-do (Type.contains-variable?
+                  (InferGlobalEnvironment.variables global-environment)
+                  variable)
+                (Array.push-back!
+                  (InferGlobalEnvironment.variables global-environment)
+                  variable)))))
+        (do
+          (Array.push-back! (InferEnvironment.locals environment)
+                            (SchemeBinding.init (CoreRef.copy reference)
+                                                (TypeScheme.copy scheme)))
+          (for [i 0 (Array.length &free-variables)]
+            (let [variable @(Array.unsafe-nth &free-variables i)]
+              (unless-do (Type.contains-variable? (InferEnvironment.variables environment)
+                                                  variable)
+                (Array.push-back! (InferEnvironment.variables environment)
+                                  variable))))))))
+
+  (private extend-builtins)
+  (hidden extend-builtins)
+  (defn extend-builtins [environment builtins]
+    (let-do [result (InferEnvironment.copy environment)
+             n (Array.length builtins)]
+      (for [i 0 n]
+        (let-do [builtin (Array.unsafe-nth builtins i)
+                 scheme (declaration-scheme
+                   (Box.peek (CoreBuiltin.signature builtin)))]
+          (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
+            (Maybe.Just _)
+              (IO.errorln &(fmt "builtin-scheme %s: %s"
+                                (CoreRef.name (CoreBuiltin.reference builtin))
+                                &(str (Box.peek (TypeScheme.body &scheme)))))
+            (Maybe.Nothing) ())
+          (extend-environment! &result (CoreBuiltin.reference builtin) &scheme)))
+      result))
+
+  (private extend-interfaces)
+  (hidden extend-interfaces)
+  (defn extend-interfaces [environment interfaces]
+    (let-do [result (InferEnvironment.copy environment)
+             n (Array.length interfaces)]
+      (for [i 0 n]
+        (let [interface (Array.unsafe-nth interfaces i)
+              scheme (declaration-scheme
+                (Box.peek (CoreInterface.signature interface)))]
+          (extend-environment! &result
+                               (CoreInterface.reference interface)
+                               &scheme)))
+      result))
+
+  (private signature-for)
+  (hidden signature-for)
+  (defn signature-for [signatures reference]
+    (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
+             n (Array.length signatures)]
+      (for [i 0 n]
+        (let [signature (Array.unsafe-nth signatures i)]
+          (when (CoreIR.same-ref? (CoreSignature.reference signature) reference)
+            (let [scheme (declaration-scheme
+                    (Box.peek (CoreSignature.signature signature)))]
+              (set! result (Maybe.Just scheme))))))
+      result))
+
+  (defn free-scheme [scheme]
+    (let-do [result (the (Array Int) [])
+             variables (Type.free-variables (Box.peek (TypeScheme.body scheme)))
+             quantified (TypeScheme.variables scheme)
+             n (Array.length &variables)]
+      (for [i 0 n]
+        (let [variable @(Array.unsafe-nth &variables i)]
+          (unless-do (Type.contains-variable? quantified variable)
+            (set! result (Type.append-variable &result variable)))))
+      result))
+
+  (private free-environment)
+  (hidden free-environment)
+  (defn free-environment [environment]
+    (let-do [result (Array.copy
+               (InferGlobalEnvironment.variables
+                 (Pointer.to-ref @(InferEnvironment.globals environment))))
+             locals (InferEnvironment.variables environment)
+             n (Array.length locals)]
+      (for [i 0 n]
+        (set! result (Type.append-variable &result @(Array.unsafe-nth locals i))))
+      result))
+
+  (private generalize)
+  (hidden generalize)
+  (private generalize-local)
+  (hidden generalize-local)
+  (defn generalize [environment type]
+    (let-do [environment-variables (free-environment environment)
+             type-variables (Type.free-variables type)
+             quantified (the (Array Int) [])
+             n (Array.length &type-variables)]
+      (for [i 0 n]
+        (let [variable @(Array.unsafe-nth &type-variables i)]
+          (unless-do (Type.contains-variable? &environment-variables variable)
+            (set! quantified (Type.append-variable &quantified variable)))))
+      (TypeScheme.init quantified
+                       (Type.free-lifetimes type)
+                       (Box.init (MonoType.copy type)))))
+
+  (defn generalize-local [environment type]
+    (let-do [scheme (generalize environment type)]
+      (TypeScheme.init @(TypeScheme.variables &scheme)
+                       []
+                       @(TypeScheme.body &scheme))))
+
+  (private instantiate)
+  (hidden instantiate)
+  (private instantiate-tagged)
+  (hidden instantiate-tagged)
+  (defn instantiate-tagged [scheme state tag]
+    (let-do [mapping (Type.empty-substitution)
+             next-variable @(InferState.next-variable state)
+             variables (TypeScheme.variables scheme)
+             lifetimes (TypeScheme.lifetime-variables scheme)
+             n (Array.length variables)
+             lifetime-count (Array.length lifetimes)
+             ignored-trace
+               (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
+                 (Maybe.Just _)
+                   (IO.errorln &(fmt "inst[%s] next=%d vars=%d lts=%d body=%s"
+                                     tag
+                                     next-variable
+                                     n
+                                     lifetime-count
+                                     &(str (Box.peek (TypeScheme.body scheme)))))
+                 (Maybe.Nothing) ())]
+      (for [i 0 n]
+        (let-do [variable @(Array.unsafe-nth variables i)
+                 fresh-variable (Type.variable next-variable)]
+          (set! mapping
+                (Type.extend-substitution &mapping variable &fresh-variable))
+          (set! next-variable (Int.inc next-variable))))
+      (for [i 0 lifetime-count]
+        ;; let-do, not let: under the reference a plain multi-body `let`
+        ;; silently DROPS the trailing forms, so this increment never ran in
+        ;; host-built binaries (found via self-hosting divergence).
+        (let-do [variable @(Array.unsafe-nth lifetimes i)
+                 fresh-lifetime (Type.lifetime next-variable)]
+          (set! mapping
+                (Type.extend-lifetime-substitution &mapping
+                                                   variable
+                                                   &fresh-lifetime))
+          (set! next-variable (Int.inc next-variable))))
+      ;; constructor variables (lowercase nominal heads, e.g. fmap's `(f a)`)
+      ;; are implicitly quantified: freshen them per instantiation so two call
+      ;; sites do not share one `f`.
+      (let-do [applied (Type.apply &mapping (Box.peek (TypeScheme.body scheme)))
+               counter [next-variable]
+               freshened (Type.freshen-constructors &applied &counter)]
+        (FreshType.init (Box.init freshened)
+                        (InferState.init @(Array.unsafe-nth &counter 0)
+                                         @(InferState.solver state)
+                                         @(InferState.trace state))))))
+
+  (defn instantiate [scheme state] (instantiate-tagged scheme state "?"))
+
+  (private infer-arguments)
+  (hidden infer-arguments)
+  (sig infer-arguments
+       (Fn
+         [(Ref InferEnvironment) (Ref (Array (Box CoreExpr))) (Ref InferState)]
+         (Result InferredArguments InferError)))
+  (private infer-expression)
+  (hidden infer-expression)
+  (private infer-expression-internal)
+  (hidden infer-expression-internal)
+  (sig infer-expression
+       (Fn
+         [(Ref InferEnvironment) (Ref CoreExpr) (Ref InferState)]
+         (Result InferredExpression InferError)))
+  (sig infer-expression-internal
+       (Fn
+         [(Ref InferEnvironment) (Ref CoreExpr) (Ref InferState)]
+         (Result InferredExpression InferError)))
+  (private infer-lambda-parameters)
+  (hidden infer-lambda-parameters)
+  (private annotation-type)
+  (hidden annotation-type)
+  (private annotation-arguments)
+  (hidden annotation-arguments)
+  (private infer-annotation)
+  (hidden infer-annotation)
+  (private infer-let)
+  (hidden infer-let)
+  (private infer-lambda)
+  (hidden infer-lambda)
+  (private infer-if)
+  (hidden infer-if)
+  (private infer-set)
+  (hidden infer-set)
+  (private infer-while)
+  (hidden infer-while)
+  (private infer-do)
+  (hidden infer-do)
+  (private infer-array-literal)
+  (hidden infer-array-literal)
+  (private infer-match)
+  (hidden infer-match)
+  (private infer-match-bindings)
+  (hidden infer-match-bindings)
+  (private constrain-core-pattern)
+  (hidden constrain-core-pattern)
+  (sig constrain-core-pattern
+       (Fn
+         [(Ref InferEnvironment)
+          (Ref CorePattern)
+          (Ref MonoType)
+          (Ref InferState)
+          Bool]
+         (Result InferState InferError)))
+  (private infer-match-branches)
+  (hidden infer-match-branches)
+
+  (defn annotation-arguments [arguments]
+    (let-do [result (the
+               (Result (Array (Box MonoType)) InferError)
+               (Result.Success []))
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success types)
+            (match (annotation-type (Box.peek (Array.unsafe-nth arguments i)))
+              (Result.Success type)
+                (set! result
+                      (Result.Success (Array.push-back @types (Box.init type))))
+              (Result.Error error) (set! result (Result.Error error)))
+          (Result.Error _) ()))
+      result))
+
+  (defn annotation-type [annotation]
+    (match-ref annotation
+      (CoreType.Integer) (Result.Success (Type.integer))
+      (CoreType.String) (Result.Success (Type.string))
+      (CoreType.Boolean) (Result.Success (Type.boolean))
+      (CoreType.Unit) (Result.Success (Type.unit))
+      (CoreType.Variable _)
+        (Result.Error
+          (InferError.init
+            @"type variables are only valid in declaration signatures"))
+      (CoreType.Named name arguments)
+        (match (annotation-arguments arguments)
+          (Result.Success argument-types)
+            (Result.Success (Type.named name argument-types))
+          (Result.Error error) (Result.Error error))
+      (CoreType.Reference inner lifetime)
+        (match (annotation-type (Box.peek inner))
+          (Result.Success inner-type)
+            (Result.Success
+              (Type.reference inner-type
+                              (match-ref lifetime
+                                (CoreLifetime.Static) (MonoLifetime.Static)
+                                (CoreLifetime.Inferred id)
+                                  (MonoLifetime.Variable (Int.- -1 @id))
+                                (CoreLifetime.Named _)
+                                  (MonoLifetime.Variable -1))))
+          (Result.Error error) (Result.Error error))
+      (CoreType.Function arguments result)
+        (match (annotation-arguments arguments)
+          (Result.Success argument-types)
+            (match (annotation-type (Box.peek result))
+              (Result.Success result-type)
+                (Result.Success (Type.function argument-types result-type))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error))))
+
+  (defn infer-annotation [environment inner annotation state]
+    (let [scheme (declaration-scheme (Box.peek annotation))
+          fresh (instantiate-tagged &scheme state "annot")
+          expected (MonoType.copy (Box.peek (FreshType.type &fresh)))
+          next-state (InferState.copy (FreshType.state &fresh))
+          ignored-probe
+            (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
+              (Maybe.Just _)
+                (IO.errorln &(fmt "annot-thread before=%d after=%d"
+                                  @(InferState.next-variable state)
+                                  @(InferState.next-variable &next-state)))
+              (Maybe.Nothing) ())]
+      (match (infer-expression environment (Box.peek inner) &next-state)
+        (Result.Success inferred)
+          (match (Type.solver-unify-at!
+              @(InferState.solver (InferredExpression.state &inferred))
+              (Box.peek (InferredExpression.type &inferred))
+              &expected)
+            (Result.Success _)
+              (let [result-type (MonoType.copy &expected)
+                    annotation-state (InferState.init
+                      @(InferState.next-variable (InferredExpression.state &inferred))
+                      @(InferState.solver (InferredExpression.state &inferred))
+                      @(InferState.trace (InferredExpression.state &inferred)))]
+                (Result.Success
+                  (InferredExpression.init (Box.init result-type)
+                                           annotation-state)))
+            (Result.Error error)
+              (Result.Error (InferError.init @(TypeError.message &error))))
+        (Result.Error error) (Result.Error error))))
+
+  (doc generalizable-value? "the value restriction: only syntactic values
+(literals, lambdas, variable references) may have their let-binding types
+generalized. Applications such as `(allocate n)` build fresh mutable state, so
+generalizing them would let each use pick a different element type and break the
+monomorphic sharing the array relies on.")
+  (defn generalizable-value? [expression]
+    (match-ref expression
+      (CoreExpr.IntLit _ _) true
+      (CoreExpr.ByteLit _ _) true
+      (CoreExpr.LongLit _ _) true
+      (CoreExpr.FloatLit _ _) true
+      (CoreExpr.DoubleLit _ _) true
+      (CoreExpr.CharLit _ _) true
+      (CoreExpr.StringLit _ _) true
+      (CoreExpr.PatternLit _ _) true
+      (CoreExpr.BoolLit _ _) true
+      (CoreExpr.UnitLit _) true
+      (CoreExpr.Lambda _ _ _) true
+      (CoreExpr.Reference _ _) true
+      _ false))
+
+  (private assigns-reference?)
+  (hidden assigns-reference?)
+  (private assigns-reference-in-expressions?)
+  (hidden assigns-reference-in-expressions?)
+  (private assigns-reference-in-branches?)
+  (hidden assigns-reference-in-branches?)
+
+  (defn assigns-reference-in-expressions? [expressions reference]
+    (let-do [found false
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (when (assigns-reference?
+            (Box.peek (Array.unsafe-nth expressions i))
+            reference)
+          (set! found true)))
+      found))
+
+  (defn assigns-reference-in-branches? [branches reference]
+    (let-do [found false
+             n (Array.length branches)]
+      (for [i 0 n]
+        (when (assigns-reference?
+            (Box.peek (CoreMatchBranch.body (Array.unsafe-nth branches i)))
+            reference)
+          (set! found true)))
+      found))
+
+  (defn assigns-reference? [expression reference]
+    (match-ref expression
+      (CoreExpr.ArrayLit _ expressions)
+        (assigns-reference-in-expressions? expressions reference)
+      (CoreExpr.StaticArrayLit _ expressions)
+        (assigns-reference-in-expressions? expressions reference)
+      (CoreExpr.Call _ callee arguments)
+        (or
+          (assigns-reference? (Box.peek callee) reference)
+          (assigns-reference-in-expressions? arguments reference))
+      (CoreExpr.Do _ expressions)
+        (assigns-reference-in-expressions? expressions reference)
+      (CoreExpr.If _ condition then-branch else-branch)
+        (or
+          (assigns-reference? (Box.peek condition) reference)
+          (or
+            (assigns-reference? (Box.peek then-branch) reference)
+            (assigns-reference? (Box.peek else-branch) reference)))
+      (CoreExpr.Let _ _ value body)
+        (or
+          (assigns-reference? (Box.peek value) reference)
+          (assigns-reference? (Box.peek body) reference))
+      (CoreExpr.Set _ target value)
+        (or (CoreIR.same-ref? target reference)
+            (assigns-reference? (Box.peek value) reference))
+      (CoreExpr.While _ condition body)
+        (or
+          (assigns-reference? (Box.peek condition) reference)
+          (assigns-reference? (Box.peek body) reference))
+      (CoreExpr.Lambda _ _ body) (assigns-reference? (Box.peek body) reference)
+      (CoreExpr.Match _ _ scrutinee branches)
+        (or
+          (assigns-reference? (Box.peek scrutinee) reference)
+          (assigns-reference-in-branches? branches reference))
+      (CoreExpr.Annotation _ inner _)
+        (assigns-reference? (Box.peek inner) reference)
+      _ false))
+
+  (defn infer-let [environment reference value body state]
+    ;; a `fn`-valued binding may reference itself (recursive let): pre-declare it
+    ;; with a fresh variable so the recursive use resolves, infer the lambda in
+    ;; that extended environment, then unify the placeholder with the result.
+    (if (match-ref (Box.peek value) (CoreExpr.Lambda _ _ _) true _ false)
+      (let [fresh-result (fresh state)
+            placeholder (MonoType.copy (Box.peek (FreshType.type &fresh-result)))
+            pre-scheme (TypeScheme.init []
+                                        []
+                                        (Box.init (MonoType.copy &placeholder)))
+            pre-env (extend-environment environment reference &pre-scheme)
+            value-state (InferState.copy (FreshType.state &fresh-result))]
+        (match (infer-expression &pre-env (Box.peek value) &value-state)
+          (Result.Success inferred-value)
+            (match (Type.solver-unify-at!
+                @(InferState.solver (InferredExpression.state &inferred-value))
+                &placeholder
+                (Box.peek (InferredExpression.type &inferred-value)))
+              (Result.Success _)
+                (let [value-type (Type.solver-apply-at
+                        @(InferState.solver
+                          (InferredExpression.state &inferred-value))
+                        &placeholder)
+                      ;; lambdas are MONOMORPHIC (as in the reference): a
+                      ;; generalized scheme would instantiate fresh variables at
+                      ;; the call site, leaving the lambda body's own node types
+                      ;; unsolved for specialization.
+                      scheme (TypeScheme.init []
+                                              []
+                                              (Box.init (MonoType.copy &value-type)))
+                      extended (extend-environment environment reference &scheme)
+                      body-state (InferState.copy
+                        (InferredExpression.state &inferred-value))]
+                  (infer-expression &extended (Box.peek body) &body-state))
+              (Result.Error error)
+                (Result.Error (InferError.init @(TypeError.message &error))))
+          (Result.Error error) (Result.Error error)))
+      (let [value-state (InferState.copy state)]
+        (match (infer-expression environment (Box.peek value) &value-state)
+          (Result.Success inferred-value)
+            (let [value-type (Type.solver-apply-at
+                    @(InferState.solver
+                      (InferredExpression.state &inferred-value))
+                    (Box.peek (InferredExpression.type &inferred-value)))
+                  scheme (if (and (generalizable-value? (Box.peek value))
+                                  (not
+                                    (assigns-reference? (Box.peek body)
+                                                        reference)))
+                    (generalize-local environment &value-type)
+                    (TypeScheme.init []
+                                     []
+                                     (Box.init (MonoType.copy &value-type))))
+                  extended (extend-environment environment reference &scheme)
+                  body-state (InferState.copy
+                    (InferredExpression.state &inferred-value))]
+              (infer-expression &extended (Box.peek body) &body-state))
+          (Result.Error error) (Result.Error error)))))
+
+  (defn infer-lambda [environment parameters body state]
+    (match (infer-lambda-parameters environment parameters state)
+      (Result.Success parameter-result)
+        (let [body-state (InferState.copy (Pair.b &parameter-result))]
+          (match (infer-expression (Pair.a &parameter-result)
+                                   (Box.peek body)
+                                   &body-state)
+            (Result.Success inferred-body)
+              (let-do [parameter-types (the (Array (Box MonoType)) [])
+                       parameter-environment (InferEnvironment.copy (Pair.a &parameter-result))
+                       n (Array.length parameters)]
+                (for [i 0 n]
+                  (let [parameter (Array.unsafe-nth parameters i)]
+                    (match (binding-for &parameter-environment parameter)
+                      (Maybe.Just scheme)
+                        (set! parameter-types
+                              (Array.push-back parameter-types
+                                               (Box.init
+                                                 (Type.solver-apply-at
+                                                   @(InferState.solver
+                                                     (InferredExpression.state &inferred-body))
+                                                   (Box.peek (TypeScheme.body &scheme))))))
+                      (Maybe.Nothing) ())))
+                (let [lambda-type (Type.function parameter-types
+                                                 (Type.solver-apply-at
+                                                   @(InferState.solver
+                                                     (InferredExpression.state &inferred-body))
+                                                   (Box.peek (InferredExpression.type &inferred-body))))]
+                  (Result.Success
+                    (InferredExpression.init (Box.init lambda-type)
+                                             @(InferredExpression.state &inferred-body)))))
+            (Result.Error error) (Result.Error error)))
+      (Result.Error error) (Result.Error error)))
+
+  (defn infer-if [environment condition then-branch else-branch state]
+    (let [condition-state (InferState.copy state)]
+      (match (infer-expression environment (Box.peek condition) &condition-state)
+        (Result.Success inferred-condition)
+          (let [boolean (Type.boolean)]
+            (match (Type.solver-unify-at!
+                @(InferState.solver
+                  (InferredExpression.state &inferred-condition))
+                (Box.peek (InferredExpression.type &inferred-condition))
+                &boolean)
+              (Result.Success _)
+                (let [then-state (InferState.init
+                        @(InferState.next-variable
+                          (InferredExpression.state &inferred-condition))
+                        @(InferState.solver
+                          (InferredExpression.state &inferred-condition))
+                        @(InferState.trace
+                          (InferredExpression.state &inferred-condition)))]
+                  (match (infer-expression environment
+                                           (Box.peek then-branch)
+                                           &then-state)
+                    (Result.Success inferred-then)
+                      (let [else-state (InferState.copy
+                              (InferredExpression.state &inferred-then))]
+                        (match (infer-expression environment
+                                                 (Box.peek else-branch)
+                                                 &else-state)
+                          (Result.Success inferred-else)
+                            (match (Type.solver-unify-at!
+                                @(InferState.solver
+                                  (InferredExpression.state &inferred-else))
+                                (Box.peek (InferredExpression.type &inferred-then))
+                                (Box.peek (InferredExpression.type &inferred-else)))
+                              (Result.Success _)
+                                (let [result-type (MonoType.copy
+                                        (Box.peek (InferredExpression.type &inferred-then)))
+                                      result-state (InferState.init
+                                        @(InferState.next-variable
+                                          (InferredExpression.state &inferred-else))
+                                        @(InferState.solver
+                                          (InferredExpression.state &inferred-else))
+                                        @(InferState.trace
+                                          (InferredExpression.state &inferred-else)))]
+                                  (Result.Success
+                                    (InferredExpression.init (Box.init result-type)
+                                                             result-state)))
+                              (Result.Error error)
+                                (Result.Error
+                                  (InferError.init @(TypeError.message &error))))
+                          (Result.Error error) (Result.Error error)))
+                    (Result.Error error) (Result.Error error)))
+              (Result.Error error)
+                (Result.Error (InferError.init @(TypeError.message &error)))))
+        (Result.Error error) (Result.Error error))))
+
+  (defn infer-set [environment reference value state]
+    (match (binding-for environment reference)
+      (Maybe.Just scheme)
+        (match (infer-expression environment (Box.peek value) state)
+          (Result.Success inferred-value)
+            (match (Type.solver-unify-at!
+                @(InferState.solver (InferredExpression.state &inferred-value))
+                (Box.peek (TypeScheme.body &scheme))
+                (Box.peek (InferredExpression.type &inferred-value)))
+              (Result.Success _)
+                (let [result-state (InferState.init
+                        @(InferState.next-variable
+                          (InferredExpression.state &inferred-value))
+                        @(InferState.solver
+                          (InferredExpression.state &inferred-value))
+                        @(InferState.trace
+                          (InferredExpression.state &inferred-value)))]
+                  (Result.Success
+                    (InferredExpression.init (Box.init (Type.unit)) result-state)))
+              (Result.Error error)
+                (Result.Error (InferError.init @(TypeError.message &error))))
+          (Result.Error error) (Result.Error error))
+      (Maybe.Nothing)
+        (Result.Error
+          (InferError.init
+            (String.concat
+              &[@"missing type scheme for "
+                (String.copy (CoreRef.name reference))
+                @"#"
+                (Int.str @(CoreRef.id reference))])))))
+
+  (defn infer-while [environment condition body state]
+    (match (infer-expression environment (Box.peek condition) state)
+      (Result.Success inferred-condition)
+        (let [boolean (Type.boolean)]
+          (match (Type.solver-unify-at!
+              @(InferState.solver (InferredExpression.state &inferred-condition))
+              (Box.peek (InferredExpression.type &inferred-condition))
+              &boolean)
+            (Result.Success _)
+              (let [body-state (InferState.init
+                      @(InferState.next-variable
+                        (InferredExpression.state &inferred-condition))
+                      @(InferState.solver
+                        (InferredExpression.state &inferred-condition))
+                      @(InferState.trace
+                        (InferredExpression.state &inferred-condition)))]
+                (match (infer-expression environment (Box.peek body) &body-state)
+                  (Result.Success inferred-body)
+                    (Result.Success
+                      (InferredExpression.init (Box.init (Type.unit))
+                                               @(InferredExpression.state &inferred-body)))
+                  (Result.Error error) (Result.Error error)))
+            (Result.Error error)
+              (Result.Error (InferError.init @(TypeError.message &error)))))
+      (Result.Error error) (Result.Error error)))
+
+  (defn infer-match-bindings [environment bindings state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length bindings)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [fresh-result (fresh (Pair.b pair))
+                  binding (Array.unsafe-nth bindings i)
+                  scheme (TypeScheme.init []
+                                          []
+                                          (Box.init
+                                            (MonoType.copy
+                                              (Box.peek (FreshType.type &fresh-result)))))]
+              (set! result
+                    (Result.Success
+                      (Pair.init
+                        (extend-environment (Pair.a pair) binding &scheme)
+                        @(FreshType.state &fresh-result)))))
+          (Result.Error _) ()))
+      result))
+
+  (private constrain-match-pattern)
+  (hidden constrain-match-pattern)
+  (defn constrain-core-pattern [environment pattern subject state by-ref]
+    (match-ref pattern
+      (CorePattern.Ignore) (Result.Success (state-copy state))
+      (CorePattern.Bind reference)
+        (match (binding-for environment reference)
+          (Maybe.Just scheme)
+            (if by-ref
+              (let-do [fresh (fresh-lifetime state)
+                       bound (Type.reference (MonoType.copy subject)
+                                             @(FreshLifetime.lifetime &fresh))
+                       work-state (FreshLifetime.state &fresh)]
+                (match (Type.solver-unify-at! @(InferState.solver work-state)
+                                              (Box.peek (TypeScheme.body &scheme))
+                                              &bound)
+                  (Result.Success _) (Result.Success (state-copy work-state))
+                  (Result.Error error)
+                    (Result.Error (InferError.init @(TypeError.message &error)))))
+              (match (Type.solver-unify-at! @(InferState.solver state)
+                                            (Box.peek (TypeScheme.body &scheme))
+                                            subject)
+                (Result.Success _) (Result.Success (state-copy state))
+                (Result.Error error)
+                  (Result.Error (InferError.init @(TypeError.message &error)))))
+          (Maybe.Nothing)
+            (Result.Error (InferError.init @"missing match binding type")))
+      (CorePattern.Constructor constructor children)
+        (match (binding-for environment constructor)
+          (Maybe.Just scheme)
+            (let-do [instantiated (instantiate-tagged &scheme state "pattern")
+                     arguments (the (Array (Box MonoType)) [])
+                     argument-state (InferState.copy (FreshType.state &instantiated))
+                     argument-index 0
+                     n (Array.length children)]
+              (while-do (Int.< argument-index n)
+                (let-do [fresh-argument (fresh &argument-state)]
+                  (set! arguments
+                        (Array.push-back arguments
+                                         (Box.init
+                                           (MonoType.copy
+                                             (Box.peek (FreshType.type &fresh-argument))))))
+                  (set! argument-state @(FreshType.state &fresh-argument))
+                  (set! argument-index (Int.inc argument-index))))
+              (let [expected (Type.function (Array.copy &arguments)
+                                            (MonoType.copy subject))]
+                (match (Type.solver-unify-at! @(InferState.solver &argument-state)
+                                              (Box.peek (FreshType.type &instantiated))
+                                              &expected)
+                  (Result.Success _)
+                    (let-do [result (the (Result InferState InferError)
+                                         (Result.Success (InferState.copy &argument-state)))]
+                      (for [i 0 n]
+                        (match-ref &result
+                          (Result.Success current)
+                            (set! result
+                                  (constrain-core-pattern environment
+                                                          (Box.peek (Array.unsafe-nth children
+                                                                                      i))
+                                                          (Box.peek (Array.unsafe-nth &arguments
+                                                                                      i))
+                                                          current
+                                                          by-ref))
+                          (Result.Error _) ()))
+                      result)
+                  (Result.Error error)
+                    (Result.Error (InferError.init @(TypeError.message &error))))))
+          (Maybe.Nothing)
+            (Result.Error (InferError.init @"missing match constructor scheme")))))
+
+  (defn constrain-match-pattern [environment branch by-reference scrutinee state]
+    (if by-reference
+      (let [fresh-subject (fresh state)
+            fresh-reference-lifetime (fresh-lifetime (FreshType.state &fresh-subject))]
+        (match (Type.solver-unify-at!
+            @(InferState.solver (FreshType.state &fresh-subject))
+            scrutinee
+            &(Type.reference
+              (MonoType.copy (Box.peek (FreshType.type &fresh-subject)))
+              @(FreshLifetime.lifetime &fresh-reference-lifetime)))
+          (Result.Success _)
+            (match (constrain-core-pattern environment
+                                           (CoreMatchBranch.pattern branch)
+                                           (Box.peek (FreshType.type &fresh-subject))
+                                           (FreshLifetime.state &fresh-reference-lifetime)
+                                           true)
+              (Result.Success constrained)
+                (Result.Success
+                  (Pair.init (InferEnvironment.copy environment) constrained))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error)
+            (Result.Error (InferError.init @(TypeError.message &error)))))
+      (match (constrain-core-pattern environment
+                                     (CoreMatchBranch.pattern branch)
+                                     scrutinee
+                                     state
+                                     false)
+        (Result.Success constrained)
+          (Result.Success
+            (Pair.init (InferEnvironment.copy environment) constrained))
+        (Result.Error error) (Result.Error error))))
+
+  (defn infer-match-branches [environment
+                              branches
+                              by-reference
+                              scrutinee
+                              expected
+                              state]
+    (let-do [result (the
+               (Result (Pair MonoType InferState) InferError)
+               (Result.Success
+                 (Pair.init (MonoType.copy expected) (state-copy state))))
+             n (Array.length branches)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [progress (Pair.copy pair)
+                  branch (Array.unsafe-nth branches i)]
+              (match (infer-match-bindings environment
+                                           (CoreMatchBranch.bindings branch)
+                                           (Pair.b &progress))
+                (Result.Success binding-result)
+                  (match (constrain-match-pattern (Pair.a &binding-result)
+                                                  branch
+                                                  by-reference
+                                                  scrutinee
+                                                  (Pair.b &binding-result))
+                    (Result.Success constrained)
+                      (match (infer-expression (Pair.a &constrained)
+                                               (Box.peek (CoreMatchBranch.body branch))
+                                               (Pair.b &constrained))
+                        (Result.Success inferred-body)
+                          (match (Type.solver-unify-at!
+                              @(InferState.solver
+                                (InferredExpression.state &inferred-body))
+                              (Box.peek (InferredExpression.type &inferred-body))
+                              (Pair.a &progress))
+                            (Result.Success _)
+                              (let [result-type (MonoType.copy (Pair.a &progress))
+                                    branch-state (InferState.init
+                                      @(InferState.next-variable
+                                        (InferredExpression.state &inferred-body))
+                                      @(InferState.solver
+                                        (InferredExpression.state &inferred-body))
+                                      @(InferState.trace
+                                        (InferredExpression.state &inferred-body)))]
+                                (set! result
+                                      (Result.Success (Pair.init result-type
+                                                                 branch-state))))
+                            (Result.Error error)
+                              (set! result
+                                    (Result.Error
+                                      (InferError.init @(TypeError.message &error)))))
+                        (Result.Error error) (set! result (Result.Error error)))
+                    (Result.Error error) (set! result (Result.Error error)))
+                (Result.Error error) (set! result (Result.Error error))))
+          (Result.Error _) ()))
+      result))
+
+  (defn infer-match [environment by-reference scrutinee branches state]
+    (match (infer-expression environment (Box.peek scrutinee) state)
+      (Result.Success inferred-scrutinee)
+        (let [fresh-result (fresh (InferredExpression.state &inferred-scrutinee))]
+          (match (infer-match-branches environment
+                                       branches
+                                       by-reference
+                                       (Box.peek
+                                         (InferredExpression.type &inferred-scrutinee))
+                                       (Box.peek (FreshType.type &fresh-result))
+                                       (FreshType.state &fresh-result))
+            (Result.Success branch-result)
+              (Result.Success
+                (InferredExpression.init
+                  (Box.init (MonoType.copy (Pair.a &branch-result)))
+                  @(Pair.b &branch-result)))
+            (Result.Error error) (Result.Error error)))
+      (Result.Error error) (Result.Error error)))
+
+  (defn infer-do [environment expressions state]
+    (let-do [result (the (Result InferredExpression InferError)
+                         (Result.Success
+                           (InferredExpression.init (Box.init (Type.unit))
+                                                    (state-copy state))))
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success current)
+            (set! result
+                  (match (infer-expression environment
+                                           (Box.peek (Array.unsafe-nth expressions
+                                                                       i))
+                                           (InferredExpression.state current))
+                    (Result.Success inferred)
+                    ;; the reference constrains every non-final do-statement
+                    ;; to Unit (GenerateConstraints, OrdDoStatement); without
+                    ;; this a discarded polymorphic result stays a free
+                    ;; variable and can never specialize.
+                    (if (Int.< i (Int.dec n))
+                      (match (Type.solver-unify-at!
+                          @(InferState.solver (InferredExpression.state &inferred))
+                          (Box.peek (InferredExpression.type &inferred))
+                          &(Type.unit))
+                        (Result.Success _) (Result.Success inferred)
+                        (Result.Error error)
+                          (Result.Error
+                            (InferError.init
+                              (String.concat
+                                &[@"a non-final expression in `do` must be Unit: "
+                                  (String.copy (TypeError.message &error))]))))
+                      (Result.Success inferred))
+                    (Result.Error error)
+                    (Result.Error error)))
+          (Result.Error _) ()))
+      result))
+
+  (defn infer-array-literal [environment expressions type-name state]
+    (let [fresh-result (fresh state)]
+      (let-do [result (the
+                 (Result (Pair MonoType InferState) InferError)
+                 (Result.Success
+                   (Pair.init
+                     (MonoType.copy (Box.peek (FreshType.type &fresh-result)))
+                     @(FreshType.state &fresh-result))))
+               n (Array.length expressions)]
+        (for [i 0 n]
+          (match-ref &result
+            (Result.Success pair)
+              (let [progress (Pair.copy pair)]
+                (match (infer-expression environment
+                                         (Box.peek (Array.unsafe-nth expressions
+                                                                     i))
+                                         (Pair.b &progress))
+                  (Result.Success inferred-element)
+                    (match (Type.solver-unify-at!
+                        @(InferState.solver
+                          (InferredExpression.state &inferred-element))
+                        (Box.peek (InferredExpression.type &inferred-element))
+                        (Pair.a &progress))
+                      (Result.Success _)
+                        (let [element-type (MonoType.copy (Pair.a &progress))
+                              element-state (InferState.init
+                                @(InferState.next-variable
+                                  (InferredExpression.state &inferred-element))
+                                @(InferState.solver
+                                  (InferredExpression.state &inferred-element))
+                                @(InferState.trace
+                                  (InferredExpression.state &inferred-element)))]
+                          (set! result
+                                (Result.Success (Pair.init element-type
+                                                           element-state))))
+                      (Result.Error error)
+                        (set! result
+                              (Result.Error
+                                (InferError.init @(TypeError.message &error)))))
+                  (Result.Error error) (set! result (Result.Error error))))
+            (Result.Error _) ()))
+        (match result
+          (Result.Success pair)
+            (Result.Success
+              (let [literal-type (Type.named type-name
+                                             [(Box.init (MonoType.copy (Pair.a &pair)))])]
+                (InferredExpression.init
+                  (Box.init
+                    (if (= type-name "StaticArray")
+                      (Type.reference literal-type (MonoLifetime.Static))
+                      literal-type))
+                  @(Pair.b &pair))))
+          (Result.Error error) (Result.Error error)))))
+
+  (defn infer-lambda-parameters [environment parameters state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length parameters)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [fresh-result (fresh (Pair.b pair))
+                  parameter (Array.unsafe-nth parameters i)
+                  scheme (TypeScheme.init []
+                                          []
+                                          (Box.init
+                                            (MonoType.copy
+                                              (Box.peek (FreshType.type &fresh-result)))))]
+              (set! result
+                    (Result.Success
+                      (Pair.init
+                        (extend-environment (Pair.a pair) parameter &scheme)
+                        @(FreshType.state &fresh-result)))))
+          (Result.Error _) ()))
+      result))
+  (defn infer-arguments [environment arguments state]
+    (let-do [result (the (Result InferredArguments InferError)
+                         (Result.Success
+                           (InferredArguments.init [] (state-copy state))))
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success inferred)
+            (match (infer-expression environment
+                                     (Box.peek (Array.unsafe-nth arguments i))
+                                     (InferredArguments.state inferred))
+              (Result.Success expression)
+                (set! result
+                      (Result.Success
+                        (InferredArguments.init
+                          (Array.push-back @(InferredArguments.types inferred)
+                                           (Box.init
+                                             (MonoType.copy
+                                               (Box.peek (InferredExpression.type &expression)))))
+                          @(InferredExpression.state &expression))))
+              (Result.Error error) (set! result (Result.Error error)))
+          (Result.Error _) ()))
+      result))
+
+  (private record-call)
+  (hidden record-call)
+  (private call-type-error)
+  (hidden call-type-error)
+  (defn call-type-error [callee error]
+    (match-ref callee
+      (CoreExpr.Reference _ reference)
+        (InferError.init
+          (String.concat
+            &[@"in call to "
+              (String.copy (CoreRef.name reference))
+              @": "
+              (String.copy (TypeError.message error))]))
+      _
+        (InferError.init
+          (String.concat
+            &[@"in call expression: " (String.copy (TypeError.message error))]))))
+
+  (defn record-call [environment call-id callee state type]
+    (match-ref callee
+      (CoreExpr.Reference _ reference)
+        (if @(CoreRef.global reference)
+          (do
+            (Array.push-back!
+              (InferenceTrace.calls (Pointer.to-ref @(InferState.trace state)))
+              (CallSite.init call-id
+                             @reference
+                             (Box.init (MonoType.copy type))
+                             (copy-owner (InferEnvironment.owner environment))))
+            (state-copy state))
+          (state-copy state))
+      _ (state-copy state)))
+
+  (defn infer-expression-internal [environment expression state]
+    (match-ref expression
+      (CoreExpr.IntLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.integer)) (state-copy state)))
+      (CoreExpr.ByteLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.named "Byte" []))
+                                   (state-copy state)))
+      (CoreExpr.LongLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.named "Long" []))
+                                   (state-copy state)))
+      (CoreExpr.FloatLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.named "Float" []))
+                                   (state-copy state)))
+      (CoreExpr.DoubleLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.named "Double" []))
+                                   (state-copy state)))
+      (CoreExpr.CharLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.named "Char" []))
+                                   (state-copy state)))
+      (CoreExpr.StringLit _ _)
+        (Result.Success
+          (InferredExpression.init
+            (Box.init (Type.reference (Type.string) (MonoLifetime.Static)))
+            (state-copy state)))
+      (CoreExpr.PatternLit _ _)
+        (Result.Success
+          (InferredExpression.init
+            (Box.init
+              (Type.reference (Type.named "Pattern" []) (MonoLifetime.Static)))
+            (state-copy state)))
+      (CoreExpr.BoolLit _ _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.boolean)) (state-copy state)))
+      (CoreExpr.UnitLit _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.unit)) (state-copy state)))
+      (CoreExpr.ArrayLit _ expressions)
+        (infer-array-literal environment expressions "Array" state)
+      (CoreExpr.StaticArrayLit _ expressions)
+        (infer-array-literal environment expressions "StaticArray" state)
+      (CoreExpr.Do _ expressions) (infer-do environment expressions state)
+      (CoreExpr.Reference _ reference)
+        (match (binding-for environment reference)
+          (Maybe.Just scheme)
+            (let [fresh-result (instantiate-tagged &scheme state "ref")]
+              (Result.Success
+                (InferredExpression.init
+                  (Box.init
+                    (MonoType.copy (Box.peek (FreshType.type &fresh-result))))
+                  @(FreshType.state &fresh-result))))
+          (Maybe.Nothing)
+            (Result.Error
+              (InferError.init
+                (String.concat
+                  &[@"missing type scheme for "
+                    (String.copy (CoreRef.name reference))
+                    @"#"
+                    (Int.str @(CoreRef.id reference))]))))
+      (CoreExpr.If _ condition then-branch else-branch)
+        (infer-if environment condition then-branch else-branch state)
+      (CoreExpr.Let _ reference value body)
+        (infer-let environment reference value body state)
+      (CoreExpr.Set _ reference value)
+        (infer-set environment reference value state)
+      (CoreExpr.While _ condition body)
+        (infer-while environment condition body state)
+      (CoreExpr.Break _)
+        (Result.Success
+          (InferredExpression.init (Box.init (Type.unit)) (state-copy state)))
+      (CoreExpr.Lambda _ parameters body)
+        (infer-lambda environment parameters body state)
+      (CoreExpr.Match _ by-reference scrutinee branches)
+        (infer-match environment @by-reference scrutinee branches state)
+      (CoreExpr.Annotation _ inner annotation)
+        (infer-annotation environment inner annotation state)
+      (CoreExpr.Call call-id callee arguments)
+        (match (infer-expression environment (Box.peek callee) state)
+          (Result.Success inferred-callee)
+            (match (infer-arguments environment
+                                    arguments
+                                    (InferredExpression.state &inferred-callee))
+              (Result.Success inferred-arguments)
+                (let [fresh-result (fresh
+                        (InferredArguments.state &inferred-arguments))
+                      expected (Type.function
+                        (Array.copy
+                          (InferredArguments.types &inferred-arguments))
+                        (MonoType.copy (Box.peek (FreshType.type &fresh-result))))]
+                  (match (Type.solver-unify-at!
+                      @(InferState.solver (FreshType.state &fresh-result))
+                      (Box.peek (InferredExpression.type &inferred-callee))
+                      &expected)
+                    (Result.Success _)
+                      (let [result-type (MonoType.copy
+                              (Box.peek (FreshType.type &fresh-result)))
+                            ;; resolve the callee type through the solver so the
+                            ;; recorded call reflects bindings inferred from the
+                            ;; arguments (e.g. a closure argument's return type
+                            ;; that pins a higher-order function's result type).
+                            callee-type (Type.solver-apply-at
+                              @(InferState.solver (FreshType.state &fresh-result))
+                              (Box.peek
+                                (InferredExpression.type &inferred-callee)))
+                            unified-state (InferState.init
+                              @(InferState.next-variable (FreshType.state &fresh-result))
+                              @(InferState.solver (FreshType.state &fresh-result))
+                              @(InferState.trace (FreshType.state &fresh-result)))
+                            recorded-state (record-call environment
+                                                        @call-id
+                                                        (Box.peek callee)
+                                                        &unified-state
+                                                        &callee-type)]
+                        (Result.Success
+                          (InferredExpression.init (Box.init result-type)
+                                                   recorded-state)))
+                    (Result.Error error)
+                      (Result.Error (call-type-error (Box.peek callee) &error))))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error))))
+
+  (defn infer-expression [environment expression state]
+    (match (infer-expression-internal environment expression state)
+      (Result.Success inferred)
+        (let-do [inferred-state (InferredExpression.state &inferred)
+                 node-type (MonoType.copy
+                   (Box.peek (InferredExpression.type &inferred)))]
+          (Array.push-back!
+            (InferenceTrace.node-types
+              (Pointer.to-ref @(InferState.trace inferred-state)))
+            (InferredNodeType.init (CoreIR.expression-id expression)
+                                   (copy-owner (InferEnvironment.owner environment))
+                                   (Box.init node-type)))
+          (Result.Success
+            (InferredExpression.init @(InferredExpression.type &inferred)
+                                     (InferState.init
+                                       @(InferState.next-variable inferred-state)
+                                       @(InferState.solver inferred-state)
+                                       @(InferState.trace inferred-state)))))
+      (Result.Error error) (Result.Error error)))
+
+  (private infer-parameters)
+  (hidden infer-parameters)
+  (defn infer-parameters [environment parameters state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length parameters)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [fresh-result (fresh (Pair.b pair))
+                  parameter (Array.unsafe-nth parameters i)
+                  scheme (TypeScheme.init []
+                                          []
+                                          (Box.init
+                                            (MonoType.copy
+                                              (Box.peek (FreshType.type &fresh-result)))))]
+              (set! result
+                    (Result.Success
+                      (Pair.init
+                        (extend-environment (Pair.a pair) parameter &scheme)
+                        @(FreshType.state &fresh-result)))))
+          (Result.Error _) ()))
+      result))
+
+  (private infer-function)
+  (hidden infer-function)
+  (defn infer-function [environment function state]
+    (match (infer-parameters environment
+                             (CoreFunction.parameters function)
+                             state)
+      (Result.Success parameter-result)
+        (match (infer-expression (Pair.a &parameter-result)
+                                 (Box.peek (CoreFunction.body function))
+                                 (Pair.b &parameter-result))
+          (Result.Success inferred-body)
+            (let-do [parameter-types (the (Array (Box MonoType)) [])
+                     parameters (CoreFunction.parameters function)
+                     parameter-environment (InferEnvironment.copy (Pair.a &parameter-result))
+                     n (Array.length parameters)]
+              (for [i 0 n]
+                (let [parameter (Array.unsafe-nth parameters i)]
+                  (match (binding-for &parameter-environment parameter)
+                    (Maybe.Just scheme)
+                      (set! parameter-types
+                            (Array.push-back parameter-types
+                                             (Box.init
+                                               (Type.solver-apply-at
+                                                 @(InferState.solver
+                                                   (InferredExpression.state &inferred-body))
+                                                 (Box.peek (TypeScheme.body &scheme))))))
+                    (Maybe.Nothing) ())))
+              (let [function-type (Type.function parameter-types
+                                                 (Type.solver-apply-at
+                                                   @(InferState.solver
+                                                     (InferredExpression.state &inferred-body))
+                                                   (Box.peek (InferredExpression.type &inferred-body))))
+                    scheme (generalize environment &function-type)]
+                (Result.Success
+                  (InferredFunction.init scheme
+                                         @(InferredExpression.state &inferred-body)))))
+          (Result.Error error) (Result.Error error))
+      (Result.Error error) (Result.Error error)))
+
+  (private infer-functions)
+  (hidden infer-functions)
+  (private predeclare-functions)
+  (hidden predeclare-functions)
+  (private infer-function-body)
+  (hidden infer-function-body)
+  (private infer-function-bodies)
+  (hidden infer-function-bodies)
+  (private finalize-functions)
+  (hidden finalize-functions)
+
+  (defn predeclare-functions [functions signatures environment state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length functions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [function (Array.unsafe-nth functions i)
+                  reference (CoreFunction.reference function)]
+              (match (signature-for signatures reference)
+                (Maybe.Just scheme)
+                  (set! result
+                        (Result.Success
+                          (Pair.init
+                            (extend-environment (Pair.a pair) reference &scheme)
+                            @(Pair.b pair))))
+                (Maybe.Nothing)
+                  (let [fresh-result (fresh (Pair.b pair))
+                        placeholder (MonoType.copy
+                          (Box.peek (FreshType.type &fresh-result)))
+                        scheme (TypeScheme.init [] [] (Box.init placeholder))]
+                    (set! result
+                          (Result.Success
+                            (Pair.init
+                              (extend-environment (Pair.a pair)
+                                                  reference
+                                                  &scheme)
+                              @(FreshType.state &fresh-result)))))))
+          (Result.Error _) ()))
+      result))
+
+  (defn infer-function-body [environment function state]
+    (let [owned-environment (environment-with-owner environment
+                                                    (CoreFunction.reference function))]
+      (match (infer-parameters &owned-environment
+                               (CoreFunction.parameters function)
+                               state)
+        (Result.Success parameter-result)
+          (match (infer-expression (Pair.a &parameter-result)
+                                   (Box.peek (CoreFunction.body function))
+                                   (Pair.b &parameter-result))
+            (Result.Success inferred-body)
+              (let-do [parameter-types (the (Array (Box MonoType)) [])
+                       parameters (CoreFunction.parameters function)
+                       parameter-environment (InferEnvironment.copy (Pair.a &parameter-result))
+                       n (Array.length parameters)]
+                (for [i 0 n]
+                  (let [parameter (Array.unsafe-nth parameters i)]
+                    (match (binding-for &parameter-environment parameter)
+                      (Maybe.Just scheme)
+                        (set! parameter-types
+                              (Array.push-back parameter-types
+                                               (Box.init
+                                                 (Type.solver-apply-at
+                                                   @(InferState.solver
+                                                     (InferredExpression.state &inferred-body))
+                                                   (Box.peek (TypeScheme.body &scheme))))))
+                      (Maybe.Nothing) ())))
+                (let [function-type (Type.function parameter-types
+                                                   (Type.solver-apply-at
+                                                     @(InferState.solver
+                                                       (InferredExpression.state &inferred-body))
+                                                     (Box.peek (InferredExpression.type &inferred-body))))]
+                  (Result.Success
+                    (InferredFunctionBody.init
+                      (CoreRef.copy (CoreFunction.reference function))
+                      (Box.init function-type)
+                      @(InferredExpression.state &inferred-body)))))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))))
+
+  (private predeclare-values)
+  (hidden predeclare-values)
+  (private infer-value-body)
+  (hidden infer-value-body)
+  (private infer-value-bodies)
+  (hidden infer-value-bodies)
+  (private finalize-values)
+  (hidden finalize-values)
+
+  (defn predeclare-values [values signatures environment state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length values)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [value (Array.unsafe-nth values i)
+                  reference (CoreValue.reference value)]
+              (match (signature-for signatures reference)
+                (Maybe.Just scheme)
+                  (set! result
+                        (Result.Success
+                          (Pair.init
+                            (extend-environment (Pair.a pair) reference &scheme)
+                            @(Pair.b pair))))
+                (Maybe.Nothing)
+                  (let [fresh-result (fresh (Pair.b pair))
+                        scheme (TypeScheme.init []
+                                                []
+                                                (Box.init
+                                                  (MonoType.copy
+                                                    (Box.peek (FreshType.type &fresh-result)))))]
+                    (set! result
+                          (Result.Success
+                            (Pair.init
+                              (extend-environment (Pair.a pair)
+                                                  reference
+                                                  &scheme)
+                              @(FreshType.state &fresh-result)))))))
+          (Result.Error _) ()))
+      result))
+
+  (defn infer-value-body [environment value state]
+    (let [owned-environment (environment-with-owner environment
+                                                    (CoreValue.reference value))]
+      (match (infer-expression &owned-environment
+                               (Box.peek (CoreValue.body value))
+                               state)
+        (Result.Success inferred)
+          (let [value-type (Type.solver-apply-at
+                  @(InferState.solver (InferredExpression.state &inferred))
+                  (Box.peek (InferredExpression.type &inferred)))]
+            (Result.Success
+              (InferredFunctionBody.init
+                (CoreRef.copy (CoreValue.reference value))
+                (Box.init value-type)
+                @(InferredExpression.state &inferred))))
+        (Result.Error error) (Result.Error error))))
+
+  (private contextual-error)
+  (hidden contextual-error)
+  (defn contextual-error [kind reference message]
+    (InferError.init
+      (String.concat
+        &[@"in "
+          (String.copy kind)
+          @" "
+          (String.copy (CoreRef.name reference))
+          @": "
+          (String.copy message)])))
+
+  (defn infer-value-bodies [values environment state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length values)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [value (Array.unsafe-nth values i)
+                  reference (CoreValue.reference value)]
+              (match (infer-value-body (Pair.a pair) value (Pair.b pair))
+                (Result.Success inferred)
+                  (match (binding-for (Pair.a pair)
+                                      (InferredFunctionBody.reference &inferred))
+                    (Maybe.Just placeholder)
+                      (match (Type.solver-unify-at!
+                          @(InferState.solver (InferredFunctionBody.state &inferred))
+                          (Box.peek (InferredFunctionBody.type &inferred))
+                          (Box.peek (TypeScheme.body &placeholder)))
+                        (Result.Success _)
+                          (let [next-state (InferState.init
+                                  @(InferState.next-variable (InferredFunctionBody.state &inferred))
+                                  @(InferState.solver (InferredFunctionBody.state &inferred))
+                                  @(InferState.trace (InferredFunctionBody.state &inferred)))]
+                            (set! result
+                                  (Result.Success
+                                    (Pair.init (InferEnvironment.copy (Pair.a pair))
+                                               next-state))))
+                        (Result.Error error)
+                          (set! result
+                                (Result.Error
+                                  (contextual-error "value"
+                                                    reference
+                                                    (TypeError.message &error)))))
+                    (Maybe.Nothing)
+                      (set! result
+                            (Result.Error
+                              (contextual-error "value"
+                                                reference
+                                                "missing placeholder"))))
+                (Result.Error error)
+                  (set! result
+                        (Result.Error
+                          (contextual-error "value"
+                                            reference
+                                            (InferError.message &error))))))
+          (Result.Error _) ()))
+      result))
+
+  (defn infer-function-bodies [functions environment state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length functions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (let [function (Array.unsafe-nth functions i)
+                  reference (CoreFunction.reference function)]
+              (match (infer-function-body (Pair.a pair) function (Pair.b pair))
+                (Result.Success inferred)
+                  (match (binding-for (Pair.a pair)
+                                      (InferredFunctionBody.reference &inferred))
+                    (Maybe.Just placeholder)
+                      (match (Type.solver-unify-at!
+                          @(InferState.solver (InferredFunctionBody.state &inferred))
+                          (Box.peek (InferredFunctionBody.type &inferred))
+                          (Box.peek (TypeScheme.body &placeholder)))
+                        (Result.Success _)
+                          (let [next-state (InferState.init
+                                  @(InferState.next-variable (InferredFunctionBody.state &inferred))
+                                  @(InferState.solver (InferredFunctionBody.state &inferred))
+                                  @(InferState.trace (InferredFunctionBody.state &inferred)))]
+                            (set! result
+                                  (Result.Success
+                                    (Pair.init (InferEnvironment.copy (Pair.a pair))
+                                               next-state))))
+                        (Result.Error error)
+                          (set! result
+                                (Result.Error
+                                  (contextual-error "function"
+                                                    reference
+                                                    (TypeError.message &error)))))
+                    (Maybe.Nothing)
+                      (set! result
+                            (Result.Error
+                              (contextual-error "function"
+                                                reference
+                                                "missing placeholder"))))
+                (Result.Error error)
+                  (set! result
+                        (Result.Error
+                          (contextual-error "function"
+                                            reference
+                                            (InferError.message &error))))))
+          (Result.Error _) ()))
+      result))
+
+  (defn finalize-functions [functions base-environment placeholders state]
+    (let-do [result (the (Result InferEnvironment InferError)
+                         (Result.Success (InferEnvironment.copy base-environment)))
+             n (Array.length functions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success environment)
+            (let [function (Array.unsafe-nth functions i)
+                  reference (CoreFunction.reference function)]
+              (match (binding-for placeholders reference)
+                (Maybe.Just placeholder)
+                  (let-do [function-type (Type.solver-apply-at @(InferState.solver state)
+                                                               (Box.peek (TypeScheme.body &placeholder)))
+                           scheme (generalize base-environment &function-type)]
+                    (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
+                      (Maybe.Just _)
+                        (IO.errorln &(fmt "finalize %s: placeholder=%s solved=%s"
+                                          (CoreRef.name reference)
+                                          &(str (Box.peek (TypeScheme.body &placeholder)))
+                                          &(str &function-type)))
+                      (Maybe.Nothing) ())
+                    (set! result
+                          (Result.Success
+                            (extend-environment environment reference &scheme))))
+                (Maybe.Nothing)
+                  (set! result
+                        (Result.Error
+                          (InferError.init @"missing function placeholder")))))
+          (Result.Error _) ()))
+      result))
+
+  (defn finalize-values [values base-environment placeholders state]
+    (let-do [result (the (Result InferEnvironment InferError)
+                         (Result.Success (InferEnvironment.copy base-environment)))
+             n (Array.length values)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success environment)
+            (let [value (Array.unsafe-nth values i)
+                  reference (CoreValue.reference value)]
+              (match (binding-for placeholders reference)
+                (Maybe.Just placeholder)
+                  (let [value-type (Type.solver-apply-at @(InferState.solver state)
+                                                         (Box.peek (TypeScheme.body &placeholder)))
+                        scheme (generalize-local base-environment &value-type)]
+                    (set! result
+                          (Result.Success
+                            (extend-environment environment reference &scheme))))
+                (Maybe.Nothing)
+                  (set! result
+                        (Result.Error
+                          (InferError.init @"missing value placeholder")))))
+          (Result.Error _) ()))
+      result))
+
+  (private function-index)
+  (hidden function-index)
+  (private dependency-present?)
+  (hidden dependency-present?)
+  (private add-expression-dependencies!)
+  (hidden add-expression-dependencies!)
+  (private add-expression-array-dependencies!)
+  (hidden add-expression-array-dependencies!)
+  (private function-dependency-graph)
+  (hidden function-dependency-graph)
+  (private functions-in-component)
+  (hidden functions-in-component)
+  (private infer-function-components)
+  (hidden infer-function-components)
+
+  (defn function-index [functions reference]
+    (let-do [result (the (Maybe Int) (Maybe.Nothing))
+             n (Array.length functions)]
+      (for [i 0 n]
+        (when (CoreIR.same-ref?
+            (CoreFunction.reference (Array.unsafe-nth functions i))
+            reference)
+          (set! result (Maybe.Just i))))
+      result))
+
+  (defn dependency-present? [dependencies candidate]
+    (let-do [found false
+             n (Array.length dependencies)]
+      (for [i 0 n]
+        (when (Int.= @(Array.unsafe-nth dependencies i) candidate)
+          (set! found true)))
+      found))
+
+  (defn add-reference-dependency! [functions reference dependencies]
+    (when @(CoreRef.global reference)
+      (match (function-index functions reference)
+        (Maybe.Just index)
+          (unless (dependency-present? dependencies index)
+            (Array.push-back! dependencies index))
+        (Maybe.Nothing) ())))
+
+  (defn add-expression-array-dependencies! [functions expressions dependencies]
+    (let [n (Array.length expressions)]
+      (for [i 0 n]
+        (add-expression-dependencies! functions
+                                      (Box.peek (Array.unsafe-nth expressions i))
+                                      dependencies))))
+
+  (defn add-expression-dependencies! [functions expression dependencies]
+    (match-ref expression
+      (CoreExpr.IntLit _ _) ()
+      (CoreExpr.ByteLit _ _) ()
+      (CoreExpr.LongLit _ _) ()
+      (CoreExpr.FloatLit _ _) ()
+      (CoreExpr.DoubleLit _ _) ()
+      (CoreExpr.CharLit _ _) ()
+      (CoreExpr.StringLit _ _) ()
+      (CoreExpr.PatternLit _ _) ()
+      (CoreExpr.BoolLit _ _) ()
+      (CoreExpr.UnitLit _) ()
+      (CoreExpr.ArrayLit _ expressions)
+        (add-expression-array-dependencies! functions expressions dependencies)
+      (CoreExpr.StaticArrayLit _ expressions)
+        (add-expression-array-dependencies! functions expressions dependencies)
+      (CoreExpr.Reference _ reference)
+        (add-reference-dependency! functions reference dependencies)
+      (CoreExpr.Call _ callee arguments)
+        (do
+          (add-expression-dependencies! functions (Box.peek callee) dependencies)
+          (add-expression-array-dependencies! functions arguments dependencies))
+      (CoreExpr.Do _ expressions)
+        (add-expression-array-dependencies! functions expressions dependencies)
+      (CoreExpr.If _ condition then-branch else-branch)
+        (do
+          (add-expression-dependencies! functions
+                                        (Box.peek condition)
+                                        dependencies)
+          (add-expression-dependencies! functions
+                                        (Box.peek then-branch)
+                                        dependencies)
+          (add-expression-dependencies! functions
+                                        (Box.peek else-branch)
+                                        dependencies))
+      (CoreExpr.Let _ _ value body)
+        (do
+          (add-expression-dependencies! functions (Box.peek value) dependencies)
+          (add-expression-dependencies! functions (Box.peek body) dependencies))
+      (CoreExpr.Set _ reference value)
+        (do
+          (add-reference-dependency! functions reference dependencies)
+          (add-expression-dependencies! functions (Box.peek value) dependencies))
+      (CoreExpr.While _ condition body)
+        (do
+          (add-expression-dependencies! functions
+                                        (Box.peek condition)
+                                        dependencies)
+          (add-expression-dependencies! functions (Box.peek body) dependencies))
+      (CoreExpr.Break _) ()
+      (CoreExpr.Lambda _ _ body)
+        (add-expression-dependencies! functions (Box.peek body) dependencies)
+      (CoreExpr.Match _ _ scrutinee branches)
+        (do
+          (add-expression-dependencies! functions
+                                        (Box.peek scrutinee)
+                                        dependencies)
+          (let [n (Array.length branches)]
+            (for [i 0 n]
+              (add-expression-dependencies! functions
+                                            (Box.peek
+                                              (CoreMatchBranch.body (Array.unsafe-nth branches
+                                                                                      i)))
+                                            dependencies))))
+      (CoreExpr.Annotation _ expression _)
+        (add-expression-dependencies! functions
+                                      (Box.peek expression)
+                                      dependencies)))
+
+  (defn function-dependency-graph [functions]
+    (let-do [n (Array.length functions)
+             empty (the (Array Int) [])
+             edges (Array.replicate n &empty)]
+      (for [i 0 n]
+        (add-expression-dependencies! functions
+                                      (Box.peek
+                                        (CoreFunction.body (Array.unsafe-nth functions
+                                                                             i)))
+                                      (Array.unsafe-nth &edges i)))
+      (IntGraph.init edges)))
+
+  (defn functions-in-component [functions component]
+    (let-do [result (the (Array CoreFunction) [])
+             n (Array.length component)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               @(Array.unsafe-nth functions
+                                                  @(Array.unsafe-nth component i)))))
+      result))
+
+  (defn infer-function-components [functions
+                                   components
+                                   signatures
+                                   environment
+                                   state]
+    (let-do [result (the
+               (Result (Pair InferEnvironment InferState) InferError)
+               (Result.Success
+                 (Pair.init (InferEnvironment.copy environment)
+                            (state-copy state))))
+             n (Array.length components)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success progress)
+            (let [component-functions (functions-in-component functions
+                                                              (Array.unsafe-nth components
+                                                                                i))]
+              (match (predeclare-functions &component-functions
+                                           signatures
+                                           (Pair.a progress)
+                                           (Pair.b progress))
+                (Result.Success predeclared)
+                  (match (infer-function-bodies &component-functions
+                                                (Pair.a &predeclared)
+                                                (Pair.b &predeclared))
+                    (Result.Success inferred)
+                      (match (finalize-functions &component-functions
+                                                 (Pair.a progress)
+                                                 (Pair.a &predeclared)
+                                                 (Pair.b &inferred))
+                        (Result.Success finalized)
+                          (set! result
+                                (Result.Success
+                                  (Pair.init finalized @(Pair.b &inferred))))
+                        (Result.Error error) (set! result (Result.Error error)))
+                    (Result.Error error) (set! result (Result.Error error)))
+                (Result.Error error) (set! result (Result.Error error))))
+          (Result.Error _) ()))
+      result))
+
+  (defn infer-functions [functions values signatures environment state]
+    (match (predeclare-values values signatures environment state)
+      (Result.Success predeclared-values)
+        (let [graph (function-dependency-graph functions)
+              components (IntGraph.strong-components &graph)]
+          (match (infer-function-components functions
+                                            &components
+                                            signatures
+                                            (Pair.a &predeclared-values)
+                                            (Pair.b &predeclared-values))
+            (Result.Success inferred-functions)
+              (match (infer-value-bodies values
+                                         (Pair.a &inferred-functions)
+                                         (Pair.b &inferred-functions))
+                (Result.Success inferred-values)
+                  (match (finalize-values values
+                                          (Pair.a &inferred-functions)
+                                          (Pair.a &predeclared-values)
+                                          (Pair.b &inferred-values))
+                    (Result.Success final-environment)
+                      (Result.Success
+                        (Pair.init final-environment @(Pair.b &inferred-values)))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error)))
+      (Result.Error error) (Result.Error error)))
+
+  (private infer-top-level-expressions)
+  (hidden infer-top-level-expressions)
+  (defn infer-top-level-expressions [expressions environment state]
+    (let-do [result (the
+               (Result (Pair (Array (Box MonoType)) InferState) InferError)
+               (Result.Success (Pair.init [] (state-copy state))))
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success pair)
+            (match (infer-expression &environment
+                                     (Box.peek (Array.unsafe-nth expressions i))
+                                     (Pair.b pair))
+              (Result.Success inferred)
+                (set! result
+                      (Result.Success
+                        (Pair.init
+                          (Array.push-back @(Pair.a pair)
+                                           (Box.init
+                                             (MonoType.copy
+                                               (Box.peek (InferredExpression.type &inferred)))))
+                          @(InferredExpression.state &inferred))))
+              (Result.Error error) (set! result (Result.Error error)))
+          (Result.Error _) ()))
+      result))
+
+  (doc module "infers principal schemes for the resolved core subset and
+  records global call signatures for specialization. A top-level definition group
+is predeclared, inferred monomorphically, unified, then generalized together.")
+  (defn module [core]
+    (let [solver (Type.solver)
+          trace (InferenceTrace.init [] [])
+          globals (InferGlobalEnvironment.init [] [] [])
+          initial-environment (InferEnvironment.init (Pointer.address &globals)
+                                                     []
+                                                     []
+                                                     (Maybe.Nothing))
+          builtin-environment (extend-builtins &initial-environment
+                                               (CoreModule.builtins core))
+          declaration-environment (extend-interfaces &builtin-environment
+                                                     (CoreModule.interfaces core))
+          initial-state (InferState.init 0
+                                         (Pointer.address &solver)
+                                         (Pointer.address &trace))]
+      (match (infer-functions (CoreModule.functions core)
+                              (CoreModule.values core)
+                              (CoreModule.signatures core)
+                              &declaration-environment
+                              &initial-state)
+        (Result.Success function-result)
+          (match (infer-top-level-expressions (CoreModule.expressions core)
+                                              (InferEnvironment.copy (Pair.a &function-result))
+                                              (Pair.b &function-result))
+            (Result.Success expression-result)
+              (Result.Success
+                (InferredModule.init
+                  (Array.copy (InferGlobalEnvironment.bindings &globals))
+                  @(Pair.a &expression-result)
+                  (Array.copy (InferenceTrace.calls &trace))
+                  (Array.copy (InferenceTrace.node-types &trace))
+                  (Type.solver-snapshot &solver)))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error)))))

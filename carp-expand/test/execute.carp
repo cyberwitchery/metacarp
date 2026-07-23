@@ -1,0 +1,314 @@
+(load "../carp-expand.carp")
+(Project.no-echo)
+
+;; quasiquote is real Core code now, so backtick macros need Quasiquote.carp
+;; (and the List/Dynamic helpers its expansion calls) in the expanded module,
+;; exactly like the driver loads them. The preludes are expanded once alone to
+;; learn how many output forms they contribute, so each test still indexes its
+;; own forms from zero.
+(defn prelude-text []
+  (String.concat &[(IO.unsafe-read-file "../../../carp/core/Macros.carp")
+                   @"\n"
+                   (IO.unsafe-read-file "../../../carp/core/List.carp")
+                   @"\n"
+                   (IO.unsafe-read-file "../../../carp/core/Quasiquote.carp")
+                   @"\n"
+                   (IO.unsafe-read-file "../../../carp/core/Dynamic.carp")
+                   @"\n"]))
+
+(defn expand-with-preludes [text]
+  (let [module (Result.from-success (Surface.parse text)
+                                    (SurfaceModule.init []))
+        config (ExpandConfig.init [@"Dynamic"])]
+    (MacroExpand.expand-module-with &module &config)))
+
+(defn expanded-module [source]
+  (let [prelude (prelude-text)
+        base (match (expand-with-preludes &prelude)
+               (Result.Success m) (Array.length (SurfaceModule.forms &m))
+               (Result.Error _) 0)
+        full (String.concat &[(String.copy &prelude) (String.copy source)])]
+    (match (expand-with-preludes &full)
+      (Result.Success m)
+        (let-do [forms (the (Array (Box SurfaceNode)) [])
+                 all (SurfaceModule.forms &m)]
+          (for [i base (Array.length all)]
+            (Array.push-back! &forms
+                              (Box.init
+                                (SurfaceNode.copy (Box.peek (Array.unsafe-nth all
+                                                                              i))))))
+          (SurfaceModule.init forms))
+      (Result.Error _) (SurfaceModule.init []))))
+
+(defn node-at [module index]
+  (SurfaceNode.copy
+    (Box.peek (Array.unsafe-nth (SurfaceModule.forms module) index))))
+
+(defn list-item [node index]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.List items)
+      (SurfaceNode.copy (Box.peek (Array.unsafe-nth items index)))
+    _ (SurfaceNode.copy node)))
+
+(defn is-symbol? [node name]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.Symbol segments)
+      (and (Int.= 1 (Array.length segments))
+           (= (Array.unsafe-nth segments 0) name))
+    _ false))
+
+(defn is-bool? [node expected]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.BoolLit actual) (Bool.= @actual expected)
+    _ false))
+
+(defn is-int? [node expected]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.IntLit actual) (Int.= @actual expected)
+    _ false))
+
+(defn expands-template-macro? []
+  (let [module (expanded-module
+          "(defmacro when [condition body] `(if %condition %body ()))
+(when true 42)")
+        form (node-at &module 0)
+        head (list-item &form 0)
+        condition (list-item &form 1)
+        body (list-item &form 2)]
+    (and
+      (Int.= 1 (Array.length (SurfaceModule.forms &module)))
+      (and (is-symbol? &head "if")
+           (and (is-bool? &condition true) (is-int? &body 42))))))
+
+(defn expands-recursively? []
+  (let [module (expanded-module
+          "(defmacro unless [condition body] `(if %condition () %body))
+(defmacro when-not [condition body] `(unless %condition %body))
+(when-not false 7)")
+        form (node-at &module 0)
+        head (list-item &form 0)]
+    (and
+      (Int.= 1 (Array.length (SurfaceModule.forms &module)))
+      (is-symbol? &head "if"))))
+
+(defn evaluates-quote? []
+  (let [quoted-module (expanded-module "(defmacro answer [] 'result)
+(answer)")
+        quoted-form (node-at &quoted-module 0)] (is-symbol? &quoted-form
+                                                            "result")))
+
+(defn evaluates-parameter? []
+  (let [module (expanded-module "(defmacro identity [x] x)
+(identity 9)")
+        form (node-at &module 0)] (is-int? &form 9)))
+
+(defn evaluates-parameter-directly? []
+  (let [module (Result.from-success (Surface.parse "x 9")
+                                    (SurfaceModule.init []))
+        body (node-at &module 0)
+        value (node-at &module 1)
+        state (CtEval.state)
+        frame (CtEval.root &state)
+        binding (CtEval.define! &state
+                                &frame
+                                "x"
+                                (CtValue.Syntax (Box.init value)))]
+    (match (CtEval.eval-template &body &state &frame)
+      (Result.Success result) (is-int? &result 9)
+      (Result.Error _) false)))
+
+(defn evaluates-control-flow? []
+  (let [then-module (expanded-module
+          "(defmacro choose [flag x] (let [saved x] (if flag (do `(do %saved)) `(do 0))))
+(choose true 7)")
+        then-form (node-at &then-module 0)
+        then-head (list-item &then-form 0)
+        then-value (list-item &then-form 1)
+        else-module (expanded-module
+          "(defmacro choose [flag x] (let [saved x] (if flag (do `(do %saved)) `(do 0))))
+(choose false 7)")
+        else-form (node-at &else-module 0)
+        else-head (list-item &else-form 0)
+        else-value (list-item &else-form 1)]
+    (and (is-symbol? &then-head "do")
+         (and (is-int? &then-value 7)
+              (and (is-symbol? &else-head "do") (is-int? &else-value 0))))))
+
+(defn evaluates-multiple-let-bindings? []
+  (let [module (expanded-module
+          "(defmacro first-of [x y] (let [first x second first] second))
+(first-of 3 9)")
+        form (node-at &module 0)]
+    (is-int? &form 3)))
+
+(defn expands-variadic-macro? []
+  (let [module (expanded-module
+          "(defmacro do-all [first :rest rest] `(do %first %@rest))
+(do-all 1 2 3)")
+        form (node-at &module 0)
+        head (list-item &form 0)
+        first (list-item &form 1)
+        second (list-item &form 2)
+        third (list-item &form 3)]
+    (and (is-symbol? &head "do")
+         (and (is-int? &first 1) (and (is-int? &second 2) (is-int? &third 3))))))
+
+(defn evaluates-returned-closure? []
+  (let [module (expanded-module
+          "(defmacro pick [a b] (let [make (fn [x] (fn [ignored] x)) first (make a)] (first b)))
+(pick 4 9)")
+        form (node-at &module 0)]
+    (is-int? &form 4)))
+
+(defn evaluates-computed-collection? []
+  (let [module (expanded-module
+          "(defmacro twice [x] (let [one [x] two [x] values (concat one two)] `(do %@values)))
+(twice 5)")
+        form (node-at &module 0)
+        first (list-item &form 1)
+        second (list-item &form 2)]
+    (and (is-int? &first 5) (is-int? &second 5))))
+
+(defn expands-dynamic-helper? []
+  (let [module (expanded-module
+          "(defndynamic build-when [condition body] (list 'if condition body (list)))
+(defmacro core-when [condition body] (build-when condition body))
+(core-when true 42)")
+        form (node-at &module 0)
+        head (list-item &form 0)
+        condition (list-item &form 1)
+        body (list-item &form 2)]
+    (and (is-symbol? &head "if")
+         (and (is-bool? &condition true) (is-int? &body 42)))))
+
+(defn expands-core-when? []
+  (let [core-source (IO.unsafe-read-file "../../../carp/core/ControlMacros.carp")
+        source (String.append &core-source "
+(when true 42)")
+        module (Result.from-success (Surface.parse &source)
+                                    (SurfaceModule.init []))
+        expanded (Result.from-success (MacroExpand.expand-module &module)
+                                      (SurfaceModule.init []))
+        form (node-at &expanded
+                      (Int.dec (Array.length (SurfaceModule.forms &expanded))))
+        head (list-item &form 0)
+        condition (list-item &form 1)
+        body (list-item &form 2)]
+    (and (is-symbol? &head "if")
+         (and (is-bool? &condition true) (is-int? &body 42)))))
+
+(defn expands-core-and? []
+  (let [core-source (IO.unsafe-read-file "../../../carp/core/Macros.carp")
+        source (String.append &core-source "
+(and true false)")
+        parsed (Surface.parse &source)]
+    (match parsed
+      (Result.Success module)
+        (match (MacroExpand.expand-module &module)
+          (Result.Success expanded)
+            (let [form (node-at &expanded
+                                (Int.dec
+                                  (Array.length (SurfaceModule.forms &expanded))))
+                  head (list-item &form 0)
+                  condition (list-item &form 1)
+                  then-branch (list-item &form 2)
+                  else-branch (list-item &form 3)]
+              (and (is-symbol? &head "if")
+                   (and (is-bool? &condition true)
+                        (and (is-bool? &then-branch false)
+                             (is-bool? &else-branch false)))))
+          (Result.Error error) (do (IO.println (CtError.message &error)) false))
+      (Result.Error _) false)))
+
+(defn expands-core-when-do? []
+  (let [core-source (IO.unsafe-read-file "../../../carp/core/ControlMacros.carp")
+        source (String.append &core-source "
+(when-do true 1 2)")
+        module (Result.from-success (Surface.parse &source)
+                                    (SurfaceModule.init []))
+        expanded (Result.from-success (MacroExpand.expand-module &module)
+                                      (SurfaceModule.init []))
+        form (node-at &expanded
+                      (Int.dec (Array.length (SurfaceModule.forms &expanded))))
+        head (list-item &form 0)
+        condition (list-item &form 1)
+        body (list-item &form 2)
+        body-head (list-item &body 0)]
+    (and (is-symbol? &head "if")
+         (and (is-bool? &condition true) (is-symbol? &body-head "do")))))
+
+(defn expands-core-cond? []
+  (let [core-source (IO.unsafe-read-file "../../../carp/core/Macros.carp")
+        source (String.append &core-source "
+(cond false 1 true 2 3)")
+        module (Result.from-success (Surface.parse &source)
+                                    (SurfaceModule.init []))
+        expanded (Result.from-success (MacroExpand.expand-module &module)
+                                      (SurfaceModule.init []))
+        form (node-at &expanded
+                      (Int.dec (Array.length (SurfaceModule.forms &expanded))))
+        head (list-item &form 0)
+        condition (list-item &form 1)
+        then-branch (list-item &form 2)
+        else-branch (list-item &form 3)
+        nested-head (list-item &else-branch 0)]
+    (and (is-symbol? &head "if")
+         (and (is-bool? &condition false)
+              (and (is-int? &then-branch 1) (is-symbol? &nested-head "if"))))))
+
+(defn expands-core-thread-first? []
+  (let [core-source (IO.unsafe-read-file "../../../carp/core/ControlMacros.carp")
+        source (String.append &core-source "
+(-> 1 (+ 2))")
+        module (Result.from-success (Surface.parse &source)
+                                    (SurfaceModule.init []))
+        expanded (Result.from-success (MacroExpand.expand-module &module)
+                                      (SurfaceModule.init []))
+        form (node-at &expanded
+                      (Int.dec (Array.length (SurfaceModule.forms &expanded))))
+        head (list-item &form 0)
+        first (list-item &form 1)
+        second (list-item &form 2)]
+    (and (is-symbol? &head "+") (and (is-int? &first 1) (is-int? &second 2)))))
+
+(defn expands-core-for? []
+  ;; the Core `for` macro is quasiquote-based, so it needs the same preludes.
+  (let [core-source (IO.unsafe-read-file "../../../carp/core/Array.carp")
+        full (String.concat &[(prelude-text)
+                              (String.copy &core-source)
+                              @"
+(for [i 0 2] (println i))"])]
+    (match (expand-with-preludes &full)
+      (Result.Success expanded)
+        (let [form (node-at &expanded
+                            (Int.dec
+                              (Array.length (SurfaceModule.forms &expanded))))
+              head (list-item &form 0)]
+          (is-symbol? &head "let"))
+      (Result.Error error) (do (IO.println (CtError.message &error)) false))))
+
+(defn rejects-wrong-arity? []
+  (let [module (Result.from-success (Surface.parse "(defmacro identity [x] x)
+(identity 1 2)") (SurfaceModule.init []))] (Result.error? &(MacroExpand.expand-module &module))))
+
+(defn main []
+  (if (and (expands-template-macro?)
+           (and (expands-recursively?)
+                (and (evaluates-quote?)
+                     (and (evaluates-parameter?)
+                          (and (evaluates-parameter-directly?)
+                               (and (evaluates-control-flow?)
+                                    (and (evaluates-multiple-let-bindings?)
+                                         (and (expands-variadic-macro?)
+                                              (and (evaluates-returned-closure?)
+                                                   (and (evaluates-computed-collection?)
+                                                        (and (expands-dynamic-helper?)
+                                                             (and (expands-core-when?)
+                                                                  (and (expands-core-and?)
+                                                                       (and (expands-core-when-do?)
+                                                                            (and (expands-core-cond?)
+                                                                                 (and (expands-core-thread-first?)
+                                                                                      (and (expands-core-for?)
+                                                                                           (rejects-wrong-arity?))))))))))))))))))
+    0
+    1))

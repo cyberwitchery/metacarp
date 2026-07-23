@@ -1,0 +1,373 @@
+(load "../carp-compiler.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn contains-text? [text fragment]
+  (Int.>= (String.index-of-string text fragment) 0))
+
+(defn compiles-source-through-expansion? []
+  (match (CarpCompiler.compile-source "(defmacro pass [x] x)
+(register int-inc (Fn [Int] Int) \"int_inc\")
+(defn increment [x] (pass (int-inc x)))
+(increment 1)") (Result.Success c)
+      (and (contains-text? &c "#include <core.h>")
+           (and (contains-text? &c "return int_inc(")
+                (and
+                  (contains-text? &c "int main(int argc, char** argv) {")
+                  (contains-text? &c "(1);")))) (Result.Error _) false))
+
+(defn compiles-loaded-source-registry? []
+  (let [sources [(ModuleSource.init (String.copy "root.carp")
+                                    (String.copy "root.carp")
+                                    (String.copy "(load \"defs.carp\")
+(twice 1)"))
+                 (ModuleSource.init (String.copy "defs.carp")
+                                    (String.copy "defs.carp")
+                                    (String.copy
+                                      "(register int-inc (Fn [Int] Int) \"int_inc\")
+(defn twice [x] (int-inc (int-inc x)))"))]
+        root (String.copy "root.carp")]
+    (Result.success? &(CarpCompiler.compile-sources &sources &root))))
+
+(defn preserves-system-includes? []
+  (match (CarpCompiler.compile-source "(system-include \"assert.h\")
+1") (Result.Success c) (contains-text? &c "#include <assert.h>") (Result.Error _)
+      false))
+
+(defn compiles-scalar-global-values? []
+  (match (CarpCompiler.compile-source "(def answer 42)
+(deftemplate emit (Fn [Int] ()) \"void $NAME(int value)\" \"$DECL { (void)value; }\")
+(emit answer)") (Result.Success c)
+      (let [symbol (CAbi.mangle "answer" &(Type.integer))]
+        (and
+          (contains-text? &c
+                          &(String.concat
+                            &[@"extern int " (String.copy &symbol) @";"]))
+          (contains-text? &c
+                          &(String.concat
+                            &[@"int " (String.copy &symbol) @" = 42;"])))) (Result.Error _)
+      false))
+
+(defn compiles-runtime-global-initializers? []
+  (match (CarpCompiler.compile-source
+      "(register inc (Fn [Int] Int) \"increment\")
+(register less? (Fn [Int Int] Bool) \"less\")
+(def answer
+  (let [value 40]
+    (do
+      (while (less? value 42)
+        (set! value (inc value)))
+      (if (less? value 43) value 0))))
+answer")
+    (Result.Success c)
+      (let [symbol (CAbi.mangle "answer" &(Type.integer))]
+        (and (contains-text? &c "while (less(")
+             (and
+               (contains-text? &c
+                               &(String.concat &[(String.copy &symbol) @" = L"]))
+               (contains-text? &c "  carp_init_globals(argc, argv);"))))
+    (Result.Error _) false))
+
+(defn reports-phase-errors? []
+  (and
+    (match (CarpCompiler.compile-source "(")
+      (Result.Error error) (= (CompileError.phase &error) "parse")
+      (Result.Success _) false)
+    (match (CarpCompiler.compile-source
+        "(register use-len (Fn [Int] Int) \"use_len\")
+(use-len true)")
+      (Result.Error error) (= (CompileError.phase &error) "infer")
+      (Result.Success _) false)))
+
+(defn emits-managed-delete? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(defn drop-it [] (let [w (make-widget)] 0))
+(drop-it)") (Result.Success c)
+      (and (contains-text? &c "= make_widget();")
+           (contains-text? &c "widget_delete(")) (Result.Error _) false))
+
+(defn compiles-managed-return-with-root-cleanup? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(defn keep-it [] (let [w (make-widget)] w))
+(keep-it)") (Result.Success c)
+      (and (contains-text? &c "return w") (contains-text? &c "widget_delete(")) (Result.Error _)
+      false))
+
+(defn compiles-managed-parameter-cleanup? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(defn dropp [w] 0)
+(dropp (make-widget))") (Result.Success c)
+      (and (contains-text? &c "(Widget ") (contains-text? &c "widget_delete(")) (Result.Error _)
+      false))
+
+(defn compiles-discarded-temporary-cleanup? []
+  ;; a do-statement must be Unit (as in the reference), so the discarded owned
+  ;; value lives inside a unit-typed let statement.
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(defn f [] (do (let [w (make-widget)] ()) 0))
+(f)") (Result.Success c)
+      (and (contains-text? &c "= make_widget();")
+           (and (contains-text? &c "widget_delete(")
+                (contains-text? &c "return 0;"))) (Result.Error _) false))
+
+(defn compiles-match-branch-cleanup? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(deftype Flag (On []) (Off []))
+(defn f [flag] (match flag (Flag.On) (let [w (make-widget)] 0) (Flag.Off) 0))
+(f (Flag.On))") (Result.Success c)
+      (and (contains-text? &c "= make_widget();")
+           (contains-text? &c "widget_delete(")) (Result.Error _) false))
+
+(defn derives-managed-deftype-deleter? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(deftype Boxx [contents Widget])
+(register box-it (Fn [Widget] Boxx) \"box_it\")
+(defn drop-box [] (let [b (box-it (make-widget))] 0))
+(drop-box)") (Result.Success c)
+      (and (contains-text? &c "Boxx_x46_delete")
+           (contains-text? &c "widget_delete(")) (Result.Error _) false))
+
+(defn derives-sum-deftype-deleter? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(deftype Thing (Full [Widget]) (Empty []))
+(register make-full (Fn [Widget] Thing) \"make_full\")
+(defn drop-thing [] (let [t (make-full (make-widget))] 0))
+(drop-thing)") (Result.Success c)
+      (and (contains-text? &c "Thing_x46_delete")
+           (and (contains-text? &c "widget_delete(")
+                (contains-text? &c "tag == 1"))) (Result.Error _) false))
+
+(defn derives-generic-deftype-deleter? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(deftype (Maybe a) (Just [a]) (Nothing []))
+(defn drop-maybe [] (let [m (Maybe.Just (make-widget))] 0))
+(drop-maybe)") (Result.Success c)
+      (and (contains-text? &c "Maybe_x46_delete")
+           (contains-text? &c "widget_delete(")) (Result.Error _) false))
+
+(defn derives-mixed-generic-deleter? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(deftype (Pair a b) (Init [a b]))
+(register mk-pair (Fn [Widget Int] (Pair Widget Int)) \"mk_pair\")
+(defn drop-pair [] (let [p (mk-pair (make-widget) 3)] 0))
+(drop-pair)") (Result.Success c)
+      (and (contains-text? &c "Pair_x46_delete")
+           (and (contains-text? &c "int field1")
+                (contains-text? &c "widget_delete("))) (Result.Error _) false))
+
+(defn lowers-by-reference-match? []
+  (match (CarpCompiler.compile-source "(deftype Point [x Int])
+(defn get-x [p] (match-ref p (Point.init px) (deref px)))
+(get-x &(Point.init 5))") (Result.Success c)
+      (and (contains-text? &c "(*match_0).tag") (contains-text? &c "int* L")) (Result.Error _)
+      false))
+
+(defn derives-managed-deftype-copier? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(defmodule Widget (register copy (Fn [(Ref Widget)] Widget) \"widget_copy\"))
+(implements copy Widget.copy)
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(deftype Boxx [contents Widget])
+(register box-it (Fn [Widget] Boxx) \"box_it\")
+(defn dup [b] (copy &b))
+(dup (box-it (make-widget)))") (Result.Success c)
+      (and (contains-text? &c "Boxx_x46_copy")
+           (and (contains-text? &c "widget_copy(")
+                (contains-text? &c "= &(*match_0)"))) (Result.Error _) false))
+
+(defn derives-generic-deftype-copier? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(defmodule Widget (register copy (Fn [(Ref Widget)] Widget) \"widget_copy\"))
+(implements copy Widget.copy)
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(deftype (Pair a b) (Init [a b]))
+(register mk-pair (Fn [Widget Int] (Pair Widget Int)) \"mk_pair\")
+(defn dup-pair [p] (copy &p))
+(dup-pair (mk-pair (make-widget) 7))") (Result.Success c)
+      (and (contains-text? &c "Pair_x46_copy")
+           (and (contains-text? &c "widget_copy(") (contains-text? &c "deref"))) (Result.Error _)
+      false))
+
+(defn compiles-polymorphic-nominal-applications? []
+  (match (CarpCompiler.compile-source "(deftype (Choice a) (Some [a]) (None))
+(defn int-code [choice] (match choice (Choice.Some value) value (Choice.None) 0))
+(defn bool-code [choice] (match choice (Choice.Some value) (if value 84 70) (Choice.None) 78))
+(int-code (Choice.Some 73))
+(bool-code (Choice.Some true))") (Result.Success c)
+      (let [int-name (CAbi.nominal-name "Choice" &[(Box.init (Type.integer))])
+            bool-name (CAbi.nominal-name "Choice" &[(Box.init (Type.boolean))])]
+        (and
+          (contains-text? &c
+                          &(String.concat
+                            &[@"typedef struct " (String.copy &int-name)]))
+          (and
+            (contains-text? &c
+                            &(String.concat
+                              &[@"typedef struct " (String.copy &bool-name)]))
+            (and (contains-text? &c "int member_0;")
+                 (contains-text? &c "bool member_0;"))))) (Result.Error _) false))
+
+(defn compiles-nested-constructor-patterns? []
+  (match (CarpCompiler.compile-source "(deftype Inner (Value [Int]) (Empty))
+(deftype Outer (Wrap [Inner]) (Other))
+(defn code [outer] (match outer (Outer.Wrap (Inner.Value value)) value (Outer.Wrap (Inner.Empty)) 69 (Outer.Other) 79))
+(code (Outer.Wrap (Inner.Value 78)))") (Result.Success c)
+      (and
+        (contains-text? &c
+                        "match_0.tag == 0 && (match_0.data.variant_0.member_0.tag == 0)")
+        (contains-text? &c
+                        "match_0.data.variant_0.member_0.data.variant_0.member_0;")) (Result.Error _)
+      false))
+
+(defn compiles-signature-only-nominal-layouts? []
+  (match (CarpCompiler.compile-source "(deftype Inner (Value [Int]) (Empty))
+(deftype Outer (Wrap [Inner]) (Other))
+(deftemplate make-outer (Fn [] Outer) \"Outer $NAME(void)\" \"$DECL { Outer outer; return outer; }\")
+(defn code [outer] (match outer (Outer.Wrap (Inner.Value value)) value (Outer.Wrap (Inner.Empty)) 69 (Outer.Other) 79))
+(code (make-outer))") (Result.Success c)
+      (let [inner-at (String.index-of-string &c "typedef struct Inner")
+            outer-at (String.index-of-string &c "typedef struct Outer")]
+        (and (Int.>= inner-at 0)
+             (and (Int.> outer-at inner-at)
+                  (contains-text? &c "Inner member_0;")))) (Result.Error _)
+      false))
+
+(defn loads-real-core-gensym? []
+  ;; quasiquote is real Core code now, so the backtick in the probe macro
+  ;; needs Quasiquote.carp (and the List/Dynamic helpers its expansion calls)
+  ;; loaded exactly like Gensym.carp itself.
+  (let [macros-source (IO.unsafe-read-file "../../carp/core/Macros.carp")
+        gensym-source (IO.unsafe-read-file "../../carp/core/Gensym.carp")
+        quasiquote-source (IO.unsafe-read-file "../../carp/core/Quasiquote.carp")
+        list-source (IO.unsafe-read-file "../../carp/core/List.carp")
+        dynamic-source (IO.unsafe-read-file "../../carp/core/Dynamic.carp")
+        sources [(ModuleSource.init (String.copy "root.carp")
+                                    (String.copy "root.carp")
+                                    (String.copy "(load \"Macros.carp\")
+(load \"List.carp\")
+(load \"Gensym.carp\")
+(load \"Quasiquote.carp\")
+(load \"Dynamic.carp\")
+(defmacro answer [] (let [g (gensym)] `(let [%g 42] %g)))
+(answer)"))
+                 (ModuleSource.init (String.copy "Macros.carp")
+                                    (String.copy "Macros.carp")
+                                    macros-source)
+                 (ModuleSource.init (String.copy "Gensym.carp")
+                                    (String.copy "Gensym.carp")
+                                    gensym-source)
+                 (ModuleSource.init (String.copy "Quasiquote.carp")
+                                    (String.copy "Quasiquote.carp")
+                                    quasiquote-source)
+                 (ModuleSource.init (String.copy "List.carp")
+                                    (String.copy "List.carp")
+                                    list-source)
+                 (ModuleSource.init (String.copy "Dynamic.carp")
+                                    (String.copy "Dynamic.carp")
+                                    dynamic-source)]
+        root (String.copy "root.carp")
+        ;; the driver marks Dynamic as a prelude so quasiquote's helpers
+        ;; resolve bare; this standalone registry compile mirrors that.
+        config (ExpandConfig.init [@"Dynamic"])]
+    (match (CarpCompiler.compile-sources-with &sources &root &config)
+      (Result.Success c) (contains-text? &c "42")
+      (Result.Error _) false)))
+
+(deftest t
+  (assert-true t
+    (compiles-source-through-expansion?)
+    "compiler composes expansion through C assembly")
+  (assert-true t
+    (compiles-loaded-source-registry?)
+    "compiler composes deterministic module loading")
+  (assert-true t
+    (preserves-system-includes?)
+    "compiler preserves source-requested system includes")
+  (assert-true t
+    (compiles-scalar-global-values?)
+    "compiler emits reachable scalar global values")
+  (assert-true t
+    (compiles-runtime-global-initializers?)
+    "compiler emits startup initialization for nonconstant scalar globals")
+  (assert-true t (reports-phase-errors?) "compiler reports the rejecting phase")
+  (assert-true t
+    (emits-managed-delete?)
+    "an owned local is initialized and its scheduled deleter is emitted")
+  (assert-true t
+    (compiles-managed-return-with-root-cleanup?)
+    "an owned value is moved out through a managed return and deleted at the root")
+  (assert-true t
+    (compiles-managed-parameter-cleanup?)
+    "an owned parameter the body does not consume is deleted at function exit")
+  (assert-true t
+    (compiles-discarded-temporary-cleanup?)
+    "an owned temporary discarded mid-body is deleted at the discard point")
+  (assert-true t
+    (compiles-match-branch-cleanup?)
+    "an owned local inside a match branch is deleted before the branch returns")
+  (assert-true t
+    (derives-managed-deftype-deleter?)
+    "a deftype owning memory through a field gets a derived deleter that frees it")
+  (assert-true t
+    (derives-sum-deftype-deleter?)
+    "a sum deftype gets a derived deleter with a branch per constructor")
+  (assert-true t
+    (derives-generic-deftype-deleter?)
+    "a generic deftype instance gets a per-instance derived deleter")
+  (assert-true t
+    (derives-mixed-generic-deleter?)
+    "a mixed generic instance deletes only its managed field, binding the rest")
+  (assert-true t
+    (lowers-by-reference-match?)
+    "a match-ref lowers to pointer member access with reference bindings")
+  (assert-true t
+    (derives-managed-deftype-copier?)
+    "a managed deftype gets a derived copy that deep-copies managed fields")
+  (assert-true t
+    (derives-generic-deftype-copier?)
+    "a mixed generic instance gets a copy that copies managed and blits the rest")
+  (assert-true t
+    (compiles-polymorphic-nominal-applications?)
+    "compiler specializes distinct polymorphic nominal applications")
+  (assert-true t
+    (compiles-nested-constructor-patterns?)
+    "compiler preserves and lowers nested constructor patterns")
+  (assert-true t
+    (compiles-signature-only-nominal-layouts?)
+    "compiler discovers dependency-ordered nominal layouts from signatures")
+  (assert-true t
+    (loads-real-core-gensym?)
+    "a user macro drives gensym loaded from the reference Core Gensym.carp"))

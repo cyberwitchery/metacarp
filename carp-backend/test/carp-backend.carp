@@ -1,0 +1,663 @@
+(load "../carp-backend.carp")
+(load "../../carp-resolve/carp-resolve.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn lower-source [source]
+  (match (Surface.parse source)
+    (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core)
+          (match (Infer.module &core)
+            (Result.Success inferred)
+              (match (Specialize.module &core &inferred)
+                (Result.Success specialized)
+                  (BackendLower.module &specialized
+                                       &(the (Array ClosureFunction) []))
+                (Result.Error error)
+                  (Result.Error
+                    (BackendError.init @(SpecializeError.message &error))))
+            (Result.Error error)
+              (Result.Error (BackendError.init @(InferError.message &error))))
+        (Result.Error error)
+          (Result.Error (BackendError.init @(ResolveError.message &error))))
+    (Result.Error _) (Result.Error (BackendError.init @"parse error"))))
+
+(defn lowers-concrete-function-declarations? []
+  (match (lower-source "(defn forward [x] (identity x))
+(defn identity [x] x)
+(forward 1)") (Result.Success backend)
+      (and
+        (Int.= 2 (Array.length (BackendModule.declarations &backend)))
+        (Result.success? &(CBackend.prototypes &backend))) (Result.Error _)
+      false))
+
+(defn contains-text? [text fragment]
+  (Int.>= (String.index-of-string text fragment) 0))
+
+(defn renders-unmanaged-user-function-bodies? []
+  (match (lower-source "(defn identity [x] x)
+(defn forward [x] (identity x))
+(defn keep [x] (do () x))
+(defn choose [b x y] (if b x y))
+(forward 1)
+(keep 2)
+(choose true 3 4)") (Result.Success backend)
+      (match (CBackend.function-definitions &backend)
+        (Result.Success rendered)
+          (and (contains-text? &rendered "return x;")
+               (and (contains-text? &rendered "((void)0);
+  return x;") (and (contains-text? &rendered "if (")
+                   (and (contains-text? &rendered "} else {")
+                        (and
+                          (contains-text? &rendered "__F1_1_IZ1_I(")
+                          (contains-text? &rendered ") {
+  return C"))))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn renders-scalar-global-values? [] (match (lower-source "(def answer 42)
+(deftemplate emit (Fn [Int] ()) \"void $NAME(int value)\" \"$DECL { (void)value; }\")
+(emit answer)") (Result.Success backend)
+      (let [symbol (CAbi.mangle "answer" &(Type.integer))]
+        (match (CBackend.executable-translation-unit &backend)
+          (Result.Success c)
+            (and
+              (contains-text? &c
+                              &(String.concat
+                                &[@"extern int " (String.copy &symbol) @";"]))
+              (and
+                (contains-text? &c
+                                &(String.concat
+                                  &[@"int " (String.copy &symbol) @" = 42;"]))
+                (contains-text? &c
+                                &(String.concat &[@"("
+                                                  (String.copy &symbol)
+                                                  @");"]))))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(defn renders-runtime-global-initializers? []
+  (match (lower-source "(register inc (Fn [Int] Int) \"increment\")
+(def answer (inc 41))
+answer") (Result.Success backend)
+      (let [symbol (CAbi.mangle "answer" &(Type.integer))]
+        (match (CBackend.executable-translation-unit &backend)
+          (Result.Success c)
+            (and
+              (contains-text? &c
+                              &(String.concat &[@"int "
+                                                (String.copy &symbol)
+                                                @";"]))
+              (and
+                (contains-text? &c
+                                &(String.concat
+                                  &[(String.copy &symbol) @" = increment(41);"]))
+                (contains-text? &c "  carp_init_globals(argc, argv);")))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(defn orders-runtime-global-initializers? []
+  (match (lower-source "(register inc (Fn [Int] Int) \"increment\")
+(def answer (read-later))
+(def later (inc 40))
+(defn read-later [] later)
+(deftemplate emit (Fn [Int] ()) \"void $NAME(int value)\" \"$DECL { (void)value; }\")
+(emit answer)") (Result.Success backend)
+      (let [answer-symbol (CAbi.mangle "answer" &(Type.integer))
+            later-symbol (CAbi.mangle "later" &(Type.integer))]
+        (match (CBackend.global-initializers &backend)
+          (Result.Success rendered)
+            (let [answer-at (String.index-of-string &rendered
+                                                    &(String.concat &[(String.copy &answer-symbol)
+                                                                      @" = "]))
+                  later-at (String.index-of-string &rendered
+                                                   &(String.concat &[(String.copy &later-symbol)
+                                                                     @" = "]))]
+              (and (Int.>= later-at 0) (Int.> answer-at later-at)))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(defn stabilizes-cyclic-global-initializers? []
+  (match (lower-source "(sig first Int)
+(sig second Int)
+(def first second)
+(def second first)
+(deftemplate emit (Fn [Int] ()) \"void $NAME(int value)\" \"$DECL { (void)value; }\")
+(emit first)") (Result.Success backend)
+      (let [first-symbol (CAbi.mangle "first" &(Type.integer))
+            second-symbol (CAbi.mangle "second" &(Type.integer))]
+        (match (CBackend.global-initializers &backend)
+          (Result.Success rendered)
+            (let [first-at (String.index-of-string &rendered
+                                                   &(String.concat &[(String.copy &first-symbol)
+                                                                     @" = "]))
+                  second-at (String.index-of-string &rendered
+                                                    &(String.concat &[(String.copy &second-symbol)
+                                                                      @" = "]))]
+              (and (Int.>= first-at 0) (Int.> second-at first-at)))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(defn lowers-managed-user-function-bodies? []
+  (match (lower-source "(defn echo [x] x)
+(echo \"hello\")") (Result.Success backend)
+      (match (CBackend.function-definitions &backend)
+        (Result.Success rendered) (contains-text? &rendered "echo")
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn renders-matching-runtime-global-initializers? []
+  (match (lower-source "(deftype Choice (Some [Int]) (None))
+(def answer
+  (match (Choice.Some 42)
+    (Choice.Some value) value
+    (Choice.None) 0))
+answer") (Result.Success backend)
+      (let [symbol (CAbi.mangle "answer" &(Type.integer))]
+        (match (CBackend.global-initializers &backend)
+          (Result.Success rendered)
+            (and (contains-text? &rendered "match_")
+                 (and (contains-text? &rendered ".tag == 0")
+                      (and
+                        (contains-text? &rendered
+                                        &(String.concat &[(String.copy &symbol)
+                                                          @" = L"]))
+                        (contains-text? &rendered
+                                        &(String.concat &[(String.copy &symbol)
+                                                          @" = 0;"])))))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(defn renders-structured-runtime-global-initializers? []
+  (match (lower-source "(register inc (Fn [Int] Int) \"increment\")
+(register positive? (Fn [Int] Bool) \"positive\")
+(register less? (Fn [Int Int] Bool) \"less\")
+(def answer
+  (let [value (inc 39)]
+    (do
+      (while (less? value 42)
+        (set! value (inc value)))
+      (if (positive? value) value 0))))
+answer") (Result.Success backend)
+      (let [symbol (CAbi.mangle "answer" &(Type.integer))]
+        (match (CBackend.global-initializers &backend)
+          (Result.Success rendered)
+            (and
+              (contains-text? &rendered " = increment(39);")
+              (and
+                (contains-text? &rendered " = increment(L")
+                (and
+                  (contains-text? &rendered "while (less(L")
+                  (and
+                    (contains-text? &rendered "if (positive(L")
+                    (and
+                      (contains-text? &rendered
+                                      &(String.concat &[(String.copy &symbol)
+                                                        @" = L"]))
+                      (contains-text? &rendered
+                                      &(String.concat &[(String.copy &symbol)
+                                                        @" = 0;"])))))))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(defn renders-unit-user-function-bodies? []
+  (match (lower-source "(defn noop [] ())
+(noop)") (Result.Success backend)
+      (match (CBackend.function-definitions &backend)
+        (Result.Success rendered) (contains-text? &rendered "((void)0);
+  return;")
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn renders-unmanaged-scalar-literals? []
+  (match (lower-source "(defn byte-value [] 1b)
+(defn long-value [] 2l)
+(defn float-value [] 1.5f)
+(defn double-value [] 2.5)
+(defn char-value [] \\a)
+(byte-value)
+(long-value)
+(float-value)
+(double-value)
+(char-value)") (Result.Success backend)
+      (match (CBackend.function-definitions &backend)
+        (Result.Success rendered)
+          (and (contains-text? &rendered "return 1;")
+               (and (contains-text? &rendered "return 2LL;")
+                    (and
+                      (contains-text? &rendered "return 1.5f;")
+                      (and (contains-text? &rendered "return 2.5")
+                           (contains-text? &rendered "return 97;")))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn renders-unmanaged-bindings-and-control-flow? []
+  (match (lower-source "(register positive? (Fn [Int] Bool) \"positive\")
+(register dec (Fn [Int] Int) \"decrement\")
+(defn reset [x] (let [y x] (do (set! y 0) y)))
+(defn down [x] (let [y x] (do (while (positive? y) (set! y (dec y))) y)))
+(defn stop [x] (do (while true (break)) x))
+(reset 1)
+(down 2)
+(stop 3)") (Result.Success backend)
+      (match (CBackend.function-definitions &backend)
+        (Result.Success rendered)
+          (and (contains-text? &rendered "int y")
+               (and (contains-text? &rendered " = 0;")
+                    (and
+                      (contains-text? &rendered "while (positive(")
+                      (and
+                        (contains-text? &rendered " = decrement(")
+                        (contains-text? &rendered "break;")))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn assembles-c-translation-unit? []
+  (match (lower-source "(defn identity [x] x)
+(identity 1)") (Result.Success backend)
+      (match (CBackend.translation-unit &backend)
+        (Result.Success c)
+          (and (contains-text? &c "#include <core.h>")
+               (and
+                 (contains-text? &c "int C8_identity__F1_1_IZ1_I(")
+                 (and (contains-text? &c ");") (contains-text? &c ") {
+  return x;"))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn emits-ownerless-roots-in-entry-wrapper? []
+  (match (lower-source "(defn identity [x] x)
+(identity 1)") (Result.Success backend)
+      (match (CBackend.executable-translation-unit &backend)
+        (Result.Success c)
+          (and
+            (contains-text? &c "int main(int argc, char** argv) {")
+            (and
+              (contains-text? &c "C8_identity__F1_1_IZ1_I(1);")
+              (contains-text? &c "  return 0;
+}")))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn emits-unmanaged-nominal-construction-and-match? []
+  (match (lower-source "(deftype Signal (Code [Bool Int]) (End))
+(defn code [signal] (match signal (Signal.Code _ value) value (Signal.End) 0))
+(code (Signal.Code true 71))") (Result.Success backend)
+      (match (CBackend.executable-translation-unit &backend)
+        (Result.Success c)
+          (and
+            (contains-text? &c "typedef struct Signal")
+            (and (contains-text? &c "value.tag = 0;")
+                 (and (contains-text? &c ".member_1 = arg1;")
+                      (and (contains-text? &c ".tag == 0")
+                           (and (contains-text? &c ".tag == 1")
+                                (and (contains-text? &c ".member_1;")
+                                     (contains-text? &c "return ")))))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn emits-distinct-polymorphic-nominal-layouts? []
+  (match (lower-source "(deftype (Choice a) (Some [a]) (None))
+(defn int-code [choice] (match choice (Choice.Some value) value (Choice.None) 0))
+(defn bool-code [choice] (match choice (Choice.Some value) (if value 84 70) (Choice.None) 78))
+(int-code (Choice.Some 73))
+(bool-code (Choice.Some true))") (Result.Success backend)
+      (match (CBackend.executable-translation-unit &backend)
+        (Result.Success c)
+          (let [int-name (CAbi.nominal-name "Choice"
+                                            &[(Box.init (Type.integer))])
+                bool-name (CAbi.nominal-name "Choice"
+                                             &[(Box.init (Type.boolean))])]
+            (and (/= &int-name &bool-name)
+                 (and
+                   (contains-text? &c
+                                   &(String.concat
+                                     &[@"typedef struct "
+                                       (String.copy &int-name)]))
+                   (and
+                     (contains-text? &c
+                                     &(String.concat
+                                       &[@"typedef struct "
+                                         (String.copy &bool-name)]))
+                     (and (contains-text? &c "int member_0;")
+                          (contains-text? &c "bool member_0;"))))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn lowers-parameterized-primitives? []
+  (match (lower-source "(register make-box (Fn [Int] (Box Int)))
+(register int-copy (Fn [&Int] Int))
+(implements copy int-copy)
+(copy &(make-box 1))") (Result.Success backend)
+      (let-do [found false
+               declarations (BackendModule.declarations &backend)
+               n (Array.length declarations)]
+        (for [i 0 n]
+          (match-ref (Array.unsafe-nth declarations i)
+            (BackendDeclaration.Template _ _ template dependencies)
+              (match-ref template
+                (PrimitiveTemplate.BoxCopy _)
+                  (when (Int.= 1 (Array.length dependencies)) (set! found true))
+                _ ())
+            _ ()))
+        found) (Result.Error _) false))
+
+(defn renders-c-abi-types? []
+  (let [signature (Type.function
+          [(Box.init
+             (Type.reference
+               (Type.named "Box" [(Box.init (Type.integer))])
+               (Type.lifetime 0)))]
+          (Type.named "Ptr" [(Box.init (Type.integer))]))
+        declaration (BackendDeclaration.Template (String.copy "Box.copy")
+                                                 (Box.init signature)
+                                                 (PrimitiveTemplate.BoxCopy (PrimitiveRegistry.reference 0
+                                                                                                         "copy"))
+                                                 [])]
+    (match (CBackend.prototype &declaration)
+      (Result.Success rendered) (= &rendered "int* Box_copy(int** arg0);")
+      (Result.Error _) false)))
+
+(defn preserves-safe-system-includes? []
+  (match (lower-source "(system-include \"assert.h\")
+(system-include \"assert.h\")
+1") (Result.Success backend)
+      (match (CBackend.system-includes &backend)
+        (Result.Success rendered) (= &rendered "#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <core.h>
+#include <carp_memory.h>
+#include <assert.h>
+")
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn rejects-unsafe-system-includes? []
+  (let [backend (BackendModule.init []
+                                    []
+                                    []
+                                    [(String.copy "bad>path")]
+                                    (the (Array ClosureFunction) []))]
+    (Result.error? &(CBackend.system-includes &backend))))
+
+(defn renders-void-parameter-list? []
+  (let [signature (Type.function [] (Type.unit))
+        declaration (BackendDeclaration.Intrinsic (String.copy "tick")
+                                                  (Box.init signature)
+                                                  (Maybe.Nothing))]
+    (match (CBackend.prototype &declaration)
+      (Result.Success rendered) (= &rendered "void tick(void);")
+      (Result.Error _) false)))
+
+(defn renders-box-copy-template? []
+  (match (lower-source "(register make-box (Fn [Int] (Box Int)))
+(register int-copy (Fn [&Int] Int))
+(implements copy int-copy)
+(copy &(make-box 1))") (Result.Success backend)
+      (let-do [rendered (String.copy "")
+               symbol (String.copy "")
+               dependency-symbol (String.copy "")
+               declarations (BackendModule.declarations &backend)
+               n (Array.length declarations)]
+        (for [i 0 n]
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (match-ref declaration
+              (BackendDeclaration.Template declaration-symbol
+                                           _
+                                           template
+                                           dependencies)
+                (match-ref template
+                  (PrimitiveTemplate.BoxCopy _)
+                    (do
+                      (set! symbol (String.copy declaration-symbol))
+                      (when (Int.= 1 (Array.length dependencies))
+                        (set! dependency-symbol
+                              (String.copy
+                                (BackendDependency.symbol (Array.unsafe-nth dependencies
+                                                                            0)))))
+                      (match (CBackend.template-definition declaration)
+                        (Result.Success definition) (set! rendered definition)
+                        (Result.Error _) ()))
+                  _ ())
+              _ ())))
+        (let [expected (String.concat
+                &[@"int* " (String.copy &symbol) @"(int** arg0) {
+  int* copy = CARP_MALLOC(sizeof(int));
+  *copy = " (String.copy &dependency-symbol) @"(*arg0);
+  return copy;
+}"])]
+          (= &rendered &expected))) (Result.Error _) false))
+
+(defn renders-pointer-copy-template? []
+  (let [pointer-type (Type.named "Ptr" [(Box.init (Type.integer))])
+        signature (Type.function
+          [(Box.init
+             (Type.reference (MonoType.copy &pointer-type) (Type.lifetime 0)))]
+          pointer-type)
+        declaration (BackendDeclaration.Template (String.copy "Pointer.copy")
+                                                 (Box.init signature)
+                                                 (PrimitiveTemplate.PointerCopy)
+                                                 [])]
+    (match (CBackend.template-definition &declaration)
+      (Result.Success rendered) (= &rendered "int* Pointer_copy(int** arg0) {
+  return *arg0;
+}")
+      (Result.Error _) false)))
+
+(defn renders-int-comparison-template? []
+  (match (lower-source "(Int./= 1 2)")
+    (Result.Success backend)
+      (match (CBackend.template-definitions &backend)
+        (Result.Success rendered)
+          (contains-text? &rendered "return arg0 != arg1;")
+        (Result.Error _) false)
+    (Result.Error _) false))
+
+(defn renders-function-copy-template? []
+  (match (lower-source "(copy &(the (Fn [Int] Int) (fn [x] x)))")
+    (Result.Success backend)
+      (let-do [rendered (String.copy "")
+               symbol (String.copy "")
+               declarations (BackendModule.declarations &backend)
+               n (Array.length declarations)]
+        (for [i 0 n]
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (match-ref declaration
+              (BackendDeclaration.Template declaration-symbol _ template _)
+                (match-ref template
+                  (PrimitiveTemplate.FunctionCopy arity)
+                    (when-do (Int.= 1 @arity)
+                      (set! symbol (String.copy declaration-symbol))
+                      (match (CBackend.template-definition declaration)
+                        (Result.Success definition) (set! rendered definition)
+                        (Result.Error _) ()))
+                  _ ())
+              _ ())))
+        (= &rendered
+           &(String.concat &[@"Lambda " (String.copy &symbol) @"(Lambda* arg0) {
+  if(arg0->env) {
+    Lambda copy;
+    copy.callback = arg0->callback;
+    copy.delete = arg0->delete;
+    copy.copy = arg0->copy;
+    copy.env = ((void*(*)(void*))arg0->copy)(arg0->env);
+    return copy;
+  }
+  return *arg0;
+}"])))
+    (Result.Error _) false))
+
+(defn lowers-source-builtin-payloads? []
+  (match (lower-source "(register inc (Fn [Int] Int) \"external_inc\")
+(deftemplate pass (Fn [Int] Int) \"int $NAME(int x)\" \"$DECL { return x; }\")
+(inc 1)
+(pass 1)") (Result.Success backend)
+      (let-do [found-external false
+               found-template false
+               declarations (BackendModule.declarations &backend)
+               n (Array.length declarations)]
+        (for [i 0 n]
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (match-ref declaration
+              (BackendDeclaration.Intrinsic symbol _ external-name)
+                (match-ref external-name
+                  (Maybe.Just name)
+                    (when (and (= symbol "external_inc")
+                               (and (= name "external_inc")
+                                    (match (CBackend.prototype declaration)
+                                      (Result.Success rendered) (= &rendered "")
+                                      (Result.Error _) false)))
+                      (set! found-external true))
+                  (Maybe.Nothing) ())
+              (BackendDeclaration.SourceTemplate symbol
+                                                 _
+                                                 _
+                                                 source-declaration
+                                                 source-body)
+                (when (and (= symbol "C4_pass__F1_1_IZ1_I")
+                           (and
+                             (= source-declaration "int $NAME(int x)")
+                             (= source-body "$DECL { return x; }")))
+                  (set! found-template true))
+              _ ())))
+        (and found-external found-template)) (Result.Error _) false))
+
+(defn instantiates-source-template-placeholders? []
+  (match (lower-source
+      "(deftemplate pass (Fn [a] a) \"$a $NAME($a x) /* $argument */\" \"$DECL { return x; }\")
+(pass 1)")
+    (Result.Success backend)
+      (and
+        (match-ref (Array.unsafe-nth (BackendModule.declarations &backend) 0)
+          (BackendDeclaration.SourceTemplate _ _ _ _ _)
+            (match (CBackend.prototype
+                (Array.unsafe-nth (BackendModule.declarations &backend) 0))
+              (Result.Success rendered)
+                (= &rendered "int C4_pass__F1_1_IZ1_I(int x) /* $argument */;")
+              (Result.Error _) false)
+          _ false)
+        (match (CBackend.template-definitions &backend)
+          (Result.Success rendered)
+            (= &rendered
+               "int C4_pass__F1_1_IZ1_I(int x) /* $argument */ { return x; }")
+          (Result.Error _) false))
+    (Result.Error _) false))
+
+(defn emits-nested-unmanaged-constructor-patterns? []
+  (match (lower-source "(deftype Inner (Value [Int]) (Empty))
+(deftype Outer (Wrap [Inner]) (Other))
+(defn code [outer] (match outer (Outer.Wrap (Inner.Value value)) value (Outer.Wrap (Inner.Empty)) 69 (Outer.Other) 79))
+(code (Outer.Wrap (Inner.Value 78)))") (Result.Success backend)
+      (match (CBackend.executable-translation-unit &backend)
+        (Result.Success c)
+          (and
+            (contains-text? &c
+                            "match_0.tag == 0 && (match_0.data.variant_0.member_0.tag == 0)")
+            (contains-text? &c
+                            "match_0.data.variant_0.member_0.data.variant_0.member_0;"))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn discovers-signature-only-nominal-layouts? []
+  (match (lower-source "(deftype Inner (Value [Int]) (Empty))
+(deftype Outer (Wrap [Inner]) (Other))
+(deftemplate make-outer (Fn [] Outer) \"Outer $NAME(void)\" \"$DECL { Outer outer; return outer; }\")
+(defn code [outer] (match outer (Outer.Wrap (Inner.Value value)) value (Outer.Wrap (Inner.Empty)) 69 (Outer.Other) 79))
+(code (make-outer))") (Result.Success backend)
+      (let-do [has-constructor-declaration false
+               declarations (BackendModule.declarations &backend)
+               n (Array.length declarations)]
+        (for [i 0 n]
+          (match-ref (Array.unsafe-nth declarations i)
+            (BackendDeclaration.Constructor _ _ _)
+              (set! has-constructor-declaration true)
+            _ ()))
+        (match (CBackend.nominal-definitions &backend)
+          (Result.Success rendered)
+            (let [inner-at (String.index-of-string &rendered
+                                                   "typedef struct Inner")
+                  outer-at (String.index-of-string &rendered
+                                                   "typedef struct Outer")]
+              (and (not has-constructor-declaration)
+                   (and (Int.>= inner-at 0)
+                        (and (Int.> outer-at inner-at)
+                             (contains-text? &rendered "Inner member_0;")))))
+          (Result.Error _) false)) (Result.Error _) false))
+
+(deftest t
+  (assert-true t
+    (lowers-concrete-function-declarations?)
+    "backend lowering emits concrete function declarations")
+  (assert-true t
+    (renders-unmanaged-user-function-bodies?)
+    "C backend emits typed unmanaged user-function bodies")
+  (assert-true t
+    (renders-scalar-global-values?)
+    "C backend emits reachable scalar global definitions and references")
+  (assert-true t
+    (renders-runtime-global-initializers?)
+    "C backend lowers nonconstant scalar globals into startup assignments")
+  (assert-true t
+    (renders-structured-runtime-global-initializers?)
+    "C backend shares let, mutation, do, and if lowering with global initialization")
+  (assert-true t
+    (orders-runtime-global-initializers?)
+    "C backend orders scalar global initialization through function dependencies")
+  (assert-true t
+    (renders-matching-runtime-global-initializers?)
+    "C backend shares nominal match lowering with global initialization")
+  (assert-true t
+    (stabilizes-cyclic-global-initializers?)
+    "C backend gives cyclic scalar globals stable declaration order")
+  (assert-true t
+    (lowers-managed-user-function-bodies?)
+    "C backend lowers managed user-function passthrough bodies")
+  (assert-true t
+    (renders-unit-user-function-bodies?)
+    "C backend emits explicit returns for unit functions")
+  (assert-true t
+    (renders-unmanaged-scalar-literals?)
+    "C backend emits every unmanaged scalar literal")
+  (assert-true t
+    (renders-unmanaged-bindings-and-control-flow?)
+    "C backend emits unmanaged bindings, mutation, loops, and breaks")
+  (assert-true t
+    (assembles-c-translation-unit?)
+    "C backend assembles one translation unit")
+  (assert-true t
+    (preserves-safe-system-includes?)
+    "C backend preserves ordered, deduplicated system includes")
+  (assert-true t
+    (rejects-unsafe-system-includes?)
+    "C backend rejects injectable system include paths")
+  (assert-true t
+    (emits-ownerless-roots-in-entry-wrapper?)
+    "C backend emits ownerless roots in an explicit entry wrapper")
+  (assert-true t
+    (emits-unmanaged-nominal-construction-and-match?)
+    "C backend emits unmanaged nominal construction and match")
+  (assert-true t
+    (emits-distinct-polymorphic-nominal-layouts?)
+    "C backend specializes polymorphic nominal layouts structurally")
+  (assert-true t
+    (lowers-parameterized-primitives?)
+    "backend declarations retain parameterized primitive lowering")
+  (assert-true t
+    (renders-c-abi-types?)
+    "C prototypes use pointer-like Box and Ptr representations")
+  (assert-true t
+    (renders-void-parameter-list?)
+    "zero-argument C prototypes use an explicit void parameter")
+  (assert-true t
+    (renders-box-copy-template?)
+    "Box copy templates call their selected element-copy dependency")
+  (assert-true t
+    (renders-pointer-copy-template?)
+    "Pointer copy templates dereference without dependencies")
+  (assert-true t
+    (renders-int-comparison-template?)
+    "compiler-provided Int comparisons emit semantic template bodies")
+  (assert-true t
+    (renders-function-copy-template?)
+    "function copy templates preserve and duplicate closure environments")
+  (assert-true t
+    (lowers-source-builtin-payloads?)
+    "backend declarations retain external names and source templates")
+  (assert-true t
+    (instantiates-source-template-placeholders?)
+    "source templates instantiate type, name, and declaration placeholders")
+  (assert-true t
+    (emits-nested-unmanaged-constructor-patterns?)
+    "C backend lowers nested unmanaged constructor patterns")
+  (assert-true t
+    (discovers-signature-only-nominal-layouts?)
+    "C backend discovers dependency-ordered nominal layouts from signatures"))

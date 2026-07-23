@@ -1,0 +1,195 @@
+(doc FrameId "is a stable index into a compile-time environment's frame store.")
+(deftype FrameId [index Int])
+
+(doc CellId "is a stable index into a compile-time environment's cell store.")
+(deftype CellId [index Int])
+
+(doc CtEnvLookup "is the result of resolving one name. Ambiguity is explicit
+so callers never depend on import order.")
+(deftype CtEnvLookup
+  (Missing [])
+  (Found [CellId])
+  (Ambiguous []))
+
+(doc CtEnvBinding "maps a name in one frame to a mutable cell.")
+(deftype CtEnvBinding [name String
+                       cell CellId])
+
+(doc CtEnvFrame "is one lexical compile-time scope. Parent and import
+relationships use stable IDs, so extending an environment does not copy
+bindings or values.")
+(deftype CtEnvFrame
+  [parent (Maybe FrameId)
+   imports (Array FrameId)
+   bindings (Array CtEnvBinding)])
+
+(doc CtEnvCell "holds one mutable compile-time value.")
+(deftype (CtEnvCell a) [value (Box a)])
+
+(doc CtEnvStore "owns all frames and cells for one compile-time session.")
+(deftype (CtEnvStore a) [frames (Array CtEnvFrame)
+                         cells (Array (CtEnvCell a))])
+
+(defmodule CtEnv
+  (doc empty "creates an environment with no frames or cells.")
+  (defn empty [] (CtEnvStore.init [] []))
+
+  (private valid-frame?)
+  (hidden valid-frame?)
+  (defn valid-frame? [store frame]
+    (let [index @(FrameId.index frame)]
+      (and (Int.>= index 0)
+           (Int.< index (Array.length (CtEnvStore.frames store))))))
+
+  (private valid-cell?)
+  (hidden valid-cell?)
+  (defn valid-cell? [store cell]
+    (let [index @(CellId.index cell)]
+      (and (Int.>= index 0)
+           (Int.< index (Array.length (CtEnvStore.cells store))))))
+
+  (doc root! "allocates a root frame.")
+  (defn root! [store]
+    (let-do [id (FrameId.init (Array.length (CtEnvStore.frames store)))]
+      (Array.push-back! (CtEnvStore.frames store)
+                        (CtEnvFrame.init (Maybe.Nothing) [] []))
+      id))
+
+  (doc child! "allocates a lexical child of `parent`.")
+  (defn child! [store parent]
+    (let-do [id (FrameId.init (Array.length (CtEnvStore.frames store)))]
+      (Array.push-back! (CtEnvStore.frames store)
+                        (CtEnvFrame.init (Maybe.Just @parent) [] []))
+      id))
+
+  (private local-cell)
+  (hidden local-cell)
+  (defn local-cell [store frame name]
+    (if (valid-frame? store frame)
+      (let-do [result (the (Maybe CellId) (Maybe.Nothing))
+               bindings (CtEnvFrame.bindings
+                 (Array.unsafe-nth (CtEnvStore.frames store)
+                                   @(FrameId.index frame)))
+               i (Int.dec (Array.length bindings))]
+        (while-do (Int.>= i 0)
+          (match-ref &result
+            (Maybe.Nothing)
+              (let [binding (Array.unsafe-nth bindings i)]
+                (when (= (CtEnvBinding.name binding) name)
+                  (set! result (Maybe.Just @(CtEnvBinding.cell binding)))))
+            (Maybe.Just _) ())
+          (set! i (Int.dec i)))
+        result)
+      (Maybe.Nothing)))
+
+  (doc bind-cell! "adds a name in `frame` that refers to an existing cell.
+This is the primitive used for aliases and imports.")
+  (defn bind-cell! [store frame name cell]
+    (if (and (valid-frame? store frame) (valid-cell? store cell))
+      (do
+        (Array.push-back!
+          (CtEnvFrame.bindings
+            (Array.unsafe-nth (CtEnvStore.frames store) @(FrameId.index frame)))
+          (CtEnvBinding.init @name @cell))
+        true)
+      false))
+
+  (doc define! "allocates a cell and binds it in `frame`. A later definition
+of the same local name shadows the earlier binding.")
+  (defn define! [store frame name value]
+    (let-do [cell (CellId.init (Array.length (CtEnvStore.cells store)))]
+      (Array.push-back! (CtEnvStore.cells store)
+                        (CtEnvCell.init (Box.init value)))
+      (ignore (bind-cell! store frame name &cell))
+      cell))
+
+  (doc add-import! "adds an imported frame searched after lexical parents.")
+  (defn add-import! [store frame imported]
+    (if (and (valid-frame? store frame) (valid-frame? store imported))
+      (do
+        (Array.push-back!
+          (CtEnvFrame.imports
+            (Array.unsafe-nth (CtEnvStore.frames store) @(FrameId.index frame)))
+          @imported)
+        true)
+      false))
+
+  (private lookup-cell-depth)
+  (hidden lookup-cell-depth)
+  (defn lookup-cell-depth [store frame name depth]
+    (if (or (not (valid-frame? store frame))
+            (Int.> depth (Array.length (CtEnvStore.frames store))))
+      (CtEnvLookup.Missing)
+      (match (local-cell store frame name)
+        (Maybe.Just cell) (CtEnvLookup.Found cell)
+        (Maybe.Nothing)
+          (let [stored (Array.unsafe-nth (CtEnvStore.frames store)
+                                         @(FrameId.index frame))]
+            (let-do [result (the CtEnvLookup (CtEnvLookup.Missing))
+                     imports (CtEnvFrame.imports stored)
+                     n (Array.length imports)]
+              (for [i 0 n]
+                (match-ref &result
+                  (CtEnvLookup.Ambiguous) ()
+                  _
+                    (match (local-cell store (Array.unsafe-nth imports i) name)
+                      (Maybe.Just imported-cell)
+                        (match-ref &result
+                          (CtEnvLookup.Missing)
+                            (set! result (CtEnvLookup.Found imported-cell))
+                          (CtEnvLookup.Found prior-cell)
+                            (when (/= @(CellId.index prior-cell)
+                                      @(CellId.index &imported-cell))
+                              (set! result (CtEnvLookup.Ambiguous)))
+                          (CtEnvLookup.Ambiguous) ())
+                      (Maybe.Nothing) ())))
+              (match result
+                (CtEnvLookup.Found cell) (CtEnvLookup.Found cell)
+                (CtEnvLookup.Ambiguous) (CtEnvLookup.Ambiguous)
+                (CtEnvLookup.Missing)
+                  (match-ref (CtEnvFrame.parent stored)
+                    (Maybe.Just parent)
+                      (lookup-cell-depth store parent name (Int.inc depth))
+                    (Maybe.Nothing) (CtEnvLookup.Missing))))))))
+
+  (doc lookup-status "resolves a name while preserving ambiguity.")
+  (defn lookup-status [store frame name] (lookup-cell-depth store frame name 0))
+
+  (doc lookup-cell "resolves a name through the current frame, imports, and
+lexical parents.")
+  (defn lookup-cell [store frame name]
+    (match (lookup-status store frame name)
+      (CtEnvLookup.Found cell) (Maybe.Just cell)
+      _ (Maybe.Nothing)))
+
+  (doc read-cell "copies the value in a cell.")
+  (defn read-cell [store cell]
+    (if (valid-cell? store cell)
+      (Maybe.Just
+        (copy
+          (Box.peek
+            (CtEnvCell.value
+              (Array.unsafe-nth (CtEnvStore.cells store) @(CellId.index cell))))))
+      (Maybe.Nothing)))
+
+  (doc lookup "resolves `name` and copies its value.")
+  (defn lookup [store frame name]
+    (match (lookup-cell store frame name)
+      (Maybe.Just cell) (read-cell store &cell)
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (doc write-cell! "replaces the value in an existing cell.")
+  (defn write-cell! [store cell value]
+    (if (valid-cell? store cell)
+      (do
+        (CtEnvCell.set-value!
+          (Array.unsafe-nth (CtEnvStore.cells store) @(CellId.index cell))
+          (Box.init value))
+        true)
+      false))
+
+  (doc set! "updates the cell resolved by `name`.")
+  (defn set! [store frame name value]
+    (match (lookup-cell store frame name)
+      (Maybe.Just cell) (write-cell! store &cell value)
+      (Maybe.Nothing) false)))

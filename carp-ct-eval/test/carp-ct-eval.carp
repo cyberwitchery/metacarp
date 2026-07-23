@@ -1,0 +1,172 @@
+(load "../carp-ct-eval.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+; renders the compile-time value of the FIRST form in `source`, or an
+; `<error: …>`/`<tag>` marker, so tests compare observable behavior.
+(defn eval-str [source]
+  (match (Surface.parse source)
+    (Result.Error _) @"<parse error>"
+    (Result.Success m)
+      (let [forms (SurfaceModule.forms &m)]
+        (if (Int.= 0 (Array.length forms))
+          @"<empty>"
+          (let-do [state (CtEval.state)
+                   root (CtEval.root &state)]
+            (match (CtEval.eval-value (Box.peek (Array.unsafe-nth forms 0))
+                                      &state
+                                      &root)
+              (Result.Success value)
+                (match value
+                  (CtValue.Syntax node) (Surface.render (Box.peek &node))
+                  (CtValue.Closure _) @"<closure>"
+                  (CtValue.Macro _) @"<macro>"
+                  (CtValue.Builtin name)
+                    (String.concat &[@"<builtin " @&name @">"])
+                  (CtValue.Collection _) @"<collection>")
+              (Result.Error e)
+                (String.concat
+                  &[@"<error: " (String.copy (CtError.message &e)) @">"])))))))
+
+; like eval-str, but a macro named `name` with parameters `fixed` and body
+; (the first form of `macro-body-source`) is registered first.
+(defn eval-str-with-macro [name fixed macro-body-source source]
+  (match (Surface.parse macro-body-source)
+    (Result.Error _) @"<parse error in macro body>"
+    (Result.Success macro-module)
+      (let [macro-forms (SurfaceModule.forms &macro-module)]
+        (if (Int.= 0 (Array.length macro-forms))
+          @"<empty macro body>"
+          (match (Surface.parse source)
+            (Result.Error _) @"<parse error>"
+            (Result.Success m)
+              (let [forms (SurfaceModule.forms &m)]
+                (if (Int.= 0 (Array.length forms))
+                  @"<empty>"
+                  (let-do [state (CtEval.state)
+                           root (CtEval.root &state)]
+                    (CtEval.register-macro! &state
+                                            &root
+                                            name
+                                            fixed
+                                            (the (Maybe String) (Maybe.Nothing))
+                                            (Box.init
+                                              (SurfaceNode.copy
+                                                (Box.peek (Array.unsafe-nth macro-forms
+                                                                            0))))
+                                            (FrameId.copy &root))
+                    (match (CtEval.eval-value (Box.peek (Array.unsafe-nth forms
+                                                                          0))
+                                              &state
+                                              &root)
+                      (Result.Success value)
+                        (match value
+                          (CtValue.Syntax node)
+                            (Surface.render (Box.peek &node))
+                          _ @"<non-syntax>")
+                      (Result.Error e)
+                        (String.concat
+                          &[@"<error: " (String.copy (CtError.message &e)) @">"]))))))))))
+
+(defn literal-evals-to-itself? [] (String.= &(eval-str "42") "42"))
+
+(defn arithmetic-evaluates? [] (String.= &(eval-str "(+ 1 2)") "3"))
+
+(defn nested-arithmetic-evaluates? []
+  (String.= &(eval-str "(* (+ 1 2) (- 10 6))") "12"))
+
+(defn let-binds-and-evaluates? []
+  (String.= &(eval-str "(let [x 5] (+ x 2))") "7"))
+
+(defn lambda-applies? [] (String.= &(eval-str "((fn [x] (+ x 1)) 4)") "5"))
+
+(defn string-concat-evaluates? []
+  (String.= &(eval-str "(String.concat [\"a\" \"b\"])") "\"ab\""))
+
+(defn char-at-in-bounds? []
+  (String.= &(eval-str "(String.char-at \"ab\" 1)") "\\b"))
+
+(defn char-at-out-of-bounds-errors? []
+  (let [rendered (eval-str "(String.char-at \"ab\" 5)")]
+    (and
+      (String.starts-with? &rendered "<error:")
+      (String.in? &rendered "too large"))))
+
+(defn cons-builds-a-list? []
+  (String.= &(eval-str "(cons 1 (list 2 3))") "(1 2 3)"))
+
+(defn cons-last-appends? []
+  (String.= &(eval-str "(cons-last 3 (list 1 2))") "(1 2 3)"))
+
+(defn append-joins-lists? []
+  (String.= &(eval-str "(append (list 1) (list 2 3))") "(1 2 3)"))
+
+(defn macro-call-expands-and-evaluates? []
+  ; body BUILDS the expansion (+ 4 1); the call evaluates it to 5.
+  (String.=
+    &(eval-str-with-macro "inc!" [@"x"] "(list (quote +) x 1)" "(inc! 4)")
+    "5"))
+
+(defn macro-expansion-uses-unevaluated-arguments? []
+  ; quoting the argument keeps it as data: (+ 1 2) arrives UNEVALUATED, so
+  ; the result renders as the list, not as 3.
+  (String.=
+    &(eval-str-with-macro "q!" [@"x"] "(list (quote quote) x)" "(q! (+ 1 2))")
+    "(+ 1 2)"))
+
+(defn macro-as-value-returns-expansion-as-data? []
+  ; `apply` on a macro yields the EXPANSION as syntax (the reference's
+  ; semantics): (+ 4 1) stays unevaluated data, while a direct call would
+  ; evaluate it to 5.
+  (String.=
+    &(eval-str-with-macro "inc!"
+                          [@"x"]
+                          "(list (quote +) x 1)"
+                          "(apply inc! (list 4))")
+    "(+ 4 1)"))
+
+(defn pure-string-commands-are-exactly-the-three? []
+  (and
+    (CtEval.pure-string-command? "String.char-at")
+    (and
+      (CtEval.pure-string-command? "String.slice")
+      (and
+        (CtEval.pure-string-command? "String.index-of")
+        (not (CtEval.pure-string-command? "String.length"))))))
+
+(defn unknown-symbol-errors? []
+  (String.starts-with? &(eval-str "definitely-not-bound") "<error:"))
+
+(deftest test
+  (assert-true test (literal-evals-to-itself?) "a literal evaluates to itself")
+  (assert-true test (arithmetic-evaluates?) "arithmetic evaluates")
+  (assert-true test (nested-arithmetic-evaluates?) "nested arithmetic evaluates")
+  (assert-true test
+    (let-binds-and-evaluates?)
+    "let binds and evaluates its body")
+  (assert-true test (lambda-applies?) "a lambda applies to arguments")
+  (assert-true test (string-concat-evaluates?) "String.concat evaluates")
+  (assert-true test (char-at-in-bounds?) "String.char-at works in bounds")
+  (assert-true test
+    (char-at-out-of-bounds-errors?)
+    "String.char-at reports an index error out of bounds")
+  (assert-true test (cons-builds-a-list?) "cons builds a list")
+  (assert-true test (cons-last-appends?) "cons-last appends")
+  (assert-true test (append-joins-lists?) "append joins lists")
+  (assert-true test
+    (macro-call-expands-and-evaluates?)
+    "a macro call expands, then evaluates")
+  (assert-true test
+    (macro-expansion-uses-unevaluated-arguments?)
+    "macro arguments bind unevaluated")
+  (assert-true test
+    (macro-as-value-returns-expansion-as-data?)
+    "apply on a macro returns the expansion as data")
+  (assert-true test
+    (pure-string-commands-are-exactly-the-three?)
+    "pure-string-command? covers exactly the implemented commands")
+  (assert-true test
+    (unknown-symbol-errors?)
+    "an unbound symbol is a compile-time error"))

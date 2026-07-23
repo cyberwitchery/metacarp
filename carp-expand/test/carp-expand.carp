@@ -1,0 +1,584 @@
+(load "../carp-expand.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+; quasiquote is REAL Core code (Quasiquote.carp) evaluated by REAL Core
+; dynamic functions (Dynamic.carp), not evaluator special forms: tests load
+; both reference files as a prelude. The prelude is expanded once on its own
+; to learn how many top-level forms it leaves, and that many are dropped from
+; each test expansion so form indices keep addressing the test's own code.
+(defn prelude-source []
+  (String.concat
+    &[;; Macros.carp holds map-internal, which List's map (and thereby the
+      ;; quasiquote array arm) calls.
+      (Result.from-success (IO.read-file "../../../carp/core/Macros.carp") @"")
+      @"
+"
+      (Result.from-success
+        (IO.read-file "../../../carp/core/Quasiquote.carp")
+        @"")
+      @"
+"
+      ;; List.carp reopens `defmodule Dynamic` with reduce/map/collect-into —
+      ;; the helpers quasiquote's expansion actually calls.
+      (Result.from-success (IO.read-file "../../../carp/core/List.carp") @"")
+      @"
+"
+      (Result.from-success (IO.read-file "../../../carp/core/Dynamic.carp") @"")
+      @"
+"]))
+
+(defn expand-source [source]
+  (let [module (Result.from-success (Surface.parse source)
+                                    (SurfaceModule.init []))
+        ;; the driver marks Dynamic as a prelude so its members resolve bare
+        ;; (quasiquote's helpers call `reduce`); the tests mirror that.
+        config (ExpandConfig.init [@"Dynamic"])]
+    (Result.from-success
+      (MacroExpand.expand-module-with &module &config)
+      (SurfaceModule.init []))))
+
+(defn expanded-module [source]
+  (let-do [prelude (prelude-source)
+           prelude-count (Array.length
+             (SurfaceModule.forms &(expand-source &prelude)))
+           full (String.concat &[(String.copy &prelude) (String.copy source)])
+           expanded (expand-source &full)
+           forms (SurfaceModule.forms &expanded)
+           kept (the (Array (Box SurfaceNode)) [])]
+    (for [i prelude-count (Array.length forms)]
+      (Array.push-back! &kept
+                        (Box.init
+                          (SurfaceNode.copy (Box.peek (Array.unsafe-nth forms i))))))
+    (SurfaceModule.init kept)))
+
+(defn node-at [module index]
+  (SurfaceNode.copy
+    (Box.peek (Array.unsafe-nth (SurfaceModule.forms module) index))))
+
+(defn list-item [node index]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.List items)
+      (SurfaceNode.copy (Box.peek (Array.unsafe-nth items index)))
+    _ (SurfaceNode.copy node)))
+
+(defn is-symbol? [node name]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.Symbol segments)
+      (and (Int.= 1 (Array.length segments))
+           (= (Array.unsafe-nth segments 0) name))
+    _ false))
+
+(defn is-string? [node value]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.StringLit actual) (= actual value)
+    _ false))
+
+(defn returned-closure-captures? []
+  (let [module (expanded-module
+          "(defmacro pick [a b] (let [make (fn [x] (fn [ignored] x)) first (make a)] (first b)))
+(pick 4 9)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 4)
+      _ false)))
+
+(defn captured-set-persists? []
+  (let [module (expanded-module
+          "(defmacro count-twice [] (let [x 0 bump (fn [] (do (set! x (inc x)) x))] (do (bump) (bump))))
+(count-twice)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 2)
+      _ false)))
+
+(defn compile-time-while-mutates? []
+  (let [module (expanded-module
+          "(defmacro sum [] (let [acc 0 i 0] (do (while (< i 10) (do (set! acc (+ acc i)) (set! i (+ i 1)))) acc)))
+(sum)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 45)
+      _ false)))
+
+(defn eval-let-do-for-mutates? []
+  (let [module (expanded-module
+          "(defmacro sum [] (eval (quote (let-do [acc 0] (for [i 0 10] (set! acc (+ acc i))) acc))))
+(sum)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 45)
+      _ false)))
+
+(defn eval-multiply-works? []
+  (let [module (expanded-module "(defmacro product [] (eval (quote (* 3 4))))
+(product)")
+        form (node-at &module 0)] (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 12)
+      _ false)))
+
+(defn eval-round-and-neg-work? []
+  (let [module (expanded-module
+          "(defmacro rounded [] (eval (quote (round 2.51))))
+(defmacro negated [] (eval (quote (neg 1))))
+(rounded)
+(negated)")
+        rounded (node-at &module 0)
+        negated (node-at &module 1)]
+    (and
+      (match-ref (SurfaceNode.form &rounded)
+        (SurfaceForm.IntLit value) (Int.= @value 3)
+        _ false)
+      (match-ref (SurfaceNode.form &negated)
+        (SurfaceForm.IntLit value) (Int.= @value -1)
+        _ false))))
+
+(defn eval-string-collections-work? []
+  (let [module (expanded-module
+          "(defmacro letters [] (eval (quote (String.to-list \"hi\"))))
+(defmacro letters-array [] (eval (quote (String.to-array \"hi\"))))
+(letters)
+(letters-array)")
+        letters (node-at &module 0)
+        letters-array (node-at &module 1)]
+    (and
+      (match-ref (SurfaceNode.form &letters)
+        (SurfaceForm.List items)
+          (and (Int.= (Array.length items) 2)
+               (and
+                 (is-string? (Box.peek (Array.unsafe-nth items 0)) "h")
+                 (is-string? (Box.peek (Array.unsafe-nth items 1)) "i")))
+        _ false)
+      (match-ref (SurfaceNode.form &letters-array)
+        (SurfaceForm.Array items)
+          (and (Int.= (Array.length items) 2)
+               (and
+                 (is-string? (Box.peek (Array.unsafe-nth items 0)) "h")
+                 (is-string? (Box.peek (Array.unsafe-nth items 1)) "i")))
+        _ false))))
+
+(defn char-and-one-character-string-compare? []
+  (let [module (expanded-module
+          "(defmacro open-brace? [] (= (String.head \"{\") \"{\"))
+(open-brace?)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.BoolLit value) @value
+      _ false)))
+
+(defn parse-string-produces-syntax? []
+  (let [module (expanded-module "(defmacro parsed [] (parse \"(+ 1 2)\"))
+(parsed)")
+        form (node-at &module 0)
+        head (list-item &form 0)
+        first-argument (list-item &form 1)] (and (is-symbol? &head "+")
+                                                 (match-ref (SurfaceNode.form &first-argument)
+                                                   (SurfaceForm.IntLit value)
+                                                     (Int.= @value 1)
+                                                   _ false))))
+
+(defn compile-time-mutual-recursion? []
+  (let [module (expanded-module
+          "(defndynamic even? [n] (if (= n 0) true (odd? (dec n))))
+(defndynamic odd? [n] (if (= n 0) false (even? (dec n))))
+(defmacro four-even? [] (even? 4))
+(four-even?)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.BoolLit value) @value
+      _ false)))
+
+(defn imported-and-qualified-macro-agree? []
+  (let [module (expanded-module "(defmodule A (defmacro answer [] 7))
+(use A)
+(answer)
+(A.answer)")
+        imported (node-at &module 2)
+        qualified (node-at &module 3)] (and
+      (match-ref (SurfaceNode.form &imported)
+        (SurfaceForm.IntLit value) (Int.= @value 7)
+        _ false)
+      (match-ref (SurfaceNode.form &qualified)
+        (SurfaceForm.IntLit value) (Int.= @value 7)
+        _ false))))
+
+(defn ambiguous-macro-import-errors? []
+  (let [module (Result.from-success
+          (Surface.parse "(defmodule A (defmacro choose [] 1))
+(defmodule B (defmacro choose [] 2))
+(use A)
+(use B)
+(choose)")
+          (SurfaceModule.init []))]
+    (match (MacroExpand.expand-module &module)
+      (Result.Error error)
+        (String.contains-string? (CtError.message &error)
+                                 "ambiguous imported macro")
+      (Result.Success _) false)))
+
+(defn ambiguous-dynamic-import-errors? []
+  (let [module (Result.from-success
+          (Surface.parse "(defmodule A (defndynamic choose [] 1))
+(defmodule B (defndynamic choose [] 2))
+(use A)
+(use B)
+(choose)")
+          (SurfaceModule.init []))]
+    (match (MacroExpand.expand-module &module)
+      (Result.Error error)
+        (String.contains-string? (CtError.message &error)
+                                 "ambiguous compile-time function")
+      (Result.Success _) false)))
+
+(defn top-level-compile-time-effect? []
+  (let [module (expanded-module "(defdynamic counter 0)
+(defndynamic bump [] (set! counter (inc counter)))
+(bump)
+(defmacro current [] counter)
+(current)")
+        form (node-at &module 0)] (and
+      (Int.= 1 (Array.length (SurfaceModule.forms &module)))
+      (match-ref (SurfaceNode.form &form)
+        (SurfaceForm.IntLit value) (Int.= @value 1)
+        _ false))))
+
+(defn top-level-eval-effect? []
+  (let [module (expanded-module "(defdynamic counter 0)
+(eval ; comment between eval and its single argument
+  (set! counter 3))
+(defmacro current [] counter)
+(current)")
+        form (node-at &module 0)] (and
+      (Int.= 1 (Array.length (SurfaceModule.forms &module)))
+      (match-ref (SurfaceNode.form &form)
+        (SurfaceForm.IntLit value) (Int.= @value 3)
+        _ false))))
+
+(defn top-level-set-effect? []
+  (let [module (expanded-module "(defdynamic counter 0)
+(set! counter 4)
+(defmacro current [] counter)
+(current)")
+        form (node-at &module 0)] (and
+      (Int.= 1 (Array.length (SurfaceModule.forms &module)))
+      (match-ref (SurfaceNode.form &form)
+        (SurfaceForm.IntLit value) (Int.= @value 4)
+        _ false))))
+
+(defn compile-time-managed-query? []
+  (let [module (expanded-module "(implements delete A.delete)
+(eval (when (not (managed? A)) (macro-error \"A should be managed\")))
+(eval (when (managed? B) (macro-error \"B should not be managed\")))
+42")
+        form (node-at &module 1)] (and
+      (Int.= 2 (Array.length (SurfaceModule.forms &module)))
+      (match-ref (SurfaceNode.form &form)
+        (SurfaceForm.IntLit value) (Int.= @value 42)
+        _ false))))
+
+(defn qualified-and-imported-dynamic-share-cell? []
+  (let [module (expanded-module
+          "(defmodule Counter (defdynamic value 0) (defndynamic bump [] (set! value (inc value))))
+(use Counter)
+(Counter.bump)
+(defmacro current [] value)
+(current)")
+        form (node-at &module 2)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 1)
+      _ false)))
+
+(defn dynamic-use-imports-module-frame? []
+  (let [module (expanded-module "(defmodule TestDyn (defndynamic x [] 7))
+(defndynamic run [] (do (use TestDyn) (x)))
+(defmacro call [] (run))
+(call)")
+        form (node-at &module 1)] (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 7)
+      _ false)))
+
+(defn runtime-call-is-emitted? []
+  (let [module (expanded-module "(runtime-call 1)")
+        form (node-at &module 0)]
+    (and
+      (Int.= 1 (Array.length (SurfaceModule.forms &module)))
+      (is-symbol? &(list-item &form 0) "runtime-call"))))
+
+(defn prelude-policy-is-explicit? []
+  (let [parsed (Result.from-success
+          (Surface.parse "(defmodule Prelude (defmacro answer [] 8))
+(answer)")
+          (SurfaceModule.init []))
+        default-expanded (Result.from-success (MacroExpand.expand-module &parsed)
+                                              (SurfaceModule.init []))
+        config (ExpandConfig.init [@"Prelude"])
+        configured-expanded (Result.from-success
+          (MacroExpand.expand-module-with &parsed &config)
+          (SurfaceModule.init []))
+        default-form (node-at &default-expanded 1)
+        configured-form (node-at &configured-expanded 1)]
+    (and
+      (is-symbol? &(list-item &default-form 0) "answer")
+      (match-ref (SurfaceNode.form &configured-form)
+        (SurfaceForm.IntLit value) (Int.= @value 8)
+        _ false))))
+
+(defn first-class-builtin-works? []
+  (let [module (expanded-module "(defndynamic apply-one [f x] (f x))
+(defmacro wrap [x] (apply-one array x))
+(wrap 3)")
+        form (node-at &module 0)] (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.Array items)
+        (and (Int.= 1 (Array.length items))
+             (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 0)))
+               (SurfaceForm.IntLit value) (Int.= @value 3)
+               _ false))
+      _ false)))
+
+(defn expression-callee-works? []
+  (let [module (expanded-module "(defmacro returned [] (((fn [x] (fn [] x)) 5)))
+(returned)")
+        form (node-at &module 0)] (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.IntLit value) (Int.= @value 5)
+      _ false)))
+
+(defn symbol-concat-and-prefix-differ? []
+  (let [module (expanded-module
+          "(defmacro joined [] (Symbol.concat ['Pair 'Ref]))
+(defmacro prefixed [] (Symbol.prefix 'PairRef '<))
+(joined)
+(prefixed)")
+        joined (node-at &module 0)
+        prefixed (node-at &module 1)]
+    (and (is-symbol? &joined "PairRef")
+         (match-ref (SurfaceNode.form &prefixed)
+           (SurfaceForm.Symbol segments)
+             (and (Int.= 2 (Array.length segments))
+                  (and
+                    (= (Array.unsafe-nth segments 0) "PairRef")
+                    (= (Array.unsafe-nth segments 1) "<")))
+           _ false))))
+
+(defn append-preserves-array-shape? []
+  (let [module (expanded-module
+          "(defmacro values [] (append (array 'a) (array 'b)))
+(values)")
+        form (node-at &module 0)]
+    (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.Array items) (Int.= 2 (Array.length items))
+      _ false)))
+
+(defn macro-comments-are-not-arguments? []
+  (let [module (expanded-module "(defmacro identity [x] x)
+(identity ; ignored
+ true)")
+        form (node-at &module 0)] (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.BoolLit value) @value
+      _ false)))
+
+; the reference REJECTS unquote-splicing inside array literals
+; ("unquote-splicing needs an enclosing list", Quasiquote.carp) — the old
+; evaluator's array splicing was a dialect extension, retired with it. Lists
+; splice; arrays do not.
+(defn list-splices-expressions? []
+  (let [module (expanded-module "(defmacro splice [] `(id 0 %@(list 1 2) 9))
+(splice)")
+        form (node-at &module 0)] (match-ref (SurfaceNode.form &form)
+      (SurfaceForm.List items) (Int.= 5 (Array.length items))
+      _ false)))
+
+(defn array-splice-rejected? []
+  (let [module (expanded-module "(defmacro splice [] `[0 %@(array 1 2) 9])
+(splice)")] (Int.= 0 (Array.length (SurfaceModule.forms &module)))))
+
+(deftest t
+  (let [module (expanded-module
+          "(defmacro when [condition body] `(if %condition %body ()))
+(when true 42)")
+        form (node-at &module 0)]
+    (assert-equal t
+      1
+      (Array.length (SurfaceModule.forms &module))
+      "macro definitions are omitted from the expanded module")
+    (assert-true t
+      (is-symbol? (list-item &form 0) "if")
+      "a quasiquoted macro body is evaluated")
+    (assert-true t
+      (match-ref (SurfaceNode.form (list-item &form 1))
+        (SurfaceForm.BoolLit true) true
+        _ false)
+      "unquote inserts the first call-site argument")
+    (assert-true t
+      (match-ref (SurfaceNode.form (list-item &form 2))
+        (SurfaceForm.IntLit 42) true
+        _ false)
+      "unquote inserts the second call-site argument"))
+
+  (let [module (expanded-module
+          "(defmacro unless [condition body] `(if %condition () %body))
+(defmacro when-not [condition body] `(unless %condition %body))
+(when-not false 7)")
+        form (node-at &module 0)]
+    (assert-equal t
+      1
+      (Array.length (SurfaceModule.forms &module))
+      "all source-order macro definitions are omitted")
+    (assert-true t
+      (is-symbol? (list-item &form 0) "if")
+      "macro results are expanded recursively"))
+
+  (let [module (expanded-module
+          "(defmacro when [condition body] `(if %condition %body ()))
+(defn f [] (when true 1))")
+        form (node-at &module 0)
+        body (list-item &form 3)
+        head (list-item &body 0)]
+    (assert-true t
+      (is-symbol? &head "if")
+      "macro expansion enters function bodies"))
+
+  (let [module (expanded-module "(defmodule Dynamic (defndynamic helper [x] x))
+(defmodule Dynamic (defmacro use-helper [x] (helper x)))
+(Dynamic.use-helper 5)")
+        form (node-at &module 2)] (assert-true t
+      (match-ref (SurfaceNode.form &form)
+        (SurfaceForm.IntLit value) (Int.= @value 5)
+        _ false)
+      "macros in reopened modules capture same-module dynamic aliases"))
+
+  (let [module (expanded-module
+          "(defmacro choose [flag x] (let [saved x] (if flag (do `(do %saved)) `(do 0))))
+(choose true 7)")
+        form (node-at &module 0)
+        head (list-item &form 0)
+        value (list-item &form 1)]
+    (assert-true t
+      (is-symbol? &head "do")
+      "compile-time control flow selects a generated form")
+    (assert-true t
+      (match-ref (SurfaceNode.form &value) (SurfaceForm.IntLit 7) true _ false)
+      "compile-time let values are visible to quasiquote"))
+
+  (let [module (expanded-module
+          "(defmacro choose [flag x] (let [saved x] (if flag (do `(do %saved)) `(do 0))))
+(choose false 7)")
+        form (node-at &module 0)
+        value (list-item &form 1)
+        let-module (expanded-module
+          "(defmacro first-of [x y] (let [first x second first] second))
+(first-of 3 9)")
+        let-form (node-at &let-module 0)
+        variadic-module (expanded-module
+          "(defmacro do-all [first :rest rest] `(do %first %@rest))
+(do-all 1 2 3)")
+        variadic-form (node-at &variadic-module 0)
+        variadic-head (list-item &variadic-form 0)
+        variadic-third (list-item &variadic-form 3)]
+    (assert-true t
+      (match-ref (SurfaceNode.form &value)
+        (SurfaceForm.IntLit actual) (Int.= @actual 0)
+        _ false)
+      "compile-time if evaluates its false branch")
+    (assert-true t
+      (match-ref (SurfaceNode.form &let-form)
+        (SurfaceForm.IntLit value) (Int.= @value 3)
+        _ false)
+      "compile-time let extends bindings from left to right")
+    (assert-true t
+      (is-symbol? &variadic-head "do")
+      "a variadic macro expands to a quasiquoted form")
+    (assert-true t
+      (match-ref (SurfaceNode.form &variadic-third)
+        (SurfaceForm.IntLit value) (Int.= @value 3)
+        _ false)
+      "unquote-splicing inserts all rest arguments"))
+
+  (let [module (Result.from-success (Surface.parse "(defmacro identity [x] x)
+(identity 1 2)") (SurfaceModule.init []))] (assert-true t
+      (Result.error? &(MacroExpand.expand-module &module))
+      "macro arity errors are reported during expansion"))
+
+  (assert-true t
+    (returned-closure-captures?)
+    "returned closures retain their lexical defining frame")
+  (assert-true t
+    (captured-set-persists?)
+    "set! through a closure updates the captured cell")
+  (assert-true t
+    (compile-time-while-mutates?)
+    "compile-time while re-evaluates its condition and mutates cells")
+  (assert-true t
+    (eval-let-do-for-mutates?)
+    "eval supports let-do and for in dynamic code")
+  (assert-true t (eval-multiply-works?) "eval supports integer multiplication")
+  (assert-true t
+    (eval-round-and-neg-work?)
+    "eval supports dynamic round and neg")
+  (assert-true t
+    (eval-string-collections-work?)
+    "eval supports String.to-list and String.to-array")
+  (assert-true t
+    (char-and-one-character-string-compare?)
+    "compile-time equality matches chars with one-character strings")
+  (assert-true t
+    (parse-string-produces-syntax?)
+    "parse turns a string into compile-time syntax")
+  (assert-true t
+    (compile-time-mutual-recursion?)
+    "compile-time definitions can recurse through their shared frame")
+  (assert-true t
+    (imported-and-qualified-macro-agree?)
+    "imported and qualified macro lookup select the same definition")
+  (assert-true t
+    (ambiguous-macro-import-errors?)
+    "ambiguous macro imports produce an error")
+  (assert-true t
+    (ambiguous-dynamic-import-errors?)
+    "ambiguous dynamic imports produce an error")
+  (assert-true t
+    (top-level-compile-time-effect?)
+    "top-level compile-time calls execute for effect and emit nothing")
+  (assert-true t
+    (top-level-eval-effect?)
+    "top-level eval executes for effect and emits nothing")
+  (assert-true t
+    (top-level-set-effect?)
+    "top-level set! executes for effect and emits nothing")
+  (assert-true t
+    (compile-time-managed-query?)
+    "managed? reads delete implementations during expansion")
+  (assert-true t
+    (qualified-and-imported-dynamic-share-cell?)
+    "qualified and imported dynamic lookup share one cell")
+  (assert-true t
+    (dynamic-use-imports-module-frame?)
+    "dynamic use imports a module frame into the current evaluator frame")
+  (assert-true t
+    (runtime-call-is-emitted?)
+    "unresolved compile-time calls remain runtime syntax")
+  (assert-true t
+    (prelude-policy-is-explicit?)
+    "prelude visibility comes from explicit expander configuration")
+  (assert-true t
+    (first-class-builtin-works?)
+    "compile-time builtins can be passed through closures")
+  (assert-true t
+    (expression-callee-works?)
+    "a compile-time call can evaluate its callee expression")
+  (assert-true t
+    (symbol-concat-and-prefix-differ?)
+    "Symbol.concat joins spelling while Symbol.prefix qualifies")
+  (assert-true t
+    (append-preserves-array-shape?)
+    "append preserves the left collection's array shape")
+  (assert-true t
+    (macro-comments-are-not-arguments?)
+    "comments do not participate in macro arity")
+  (assert-true t
+    (list-splices-expressions?)
+    "unquote-splicing of an expression into a list splices it")
+  (assert-true t
+    (array-splice-rejected?)
+    "unquote-splicing inside an array literal is rejected, as in the reference"))

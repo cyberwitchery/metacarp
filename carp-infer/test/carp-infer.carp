@@ -1,0 +1,328 @@
+(load "../carp-infer.carp")
+(load "../../carp-resolve/carp-resolve.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn infer-source [source]
+  (match (Surface.parse source)
+    (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core) (Infer.module &core)
+        (Result.Error _) (Result.Error (InferError.init @"resolve error")))
+    (Result.Error _) (Result.Error (InferError.init @"parse error"))))
+
+(defn scheme-by-name [inferred name]
+  (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
+           bindings (InferredModule.environment inferred)
+           n (Array.length bindings)]
+    (for [i 0 n]
+      (let [binding (Array.unsafe-nth bindings i)]
+        (when (= (CoreRef.name (SchemeBinding.reference binding)) name)
+          (set! result
+                (Maybe.Just (TypeScheme.copy (SchemeBinding.scheme binding)))))))
+    result))
+
+(defn root-node-type [inferred id]
+  (let-do [result (the (Maybe MonoType) (Maybe.Nothing))
+           nodes (InferredModule.node-types inferred)
+           n (Array.length nodes)]
+    (for [i 0 n]
+      (let [node (Array.unsafe-nth nodes i)]
+        (when (and (Int.= @(InferredNodeType.id node) id)
+                   (match-ref (InferredNodeType.owner node)
+                     (Maybe.Nothing) true
+                     _ false))
+          (set! result
+                (Maybe.Just
+                  (MonoType.copy (Box.peek (InferredNodeType.type node))))))))
+    result))
+
+(defn infers-polymorphic-identity? []
+  (match (infer-source "(defn identity [x] x)
+(identity 1)
+(identity \"ok\")") (Result.Success inferred)
+      (let [bindings (InferredModule.environment &inferred)
+            scheme (SchemeBinding.scheme (Array.unsafe-nth bindings 0))
+            calls (InferredModule.calls &inferred)]
+        (and
+          (Int.= 1 (Array.length (TypeScheme.variables scheme)))
+          (Int.= 2 (Array.length calls)))) (Result.Error _) false))
+
+(defn infers-core-control-and-lexical-forms? []
+  (match (infer-source "(defn choose [b x] (if b x x))
+(choose true 1)
+(let [identity (fn [x] x)] (identity \"ok\"))
+(the Int (if true 1 2))
+(the (Fn [Int] Int) (fn [x] x))") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-recursive-definition-group? []
+  (match (infer-source "(defn outer [b] (inner b))
+(defn inner [b] (if b true false))
+(outer true)") (Result.Success inferred)
+      (Int.= 2 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-interface-and-builtin-call? []
+  (match (infer-source "(definterface add (Fn [a a] a))
+(register int-add (Fn [Int Int] Int))
+(implements add int-add)
+(add 1 2)") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-multi-variable-interface? []
+  (match (infer-source "(definterface first (Fn [a b] a))
+(register int-first (Fn [Int String] Int))
+(implements first int-first)
+(first 1 \"ok\")") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-module-scoped-interface? []
+  (match (infer-source "(definterface add (Fn [a a] a))
+(defmodule Int
+  (register + (λ [Int Int] Int) \"CARP_INT_PLUS\")
+  (implements add +))
+(add 1 2)") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-module-local-function-body? [] (match (infer-source "(defmodule Int
+  (register + (Fn [Int Int] Int))
+  (defn double [x] (+ x x)))
+(Int.double 2)") (Result.Success inferred)
+      (Int.= 2 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-signed-global-value? []
+  (match (infer-source "(sig f (Fn [Int] Int))
+(def f (fn [x] x))
+(f 1)") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-nominal-reference-and-unit-declarations? []
+  (match (infer-source "(register-type Byte)
+(register consume (Fn [&String] Int))
+(defn use [s] (consume &s))") (Result.Success inferred)
+      (Int.= 2 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn preserves-explicit-lifetime-identities? []
+  (match (infer-source "(sig borrow-id (Fn [(Ref String a)] (Ref String a)))
+(defn borrow-id [value] value)") (Result.Success inferred)
+      (match (scheme-by-name &inferred "borrow-id")
+        (Maybe.Just scheme)
+          (and
+            (Int.= 1 (Array.length (TypeScheme.lifetime-variables &scheme)))
+            (match-ref (Box.peek (TypeScheme.body &scheme))
+              (MonoType.Function arguments result)
+                (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+                  (MonoType.Reference _ argument-lifetime)
+                    (match-ref (Box.peek result)
+                      (MonoType.Reference _ result-lifetime)
+                        (Type.same-lifetime? argument-lifetime result-lifetime)
+                      _ false)
+                  _ false)
+              _ false))
+        (Maybe.Nothing) false) (Result.Error _) false))
+
+(defn distinguishes-implicit-and-static-lifetimes? []
+  (match (infer-source "(register independent (Fn [&String &String] &String))
+(register static-ref (Fn [] (Ref String static)))") (Result.Success inferred)
+      (match (scheme-by-name &inferred "independent")
+        (Maybe.Just first)
+          (match (scheme-by-name &inferred "static-ref")
+            (Maybe.Just second)
+              (and
+                (Int.= 3 (Array.length (TypeScheme.lifetime-variables &first)))
+                (Int.= 0 (Array.length (TypeScheme.lifetime-variables &second))))
+            (Maybe.Nothing) false)
+        (Maybe.Nothing) false) (Result.Error _) false))
+
+(defn preserves-local-borrow-identities? []
+  (match (infer-source "(register discard (Fn [&String] ()))
+(let [value @\"owned\"]
+  (let [borrowed &value]
+    (do (discard borrowed) borrowed)))") (Result.Success inferred)
+      (match (root-node-type &inferred 11)
+        (Maybe.Just first)
+          (match (root-node-type &inferred 12)
+            (Maybe.Just second)
+              (match-ref &first
+                (MonoType.Reference _ first-lifetime)
+                  (match-ref &second
+                    (MonoType.Reference _ second-lifetime)
+                      (Type.same-lifetime? first-lifetime second-lifetime)
+                    _ false)
+                _ false)
+            (Maybe.Nothing) false)
+        (Maybe.Nothing) false) (Result.Error _) false))
+
+(defn gives-literals-static-lifetimes? []
+  (match (infer-source "\"borrowed\"")
+    (Result.Success inferred)
+      (match-ref (Box.peek
+          (Array.unsafe-nth (InferredModule.expression-types &inferred) 0))
+        (MonoType.Reference _ lifetime)
+          (match-ref lifetime (MonoLifetime.Static) true _ false)
+        _ false)
+    (Result.Error _) false))
+
+(defn infers-use-all-import? [] (match (infer-source "(defmodule Int
+  (register + (Fn [Int Int] Int)))
+(use-all Int)
+(+ 1 2)") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-local-annotation-variables? []
+  (match (infer-source "(defn as-pointer [x] (the (Ptr a) x))
+(the (Fn [a] a) (fn [x] x))") (Result.Success inferred)
+      (Int.= 1
+             (Array.length
+               (TypeScheme.variables
+                 (SchemeBinding.scheme
+                   (Array.unsafe-nth (InferredModule.environment &inferred) 0))))) (Result.Error _)
+      false))
+
+(defn instantiates-functions-within-definition-group? []
+  (match (infer-source "(register discard-int (Fn [Int] ()))
+(defn identity [x] x)
+(defn use-both [] (do (discard-int (identity 1)) (identity \"ok\")))") (Result.Success inferred)
+      (Int.= 3 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-string-literal-ownership? []
+  (match (infer-source "(the &String \"borrowed\")
+(the String @\"owned\")") (Result.Success inferred)
+      (Int.= 2 (Array.length (InferredModule.expression-types &inferred))) (Result.Error _)
+      false))
+
+(defn infers-pattern-literal-ownership? []
+  (match (infer-source "(register accepts-pattern (Fn [&Pattern] Bool))
+(accepts-pattern #\"x\")") (Result.Success inferred)
+      (Int.= 1 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-record-updater-callback? []
+  (match (infer-source "(deftype (Cell a) [value a])
+(defn keep [cell] (Cell.update-value cell &(fn [value] value)))") (Result.Success _)
+      true (Result.Error _) false))
+
+(defn generalizes-dependencies-before-consumers? []
+  (match (infer-source "(defn int-use [] (identity 1))
+(defn identity [x] x)
+(defn string-use [] (identity \"ok\"))
+(int-use)
+(string-use)") (Result.Success inferred)
+      (Int.= 4 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn infers-mutually-recursive-component? []
+  (match (infer-source "(defn left [x] (right x))
+(defn right [x] (if x (left false) true))
+(left true)") (Result.Success inferred)
+      (Int.= 3 (Array.length (InferredModule.calls &inferred))) (Result.Error _)
+      false))
+
+(defn relates-indexed-collection-elements? []
+  (match (infer-source "(deftype Ints [values (Array Int)])
+(defn first-value [ints] (Array.unsafe-nth (Ints.values &ints) 0))
+(Array.unsafe-nth &[1] 0)") (Result.Success _) true (Result.Error _) false))
+
+(defn infers-constructor-patterns? []
+  (match (infer-source "(deftype (Choice a) (Some [a]) (None))
+(defn owned-choice? [x] (match x (Choice.Some _) true (Choice.None) false))
+(defn borrowed-choice? [x] (match-ref x (Choice.Some _) true (Choice.None) false))
+(the (Fn [(Choice Int)] Bool) owned-choice?)
+(the (Fn [&(Choice Int)] Bool) borrowed-choice?)") (Result.Success _) true (Result.Error _)
+      false))
+
+(defn infers-positional-pattern-bindings? []
+  (match (infer-source "(deftype Signal (Code [Bool Int]) (End))
+(defn code [signal] (match signal (Signal.Code _ value) value (Signal.End) 0))
+(the (Fn [Signal] Int) code)") (Result.Success _) true (Result.Error _) false))
+
+(defn infers-nested-constructor-patterns? []
+  (match (infer-source "(deftype Inner (Value [Int]) (Empty))
+(deftype Outer (Wrap [Inner]) (Other))
+(defn code [outer] (match outer (Outer.Wrap (Inner.Value value)) value (Outer.Wrap (Inner.Empty)) 0 (Outer.Other) 1))
+(the (Fn [Outer] Int) code)") (Result.Success _) true (Result.Error _) false))
+
+(deftest t
+  (assert-true t
+    (infers-polymorphic-identity?)
+    "inference generalizes identity and instantiates each call")
+  (assert-true t
+    (infers-core-control-and-lexical-forms?)
+    "inference handles if, let, lambdas, and annotations")
+  (assert-true t
+    (infers-recursive-definition-group?)
+    "inference predeclares and solves recursive definition groups")
+  (assert-true t
+    (infers-interface-and-builtin-call?)
+    "inference instantiates an interface declaration at a call site")
+  (assert-true t
+    (infers-multi-variable-interface?)
+    "inference preserves distinct declaration type variables")
+  (assert-true t
+    (infers-module-scoped-interface?)
+    "inference sees module-qualified interface implementations")
+  (assert-true t
+    (infers-module-local-function-body?)
+    "inference handles module-local builtin references in function bodies")
+  (assert-true t (infers-signed-global-value?) "inference handles sig plus def")
+  (assert-true t
+    (infers-nominal-reference-and-unit-declarations?)
+    "inference converts nominal, reference, and unit declaration types")
+  (assert-true t
+    (preserves-explicit-lifetime-identities?)
+    "inference preserves one shared explicit argument/result lifetime")
+  (assert-true t
+    (distinguishes-implicit-and-static-lifetimes?)
+    "inference gives implicit references distinct identities and does not quantify static")
+  (assert-true t
+    (preserves-local-borrow-identities?)
+    "let-bound borrows retain one identity across repeated uses")
+  (assert-true t
+    (gives-literals-static-lifetimes?)
+    "string literals carry a static lifetime")
+  (assert-true t (infers-use-all-import?) "inference follows use-all imports")
+  (assert-true t
+    (infers-local-annotation-variables?)
+    "expression annotations instantiate locally scoped type variables")
+  (assert-true t
+    (instantiates-functions-within-definition-group?)
+    "function placeholders instantiate at each definition-group call")
+  (assert-true t
+    (infers-string-literal-ownership?)
+    "plain string literals are borrowed and @ copies them")
+  (assert-true t
+    (infers-pattern-literal-ownership?)
+    "pattern literals are borrowed Pattern values")
+  (assert-true t
+    (infers-record-updater-callback?)
+    "record updater helpers accept borrowed callbacks")
+  (assert-true t
+    (generalizes-dependencies-before-consumers?)
+    "dependency SCCs are generalized before their consumers")
+  (assert-true t
+    (infers-mutually-recursive-component?)
+    "mutually recursive functions remain monomorphic as one SCC")
+  (assert-true t
+    (relates-indexed-collection-elements?)
+    "qualified indexed primitives relate collections to elements and borrow places")
+  (assert-true t
+    (infers-constructor-patterns?)
+    "constructor patterns constrain owned and borrowed scrutinees")
+  (assert-true t
+    (infers-positional-pattern-bindings?)
+    "constructor pattern bindings retain payload positions")
+  (assert-true t
+    (infers-nested-constructor-patterns?)
+    "inference constrains recursive constructor patterns"))

@@ -1,0 +1,3118 @@
+(load "../carp-surface/carp-surface.carp")
+(load "../carp-ct-env/carp-ct-env.carp")
+
+(doc CtValue "is a value in the compile-time evaluator. Syntax is kept
+separate from closures and computed collections so macro execution never has
+to use generated-program values.")
+(deftype CtValue
+  (Syntax [(Box SurfaceNode)])
+  (Closure [(Box CtClosure)])
+  (Builtin [String])
+  (Collection [(Array (Box CtValue))])
+  ;; a macro is a compile-time closure whose arguments bind UNEVALUATED and
+  ;; whose result is evaluated again. Registering macros as environment
+  ;; citizens (the reference's model) lets the evaluator expand macros it
+  ;; meets mid-evaluation — the unification that makes real Core macro code
+  ;; runnable.
+  (Macro [(Box CtClosure)]))
+
+(doc CtClosure "is a lexical compile-time function. It retains the stable ID
+of its defining frame, so captures are shared without copying values.")
+(deftype CtClosure
+  [parameters (Array String)
+   rest (Maybe String)
+   body (Box SurfaceNode)
+   defining-frame FrameId])
+
+(deftype CtParameters [fixed (Array String)
+                       rest (Maybe String)])
+
+(doc CtModuleFrame "records the compile-time frame for one module path.")
+(deftype CtModuleFrame [path String
+                        frame FrameId])
+
+(doc CtState "owns the persistent frame-and-cell store for one compile-time
+evaluation session.")
+(deftype CtState
+  [environment (CtEnvStore CtValue)
+   root FrameId
+   modules (Array CtModuleFrame)])
+
+(doc CtError "is an error raised while evaluating compile-time syntax. The
+span points to the macro body or invocation that caused the failure.")
+(deftype CtError [message String
+                  span SurfaceSpan])
+
+;; the compile-time load stack: the filesystem path of every file whose forms
+;; are currently being expanded, innermost last. Maintained by the expander
+;; from the loader's `Unsafe.load-stack-push!`/`-pop!` markers; `current-file`
+;; (Core Dynamic) reads it through the `Unsafe.load-stack` builtin.
+(def *ct-load-stack* (the (Array String) []))
+
+(defmodule CtEval
+  (defn reset-load-stack! [] (set! *ct-load-stack* []))
+
+  (defn push-load-file! [path]
+    (Array.push-back! &*ct-load-stack* @path))
+
+  (defn pop-load-file! []
+    (when (Int.> (Array.length &*ct-load-stack*) 0)
+      (ignore (Array.pop-back! &*ct-load-stack*))))
+
+  (private symbol-name)
+  (hidden symbol-name)
+  (defn symbol-name [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (if (Int.= 1 (Array.length segments))
+          (Maybe.Just @(Array.unsafe-nth segments 0))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private symbol-key)
+  (hidden symbol-key)
+  (defn symbol-key [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (if (Int.> (Array.length segments) 0)
+          (Maybe.Just (String.join "." segments))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private named?)
+  (hidden named?)
+  (defn named? [node name]
+    (match (symbol-key node)
+      (Maybe.Just found) (= found name)
+      (Maybe.Nothing) false))
+
+  (private error-at)
+  (hidden error-at)
+  (defn error-at [node message] (CtError.init message @(SurfaceNode.span node)))
+
+  (private path-directory)
+  (hidden path-directory)
+  (defn path-directory [path]
+    (let-do [slash -1
+             i 0
+             n (String.length path)]
+      (while-do (Int.< i n)
+        (when (Char.= (String.char-at path i) \/) (set! slash i))
+        (set! i (Int.inc i)))
+      (cond
+        (Int.< slash 0) (String.copy ".")
+        (Int.= slash 0) (String.copy "/")
+        (String.slice path 0 slash))))
+
+  (private semantic-items)
+  (hidden semantic-items)
+  (defn semantic-items [items]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length items)]
+      (for [i 0 n]
+        (let [item (Box.peek (Array.unsafe-nth items i))]
+          (match-ref (SurfaceNode.form item)
+            (SurfaceForm.Comment _) ()
+            _
+              (set! result
+                    (Array.push-back result (Box.init (SurfaceNode.copy item)))))))
+      result))
+
+  (doc state "creates a compile-time state with one root frame.")
+  (defn state []
+    (let-do [environment (CtEnv.empty)
+             root (CtEnv.root! &environment)]
+      (CtState.init environment
+                    root
+                    [(CtModuleFrame.init @"" (FrameId.copy &root))])))
+
+  (doc root "returns the root frame of a compile-time state.")
+  (defn root [state] @(CtState.root state))
+
+  (doc child! "allocates a lexical child frame.")
+  (defn child! [state parent] (CtEnv.child! (CtState.environment state) parent))
+
+  (doc define! "defines a value in a compile-time frame.")
+  (defn define! [state frame name value]
+    (CtEnv.define! (CtState.environment state) frame name value))
+
+  (doc alias! "binds `name` to an existing compile-time cell.")
+  (defn alias! [state frame name cell]
+    (CtEnv.bind-cell! (CtState.environment state) frame name cell))
+
+  (doc import! "adds an imported compile-time frame.")
+  (defn import! [state frame imported]
+    (CtEnv.add-import! (CtState.environment state) frame imported))
+
+  (doc register-module! "records the compile-time frame for a module path.")
+  (defn register-module! [state path frame]
+    (let-do [known false
+             modules (CtState.modules state)
+             n (Array.length modules)]
+      (for [i 0 n]
+        (let [entry (Array.unsafe-nth modules i)]
+          (when (= (CtModuleFrame.path entry) path) (set! known true))))
+      (unless known (Array.push-back! modules (CtModuleFrame.init @path @frame)))
+      true))
+
+  (doc module-frame "looks up the compile-time frame for a module path.")
+  (defn module-frame [state path]
+    (let-do [result (the (Maybe FrameId) (Maybe.Nothing))
+             modules (CtState.modules state)
+             n (Array.length modules)]
+      (for [i 0 n]
+        (match-ref &result
+          (Maybe.Nothing)
+            (let [entry (Array.unsafe-nth modules i)]
+              (when (= (CtModuleFrame.path entry) path)
+                (set! result (Maybe.Just @(CtModuleFrame.frame entry)))))
+          (Maybe.Just _) ()))
+      result))
+
+  (doc lookup-value "looks up a compile-time binding by name.")
+  (defn lookup-value [state frame name]
+    (CtEnv.lookup (CtState.environment state) frame name))
+
+  (doc lookup-status "resolves a compile-time name while preserving import
+ambiguity.")
+  (private module-member-lookup)
+  (hidden module-member-lookup)
+  (defn module-member-lookup [state path local]
+    (match (module-frame state path)
+      (Maybe.Just target)
+        (CtEnv.lookup-status (CtState.environment state) &target local)
+      (Maybe.Nothing) (CtEnvLookup.Missing)))
+
+  (private static-definition-value?)
+  (hidden static-definition-value?)
+  ;; a static definition's recorded source syntax is not evaluable; dynamic
+  ;; evaluation must not let it shadow a same-named `Dynamic` binding (the
+  ;; reference's dynamic lookup preference) — e.g. `(length m)` inside the
+  ;; `Map` module means `Dynamic.length`, not the static `Map.length` source.
+  (defn static-definition-value? [value]
+    (match-ref value
+      (CtValue.Syntax boxed)
+        (match-ref (SurfaceNode.form (Box.peek boxed))
+          (SurfaceForm.List items)
+            (if (Int.> (Array.length items) 0)
+              (let [head (Box.peek (Array.unsafe-nth items 0))]
+                (or (named? head @"defn")
+                    (or (named? head @"defn-")
+                        (or (named? head @"def")
+                            (or (named? head @"def-")
+                                (or (named? head @"deftype")
+                                    (or (named? head @"deftemplate")
+                                        (or (named? head @"register")
+                                            (or (named? head @"definterface")
+                                                (named? head @"defmodule"))))))))))
+              false)
+          _ false)
+      _ false))
+
+  (defn lookup-status [state frame name]
+    (match (CtEnv.lookup-status (CtState.environment state) frame name)
+      (CtEnvLookup.Found cell)
+      (if (and (not (String.contains? name \.))
+               (match (CtEnv.read-cell (CtState.environment state) &cell)
+                 (Maybe.Just value) (static-definition-value? &value)
+                 (Maybe.Nothing) false))
+        (match (module-member-lookup state "Dynamic" name)
+          (CtEnvLookup.Found dynamic-cell) (CtEnvLookup.Found dynamic-cell)
+          _ (CtEnvLookup.Found cell))
+        (CtEnvLookup.Found cell))
+      (CtEnvLookup.Ambiguous)
+      (CtEnvLookup.Ambiguous)
+      (CtEnvLookup.Missing)
+      ;; a qualified name reaches into the named module's frame. Compile-time
+      ;; code prefers the `Dynamic` module (the reference resolves `Map.len`
+      ;; in dynamic code to `Dynamic.Map.len`, never the static function).
+      (if (String.contains? name \.)
+        (let-do [segments (String.split-by name &[\.])
+                 segment-count (Array.length &segments)
+                 local (String.copy
+                   (Array.unsafe-nth &segments (Int.dec segment-count)))
+                 module-path (String.join "."
+                                          &(Array.prefix &segments
+                                                         (Int.dec segment-count)))
+                 found (module-member-lookup state
+                                             &(String.concat
+                                               &[@"Dynamic."
+                                                 (String.copy &module-path)])
+                                             &local)]
+          (match found
+            (CtEnvLookup.Missing)
+              (module-member-lookup state &module-path &local)
+            _ found))
+        (module-member-lookup state "Dynamic" name))))
+
+  (doc read-cell "copies a compile-time value from a resolved cell.")
+  (defn read-cell [state cell]
+    (CtEnv.read-cell (CtState.environment state) cell))
+
+  (doc lookup "looks up syntax bound to `name`. It remains public for clients
+that only need syntax parameters; closures and collections return `Nothing`.")
+  (defn lookup [state frame name]
+    (match (lookup-value state frame name)
+      (Maybe.Just value)
+        (match value
+          (CtValue.Syntax syntax)
+            (Maybe.Just (SurfaceNode.copy (Box.peek &syntax)))
+          _ (Maybe.Nothing))
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (private copy-children)
+  (hidden copy-children)
+  (defn copy-children [items]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length items)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (SurfaceNode.copy (Box.peek (Array.unsafe-nth items
+                                                                               i)))))))
+      result))
+
+  (private append-children)
+  (hidden append-children)
+  (private append-values)
+  (hidden append-values)
+  (defn append-children [left right]
+    (let-do [result left
+             n (Array.length right)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (SurfaceNode.copy (Box.peek (Array.unsafe-nth right
+                                                                               i)))))))
+      result))
+
+  (defn append-values [left right]
+    (let-do [result left
+             n (Array.length right)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (CtValue.copy (Box.peek (Array.unsafe-nth right
+                                                                           i)))))))
+      result))
+
+  (private splice-children)
+  (hidden splice-children)
+  (defn splice-children [node value]
+    (match-ref (SurfaceNode.form value)
+      (SurfaceForm.List items) (Result.Success (copy-children items))
+      (SurfaceForm.Array items) (Result.Success (copy-children items))
+      (SurfaceForm.StaticArray items) (Result.Success (copy-children items))
+      (SurfaceForm.Dictionary items) (Result.Success (copy-children items))
+      _
+        (Result.Error
+          (error-at node @"unquote-splicing requires a collection of syntax"))))
+
+  (private syntax-from-value)
+  (hidden syntax-from-value)
+  (defn syntax-from-value [node value]
+    (match-ref value
+      (CtValue.Syntax syntax)
+        (Result.Success (SurfaceNode.copy (Box.peek syntax)))
+      (CtValue.Collection values)
+        (let-do [result (the
+                   (Result (Array (Box SurfaceNode)) CtError)
+                   (Result.Success []))
+                 n (Array.length values)]
+          (for [i 0 n]
+            (match-ref &result
+              (Result.Success items)
+                (match-ref (Box.peek (Array.unsafe-nth values i))
+                  (CtValue.Syntax syntax)
+                    (set! result
+                          (Result.Success
+                            (Array.push-back @items
+                                             (Box.init (SurfaceNode.copy (Box.peek syntax))))))
+                  _
+                    (set! result
+                          (Result.Error
+                            (error-at node
+                                      @"compile-time collection contains a non-syntax value"))))
+              (Result.Error error) (set! result (Result.Error @error))))
+          (match result
+            (Result.Success items)
+              (Result.Success
+                (SurfaceNode.init @(SurfaceNode.span node)
+                                  (SurfaceForm.Array items)))
+            (Result.Error error) (Result.Error error)))
+      _
+        (Result.Error
+          (error-at node @"compile-time expression must evaluate to syntax"))))
+
+  (private splice-value)
+  (hidden splice-value)
+  (defn splice-value [node value]
+    (match-ref value
+      (CtValue.Syntax syntax) (splice-children node (Box.peek syntax))
+      (CtValue.Collection values)
+        (let-do [result (the
+                   (Result (Array (Box SurfaceNode)) CtError)
+                   (Result.Success []))
+                 n (Array.length values)]
+          (for [i 0 n]
+            (match-ref &result
+              (Result.Success syntax-items)
+                (let [item (Box.peek (Array.unsafe-nth values i))]
+                  (match (syntax-from-value node item)
+                    (Result.Success syntax)
+                      (set! result
+                            (Result.Success
+                              (Array.push-back @syntax-items (Box.init syntax))))
+                    (Result.Error error) (set! result (Result.Error error))))
+              (Result.Error error) (set! result (Result.Error @error))))
+          result)
+      _
+        (Result.Error
+          (error-at node
+                    @"unquote-splicing requires syntax or a syntax collection"))))
+
+  (private closure-parameters)
+  (hidden closure-parameters)
+  (private list-or-collection)
+  (hidden list-or-collection)
+  (defn closure-parameters [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Array forms)
+        (let-do [fixed (the (Array String) [])
+                 rest (the (Maybe String) (Maybe.Nothing))
+                 result (the (Result CtParameters CtError)
+                             (Result.Success (CtParameters.init []
+                                                                (Maybe.Nothing))))
+                 n (Array.length forms)]
+          (for [i 0 n]
+            (match-ref &result
+              (Result.Success _)
+                (let [form (Box.peek (Array.unsafe-nth forms i))]
+                  (let [name-result (symbol-name form)]
+                    (match-ref &name-result
+                      (Maybe.Just name)
+                        (cond
+                          (= name ":rest")
+                            (if (Int.= (Int.inc i) (Int.dec n))
+                              (let [rest-form (Box.peek (Array.unsafe-nth forms
+                                                                          (Int.inc i)))]
+                                (let [rest-name-result (symbol-name rest-form)]
+                                  (match-ref &rest-name-result
+                                    (Maybe.Just rest-name)
+                                      (do
+                                        (set! rest
+                                              (Maybe.Just (String.copy rest-name)))
+                                        (set! i (Int.inc i)))
+                                    (Maybe.Nothing)
+                                      (set! result
+                                            (Result.Error
+                                              (error-at rest-form
+                                                        @"compile-time :rest must be followed by an unqualified symbol"))))))
+                              (set! result
+                                    (Result.Error
+                                      (error-at form
+                                                @"compile-time :rest must be followed by the final parameter"))))
+                          (Maybe.nothing? &rest)
+                            (set! fixed
+                                  (Array.push-back fixed (String.copy name)))
+                          (set! result
+                                (Result.Error
+                                  (error-at form
+                                            @"compile-time parameters cannot follow :rest"))))
+                      (Maybe.Nothing)
+                        (set! result
+                              (Result.Error
+                                (error-at form
+                                          @"compile-time fn parameters must be symbols"))))))
+              (Result.Error error) (set! result (Result.Error @error))))
+          (match result
+            (Result.Success _) (Result.Success (CtParameters.init fixed rest))
+            (Result.Error error) (Result.Error error)))
+      _
+        (Result.Error
+          (error-at node @"compile-time fn parameters must be an array"))))
+
+  (private bind-closure)
+  (hidden bind-closure)
+  (defn bind-closure [call state closure arguments]
+    (let [parameters (CtClosure.parameters closure)
+          rest @(CtClosure.rest closure)
+          expected (Array.length parameters)
+          actual (Array.length arguments)]
+      (if (or (Int.< actual expected)
+              (and (Maybe.nothing? &rest) (/= expected actual)))
+        (Result.Error
+          (error-at call
+                    @"compile-time function called with the wrong number of arguments"))
+        (let-do [frame (child! state (CtClosure.defining-frame closure))]
+          (for [i 0 expected]
+            (ignore
+              (define! state
+                       &frame
+                       (Array.unsafe-nth parameters i)
+                       (CtValue.copy (Box.peek (Array.unsafe-nth arguments i))))))
+          (match rest
+            (Maybe.Just rest-name)
+              (let-do [rest-values (the (Array (Box CtValue)) [])]
+                (for [i expected actual]
+                  (Array.push-back! &rest-values
+                                    (Box.init
+                                      (CtValue.copy
+                                        (Box.peek (Array.unsafe-nth arguments i))))))
+                (ignore
+                  (define! state
+                           &frame
+                           &rest-name
+                           (list-or-collection call &rest-values))))
+            (Maybe.Nothing) ())
+          (Result.Success frame)))))
+
+  (doc define-function "creates a lexical compile-time closure from a
+parameter array and body. Macro loaders use this for `defndynamic` bindings.")
+  (defn define-function [parameters body frame]
+    (match (closure-parameters parameters)
+      (Result.Success parsed)
+        (Result.Success
+          (CtValue.Closure
+            (Box.init
+              (CtClosure.init @(CtParameters.fixed &parsed)
+                              @(CtParameters.rest &parsed)
+                              (Box.init (SurfaceNode.copy body))
+                              @frame))))
+      (Result.Error error) (Result.Error error)))
+
+  (doc define-dynamic-function "creates a top-level `defndynamic` closure in
+its definition frame.")
+  (defn define-dynamic-function [parameters body frame]
+    (define-function parameters body frame))
+
+  (private syntax-arguments)
+  (hidden syntax-arguments)
+  (defn syntax-arguments [call values]
+    (let-do [result (the
+               (Result (Array (Box SurfaceNode)) CtError)
+               (Result.Success []))
+             n (Array.length values)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success syntax)
+            (let [value (Box.peek (Array.unsafe-nth values i))]
+              (match (syntax-from-value call value)
+                (Result.Success node)
+                  (set! result
+                        (Result.Success
+                          (Array.push-back @syntax (Box.init node))))
+                (Result.Error error) (set! result (Result.Error error))))
+          (Result.Error error) (set! result (Result.Error @error))))
+      result))
+
+  (private list-items)
+  (hidden list-items)
+  (private values-from-syntax-items)
+  (hidden values-from-syntax-items)
+  (private collection-values)
+  (hidden collection-values)
+  (private operation-name)
+  (hidden operation-name)
+  (defn operation-name [call]
+    (match-ref (SurfaceNode.form call)
+      (SurfaceForm.List items)
+        (if (Int.> (Array.length items) 0)
+          (match (symbol-key (Box.peek (Array.unsafe-nth items 0)))
+            (Maybe.Just name) name
+            (Maybe.Nothing) @"unknown")
+          @"unknown")
+      _ @"unknown"))
+
+  (defn list-items [call value]
+    (match-ref value
+      (CtValue.Collection values) (syntax-arguments call values)
+      _
+        (match (syntax-from-value call value)
+          (Result.Success node)
+            (match-ref (SurfaceNode.form &node)
+              (SurfaceForm.List items) (Result.Success (copy-children items))
+              (SurfaceForm.Array items) (Result.Success (copy-children items))
+              (SurfaceForm.StaticArray items)
+                (Result.Success (copy-children items))
+              (SurfaceForm.Symbol _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got a symbol"))
+              (SurfaceForm.IntLit _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got an Int"))
+              (SurfaceForm.StringLit _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got a String"))
+              (SurfaceForm.BoolLit _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got a Bool"))
+              (SurfaceForm.CharLit _)
+                (Result.Success [(Box.init (SurfaceNode.copy &node))])
+              _
+                (Result.Error
+                  (error-at call
+                            (String.append
+                              "compile-time list operation expects a list or array: "
+                              &(operation-name call)))))
+          (Result.Error error) (Result.Error error))))
+
+  (defn values-from-syntax-items [items]
+    (let-do [result (the (Array (Box CtValue)) [])
+             n (Array.length items)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (CtValue.Syntax
+                                   (Box.init
+                                     (SurfaceNode.copy (Box.peek (Array.unsafe-nth items
+                                                                                   i)))))))))
+      result))
+
+  (defn collection-values [call value]
+    (match-ref value
+      (CtValue.Collection values) (Result.Success @values)
+      _
+        (match (syntax-from-value call value)
+          (Result.Success node)
+            (match-ref (SurfaceNode.form &node)
+              (SurfaceForm.List items)
+                (Result.Success (values-from-syntax-items items))
+              (SurfaceForm.Array items)
+                (Result.Success (values-from-syntax-items items))
+              (SurfaceForm.StaticArray items)
+                (Result.Success (values-from-syntax-items items))
+              (SurfaceForm.Symbol _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got a symbol"))
+              (SurfaceForm.IntLit _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got an Int"))
+              (SurfaceForm.StringLit _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got a String"))
+              (SurfaceForm.BoolLit _)
+                (Result.Error
+                  (error-at call
+                            @"compile-time operation expected a list or array, got a Bool"))
+              (SurfaceForm.CharLit _)
+                (Result.Success
+                  [(Box.init
+                     (CtValue.Syntax (Box.init (SurfaceNode.copy &node))))])
+              _
+                (Result.Error
+                  (error-at call
+                            (String.append
+                              "compile-time list operation expects a list or array: "
+                              &(operation-name call)))))
+          (Result.Error error) (Result.Error error))))
+
+  (private syntax-int)
+  (hidden syntax-int)
+  (defn syntax-int [call value]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.IntLit value)))))
+
+  (private syntax-bool)
+  (hidden syntax-bool)
+  (defn syntax-bool [call value]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.BoolLit value)))))
+
+  (private syntax-string)
+  (hidden syntax-string)
+  (defn syntax-string [call value]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call)
+                          (SurfaceForm.StringLit (String.copy value))))))
+
+  (private syntax-string-collection)
+  (hidden syntax-string-collection)
+  (defn syntax-string-collection [call source array?]
+    (let-do [items (the (Array (Box SurfaceNode)) [])
+             n (String.length source)]
+      (for [i 0 n]
+        (let [piece (String.slice source i (Int.inc i))]
+          (Array.push-back! &items
+                            (Box.init
+                              (SurfaceNode.init @(SurfaceNode.span call)
+                                                (SurfaceForm.StringLit piece))))))
+      (if array?
+        (CtValue.Syntax
+          (Box.init
+            (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.Array items))))
+        (CtValue.Syntax
+          (Box.init
+            (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items)))))))
+
+  (private syntax-char)
+  (hidden syntax-char)
+  (defn syntax-char [call value]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.CharLit value)))))
+
+  (private syntax-empty)
+  (hidden syntax-empty)
+  (defn syntax-empty [call]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List [])))))
+
+  (private syntax-symbol)
+  (hidden syntax-symbol)
+  (defn syntax-symbol [call segments]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.Symbol segments)))))
+
+  (private source-line)
+  (hidden source-line)
+  (defn source-line [node]
+    @(Info.line (SurfaceSpan.start (SurfaceNode.span node))))
+
+  (private source-column)
+  (hidden source-column)
+  (defn source-column [node]
+    @(Info.col (SurfaceSpan.start (SurfaceNode.span node))))
+
+  (private concat-symbols)
+  (hidden concat-symbols)
+  (defn concat-symbols [call value]
+    (match (list-items call value)
+      (Result.Success items)
+        (let-do [result (the (Result String CtError) (Result.Success @""))
+                 n (Array.length &items)]
+          (for [i 0 n]
+            (match-ref &result
+              (Result.Success text)
+                (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth &items
+                                                                         i)))
+                  (SurfaceForm.Symbol parts)
+                    (let [part (String.join "." parts)]
+                      (set! result (Result.Success (String.append text &part))))
+                  _
+                    (set! result
+                          (Result.Error
+                            (error-at call @"Symbol.concat expects symbols"))))
+              (Result.Error error) (set! result (Result.Error @error))))
+          (match result
+            (Result.Success text) (Result.Success (syntax-symbol call [text]))
+            (Result.Error error) (Result.Error error)))
+      (Result.Error error) (Result.Error error)))
+
+  (private prefix-symbols)
+  (hidden prefix-symbols)
+  (defn prefix-symbols [call left right]
+    (match (syntax-from-value call left)
+      (Result.Success left-node)
+        (match (syntax-from-value call right)
+          (Result.Success right-node)
+            (match-ref (SurfaceNode.form &left-node)
+              (SurfaceForm.Symbol left-parts)
+                (match-ref (SurfaceNode.form &right-node)
+                  (SurfaceForm.Symbol right-parts)
+                    (let-do [segments (Array.copy left-parts)
+                             n (Array.length right-parts)]
+                      (for [i 0 n]
+                        (set! segments
+                              (Array.push-back segments
+                                               @(Array.unsafe-nth right-parts i))))
+                      (Result.Success (syntax-symbol call segments)))
+                  _
+                    (Result.Error
+                      (error-at call @"Symbol.prefix expects symbols")))
+              _ (Result.Error (error-at call @"Symbol.prefix expects symbols")))
+          (Result.Error error) (Result.Error error))
+      (Result.Error error) (Result.Error error)))
+
+  (private int-argument)
+  (hidden int-argument)
+  (defn int-argument [call value]
+    (match (syntax-from-value call value)
+      (Result.Success node)
+        (match-ref (SurfaceNode.form &node)
+          (SurfaceForm.IntLit integer) (Result.Success @integer)
+          _
+            (Result.Error
+              (error-at call @"compile-time operation expects Int syntax")))
+      (Result.Error error) (Result.Error error)))
+
+  (private number-from-node)
+  (hidden number-from-node)
+  (defn number-from-node [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.IntLit value) (Maybe.Just (Double.from-int @value))
+      (SurfaceForm.ByteLit value)
+        (Maybe.Just (Double.from-int (Byte.to-int @value)))
+      (SurfaceForm.LongLit value) (Maybe.Just (Double.from-long @value))
+      (SurfaceForm.FloatLit value) (Maybe.Just (Double.from-float @value))
+      (SurfaceForm.DoubleLit value) (Maybe.Just @value)
+      _ (Maybe.Nothing)))
+
+  (private number-argument)
+  (hidden number-argument)
+  (defn number-argument [call value]
+    (match (syntax-from-value call value)
+      (Result.Success node)
+        (match (number-from-node &node)
+          (Maybe.Just number) (Result.Success number)
+          (Maybe.Nothing)
+            (Result.Error
+              (error-at call @"compile-time operation expects numeric syntax")))
+      (Result.Error error) (Result.Error error)))
+
+  (private symbol-from-value)
+  (hidden symbol-from-value)
+  (defn symbol-from-value [call value]
+    (match (syntax-from-value call value)
+      (Result.Success node)
+        (match-ref (SurfaceNode.form &node)
+          (SurfaceForm.IntLit integer)
+            (Result.Success (syntax-symbol call [(Int.str @integer)]))
+          (SurfaceForm.StringLit string)
+            (Result.Success (syntax-symbol call [@string]))
+          _
+            (Result.Error
+              (error-at call @"Symbol.from expects Int or String syntax")))
+      (Result.Error error) (Result.Error error)))
+
+  (private bool-argument)
+  (hidden bool-argument)
+  (defn bool-argument [call value]
+    (match (syntax-from-value call value)
+      (Result.Success node)
+        (match-ref (SurfaceNode.form &node)
+          (SurfaceForm.BoolLit boolean) (Result.Success @boolean)
+          _
+            (Result.Error
+              (error-at call @"compile-time operation expects Bool syntax")))
+      (Result.Error error) (Result.Error error)))
+
+  (private dynamic-type)
+  (hidden dynamic-type)
+  (defn dynamic-type [call value]
+    (match-ref value
+      (CtValue.Closure _) (Result.Success (syntax-symbol call [@"closure"]))
+      (CtValue.Builtin _) (Result.Success (syntax-symbol call [@"fn"]))
+      (CtValue.Collection _) (Result.Success (syntax-symbol call [@"array"]))
+      (CtValue.Syntax syntax)
+        (match-ref (SurfaceNode.form (Box.peek syntax))
+          (SurfaceForm.IntLit _) (Result.Success (syntax-symbol call [@"int"]))
+          (SurfaceForm.ByteLit _)
+            (Result.Success (syntax-symbol call [@"byte"]))
+          (SurfaceForm.LongLit _)
+            (Result.Success (syntax-symbol call [@"long"]))
+          (SurfaceForm.FloatLit _)
+            (Result.Success (syntax-symbol call [@"float"]))
+          (SurfaceForm.DoubleLit _)
+            (Result.Success (syntax-symbol call [@"double"]))
+          (SurfaceForm.BoolLit _)
+            (Result.Success (syntax-symbol call [@"bool"]))
+          (SurfaceForm.CharLit _)
+            (Result.Success (syntax-symbol call [@"char"]))
+          (SurfaceForm.StringLit _)
+            (Result.Success (syntax-symbol call [@"string"]))
+          (SurfaceForm.Symbol _)
+            (Result.Success (syntax-symbol call [@"symbol"]))
+          (SurfaceForm.List _) (Result.Success (syntax-symbol call [@"list"]))
+          (SurfaceForm.Array _) (Result.Success (syntax-symbol call [@"array"]))
+          (SurfaceForm.StaticArray _)
+            (Result.Success (syntax-symbol call [@"array"]))
+          (SurfaceForm.Dictionary _)
+            (Result.Success (syntax-symbol call [@"array"]))
+          (SurfaceForm.Comment _)
+            (Result.Success (syntax-symbol call [@"comment"]))
+          (SurfaceForm.PatternLit _)
+            (Result.Success (syntax-symbol call [@"pattern"])))))
+
+  (private value-at)
+  (hidden value-at)
+  (defn value-at [call values index]
+    (if (and (Int.>= index 0) (Int.< index (Array.length values)))
+      (Result.Success (CtValue.copy (Box.peek (Array.unsafe-nth values index))))
+      (Result.Error
+        (error-at call @"compile-time operation received too few arguments"))))
+
+  (private source-position-node)
+  (hidden source-position-node)
+  (defn source-position-node [call values]
+    (if (Int.= 0 (Array.length values))
+      (Result.Success (SurfaceNode.copy call))
+      (match (value-at call values 0)
+        (Result.Success value) (syntax-from-value call &value)
+        (Result.Error error) (Result.Error error))))
+
+  (private symbol-node)
+  (hidden symbol-node)
+  (defn symbol-node [anchor name]
+    (SurfaceNode.init @(SurfaceNode.span anchor)
+                      (SurfaceForm.Symbol [(String.copy name)])))
+
+  (private call-node)
+  (hidden call-node)
+  (private call-node-with-head)
+  (hidden call-node-with-head)
+  (defn call-node [anchor head arguments]
+    (let-do [items [(Box.init (symbol-node anchor head))]
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (Array.push-back! &items
+                          (Box.init
+                            (SurfaceNode.copy
+                              (Box.peek (Array.unsafe-nth arguments i))))))
+      (SurfaceNode.init @(SurfaceNode.span anchor) (SurfaceForm.List items))))
+
+  (defn call-node-with-head [anchor head arguments]
+    (let-do [items [(Box.init (SurfaceNode.copy head))]
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (Array.push-back! &items
+                          (Box.init
+                            (SurfaceNode.copy
+                              (Box.peek (Array.unsafe-nth arguments i))))))
+      (SurfaceNode.init @(SurfaceNode.span anchor) (SurfaceForm.List items))))
+
+  (private ref-node)
+  (hidden ref-node)
+  (defn ref-node [anchor value]
+    (call-node anchor "ref" &[(Box.init (SurfaceNode.copy value))]))
+
+  (private set-ref-node)
+  (hidden set-ref-node)
+  (defn set-ref-node [anchor name value]
+    (call-node anchor
+               "set!"
+               &[(Box.init (SurfaceNode.copy name))
+                 (Box.init (ref-node anchor value))]))
+
+  (private eval-with-test-internal)
+  (hidden eval-with-test-internal)
+
+  (private list-with-items)
+  (hidden list-with-items)
+  (private list-or-collection)
+  (hidden list-or-collection)
+  (private collection-like)
+  (hidden collection-like)
+  (defn list-with-items [call items]
+    (CtValue.Syntax
+      (Box.init
+        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items)))))
+
+  (defn list-or-collection [call values]
+    (match (syntax-arguments call values)
+      (Result.Success items) (list-with-items call items)
+      (Result.Error _) (CtValue.Collection @values)))
+
+  (defn collection-like [call prototype values]
+    (match-ref prototype
+      (CtValue.Collection _) (CtValue.Collection @values)
+      (CtValue.Syntax syntax)
+        (match-ref (SurfaceNode.form (Box.peek syntax))
+          (SurfaceForm.Array _)
+            (match (syntax-arguments call values)
+              (Result.Success items)
+                (CtValue.Syntax
+                  (Box.init
+                    (SurfaceNode.init @(SurfaceNode.span call)
+                                      (SurfaceForm.Array items))))
+              (Result.Error _) (CtValue.Collection @values))
+          (SurfaceForm.StaticArray _)
+            (match (syntax-arguments call values)
+              (Result.Success items)
+                (CtValue.Syntax
+                  (Box.init
+                    (SurfaceNode.init @(SurfaceNode.span call)
+                                      (SurfaceForm.StaticArray items))))
+              (Result.Error _) (CtValue.Collection @values))
+          _ (list-or-collection call values))
+      _ (list-or-collection call values)))
+
+  (private syntax-equal?)
+  (private syntax-items-equal?)
+  (hidden syntax-items-equal?)
+  (sig syntax-equal? (Fn [(Ref SurfaceNode) (Ref SurfaceNode)] Bool))
+  (sig syntax-items-equal?
+       (Fn
+         [(Ref (Array (Box SurfaceNode))) (Ref (Array (Box SurfaceNode)))]
+         Bool))
+  (hidden syntax-equal?)
+  (defn syntax-equal? [left right]
+    (match (number-from-node left)
+      (Maybe.Just left-number)
+        (match (number-from-node right)
+          (Maybe.Just right-number) (Double.= left-number right-number)
+          (Maybe.Nothing) false)
+      (Maybe.Nothing)
+        (match-ref (SurfaceNode.form left)
+          (SurfaceForm.BoolLit left-value)
+          (match-ref (SurfaceNode.form right)
+            (SurfaceForm.BoolLit right-value) (Bool.= @left-value @right-value)
+            _ false)
+          (SurfaceForm.StringLit left-value)
+          (match-ref (SurfaceNode.form right)
+            (SurfaceForm.StringLit right-value)
+              (String.= left-value right-value)
+            (SurfaceForm.CharLit right-value)
+              (and (Int.= (String.length left-value) 1)
+                   (Char.= (String.char-at left-value 0) @right-value))
+            _ false)
+          (SurfaceForm.CharLit left-value)
+          (match-ref (SurfaceNode.form right)
+            (SurfaceForm.CharLit right-value) (Char.= @left-value @right-value)
+            (SurfaceForm.StringLit right-value)
+              (and (Int.= (String.length right-value) 1)
+                   (Char.= @left-value (String.char-at right-value 0)))
+            _ false)
+          (SurfaceForm.Symbol left-segments)
+          (match-ref (SurfaceNode.form right)
+            (SurfaceForm.Symbol right-segments) (= left-segments right-segments)
+            _ false)
+          ;; lists and arrays compare structurally, element by element (see
+          ;; syntax-items-equal? below); without this `(= value '())` (i.e.
+          ;; `nil?`) is never true and dynamic list recursion cannot terminate.
+          (SurfaceForm.List left-items)
+          (match-ref (SurfaceNode.form right)
+            (SurfaceForm.List right-items)
+              (syntax-items-equal? left-items right-items)
+            _ false)
+          (SurfaceForm.Array left-items)
+          (match-ref (SurfaceNode.form right)
+            (SurfaceForm.Array right-items)
+              (syntax-items-equal? left-items right-items)
+            _ false)
+          _
+          false)))
+
+  (defn syntax-items-equal? [left-raw right-raw]
+    (let-do [left (semantic-items left-raw)
+             right (semantic-items right-raw)
+             n (Array.length &left)
+             same (Int.= n (Array.length &right))]
+      (when same
+        (for [i 0 n]
+          (unless (syntax-equal? (Box.peek (Array.unsafe-nth &left i))
+                                 (Box.peek (Array.unsafe-nth &right i)))
+            (set! same false))))
+      same))
+
+  (private list-item)
+  (hidden list-item)
+  (defn list-item [call value index]
+    (let [items-result (collection-values call value)]
+      (match-ref &items-result
+        (Result.Success items)
+          (if (and (Int.>= index 0) (Int.< index (Array.length items)))
+            (Result.Success
+              (CtValue.copy (Box.peek (Array.unsafe-nth items index))))
+            (Result.Error
+              (error-at call @"compile-time list index is out of bounds")))
+        (Result.Error error) (Result.Error @error))))
+
+  (private list-tail)
+  (hidden list-tail)
+  (defn list-tail [call value start]
+    (let [items-result (collection-values call value)]
+      (match-ref &items-result
+        (Result.Success items)
+          (let-do [result (the (Array (Box CtValue)) [])
+                   n (Array.length items)]
+            (for [i start n]
+              (set! result
+                    (Array.push-back result
+                                     (Box.init
+                                       (CtValue.copy (Box.peek (Array.unsafe-nth items
+                                                                                 i)))))))
+            (Result.Success (list-or-collection call &result)))
+        (Result.Error error) (Result.Error @error))))
+
+  (private list-prefix)
+  (hidden list-prefix)
+  (defn list-prefix [call value end]
+    (let [items-result (collection-values call value)]
+      (match-ref &items-result
+        (Result.Success items)
+          (let-do [result (the (Array (Box CtValue)) [])]
+            (for [i 0 end]
+              (set! result
+                    (Array.push-back result
+                                     (Box.init
+                                       (CtValue.copy (Box.peek (Array.unsafe-nth items
+                                                                                 i)))))))
+            (Result.Success (list-or-collection call &result)))
+        (Result.Error error) (Result.Error @error))))
+
+  (private string-argument)
+  (hidden string-argument)
+  (defn string-argument [call value]
+    (match (syntax-from-value call value)
+      (Result.Success node)
+        (match-ref (SurfaceNode.form &node)
+          (SurfaceForm.StringLit string) (Result.Success @string)
+          _
+            (Result.Error
+              (error-at call @"compile-time operation expects String syntax")))
+      (Result.Error error) (Result.Error error)))
+
+  (private concat-strings)
+  (hidden concat-strings)
+  (defn concat-strings [call value]
+    (match (collection-values call value)
+      (Result.Success values)
+        (let-do [parts (the (Result (Array String) CtError) (Result.Success []))
+                 n (Array.length &values)]
+          (for [i 0 n]
+            (match-ref &parts
+              (Result.Success strings)
+                (match (string-argument call
+                                        (Box.peek (Array.unsafe-nth &values i)))
+                  (Result.Success string)
+                    (set! parts
+                          (Result.Success (Array.push-back @strings string)))
+                  (Result.Error error) (set! parts (Result.Error error)))
+              (Result.Error error) (set! parts (Result.Error @error))))
+          (match parts
+            (Result.Success strings)
+              (let [joined (String.concat &strings)]
+                (Result.Success (syntax-string call &joined)))
+            (Result.Error error) (Result.Error error)))
+      (Result.Error error) (Result.Error error)))
+
+  (private char-argument)
+  (hidden char-argument)
+  (defn char-argument [call value]
+    (match (syntax-from-value call value)
+      (Result.Success node)
+        (match-ref (SurfaceNode.form &node)
+          (SurfaceForm.CharLit character) (Result.Success @character)
+          _
+            (Result.Error
+              (error-at call @"compile-time operation expects Char syntax")))
+      (Result.Error error) (Result.Error error)))
+
+  (private apply-builtin)
+  (hidden apply-builtin)
+  (defn apply-builtin [call head values]
+    (cond
+      (named? head @"Unsafe.load-stack")
+        (let-do [items (the (Array (Box CtValue)) [])
+                 n (Array.length &*ct-load-stack*)]
+          (for [i 0 n]
+            (Array.push-back!
+              &items
+              (Box.init
+                (CtValue.Syntax
+                  (Box.init
+                    (SurfaceNode.init
+                      @(SurfaceNode.span call)
+                      (SurfaceForm.StringLit
+                        @(Array.unsafe-nth &*ct-load-stack*
+                                           (Int.- (Int.dec n) i)))))))))
+          (Maybe.Just (Result.Success (CtValue.Collection items))))
+      (named? head @"list")
+        (Maybe.Just (Result.Success (list-or-collection call values)))
+      (named? head @"array")
+        (match (syntax-arguments call values)
+          (Result.Success items)
+            (Maybe.Just
+              (Result.Success
+                (CtValue.Syntax
+                  (Box.init
+                    (SurfaceNode.init @(SurfaceNode.span call)
+                                      (SurfaceForm.Array items))))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"Symbol.from")
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (symbol-from-value call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"Symbol.concat")
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (concat-symbols call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"Symbol.prefix")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (Maybe.Just (prefix-symbols call &left &right))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"car") (named? head @"Dynamic.car"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 0))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cdr") (named? head @"Dynamic.cdr"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-tail call &value 1))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cadr") (named? head @"Dynamic.cadr"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 1))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"caddr") (named? head @"Dynamic.caddr"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 2))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cadddr") (named? head @"Dynamic.cadddr"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 3))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cddr") (named? head @"Dynamic.cddr"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-tail call &value 2))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"caadr") (named? head @"Dynamic.caadr"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (list-item call &value 1)
+              (Result.Success nested) (Maybe.Just (list-item call &nested 0))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cdadr") (named? head @"Dynamic.cdadr"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (list-item call &value 1)
+              (Result.Success nested) (Maybe.Just (list-tail call &nested 1))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"last") (named? head @"Dynamic.last"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (list-item call &value (Int.dec (Array.length items))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"all-but-last") (named? head @"Dynamic.all-but-last"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (list-prefix call &value (Int.dec (Array.length items))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cons") (named? head @"Dynamic.cons"))
+        (match (value-at call values 0)
+          (Result.Success first)
+            (match (value-at call values 1)
+              (Result.Success rest)
+                (let [items-result (collection-values call &rest)]
+                  (match-ref &items-result
+                    (Result.Success rest-items)
+                      (Maybe.Just
+                        (Result.Success
+                          (let [combined (append-values [(Box.init first)]
+                                                        rest-items)]
+                            (list-or-collection call &combined))))
+                    (Result.Error error) (Maybe.Just (Result.Error @error))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"cons-last") (named? head @"Dynamic.cons-last"))
+        (match (value-at call values 0)
+          (Result.Success last-value)
+            (match (value-at call values 1)
+              (Result.Success initial)
+                (let [items-result (collection-values call &initial)]
+                  (match-ref &items-result
+                    (Result.Success initial-items)
+                      (Maybe.Just
+                        (Result.Success
+                          (let [combined (Array.push-back @initial-items
+                                                          (Box.init last-value))]
+                            (list-or-collection call &combined))))
+                    (Result.Error error) (Maybe.Just (Result.Error @error))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"append") (named? head @"Dynamic.append"))
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (let [left-result (collection-values call &left)
+                      right-result (collection-values call &right)]
+                  (match-ref &left-result
+                    (Result.Success left-items)
+                      (match-ref &right-result
+                        (Result.Success right-items)
+                          (Maybe.Just
+                            (Result.Success
+                              (let [combined (append-values @left-items
+                                                            right-items)]
+                                (collection-like call &left &combined))))
+                        (Result.Error error) (Maybe.Just (Result.Error @error)))
+                    (Result.Error error) (Maybe.Just (Result.Error @error))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"length") (named? head @"Dynamic.length"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (Result.Success (syntax-int call (Array.length items))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"empty?") (named? head @"Dynamic.empty?"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (Result.Success
+                      (syntax-bool call (Int.= 0 (Array.length items)))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"list?") (named? head @"Dynamic.list?"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success node)
+                (match-ref (SurfaceNode.form &node)
+                  (SurfaceForm.List _)
+                    (Maybe.Just (Result.Success (syntax-bool call true)))
+                  _ (Maybe.Just (Result.Success (syntax-bool call false))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"array?") (named? head @"Dynamic.array?"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success node)
+                (match-ref (SurfaceNode.form &node)
+                  (SurfaceForm.Array _)
+                    (Maybe.Just (Result.Success (syntax-bool call true)))
+                  _ (Maybe.Just (Result.Success (syntax-bool call false))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"not")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (bool-argument call &value)
+              (Result.Success boolean)
+                (Maybe.Just (Result.Success (syntax-bool call (not boolean))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"dynamic-type")
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (dynamic-type call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"=") (named? head @"Dynamic.="))
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (syntax-from-value call &left)
+                  (Result.Success left-node)
+                    (match (syntax-from-value call &right)
+                      (Result.Success right-node)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-bool call
+                                         (syntax-equal? &left-node &right-node))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"+")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (int-argument call &left)
+                  (Result.Success left-int)
+                    (match (int-argument call &right)
+                      (Result.Success right-int)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-int call (Int.+ left-int right-int))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"-")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (int-argument call &left)
+                  (Result.Success left-int)
+                    (match (int-argument call &right)
+                      (Result.Success right-int)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-int call (Int.- left-int right-int))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"*")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (int-argument call &left)
+                  (Result.Success left-int)
+                    (match (int-argument call &right)
+                      (Result.Success right-int)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-int call (Int.* left-int right-int))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"/")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (int-argument call &left)
+                  (Result.Success left-int)
+                    (match (int-argument call &right)
+                      (Result.Success right-int)
+                        (if (Int.= 0 right-int)
+                          (Maybe.Just
+                            (Result.Error
+                              (error-at call @"compile-time division by zero")))
+                          (Maybe.Just
+                            (Result.Success
+                              (syntax-int call (Int./ left-int right-int)))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"mod")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (int-argument call &left)
+                  (Result.Success left-int)
+                    (match (int-argument call &right)
+                      (Result.Success right-int)
+                        (if (Int.= 0 right-int)
+                          (Maybe.Just
+                            (Result.Error
+                              (error-at call @"compile-time modulo by zero")))
+                          (Maybe.Just
+                            (Result.Success
+                              (syntax-int call (Int.mod left-int right-int)))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"neg")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (int-argument call &value)
+              (Result.Success integer)
+                (Maybe.Just (Result.Success (syntax-int call (Int.- 0 integer))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"round")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (number-argument call &value)
+              (Result.Success number)
+                (Maybe.Just
+                  (Result.Success
+                    (syntax-int call
+                                (if (Double.< number 0.0)
+                                  (Double.to-int (Double.- number 0.5))
+                                  (Double.to-int (Double.+ number 0.5))))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"inc")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (int-argument call &value)
+              (Result.Success integer)
+                (Maybe.Just (Result.Success (syntax-int call (Int.inc integer))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"dec")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (int-argument call &value)
+              (Result.Success integer)
+                (Maybe.Just (Result.Success (syntax-int call (Int.dec integer))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @">")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (number-argument call &left)
+                  (Result.Success left-number)
+                    (match (number-argument call &right)
+                      (Result.Success right-number)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-bool call
+                                         (Double.> left-number right-number))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"<")
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (number-argument call &left)
+                  (Result.Success left-number)
+                    (match (number-argument call &right)
+                      (Result.Success right-number)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-bool call
+                                         (Double.< left-number right-number))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.length")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-int call (String.length &source))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.index-of")
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success char-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (char-argument call &char-value)
+                      (Result.Success character)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-int call (String.index-of &source character))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.char-at")
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success index-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (int-argument call &index-value)
+                      (Result.Success index)
+                      ;; bounds-checked like the reference command
+                      ;; (Commands.hs commandCharAt): indexing past the end
+                      ;; is a compile-time evaluation error.
+                      (if (Int.>= index (String.length &source))
+                        (Maybe.Just
+                          (Result.Error
+                            (error-at call
+                                      (String.concat
+                                        &[@"Can't call char-at with \""
+                                          (String.copy &source)
+                                          @"\" and "
+                                          (Int.str index)
+                                          @", index too large"]))))
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-char call (String.char-at &source index)))))
+                      (Result.Error error)
+                      (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.slice")
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success start-value)
+                (match (value-at call values 2)
+                  (Result.Success end-value)
+                    (match (string-argument call &source-value)
+                      (Result.Success source)
+                        (match (int-argument call &start-value)
+                          (Result.Success start)
+                            (match (int-argument call &end-value)
+                              (Result.Success end)
+                                (let [slice (String.slice &source start end)]
+                                  (Maybe.Just
+                                    (Result.Success (syntax-string call &slice))))
+                              (Result.Error error)
+                                (Maybe.Just (Result.Error error)))
+                          (Result.Error error) (Maybe.Just (Result.Error error)))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.prefix")
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success end-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (int-argument call &end-value)
+                      (Result.Success end)
+                        (let [prefix (String.prefix &source end)]
+                          (Maybe.Just
+                            (Result.Success (syntax-string call &prefix))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.suffix")
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success start-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (int-argument call &start-value)
+                      (Result.Success start)
+                        (let [suffix (String.suffix &source start)]
+                          (Maybe.Just
+                            (Result.Success (syntax-string call &suffix))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.head")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-char call (String.head &source))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.tail")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (let [tail (String.tail &source)]
+                  (Maybe.Just (Result.Success (syntax-string call &tail))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.empty?")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-bool call (String.empty? &source))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"String.to-list")
+          (named? head @"Dynamic.String.to-list"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-string-collection call &source false)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"String.to-array")
+          (named? head @"Dynamic.String.to-array"))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-string-collection call &source true)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"String.append")
+        (match (value-at call values 0)
+          (Result.Success left-value)
+            (match (value-at call values 1)
+              (Result.Success right-value)
+                (match (string-argument call &left-value)
+                  (Result.Success left)
+                    (match (string-argument call &right-value)
+                      (Result.Success right)
+                        (let [appended (String.append &left &right)]
+                          (Maybe.Just
+                            (Result.Success (syntax-string call &appended))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"Dynamic.String.concat") (named? head @"String.concat"))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (concat-strings call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"parse")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (match (Surface.parse &source)
+                  (Result.Success module)
+                    (let [forms (SurfaceModule.forms &module)]
+                      (if (Int.= (Array.length forms) 1)
+                        (Maybe.Just
+                          (Result.Success
+                            (CtValue.Syntax
+                              (Box.init
+                                (SurfaceNode.copy (Box.peek (Array.unsafe-nth forms
+                                                                              0)))))))
+                        (Maybe.Just
+                          (Result.Error
+                            (error-at call @"parse expects exactly one form")))))
+                  (Result.Error message)
+                    (Maybe.Just (Result.Error (error-at call (str &message)))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"Dynamic.Path.directory")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success path)
+                (let [directory (path-directory &path)]
+                  (Maybe.Just (Result.Success (syntax-string call &directory))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"read-file")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success path)
+                (let [direct-result (IO.read-file &path)]
+                  (match-ref &direct-result
+                    (Result.Success text)
+                      (Maybe.Just (Result.Success (syntax-string call text)))
+                    (Result.Error _)
+                      (let [fallback (String.concat &[@"../../carp/" path])
+                            fallback-result (IO.read-file &fallback)]
+                        (match-ref &fallback-result
+                          (Result.Success text)
+                            (Maybe.Just
+                              (Result.Success (syntax-string call text)))
+                          (Result.Error error)
+                            (Maybe.Just
+                              (Result.Error
+                                (error-at call
+                                          (String.append "read-file failed: "
+                                                         error))))))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"line")
+        (match (source-position-node call values)
+          (Result.Success node)
+            (Maybe.Just (Result.Success (syntax-int call (source-line &node))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"column")
+        (match (source-position-node call values)
+          (Result.Success node)
+            (Maybe.Just (Result.Success (syntax-int call (source-column &node))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"file")
+        (Maybe.Just (Result.Success (syntax-string call "unknown")))
+      (named? head @"macro-log")
+        (Maybe.Just (Result.Success (syntax-empty call)))
+      (named? head @"str")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success syntax)
+              ;; `str` of a string is the string itself; quoting is `prn`'s job.
+              (match-ref (SurfaceNode.form &syntax)
+                (SurfaceForm.StringLit text)
+                  (Maybe.Just (Result.Success (syntax-string call text)))
+                _
+                  (let [rendered (str &syntax)]
+                    (Maybe.Just (Result.Success (syntax-string call &rendered)))))
+              (Result.Error error)
+              (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"hash")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success syntax)
+              ;; any deterministic hash works: dynamic maps only need
+              ;; internal consistency, and the suite compares unordered.
+              (let-do [rendered (str &syntax)
+                       hashed 5381
+                       n (String.length &rendered)]
+                (for [i 0 n]
+                  (set! hashed
+                        (Int.bit-and 1073741823
+                                     (Int.+ (Int.* hashed 33)
+                                            (Char.to-int (String.char-at &rendered
+                                                                         i))))))
+                (Maybe.Just (Result.Success (syntax-int call hashed))))
+              (Result.Error error)
+              (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (named? head @"macro-error")
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success message)
+                (Maybe.Just (Result.Error (error-at call message)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+      (Maybe.Nothing)))
+
+  (private apply-builtin-name)
+  (hidden apply-builtin-name)
+  (defn apply-builtin-name [call name values]
+    (let [head (SurfaceNode.init @(SurfaceNode.span call)
+                                 (SurfaceForm.Symbol [@name]))]
+      (apply-builtin call &head values)))
+
+  (private builtin-name?)
+  (hidden builtin-name?)
+  (private sexpr-for-binding)
+  (hidden sexpr-for-binding)
+  (private sexpr-from-value)
+  (hidden sexpr-from-value)
+  (private apply-function-value)
+  (hidden apply-function-value)
+  (private applied-call-syntax)
+  (hidden applied-call-syntax)
+  (private expand-known-syntax)
+  (hidden expand-known-syntax)
+  (private eval-apply)
+  (hidden eval-apply)
+  (private eval-expand)
+  (hidden eval-expand)
+  (private eval-compose)
+  (hidden eval-compose)
+  (private eval-let-do)
+  (hidden eval-let-do)
+  (private eval-for)
+  (hidden eval-for)
+  (defn builtin-name? [call name]
+    (let [values (the (Array (Box CtValue)) [])]
+      (match (apply-builtin-name call name &values)
+        (Maybe.Just _) true
+        (Maybe.Nothing) false)))
+
+  (defn sexpr-for-binding [state frame body binding]
+    (let [binding-name (String.concat &[@"__sexpr_" (String.copy binding)])]
+      (match (lookup-status state frame &binding-name)
+        (CtEnvLookup.Found cell)
+          (match (read-cell state &cell)
+            (Maybe.Just value) (Result.Success value)
+            (Maybe.Nothing)
+              (Result.Error (error-at body @"s-expr: invalid cell")))
+        _
+          (Result.Error
+            (error-at body
+                      (String.append "unknown compile-time symbol: " binding))))))
+
+  (defn sexpr-from-value [state frame body value]
+    (match (syntax-from-value body value)
+      (Result.Success node)
+        (match (symbol-key &node)
+          (Maybe.Just binding) (sexpr-for-binding state frame body &binding)
+          (Maybe.Nothing)
+            (Result.Error (error-at body @"s-expr expects a symbol")))
+      (Result.Error error) (Result.Error error)))
+
+  (defn eval-compose [body items state frame]
+    (if (Int.= 3 (Array.length items))
+      (let [f-form (Box.peek (Array.unsafe-nth items 1))
+            g-form (Box.peek (Array.unsafe-nth items 2))]
+        (match (symbol-key g-form)
+          (Maybe.Just g-name)
+            (match (sexpr-for-binding state frame body &g-name)
+              (Result.Success g-source)
+                (match (list-item body &g-source 2)
+                  (Result.Success parameters-value)
+                    (match (syntax-from-value body &parameters-value)
+                      (Result.Success parameters)
+                        (let [quoted-parameters (call-node body
+                                                           "quote"
+                                                           &[(Box.init (SurfaceNode.copy &parameters))])
+                              apply-call (call-node body
+                                                    "apply"
+                                                    &[(Box.init (SurfaceNode.copy g-form))
+                                                      (Box.init quoted-parameters)])
+                              eval-call (call-node body
+                                                   "eval"
+                                                   &[(Box.init apply-call)])
+                              composed-body (call-node-with-head body
+                                                                 f-form
+                                                                 &[(Box.init eval-call)])
+                              fn-node (call-node body
+                                                 "fn"
+                                                 &[(Box.init parameters)
+                                                   (Box.init composed-body)])]
+                          (Result.Success (CtValue.Syntax (Box.init fn-node))))
+                      (Result.Error error) (Result.Error error))
+                  (Result.Error error) (Result.Error error))
+              (Result.Error error) (Result.Error error))
+          (Maybe.Nothing)
+            (Result.Error
+              (error-at g-form @"Dynamic.compose expects named functions"))))
+      (Result.Error (error-at body @"Dynamic.compose expects two functions"))))
+
+  (sig macro-closure-for
+       (Fn [(Ref SurfaceNode) (Ref CtState) (Ref FrameId)] (Maybe CtClosure)))
+  (sig apply-ct-macro
+       (Fn
+         [(Ref SurfaceNode)
+          (Ref CtClosure)
+          (Ref (Array (Box SurfaceNode)))
+          (Ref CtState)
+          (Ref FrameId)]
+         (Result CtValue CtError)))
+  (sig apply-macro-to-values
+       (Fn
+         [(Ref SurfaceNode)
+          (Ref CtClosure)
+          (Ref (Array (Box CtValue)))
+          (Ref CtState)
+          (Ref FrameId)]
+         (Result CtValue CtError)))
+
+  (doc eval-value "evaluates a compile-time expression to syntax, a lexical
+closure, or a collection of compile-time values. It never evaluates target
+program code.")
+  (defn eval-value [body state frame]
+    (match (symbol-key body)
+      (Maybe.Just name)
+        (match (lookup-status state frame &name)
+          (CtEnvLookup.Found cell)
+            (match (read-cell state &cell)
+              (Maybe.Just value) (Result.Success value)
+              (Maybe.Nothing)
+                (Result.Error (error-at body @"invalid compile-time cell")))
+          (CtEnvLookup.Ambiguous)
+            (Result.Error
+              (error-at body
+                        (String.append "ambiguous compile-time binding: " &name)))
+          (CtEnvLookup.Missing)
+            (if (builtin-name? body &name)
+              (Result.Success (CtValue.Builtin name))
+              (Result.Error
+                (error-at body
+                          (String.append "unknown compile-time symbol: " &name)))))
+      (Maybe.Nothing)
+        (match-ref (SurfaceNode.form body)
+          (SurfaceForm.List items)
+          (if (Int.= 0 (Array.length items))
+            (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy body))))
+            (let [head (Box.peek (Array.unsafe-nth items 0))]
+              (cond
+                (named? head @"quote")
+                (if (Int.= 2 (Array.length items))
+                  (Result.Success
+                    (CtValue.Syntax
+                      (Box.init
+                        (SurfaceNode.copy (Box.peek (Array.unsafe-nth items 1))))))
+                  (Result.Error (error-at body @"quote expects one argument")))
+                (named? head @"apply")
+                (let [apply-items (semantic-items items)]
+                  (eval-apply body &apply-items state frame))
+                (named? head @"expand")
+                (let [expand-items (semantic-items items)]
+                  (eval-expand body &expand-items state frame))
+                ;; `eval` runs a compile-time expression: evaluate the argument
+                ;; to a value, and if that value is a piece of syntax (a form),
+                ;; evaluate the form itself.
+                (named? head @"eval")
+                (let [eval-items (semantic-items items)]
+                  (if (Int.= 2 (Array.length &eval-items))
+                    (match (eval-value
+                        (Box.peek (Array.unsafe-nth &eval-items 1))
+                        state
+                        frame)
+                      (Result.Success evaluated)
+                        (match evaluated
+                          (CtValue.Syntax node)
+                            (let [syntax (Box.peek &node)]
+                              (match (symbol-key syntax)
+                                (Maybe.Just syntax-name)
+                                  (match (lookup-status state frame &syntax-name)
+                                    (CtEnvLookup.Missing)
+                                      (if (builtin-name? syntax &syntax-name)
+                                        (eval-value syntax state frame)
+                                        (Result.Success
+                                          (CtValue.Syntax (Box.init (SurfaceNode.copy syntax)))))
+                                    _ (eval-value syntax state frame))
+                                (Maybe.Nothing) (eval-value syntax state frame)))
+                          other (Result.Success other))
+                      (Result.Error error) (Result.Error error))
+                    (Result.Error (error-at body @"eval expects one argument"))))
+                ;; `members` returns a type's members as `[[name type] ...]`.
+                ;; The expander records them under `__members_<TypeName>` when it
+                ;; sees the `deftype`; the argument is an unevaluated type symbol.
+                (named? head @"members")
+                (if (Int.= 2 (Array.length items))
+                  (match (symbol-key (Box.peek (Array.unsafe-nth items 1)))
+                    (Maybe.Just type-name)
+                      (let [binding-name (String.concat
+                              &[@"__members_" (String.copy &type-name)])]
+                        (match (lookup-status state frame &binding-name)
+                          (CtEnvLookup.Found cell)
+                            (match (read-cell state &cell)
+                              (Maybe.Just value) (Result.Success value)
+                              (Maybe.Nothing)
+                                (Result.Error (error-at body
+                                                        @"members: invalid cell")))
+                          _
+                            (Result.Error
+                              (error-at body
+                                        (String.append "not a type: " &type-name)))))
+                    (Maybe.Nothing)
+                      (Result.Error
+                        (error-at body @"members expects a type symbol")))
+                  (Result.Error (error-at body @"members expects one argument")))
+                (named? head @"managed?")
+                (if (Int.= 2 (Array.length items))
+                  (match (symbol-key (Box.peek (Array.unsafe-nth items 1)))
+                    (Maybe.Just type-name)
+                      (let [binding-name (String.concat
+                              &[@"__managed_" (String.copy &type-name)])]
+                        (match (lookup-status state frame &binding-name)
+                          (CtEnvLookup.Found _)
+                            (Result.Success (syntax-bool body true))
+                          _ (Result.Success (syntax-bool body false))))
+                    (Maybe.Nothing)
+                      (Result.Error
+                        (error-at body @"managed? expects a type symbol")))
+                  (Result.Error (error-at body @"managed? expects one argument")))
+                (named? head @"s-expr")
+                (if (Int.= 2 (Array.length items))
+                  (let [argument (Box.peek (Array.unsafe-nth items 1))]
+                    (match (symbol-key argument)
+                      (Maybe.Just binding)
+                        (match (lookup-status state frame &binding)
+                          (CtEnvLookup.Found _)
+                            (match (eval-value argument state frame)
+                              (Result.Success value)
+                                (sexpr-from-value state frame body &value)
+                              (Result.Error error) (Result.Error error))
+                          (CtEnvLookup.Ambiguous)
+                            (Result.Error
+                              (error-at body
+                                        (String.append "ambiguous compile-time binding: "
+                                                       &binding)))
+                          (CtEnvLookup.Missing)
+                            (sexpr-for-binding state frame body &binding))
+                      (Maybe.Nothing)
+                        (match (eval-value argument state frame)
+                          (Result.Success value)
+                            (sexpr-from-value state frame body &value)
+                          (Result.Error error) (Result.Error error))))
+                  (Result.Error (error-at body @"s-expr expects one argument")))
+                (named? head @"use")
+                (if (Int.= 2 (Array.length items))
+                  (let [target (Box.peek (Array.unsafe-nth items 1))]
+                    (match (symbol-key target)
+                      (Maybe.Just path)
+                        (match (module-frame state &path)
+                          (Maybe.Just imported)
+                            (if (import! state frame &imported)
+                              (Result.Success (syntax-empty body))
+                              (Result.Error
+                                (error-at target
+                                          @"invalid compile-time module frame")))
+                          (Maybe.Nothing)
+                            (Result.Error
+                              (error-at target
+                                        (String.append "unknown compile-time module: "
+                                                       &path))))
+                      (Maybe.Nothing)
+                        (Result.Error
+                          (error-at target @"use expects a module symbol"))))
+                  (Result.Error (error-at body @"use expects one module")))
+                (named? head @"Dynamic.compose")
+                (let [compose-items (semantic-items items)]
+                  (eval-compose body &compose-items state frame))
+                (named? head @"fn")
+                (let [fn-items (semantic-items items)]
+                  (if (Int.= 3 (Array.length &fn-items))
+                    (let [parameters (Box.peek (Array.unsafe-nth &fn-items 1))
+                          fn-body (Box.peek (Array.unsafe-nth &fn-items 2))]
+                      (define-function parameters fn-body frame))
+                    (Result.Error
+                      (error-at body @"fn expects parameters and a body"))))
+                (named? head @"do")
+                (let-do [result (the (Result CtValue CtError)
+                                     (Result.Success
+                                       (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))
+                         n (Array.length items)]
+                  (for [i 1 n]
+                    (match-ref &result
+                      (Result.Success _)
+                        (set! result
+                              (eval-value (Box.peek (Array.unsafe-nth items i))
+                                          state
+                                          frame))
+                      (Result.Error error) (set! result (Result.Error @error))))
+                  result)
+                (named? head @"let-do")
+                (eval-let-do body items state frame)
+                (named? head @"if")
+                (let [if-items (semantic-items items)]
+                  (if (Int.= 4 (Array.length &if-items))
+                    (let [condition (Box.peek (Array.unsafe-nth &if-items 1))
+                          then-branch (Box.peek (Array.unsafe-nth &if-items 2))
+                          else-branch (Box.peek (Array.unsafe-nth &if-items 3))]
+                      (match (eval-value condition state frame)
+                        (Result.Success condition-value)
+                          (match-ref &condition-value
+                            (CtValue.Syntax syntax)
+                              (match-ref (SurfaceNode.form (Box.peek syntax))
+                                (SurfaceForm.BoolLit value)
+                                  (if @value
+                                    (eval-value then-branch state frame)
+                                    (eval-value else-branch state frame))
+                                _
+                                  (Result.Error
+                                    (error-at condition
+                                              @"compile-time if condition must evaluate to Bool syntax")))
+                            _
+                              (Result.Error
+                                (error-at condition
+                                          @"compile-time if condition must evaluate to Bool syntax")))
+                        (Result.Error error) (Result.Error error)))
+                    (Result.Error
+                      (error-at body
+                                @"if expects condition, then, and else forms"))))
+                (named? head @"when")
+                (if (Int.= 3 (Array.length items))
+                  (let [condition (Box.peek (Array.unsafe-nth items 1))
+                        then-branch (Box.peek (Array.unsafe-nth items 2))]
+                    (match (eval-value condition state frame)
+                      (Result.Success condition-value)
+                        (match (bool-argument condition &condition-value)
+                          (Result.Success value)
+                            (if value
+                              (eval-value then-branch state frame)
+                              (Result.Success (syntax-empty body)))
+                          (Result.Error error) (Result.Error error))
+                      (Result.Error error) (Result.Error error)))
+                  (Result.Error
+                    (error-at body @"when expects a condition and a body")))
+                (named? head @"and")
+                (let-do [result (the (Result CtValue CtError)
+                                     (Result.Success (syntax-bool body true)))
+                         stopped false
+                         n (Array.length items)]
+                  (for [i 1 n]
+                    (match-ref &result
+                      (Result.Success _)
+                        (unless stopped
+                          (let [form (Box.peek (Array.unsafe-nth items i))]
+                            (match (eval-value form state frame)
+                              (Result.Success value)
+                                (if (Int.= i (Int.dec n))
+                                  (set! result (Result.Success value))
+                                  (match (bool-argument form &value)
+                                    (Result.Success boolean)
+                                      (unless-do boolean
+                                        (set! result (Result.Success value))
+                                        (set! stopped true))
+                                    (Result.Error error)
+                                      (set! result (Result.Error error))))
+                              (Result.Error error)
+                                (set! result (Result.Error error)))))
+                      (Result.Error error) (set! result (Result.Error @error))))
+                  result)
+                (named? head @"or")
+                (let-do [result (the (Result CtValue CtError)
+                                     (Result.Success (syntax-bool body false)))
+                         stopped false
+                         n (Array.length items)]
+                  (for [i 1 n]
+                    (match-ref &result
+                      (Result.Success _)
+                        (unless stopped
+                          (let [form (Box.peek (Array.unsafe-nth items i))]
+                            (match (eval-value form state frame)
+                              (Result.Success value)
+                                (if (Int.= i (Int.dec n))
+                                  (set! result (Result.Success value))
+                                  (match (bool-argument form &value)
+                                    (Result.Success boolean)
+                                      (when-do boolean
+                                        (set! result (Result.Success value))
+                                        (set! stopped true))
+                                    (Result.Error error)
+                                      (set! result (Result.Error error))))
+                              (Result.Error error)
+                                (set! result (Result.Error error)))))
+                      (Result.Error error) (set! result (Result.Error @error))))
+                  result)
+                (named? head @"set!")
+                (if (Int.= 3 (Array.length items))
+                  (let [target (Box.peek (Array.unsafe-nth items 1))
+                        value-node (Box.peek (Array.unsafe-nth items 2))]
+                    (match (symbol-key target)
+                      (Maybe.Just target-name)
+                        (match (eval-value value-node state frame)
+                          (Result.Success value)
+                            (if (CtEnv.set! (CtState.environment state)
+                                            frame
+                                            &target-name
+                                            (CtValue.copy &value))
+                              (Result.Success value)
+                              (Result.Error
+                                (error-at target
+                                          (String.append "unknown compile-time set! target: "
+                                                         &target-name))))
+                          (Result.Error error) (Result.Error error))
+                      (Maybe.Nothing)
+                        (Result.Error
+                          (error-at target @"set! target must be a symbol"))))
+                  (Result.Error
+                    (error-at body @"set! expects a name and a value")))
+                (named? head @"let")
+                (if (Int.= 3 (Array.length items))
+                  (let [binding-form (Box.peek (Array.unsafe-nth items 1))
+                        let-body (Box.peek (Array.unsafe-nth items 2))]
+                    (match-ref (SurfaceNode.form binding-form)
+                      (SurfaceForm.Array pair)
+                        (let [binding-items (semantic-items pair)]
+                          (if (Int.= (mod (Array.length &binding-items) 2) 0)
+                            (let-do [let-frame (child! state frame)
+                                     failure (the (Maybe CtError)
+                                                  (Maybe.Nothing))
+                                     n (Array.length &binding-items)]
+                              (for [binding-index 0 (/ n 2)]
+                                (match-ref &failure
+                                  (Maybe.Nothing)
+                                    (let [index (* binding-index 2)
+                                          name-form (Box.peek (Array.unsafe-nth &binding-items
+                                                                                index))
+                                          value-form (Box.peek
+                                            (Array.unsafe-nth &binding-items
+                                                              (Int.inc index)))]
+                                      (match (symbol-name name-form)
+                                        (Maybe.Just name)
+                                          (match (eval-value value-form
+                                                             state
+                                                             &let-frame)
+                                            (Result.Success value)
+                                              (ignore (define! state
+                                                               &let-frame
+                                                               &name
+                                                               value))
+                                            (Result.Error error)
+                                              (set! failure (Maybe.Just error)))
+                                        (Maybe.Nothing)
+                                          (set! failure
+                                                (Maybe.Just
+                                                  (error-at name-form
+                                                            @"compile-time let binding must have a symbol name")))))
+                                  (Maybe.Just _) ()))
+                              (match failure
+                                (Maybe.Nothing)
+                                  (eval-value let-body state &let-frame)
+                                (Maybe.Just error) (Result.Error error)))
+                            (Result.Error
+                              (error-at binding-form
+                                        @"compile-time let bindings must contain name/value pairs"))))
+                      _
+                        (Result.Error
+                          (error-at binding-form
+                                    @"compile-time let bindings must be an array"))))
+                  (Result.Error
+                    (error-at body @"let expects bindings and a body")))
+                (named? head @"while")
+                (if (Int.= 3 (Array.length items))
+                  (let [condition (Box.peek (Array.unsafe-nth items 1))
+                        loop-body (Box.peek (Array.unsafe-nth items 2))]
+                    (let-do [result (the (Result CtValue CtError)
+                                         (Result.Success (syntax-empty body)))
+                             running true]
+                      (while-do running
+                        (match-ref &result
+                          (Result.Success _)
+                            (match (eval-value condition state frame)
+                              (Result.Success condition-value)
+                                (match (bool-argument condition &condition-value)
+                                  (Result.Success boolean)
+                                    (if boolean
+                                      (match (eval-value loop-body state frame)
+                                        (Result.Success _) ()
+                                        (Result.Error error)
+                                          (do
+                                            (set! result (Result.Error error))
+                                            (set! running false)))
+                                      (set! running false))
+                                  (Result.Error error)
+                                    (do
+                                      (set! result (Result.Error error))
+                                      (set! running false)))
+                              (Result.Error error)
+                                (do
+                                  (set! result (Result.Error error))
+                                  (set! running false)))
+                          (Result.Error _) (set! running false)))
+                      result))
+                  (Result.Error
+                    (error-at body @"while expects a condition and a body")))
+                (named? head @"for")
+                (eval-for body items state frame)
+                (named? head @"case")
+                (if (Int.> (Array.length items) 2)
+                  (let [target-form (Box.peek (Array.unsafe-nth items 1))]
+                    (match (eval-value target-form state frame)
+                      (Result.Success target-value)
+                        (match (syntax-from-value target-form &target-value)
+                          (Result.Success target)
+                            (let-do [result (the (Result CtValue CtError)
+                                                 (Result.Error
+                                                   (error-at body
+                                                             @"compile-time case has no matching branch")))
+                                     expect-pattern true
+                                     take-branch false
+                                     settled false
+                                     n (Array.length items)]
+                              (for [i 2 n]
+                                (match-ref &result
+                                  (Result.Success _) ()
+                                  (Result.Error _)
+                                    (unless settled
+                                      (let [form (Box.peek (Array.unsafe-nth items
+                                                                             i))]
+                                        (cond
+                                          expect-pattern
+                                            (if (Int.= i (Int.dec n))
+                                              (do
+                                                (set! result
+                                                      (eval-value form
+                                                                  state
+                                                                  frame))
+                                                (set! settled true))
+                                              (match (eval-value form
+                                                                 state
+                                                                 frame)
+                                                (Result.Success candidate-value)
+                                                  (match (syntax-from-value form
+                                                                            &candidate-value)
+                                                    (Result.Success candidate)
+                                                      (do
+                                                        (set! take-branch
+                                                              (syntax-equal? &target
+                                                                             &candidate))
+                                                        (set! expect-pattern
+                                                              false))
+                                                    (Result.Error error)
+                                                      (set! result
+                                                            (Result.Error error)))
+                                                (Result.Error error)
+                                                  (set! result
+                                                        (Result.Error error))))
+                                          take-branch
+                                            (do
+                                              (set! result
+                                                    (eval-value form state frame))
+                                              (set! settled true))
+                                          (set! expect-pattern true))))))
+                              result)
+                          (Result.Error error) (Result.Error error))
+                      (Result.Error error) (Result.Error error)))
+                  (Result.Error
+                    (error-at body @"case expects a value and branches")))
+                (named? head @"cond")
+                (let-do [result (the (Result CtValue CtError)
+                                     (Result.Success
+                                       (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))
+                         expect-condition true
+                         take-branch false
+                         settled false
+                         n (Array.length items)]
+                  (for [i 1 n]
+                    (match-ref &result
+                      (Result.Success _)
+                        (unless settled
+                          (let [form (Box.peek (Array.unsafe-nth items i))]
+                            (cond
+                              expect-condition
+                                (if (Int.= i (Int.dec n))
+                                  (do
+                                    (set! result (eval-value form state frame))
+                                    (set! settled true))
+                                  (match (eval-value form state frame)
+                                    (Result.Success condition)
+                                      (match (bool-argument form &condition)
+                                        (Result.Success boolean)
+                                          (do
+                                            (set! take-branch boolean)
+                                            (set! expect-condition false))
+                                        (Result.Error error)
+                                          (set! result (Result.Error error)))
+                                    (Result.Error error)
+                                      (set! result (Result.Error error))))
+                              take-branch
+                                (do
+                                  (set! result (eval-value form state frame))
+                                  (set! settled true))
+                              (set! expect-condition true))))
+                      (Result.Error error) (set! result (Result.Error @error))))
+                  result)
+                (named? head @"with-test-internal")
+                (eval-with-test-internal body items state frame)
+                (named? head @"concat")
+                (if (Int.= 3 (Array.length items))
+                  (let [left (Box.peek (Array.unsafe-nth items 1))
+                        right (Box.peek (Array.unsafe-nth items 2))]
+                    (match (eval-value left state frame)
+                      (Result.Success left-value)
+                        (match (eval-value right state frame)
+                          (Result.Success right-value)
+                            (match-ref &left-value
+                              (CtValue.Collection left-items)
+                                (match-ref &right-value
+                                  (CtValue.Collection right-items)
+                                    (let-do [items @left-items
+                                             n (Array.length right-items)]
+                                      (for [i 0 n]
+                                        (set! items
+                                              (Array.push-back items
+                                                               (Box.init
+                                                                 (CtValue.copy
+                                                                   (Box.peek (Array.unsafe-nth right-items
+                                                                                               i)))))))
+                                      (Result.Success (CtValue.Collection items)))
+                                  _
+                                    (Result.Error
+                                      (error-at right
+                                                @"concat expects compile-time collections")))
+                              _
+                                (Result.Error
+                                  (error-at left
+                                            @"concat expects compile-time collections")))
+                          (Result.Error error) (Result.Error error))
+                      (Result.Error error) (Result.Error error)))
+                  (Result.Error
+                    (error-at body @"concat expects two collections")))
+                (match (the (Maybe CtClosure)
+                            (macro-closure-for head state frame))
+                  (Maybe.Just macro-closure)
+                    (apply-ct-macro body &macro-closure items state frame)
+                  (Maybe.Nothing)
+                    (let-do [arguments (the (Result (Array (Box CtValue))
+                                                    CtError)
+                                            (Result.Success []))
+                             n (Array.length items)]
+                      (for [i 1 n]
+                        (match-ref &arguments
+                          (Result.Success values)
+                            (let [argument (Box.peek (Array.unsafe-nth items i))]
+                              (match (match (symbol-key argument)
+                                  (Maybe.Just name)
+                                    (if (or (named? head @"Dynamic.compose")
+                                            (and (named? head @"Dynamic.curry*")
+                                                 (Int.= i 1)))
+                                      (match (sexpr-for-binding state
+                                                                frame
+                                                                body
+                                                                &name)
+                                        (Result.Success value)
+                                          (Result.Success value)
+                                        (Result.Error _)
+                                          (eval-value argument state frame))
+                                      (match (lookup-status state frame &name)
+                                        (CtEnvLookup.Missing)
+                                          (if (builtin-name? argument &name)
+                                            (eval-value argument state frame)
+                                            (Result.Success
+                                              (CtValue.Syntax (Box.init (SurfaceNode.copy argument)))))
+                                        _ (eval-value argument state frame)))
+                                  (Maybe.Nothing)
+                                    (eval-value argument state frame))
+                                (Result.Success value)
+                                  (set! arguments
+                                        (Result.Success
+                                          (Array.push-back @values
+                                                           (Box.init value))))
+                                (Result.Error error)
+                                  (set! arguments (Result.Error error))))
+                          (Result.Error error)
+                            (set! arguments (Result.Error @error))))
+                      (match arguments
+                        (Result.Success values)
+                          (match (apply-builtin body head &values)
+                            (Maybe.Just builtin-result) builtin-result
+                            (Maybe.Nothing)
+                              (match (symbol-key head)
+                                (Maybe.Just function-name)
+                                  (match (lookup-status state
+                                                        frame
+                                                        &function-name)
+                                    (CtEnvLookup.Found cell)
+                                      (match (read-cell state &cell)
+                                        (Maybe.Just function-value)
+                                          (match function-value
+                                            (CtValue.Closure closure)
+                                            (match (bind-closure body
+                                                                 state
+                                                                 (Box.peek &closure)
+                                                                 &values)
+                                              (Result.Success closure-frame)
+                                                (match (eval-value
+                                                    (Box.peek (CtClosure.body (Box.peek &closure)))
+                                                    state
+                                                    &closure-frame)
+                                                  (Result.Success value)
+                                                    (Result.Success value)
+                                                  (Result.Error error)
+                                                    (Result.Error error))
+                                              (Result.Error error)
+                                                (Result.Error error))
+                                            (CtValue.Builtin builtin-name)
+                                            (match (apply-builtin-name body
+                                                                       &builtin-name
+                                                                       &values)
+                                              (Maybe.Just result) result
+                                              (Maybe.Nothing)
+                                                (Result.Error
+                                                  (error-at body
+                                                            @"unknown compile-time builtin")))
+                                            ;; a parameter bound to function-naming
+                                            ;; syntax (e.g. a macro receiving
+                                            ;; `list-equal-unordered`) resolves
+                                            ;; through evaluation before applying.
+                                            (CtValue.Syntax function-syntax)
+                                            (match (eval-value (Box.peek &function-syntax)
+                                                               state
+                                                               frame)
+                                              (Result.Success resolved)
+                                                (match resolved
+                                                  (CtValue.Closure resolved-closure)
+                                                    (match (bind-closure body
+                                                                         state
+                                                                         (Box.peek &resolved-closure)
+                                                                         &values)
+                                                      (Result.Success resolved-frame)
+                                                        (eval-value
+                                                          (Box.peek
+                                                            (CtClosure.body (Box.peek &resolved-closure)))
+                                                          state
+                                                          &resolved-frame)
+                                                      (Result.Error error)
+                                                        (Result.Error error))
+                                                  (CtValue.Builtin resolved-builtin)
+                                                    (match (apply-builtin-name body
+                                                                               &resolved-builtin
+                                                                               &values)
+                                                      (Maybe.Just result) result
+                                                      (Maybe.Nothing)
+                                                        (Result.Error
+                                                          (error-at body
+                                                                    @"unknown compile-time builtin")))
+                                                  (CtValue.Macro resolved-macro)
+                                                    (apply-macro-to-values body
+                                                                           (Box.peek &resolved-macro)
+                                                                           &values
+                                                                           state
+                                                                           frame)
+                                                  _
+                                                    (Result.Error
+                                                      (error-at body
+                                                                @"compile-time application expects a function")))
+                                              (Result.Error error)
+                                                (Result.Error error))
+                                            (CtValue.Macro cell-macro)
+                                            (apply-macro-to-values body
+                                                                   (Box.peek &cell-macro)
+                                                                   &values
+                                                                   state
+                                                                   frame)
+                                            _
+                                            (Result.Error
+                                              (error-at body
+                                                        @"compile-time application expects a function")))
+                                        (Maybe.Nothing)
+                                          (Result.Error
+                                            (error-at body
+                                                      @"invalid compile-time cell")))
+                                    (CtEnvLookup.Ambiguous)
+                                      (Result.Error
+                                        (error-at body
+                                                  (String.append "ambiguous compile-time function: "
+                                                                 &function-name)))
+                                    (CtEnvLookup.Missing)
+                                      (Result.Error
+                                        (error-at body
+                                                  (String.append "unknown compile-time function: "
+                                                                 &function-name))))
+                                (Maybe.Nothing)
+                                  (match (eval-value head state frame)
+                                    (Result.Success function-value)
+                                      (apply-function-value body
+                                                            &function-value
+                                                            &values
+                                                            state
+                                                            frame)
+                                    (Result.Error error) (Result.Error error))))
+                        (Result.Error error) (Result.Error error)))))))
+          (SurfaceForm.Array items)
+          (let-do [result (the (Result (Array (Box CtValue)) CtError)
+                               (Result.Success []))
+                   n (Array.length items)]
+            (for [i 0 n]
+              (match-ref &result
+                (Result.Success values)
+                  (match (eval-value (Box.peek (Array.unsafe-nth items i))
+                                     state
+                                     frame)
+                    (Result.Success value)
+                      (set! result
+                            (Result.Success
+                              (Array.push-back @values (Box.init value))))
+                    (Result.Error error) (set! result (Result.Error error)))
+                (Result.Error error) (set! result (Result.Error @error))))
+            (match result
+              (Result.Success values)
+                (Result.Success (CtValue.Collection values))
+              (Result.Error error) (Result.Error error)))
+          ;; `{k v ...}` desugars to `(Map.from-array [(Pair.init k v) ...])`,
+          ;; exactly like the reference parser; in dynamic code the call then
+          ;; resolves through the `Dynamic` module.
+          (SurfaceForm.Dictionary entries)
+          (let [pairs (semantic-items entries)]
+            (if (Int./= 0 (Int.mod (Array.length &pairs) 2))
+              (Result.Error
+                (error-at body
+                          @"dictionary literal needs an even number of forms"))
+              (let-do [span @(SurfaceNode.span body)
+                       pair-nodes (the (Array (Box SurfaceNode)) [])
+                       n (Array.length &pairs)
+                       i 0]
+                (while-do (Int.< i n)
+                  (Array.push-back! &pair-nodes
+                                    (Box.init
+                                      (SurfaceNode.init @&span
+                                                        (SurfaceForm.List
+                                                          [(Box.init
+                                                             (SurfaceNode.init @&span
+                                                                               (SurfaceForm.Symbol [@"Pair"
+                                                                                                    @"init"])))
+                                                           (Box.init
+                                                             (SurfaceNode.copy (Box.peek (Array.unsafe-nth &pairs
+                                                                                                           i))))
+                                                           (Box.init
+                                                             (SurfaceNode.copy
+                                                               (Box.peek (Array.unsafe-nth &pairs
+                                                                                           (Int.inc i)))))]))))
+                  (set! i (Int.+ i 2)))
+                (eval-value
+                  &(SurfaceNode.init @&span
+                                     (SurfaceForm.List
+                                       [(Box.init
+                                          (SurfaceNode.init @&span
+                                                            (SurfaceForm.Symbol [@"Map"
+                                                                                 @"from-array"])))
+                                        (Box.init
+                                          (SurfaceNode.init @&span
+                                                            (SurfaceForm.Array pair-nodes)))]))
+                  state
+                  frame))))
+          _
+          (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))))
+
+  (defn apply-function-value [call function-value values state frame]
+    (match-ref function-value
+      (CtValue.Syntax syntax)
+        (match (eval-value (Box.peek syntax) state frame)
+          (Result.Success evaluated)
+            (apply-function-value call &evaluated values state frame)
+          (Result.Error error) (Result.Error error))
+      (CtValue.Closure closure)
+        (match (bind-closure call state (Box.peek closure) values)
+          (Result.Success closure-frame)
+            (eval-value
+              (Box.peek (CtClosure.body (Box.peek closure)))
+              state
+              &closure-frame)
+          (Result.Error error) (Result.Error error))
+      (CtValue.Builtin builtin-name)
+        (match (apply-builtin-name call builtin-name values)
+          (Maybe.Just result) result
+          (Maybe.Nothing)
+            (Result.Error (error-at call @"unknown compile-time builtin")))
+      (CtValue.Macro macro-closure)
+        (apply-macro-to-values call (Box.peek macro-closure) values state frame)
+      _
+        (Result.Error
+          (error-at call @"compile-time application expects a function"))))
+
+  (defn applied-call-syntax [call function-form values]
+    (let-do [result (the
+               (Result (Array (Box SurfaceNode)) CtError)
+               (Result.Success [(Box.init (SurfaceNode.copy function-form))]))
+             n (Array.length values)]
+      (for [i 0 n]
+        (match-ref &result
+          (Result.Success items)
+            (match (syntax-from-value call
+                                      (Box.peek (Array.unsafe-nth values i)))
+              (Result.Success node)
+                (set! result
+                      (Result.Success (Array.push-back @items (Box.init node))))
+              (Result.Error error) (set! result (Result.Error error)))
+          (Result.Error error) (set! result (Result.Error @error))))
+      (match result
+        (Result.Success items)
+          (Result.Success
+            (CtValue.Syntax
+              (Box.init
+                (SurfaceNode.init @(SurfaceNode.span call)
+                                  (SurfaceForm.List items)))))
+        (Result.Error error) (Result.Error error))))
+
+  (defn expand-known-syntax [call node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.List raw-items)
+        (let [items (semantic-items raw-items)]
+          (if (and (Int.> (Array.length &items) 0)
+                   (named? (Box.peek (Array.unsafe-nth &items 0)) @"ignore*"))
+            (let-do [expanded (the (Array (Box SurfaceNode)) [])
+                     n (Array.length &items)]
+              (for [i 1 n]
+                (let [ignored (call-node call
+                                         "ignore"
+                                         &[(Box.init
+                                             (SurfaceNode.copy (Box.peek (Array.unsafe-nth &items
+                                                                                           i))))])]
+                  (Array.push-back! &expanded (Box.init ignored))))
+              (Result.Success (list-with-items call expanded)))
+            (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy node))))))
+      _ (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy node))))))
+
+  (defn eval-apply [body items state frame]
+    (if (Int.= 3 (Array.length items))
+      (let [function-form (Box.peek (Array.unsafe-nth items 1))
+            arguments-form (Box.peek (Array.unsafe-nth items 2))]
+        (match (eval-value arguments-form state frame)
+          (Result.Success argument-list)
+            (let [values-result (collection-values body &argument-list)]
+              (match-ref &values-result
+                (Result.Success values)
+                  (match (symbol-key function-form)
+                    (Maybe.Just function-name)
+                      (if (or (String.contains? &function-name \.)
+                              (builtin-name? function-form &function-name))
+                        (applied-call-syntax body function-form values)
+                        (match (lookup-status state frame &function-name)
+                          (CtEnvLookup.Found cell)
+                            (match (read-cell state &cell)
+                              (Maybe.Just function-value)
+                                (let [syntax-candidate (CtValue.copy &function-value)]
+                                  (match (syntax-from-value body
+                                                            &syntax-candidate)
+                                    (Result.Success function-node)
+                                      (applied-call-syntax body
+                                                           &function-node
+                                                           values)
+                                    (Result.Error _)
+                                      (let [callable-copy (CtValue.copy &function-value)]
+                                        (apply-function-value body
+                                                              &callable-copy
+                                                              values
+                                                              state
+                                                              frame))))
+                              (Maybe.Nothing)
+                                (Result.Error
+                                  (error-at body @"invalid compile-time cell")))
+                          (CtEnvLookup.Ambiguous)
+                            (Result.Error
+                              (error-at body
+                                        (String.append "ambiguous compile-time function: "
+                                                       &function-name)))
+                          (CtEnvLookup.Missing)
+                            (applied-call-syntax body function-form values)))
+                    (Maybe.Nothing)
+                      (match (eval-value function-form state frame)
+                        (Result.Success function-value)
+                          (apply-function-value body
+                                                &function-value
+                                                values
+                                                state
+                                                frame)
+                        (Result.Error error) (Result.Error error)))
+                (Result.Error error) (Result.Error @error)))
+          (Result.Error error) (Result.Error error)))
+      (Result.Error (error-at body @"apply expects a function and arguments"))))
+
+  (defn eval-let-do [body items state frame]
+    (if (Int.> (Array.length items) 2)
+      (let [binding-form (Box.peek (Array.unsafe-nth items 1))]
+        (match-ref (SurfaceNode.form binding-form)
+          (SurfaceForm.Array pair)
+            (let [binding-items (semantic-items pair)]
+              (if (Int.= (mod (Array.length &binding-items) 2) 0)
+                (let-do [let-frame (child! state frame)
+                         failure (the (Maybe CtError) (Maybe.Nothing))
+                         n (Array.length &binding-items)]
+                  (for [binding-index 0 (/ n 2)]
+                    (match-ref &failure
+                      (Maybe.Nothing)
+                        (let [index (* binding-index 2)
+                              name-form (Box.peek (Array.unsafe-nth &binding-items
+                                                                    index))
+                              value-form (Box.peek
+                                (Array.unsafe-nth &binding-items (Int.inc index)))]
+                          (match (symbol-name name-form)
+                            (Maybe.Just name)
+                              (match (eval-value value-form state &let-frame)
+                                (Result.Success value)
+                                  (ignore (define! state &let-frame &name value))
+                                (Result.Error error)
+                                  (set! failure (Maybe.Just error)))
+                            (Maybe.Nothing)
+                              (set! failure
+                                    (Maybe.Just
+                                      (error-at name-form
+                                                @"compile-time let-do binding must have a symbol name")))))
+                      (Maybe.Just _) ()))
+                  (match failure
+                    (Maybe.Nothing)
+                      (let-do [result (the (Result CtValue CtError)
+                                           (Result.Success (syntax-empty body)))
+                               item-count (Array.length items)]
+                        (for [i 2 item-count]
+                          (match-ref &result
+                            (Result.Success _)
+                              (set! result
+                                    (eval-value (Box.peek (Array.unsafe-nth items
+                                                                            i))
+                                                state
+                                                &let-frame))
+                            (Result.Error error)
+                              (set! result (Result.Error @error))))
+                        result)
+                    (Maybe.Just error) (Result.Error error)))
+                (Result.Error
+                  (error-at binding-form
+                            @"compile-time let-do bindings must contain name/value pairs"))))
+          _
+            (Result.Error
+              (error-at binding-form
+                        @"compile-time let-do bindings must be an array"))))
+      (Result.Error (error-at body @"let-do expects bindings and a body"))))
+
+  (defn eval-for [body items state frame]
+    (let [item-count (Array.length items)]
+      (if (and (Int.>= item-count 2) (Int.<= item-count 3))
+        (let [settings-form (Box.peek (Array.unsafe-nth items 1))]
+          (match-ref (SurfaceNode.form settings-form)
+            (SurfaceForm.Array raw-settings)
+              (let [settings (semantic-items raw-settings)
+                    setting-count (Array.length &settings)]
+                (if (and (Int.>= setting-count 3) (Int.<= setting-count 5))
+                  (let [variable-form (Box.peek (Array.unsafe-nth &settings 0))
+                        from-form (Box.peek (Array.unsafe-nth &settings 1))
+                        to-form (Box.peek (Array.unsafe-nth &settings 2))
+                        step-form (if (Int.> setting-count 3)
+                          (SurfaceNode.copy
+                            (Box.peek (Array.unsafe-nth &settings 3)))
+                          (SurfaceNode.init @(SurfaceNode.span body)
+                                            (SurfaceForm.IntLit 1)))
+                        comp-form (if (Int.> setting-count 4)
+                          (SurfaceNode.copy
+                            (Box.peek (Array.unsafe-nth &settings 4)))
+                          (match-ref (SurfaceNode.form &step-form)
+                            (SurfaceForm.IntLit step)
+                              (if (Int.< @step 0)
+                                (symbol-node body ">")
+                                (symbol-node body "<"))
+                            _ (symbol-node body "<")))]
+                    (match (symbol-name variable-form)
+                      (Maybe.Just variable-name)
+                        (match (eval-value from-form state frame)
+                          (Result.Success start-value)
+                            (let-do [loop-frame (child! state frame)
+                                     result (the (Result CtValue CtError)
+                                                 (Result.Success (syntax-empty body)))
+                                     running true]
+                              (ignore
+                                (define! state
+                                         &loop-frame
+                                         &variable-name
+                                         start-value))
+                              (while-do running
+                                (match-ref &result
+                                  (Result.Success _)
+                                    (let [condition-call (call-node-with-head body
+                                                                              &comp-form
+                                                                              &[(Box.init (SurfaceNode.copy variable-form))
+                                                                                (Box.init (SurfaceNode.copy to-form))])]
+                                      (match (eval-value &condition-call
+                                                         state
+                                                         &loop-frame)
+                                        (Result.Success condition-value)
+                                          (match (bool-argument &condition-call
+                                                                &condition-value)
+                                            (Result.Success keep-going)
+                                              (if keep-going
+                                                (let [addition-call (call-node body
+                                                                               "+"
+                                                                               &[(Box.init (SurfaceNode.copy variable-form))
+                                                                                 (Box.init (SurfaceNode.copy &step-form))])
+                                                      increment-call (call-node body
+                                                                                "set!"
+                                                                                &[(Box.init (SurfaceNode.copy variable-form))
+                                                                                  (Box.init addition-call)])]
+                                                  (match (if (Int.= item-count 3)
+                                                      (eval-value (Box.peek (Array.unsafe-nth items
+                                                                                              2))
+                                                                  state
+                                                                  &loop-frame)
+                                                      (Result.Success (syntax-empty body)))
+                                                    (Result.Success _)
+                                                      (match (eval-value &increment-call
+                                                                         state
+                                                                         &loop-frame)
+                                                        (Result.Success _) ()
+                                                        (Result.Error error)
+                                                          (do
+                                                            (set! result
+                                                                  (Result.Error error))
+                                                            (set! running false)))
+                                                    (Result.Error error)
+                                                      (do
+                                                        (set! result
+                                                              (Result.Error error))
+                                                        (set! running false))))
+                                                (set! running false))
+                                            (Result.Error error)
+                                              (do
+                                                (set! result
+                                                      (Result.Error error))
+                                                (set! running false)))
+                                        (Result.Error error)
+                                          (do
+                                            (set! result (Result.Error error))
+                                            (set! running false))))
+                                  (Result.Error _) (set! running false)))
+                              result)
+                          (Result.Error error) (Result.Error error))
+                      (Maybe.Nothing)
+                        (Result.Error
+                          (error-at variable-form
+                                    @"for binding must have a symbol name"))))
+                  (Result.Error
+                    (error-at settings-form
+                              @"for expects [name from to] settings"))))
+            _
+              (Result.Error
+                (error-at settings-form @"for settings must be an array"))))
+        (Result.Error
+          (error-at body @"for expects settings and at most one body form")))))
+
+  (defn eval-expand [body items state frame]
+    (if (Int.= 2 (Array.length items))
+      (match (eval-value (Box.peek (Array.unsafe-nth items 1)) state frame)
+        (Result.Success value)
+          (match (syntax-from-value body &value)
+            (Result.Success node) (expand-known-syntax body &node)
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))
+      (Result.Error (error-at body @"expand expects one argument"))))
+
+  (defn eval-with-test-internal [body items state frame]
+    (if (Int.= 3 (Array.length items))
+      (let [name-form (Box.peek (Array.unsafe-nth items 1))
+            forms-form (Box.peek (Array.unsafe-nth items 2))]
+        (match (eval-value name-form state frame)
+          (Result.Success name-value)
+            (match (syntax-from-value name-form &name-value)
+              (Result.Success name-node)
+                (match (eval-value forms-form state frame)
+                  (Result.Success forms-value)
+                    (match (list-items body &forms-value)
+                      (Result.Success forms)
+                        (let-do [result (the (Array (Box CtValue)) [])
+                                 n (Array.length &forms)]
+                          (for [i 0 n]
+                            (Array.push-back! &result
+                                              (Box.init
+                                                (CtValue.Syntax
+                                                  (Box.init
+                                                    (set-ref-node body
+                                                                  &name-node
+                                                                  (Box.peek (Array.unsafe-nth &forms
+                                                                                              i))))))))
+                          (Result.Success (CtValue.Collection result)))
+                      (Result.Error error) (Result.Error error))
+                  (Result.Error error) (Result.Error error))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error)))
+      (Result.Error
+        (error-at body @"with-test-internal expects a name and forms"))))
+
+  (doc eval-template "evaluates a macro body and requires its result to be
+syntax. The evaluator also supports lexical `fn` closures and computed array
+collections internally; a macro must still return syntax to the expander.")
+  (private macro-closure-for)
+  (hidden macro-closure-for)
+  (doc macro-closure-for "the macro bound to a call head, when the head names
+one in the compile-time environment. Macros are environment citizens (see
+CtValue.Macro), so the evaluator can meet one anywhere a call is evaluated.")
+  (defn macro-closure-for [head state frame]
+    (match (symbol-key head)
+      (Maybe.Just name)
+        (match (lookup-status state frame &name)
+          (CtEnvLookup.Found cell)
+            (match (read-cell state &cell)
+              (Maybe.Just value)
+                (match value
+                  (CtValue.Macro closure)
+                    (Maybe.Just (CtClosure.copy (Box.peek &closure)))
+                  _ (the (Maybe CtClosure) (Maybe.Nothing)))
+              (Maybe.Nothing) (the (Maybe CtClosure) (Maybe.Nothing)))
+          _ (the (Maybe CtClosure) (Maybe.Nothing)))
+      (Maybe.Nothing) (the (Maybe CtClosure) (Maybe.Nothing))))
+
+  (private macro-rest-syntax)
+  (hidden macro-rest-syntax)
+  (defn macro-rest-syntax [call arguments start]
+    (let-do [items (the (Array (Box SurfaceNode)) [])
+             n (Array.length arguments)]
+      (for [i start n]
+        (set! items
+              (Array.push-back items
+                               (Box.init
+                                 (SurfaceNode.copy
+                                   (Box.peek (Array.unsafe-nth arguments i)))))))
+      (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items))))
+
+  (private apply-ct-macro)
+  (hidden apply-ct-macro)
+  (private expand-ct-macro)
+  (hidden expand-ct-macro)
+  (doc expand-ct-macro "binds the raw argument syntax (fixed then :rest) in a
+child of the macro's defining frame and evaluates the body, yielding the
+EXPANSION as syntax. Callers decide whether to evaluate it (a macro call) or
+keep it as data (a macro reached through `apply`).")
+  (defn expand-ct-macro [call closure items state]
+    (let-do [arguments (the (Array (Box SurfaceNode)) [])]
+      (for [i 1 (Array.length items)]
+        (set! arguments
+              (Array.push-back arguments
+                               (Box.init
+                                 (SurfaceNode.copy (Box.peek (Array.unsafe-nth items
+                                                                               i)))))))
+      (let [fixed (CtClosure.parameters closure)
+            rest @(CtClosure.rest closure)
+            fixed-count (Array.length fixed)
+            argument-count (Array.length &arguments)]
+        (if (or (Int.< argument-count fixed-count)
+                (and (Maybe.nothing? &rest) (/= fixed-count argument-count)))
+          (Result.Error
+            (error-at call @"macro called with the wrong number of arguments"))
+          (let-do [macro-frame (child! state (CtClosure.defining-frame closure))]
+            (for [i 0 fixed-count]
+              (ignore
+                (define! state
+                         &macro-frame
+                         (Array.unsafe-nth fixed i)
+                         (CtValue.Syntax
+                           (Box.init
+                             (SurfaceNode.copy
+                               (Box.peek (Array.unsafe-nth &arguments i))))))))
+            (match rest
+              (Maybe.Just rest-name)
+                (ignore
+                  (define! state
+                           &macro-frame
+                           &rest-name
+                           (CtValue.Syntax
+                             (Box.init
+                               (macro-rest-syntax call &arguments fixed-count)))))
+              (Maybe.Nothing) ())
+            (match (eval-value (Box.peek (CtClosure.body closure))
+                               state
+                               &macro-frame)
+              (Result.Success expansion-value)
+                (syntax-from-value call &expansion-value)
+              (Result.Error error) (Result.Error error)))))))
+
+  (doc apply-ct-macro "a macro CALL met during evaluation: expansion followed
+by evaluation of the expansion in the CALLER's frame.")
+  (defn apply-ct-macro [call closure items state frame]
+    (match (expand-ct-macro call closure items state)
+      (Result.Success expansion) (eval-value &expansion state frame)
+      (Result.Error error) (Result.Error error)))
+
+  (private apply-macro-to-values)
+  (hidden apply-macro-to-values)
+  (doc apply-macro-to-values "applies a macro reached as a VALUE (`apply`,
+higher-order use): each argument value converts back to the syntax it wraps
+and binds unevaluated, matching the reference's first-class treatment of
+macros in dynamic code (e.g. ControlMacros' `(apply ignore* forms)`).")
+  (defn apply-macro-to-values [call closure values state frame]
+    (let-do [items (the (Array (Box SurfaceNode))
+                        [(Box.init (SurfaceNode.copy call))])
+             failure (the (Maybe CtError) (Maybe.Nothing))
+             n (Array.length values)]
+      (for [i 0 n]
+        (when (match-ref &failure (Maybe.Nothing) true _ false)
+          (match (syntax-from-value call (Box.peek (Array.unsafe-nth values i)))
+            (Result.Success node) (Array.push-back! &items (Box.init node))
+            (Result.Error error) (set! failure (Maybe.Just error)))))
+      (match failure
+        (Maybe.Just error)
+        (Result.Error error)
+        (Maybe.Nothing)
+        ;; the reference's `apply` on a macro yields the expansion as DATA
+        ;; (dynamic code like ControlMacros' `(expand (apply ignore* forms))`
+        ;; goes on to manipulate it), so no evaluation here.
+        (match (expand-ct-macro call closure &items state)
+          (Result.Success expansion)
+            (Result.Success (CtValue.Syntax (Box.init expansion)))
+          (Result.Error error) (Result.Error error)))))
+
+  (doc pure-string-command? "the pure string commands this evaluator
+implements with the reference's load-time semantics, including bounds errors
+(see the String.char-at/slice/index-of builtin arms). The expander consults
+this to evaluate literal-argument top-level calls the way the reference's
+REPL does — the knowledge lives here, beside the implementations.")
+  (defn pure-string-command? [name]
+    (or (String.= name "String.char-at")
+        (or (String.= name "String.slice") (String.= name "String.index-of"))))
+
+  (doc register-macro! "binds a macro into the compile-time environment as a
+CtValue.Macro, making it visible to mid-evaluation expansion.")
+  (defn register-macro! [state frame name fixed rest body defining-frame]
+    (ignore
+      (define! state
+               frame
+               name
+               (CtValue.Macro
+                 (Box.init (CtClosure.init fixed rest body defining-frame))))))
+
+  (defn eval-template [body state frame]
+    (match (eval-value body state frame)
+      (Result.Success value) (syntax-from-value body &value)
+      (Result.Error error) (Result.Error error))))

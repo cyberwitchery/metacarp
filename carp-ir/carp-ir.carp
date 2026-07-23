@@ -1,0 +1,668 @@
+(doc CoreRef "is a resolved binding identity. `global` distinguishes a
+top-level definition from a lexical binding; `id` is the stable identity used
+by later compiler phases.")
+(deftype CoreRef [id Int
+                  name String
+                  global Bool])
+
+(doc CoreType "is resolved type syntax retained by the core IR. The inference
+package translates it to `MonoType`, keeping the IR independent of the
+unification implementation.")
+(deftype CoreLifetime
+  (Inferred [Int])
+  (Named [String])
+  (Static []))
+
+(deftype CoreType
+  (Integer [])
+  (String [])
+  (Boolean [])
+  (Unit [])
+  (Variable [String])
+  (Named [String (Array (Box CoreType))])
+  (Reference [(Box CoreType) CoreLifetime])
+  (Function [(Array (Box CoreType)) (Box CoreType)]))
+
+(deftype CorePattern
+  (Ignore [])
+  (Bind [CoreRef])
+  (Constructor [CoreRef (Array (Box CorePattern))]))
+
+(deftype CoreMatchBranch
+  [pattern CorePattern
+   bindings (Array CoreRef)
+   body (Box CoreExpr)])
+
+(doc CoreExpr "is the deliberately small typed-pipeline IR. It is independent
+of reader spans and macro expansion; later lowering can extend it with Carp's
+ownership and control-flow forms without changing type unification.")
+(deftype CoreExpr
+  (IntLit [Int Int])
+  (ByteLit [Int Byte])
+  (LongLit [Int Long])
+  (FloatLit [Int Float])
+  (DoubleLit [Int Double])
+  (CharLit [Int Char])
+  (StringLit [Int String])
+  (PatternLit [Int String])
+  (BoolLit [Int Bool])
+  (UnitLit [Int])
+  (ArrayLit [Int (Array (Box CoreExpr))])
+  (StaticArrayLit [Int (Array (Box CoreExpr))])
+  (Reference [Int CoreRef])
+  (Call [Int (Box CoreExpr) (Array (Box CoreExpr))])
+  (Do [Int (Array (Box CoreExpr))])
+  (If [Int (Box CoreExpr) (Box CoreExpr) (Box CoreExpr)])
+  (Let [Int CoreRef (Box CoreExpr) (Box CoreExpr)])
+  (Set [Int CoreRef (Box CoreExpr)])
+  (While [Int (Box CoreExpr) (Box CoreExpr)])
+  (Break [Int])
+  (Lambda [Int (Array CoreRef) (Box CoreExpr)])
+  (Match [Int Bool (Box CoreExpr) (Array CoreMatchBranch)])
+  (Annotation [Int (Box CoreExpr) (Box CoreType)]))
+
+(doc IdAllocator "mints fresh CoreRef ids from a module-derived watermark
+instead of hardcoded ranges. The resolver's convention is that global ids
+count up from zero and local binder ids are negative, so a fresh-global
+allocator counts up from one past the module's highest declared global id and
+a fresh-local allocator counts down from one below the module's lowest local
+id — the two spaces can never meet, and neither can collide with anything
+already in the module.")
+(deftype IdAllocator [cell (Array Int)])
+
+(defmodule IdAllocator
+  (doc next-up! "returns the next fresh id counting upward (globals).")
+  (defn next-up! [alloc]
+    (let-do [value @(Array.unsafe-nth (IdAllocator.cell alloc) 0)]
+      (Array.aset! (IdAllocator.cell alloc) 0 (Int.inc value))
+      value))
+
+  (doc next-down! "returns the next fresh id counting downward (locals).")
+  (defn next-down! [alloc]
+    (let-do [value @(Array.unsafe-nth (IdAllocator.cell alloc) 0)]
+      (Array.aset! (IdAllocator.cell alloc) 0 (Int.dec value))
+      value)))
+
+(deftype CoreFunction
+  [reference CoreRef
+   parameters (Array CoreRef)
+   body (Box CoreExpr)])
+
+(deftype CoreValue [reference CoreRef
+                    body (Box CoreExpr)])
+
+(doc CoreBuiltin "declares a typed external or intrinsic binding. Builtins
+have no core body but participate in inference and specialization exactly like
+other globals.")
+(deftype CoreBuiltin [reference CoreRef
+                      signature (Box CoreType)])
+
+(deftype CoreBuiltinPayload
+  (External [(Maybe String)])
+  (Template [String String]))
+
+(doc CoreBuiltinSource "retains source-level lowering data for register and
+deftemplate declarations. Compiler-provided primitives have no source entry
+and obtain their lowering from the primitive registry.")
+(deftype CoreBuiltinSource
+  [reference CoreRef
+   signature (Box CoreType)
+   payload CoreBuiltinPayload])
+
+(doc CoreSignature "declares the expected type for a function or value
+definition. It is resolved to a global reference after collection, so it can
+appear before or after the definition.")
+(deftype CoreSignature [reference CoreRef
+                        signature (Box CoreType)])
+
+(doc CoreTypeDeclaration "declares a nominal type name introduced by forms like
+`register-type`. The first typed gate preserves the name for later lowering and
+uses nominal syntax structurally during inference.")
+(deftype CoreTypeDeclaration
+  [name String
+   representation (Maybe String)
+   members (Array (Pair String CoreType))])
+
+(doc CoreConstructorDeclaration "describes one source-declared nominal
+constructor. Tags are stable source-order indices within the nominal type.")
+(deftype CoreConstructorDeclaration
+  [reference CoreRef
+   tag Int
+   arguments (Array (Box CoreType))
+   field-names (Array String)
+   result (Box CoreType)])
+
+(doc CoreInterface "declares a polymorphic dispatch signature. Calls are
+resolved to a concrete implementation during specialization.")
+(deftype CoreInterface [reference CoreRef
+                        signature (Box CoreType)])
+
+(doc CoreImplementation "associates an interface binding with one concrete
+global implementation binding.")
+(deftype CoreImplementation [interface CoreRef
+                             implementation CoreRef])
+
+(deftype CoreModule
+  [functions (Array CoreFunction)
+   values (Array CoreValue)
+   builtins (Array CoreBuiltin)
+   builtin-sources (Array CoreBuiltinSource)
+   signatures (Array CoreSignature)
+   type-declarations (Array CoreTypeDeclaration)
+   constructors (Array CoreConstructorDeclaration)
+   interfaces (Array CoreInterface)
+   implementations (Array CoreImplementation)
+   system-includes (Array String)
+   expressions (Array (Box CoreExpr))])
+
+(deftype IndexedCoreExpr [expression (Box CoreExpr)
+                          next-call-id Int])
+
+(deftype IndexedCoreExpressions
+  [expressions (Array (Box CoreExpr))
+   next-call-id Int])
+
+(deftype IndexedCoreBranches [branches (Array CoreMatchBranch)
+                              next-call-id Int])
+
+(defmodule CoreIR
+  (private index-call-sites-in-expression)
+  (hidden index-call-sites-in-expression)
+  (private index-call-sites-in-expressions)
+  (hidden index-call-sites-in-expressions)
+  (private index-call-sites-in-branches)
+  (hidden index-call-sites-in-branches)
+
+  (doc same-ref? "compares resolved bindings by stable identity.")
+  (private consider-max)
+  (hidden consider-max)
+  (defn consider-max [m reference] (Int.max m @(CoreRef.id reference)))
+
+  (doc max-declared-global-id "the highest id among every DECLARED global
+reference in the module: functions, values, builtins, builtin sources,
+signatures, constructors, interfaces, and implementation entries. Fresh
+globals allocate one past this watermark.")
+  (defn max-declared-global-id [core]
+    (let-do [m -1]
+      (let [functions (CoreModule.functions core)]
+        (for [i 0 (Array.length functions)]
+          (set! m
+                (consider-max m
+                              (CoreFunction.reference (Array.unsafe-nth functions
+                                                                        i))))))
+      (let [values (CoreModule.values core)]
+        (for [i 0 (Array.length values)]
+          (set! m
+                (consider-max m
+                              (CoreValue.reference (Array.unsafe-nth values i))))))
+      (let [builtins (CoreModule.builtins core)]
+        (for [i 0 (Array.length builtins)]
+          (set! m
+                (consider-max m
+                              (CoreBuiltin.reference (Array.unsafe-nth builtins
+                                                                       i))))))
+      (let [sources (CoreModule.builtin-sources core)]
+        (for [i 0 (Array.length sources)]
+          (set! m
+                (consider-max m
+                              (CoreBuiltinSource.reference (Array.unsafe-nth sources
+                                                                             i))))))
+      (let [signatures (CoreModule.signatures core)]
+        (for [i 0 (Array.length signatures)]
+          (set! m
+                (consider-max m
+                              (CoreSignature.reference (Array.unsafe-nth signatures
+                                                                         i))))))
+      (let [constructors (CoreModule.constructors core)]
+        (for [i 0 (Array.length constructors)]
+          (set! m
+                (consider-max m
+                              (CoreConstructorDeclaration.reference (Array.unsafe-nth constructors
+                                                                                      i))))))
+      (let [interfaces (CoreModule.interfaces core)]
+        (for [i 0 (Array.length interfaces)]
+          (set! m
+                (consider-max m
+                              (CoreInterface.reference (Array.unsafe-nth interfaces
+                                                                         i))))))
+      (let [implementations (CoreModule.implementations core)]
+        (for [i 0 (Array.length implementations)]
+          (let-do [entry (Array.unsafe-nth implementations i)]
+            (set! m (consider-max m (CoreImplementation.interface entry)))
+            (set! m (consider-max m (CoreImplementation.implementation entry))))))
+      m))
+
+  (doc fresh-global-allocator "an IdAllocator counting up from one past the
+module's highest declared global id.")
+  (defn fresh-global-allocator [core]
+    (IdAllocator.init [(Int.inc (max-declared-global-id core))]))
+
+  (private first-duplicate)
+  (hidden first-duplicate)
+  (defn first-duplicate [ids]
+    (let-do [result (the (Maybe Int) (Maybe.Nothing))
+             n (Array.length ids)]
+      (for [i 0 n]
+        (when (match-ref &result (Maybe.Nothing) true _ false)
+          (let [candidate @(Array.unsafe-nth ids i)]
+            (for [j (Int.inc i) n]
+              (when (Int.= candidate @(Array.unsafe-nth ids j))
+                (set! result (Maybe.Just candidate)))))))
+      result))
+
+  (doc duplicate-global-id "the id of a DEFINING global declared twice within
+its own category (function, value, builtin, or interface), or Nothing. The
+id-authority invariant; cross-category sharing (e.g. a constructor
+declaration and its callable) is deliberate identity, not duplication.")
+  (defn duplicate-global-id [core]
+    (let-do [result (the (Maybe Int) (Maybe.Nothing))
+             function-ids (the (Array Int) [])
+             value-ids (the (Array Int) [])
+             builtin-ids (the (Array Int) [])
+             interface-ids (the (Array Int) [])
+             functions (CoreModule.functions core)
+             values (CoreModule.values core)
+             builtins (CoreModule.builtins core)
+             interfaces (CoreModule.interfaces core)]
+      (for [i 0 (Array.length functions)]
+        (Array.push-back! &function-ids
+                          @(CoreRef.id
+                            (CoreFunction.reference (Array.unsafe-nth functions
+                                                                      i)))))
+      (for [i 0 (Array.length values)]
+        (Array.push-back! &value-ids
+                          @(CoreRef.id
+                            (CoreValue.reference (Array.unsafe-nth values i)))))
+      (for [i 0 (Array.length builtins)]
+        (Array.push-back! &builtin-ids
+                          @(CoreRef.id
+                            (CoreBuiltin.reference (Array.unsafe-nth builtins i)))))
+      (for [i 0 (Array.length interfaces)]
+        (Array.push-back! &interface-ids
+                          @(CoreRef.id
+                            (CoreInterface.reference (Array.unsafe-nth interfaces
+                                                                       i)))))
+      (match (first-duplicate &function-ids)
+        (Maybe.Just found) (set! result (Maybe.Just found))
+        (Maybe.Nothing) ())
+      (when (match-ref &result (Maybe.Nothing) true _ false)
+        (match (first-duplicate &value-ids)
+          (Maybe.Just found) (set! result (Maybe.Just found))
+          (Maybe.Nothing) ()))
+      (when (match-ref &result (Maybe.Nothing) true _ false)
+        (match (first-duplicate &builtin-ids)
+          (Maybe.Just found) (set! result (Maybe.Just found))
+          (Maybe.Nothing) ()))
+      (when (match-ref &result (Maybe.Nothing) true _ false)
+        (match (first-duplicate &interface-ids)
+          (Maybe.Just found) (set! result (Maybe.Just found))
+          (Maybe.Nothing) ()))
+      result))
+
+  (private min-local-in-pattern)
+  (hidden min-local-in-pattern)
+  (private min-local-in-expr)
+  (hidden min-local-in-expr)
+  (private min-local-in-array)
+  (hidden min-local-in-array)
+  (sig min-local-in-pattern (Fn [(Ref CorePattern) Int] Int))
+  (sig min-local-in-expr (Fn [(Ref CoreExpr) Int] Int))
+  (sig min-local-in-array (Fn [(Ref (Array (Box CoreExpr))) Int] Int))
+  (defn min-local-in-pattern [pattern m]
+    (match-ref pattern
+      (CorePattern.Bind reference) (Int.min m @(CoreRef.id reference))
+      (CorePattern.Constructor _ children)
+        (let-do [current m]
+          (for [i 0 (Array.length children)]
+            (set! current
+                  (min-local-in-pattern (Box.peek (Array.unsafe-nth children i))
+                                        current)))
+          current)
+      _ m))
+
+  (defn min-local-in-array [expressions m]
+    (let-do [current m]
+      (for [i 0 (Array.length expressions)]
+        (set! current
+              (min-local-in-expr
+                (Box.peek (Array.unsafe-nth expressions i))
+                current)))
+      current))
+
+  (defn min-local-in-expr [expr m]
+    (match-ref expr
+      (CoreExpr.Reference _ reference)
+        (if @(CoreRef.global reference) m (Int.min m @(CoreRef.id reference)))
+      (CoreExpr.Call _ callee arguments)
+        (min-local-in-array arguments (min-local-in-expr (Box.peek callee) m))
+      (CoreExpr.Do _ expressions) (min-local-in-array expressions m)
+      (CoreExpr.If _ c t e)
+        (min-local-in-expr (Box.peek e)
+                           (min-local-in-expr (Box.peek t)
+                                              (min-local-in-expr (Box.peek c) m)))
+      (CoreExpr.Let _ binder value body)
+        (min-local-in-expr (Box.peek body)
+                           (min-local-in-expr (Box.peek value)
+                                              (Int.min m @(CoreRef.id binder))))
+      (CoreExpr.Set _ binder value)
+        (min-local-in-expr (Box.peek value) (Int.min m @(CoreRef.id binder)))
+      (CoreExpr.While _ c body)
+        (min-local-in-expr (Box.peek body) (min-local-in-expr (Box.peek c) m))
+      (CoreExpr.Lambda _ parameters body)
+        (let-do [current m]
+          (for [i 0 (Array.length parameters)]
+            (set! current
+                  (Int.min current @(CoreRef.id (Array.unsafe-nth parameters i)))))
+          (min-local-in-expr (Box.peek body) current))
+      (CoreExpr.Match _ _ scrutinee branches)
+        (let-do [current (min-local-in-expr (Box.peek scrutinee) m)]
+          (for [i 0 (Array.length branches)]
+            (let-do [branch (Array.unsafe-nth branches i)]
+              (set! current
+                    (min-local-in-pattern (CoreMatchBranch.pattern branch)
+                                          current))
+              (let [bindings (CoreMatchBranch.bindings branch)]
+                (for [j 0 (Array.length bindings)]
+                  (set! current
+                        (Int.min current
+                                 @(CoreRef.id (Array.unsafe-nth bindings j))))))
+              (set! current
+                    (min-local-in-expr (Box.peek (CoreMatchBranch.body branch))
+                                       current))))
+          current)
+      (CoreExpr.Annotation _ inner _) (min-local-in-expr (Box.peek inner) m)
+      (CoreExpr.ArrayLit _ expressions) (min-local-in-array expressions m)
+      (CoreExpr.StaticArrayLit _ expressions) (min-local-in-array expressions m)
+      _ m))
+
+  (doc fresh-local-allocator "an IdAllocator counting down from one below the
+module's lowest local binder id. The floor is clamped below the resolver's
+local range start (-(2^20)) so a module whose synthesized locals are still in
+legacy positive ranges cannot produce ids that collide with resolver locals.")
+  (defn fresh-local-allocator [core]
+    (let-do [m -1048576
+             functions (CoreModule.functions core)]
+      (for [i 0 (Array.length functions)]
+        (let-do [function (Array.unsafe-nth functions i)]
+          (let [parameters (CoreFunction.parameters function)]
+            (for [j 0 (Array.length parameters)]
+              (set! m (Int.min m @(CoreRef.id (Array.unsafe-nth parameters j))))))
+          (set! m (min-local-in-expr (Box.peek (CoreFunction.body function)) m))))
+      (let [values (CoreModule.values core)]
+        (for [i 0 (Array.length values)]
+          (set! m
+                (min-local-in-expr
+                  (Box.peek (CoreValue.body (Array.unsafe-nth values i)))
+                  m))))
+      (let [expressions (CoreModule.expressions core)]
+        (for [i 0 (Array.length expressions)]
+          (set! m
+                (min-local-in-expr (Box.peek (Array.unsafe-nth expressions i)) m))))
+      (IdAllocator.init [(Int.dec m)])))
+
+  (defn same-ref? [left right]
+    (and
+      (Int.= @(CoreRef.id left) @(CoreRef.id right))
+      (and
+        (Bool.= @(CoreRef.global left) @(CoreRef.global right))
+        (String.= (CoreRef.name left) (CoreRef.name right)))))
+
+  (doc global? "checks whether a resolved binding is top-level.")
+  (defn global? [reference] @(CoreRef.global reference))
+
+  (defn expression-id [expression]
+    (match-ref expression
+      (CoreExpr.IntLit id _) @id
+      (CoreExpr.ByteLit id _) @id
+      (CoreExpr.LongLit id _) @id
+      (CoreExpr.FloatLit id _) @id
+      (CoreExpr.DoubleLit id _) @id
+      (CoreExpr.CharLit id _) @id
+      (CoreExpr.StringLit id _) @id
+      (CoreExpr.PatternLit id _) @id
+      (CoreExpr.BoolLit id _) @id
+      (CoreExpr.UnitLit id) @id
+      (CoreExpr.ArrayLit id _) @id
+      (CoreExpr.StaticArrayLit id _) @id
+      (CoreExpr.Reference id _) @id
+      (CoreExpr.Call id _ _) @id
+      (CoreExpr.Do id _) @id
+      (CoreExpr.If id _ _ _) @id
+      (CoreExpr.Let id _ _ _) @id
+      (CoreExpr.Set id _ _) @id
+      (CoreExpr.While id _ _) @id
+      (CoreExpr.Break id) @id
+      (CoreExpr.Lambda id _ _) @id
+      (CoreExpr.Match id _ _ _) @id
+      (CoreExpr.Annotation id _ _) @id))
+
+  (defn index-call-sites-in-expressions [expressions next-call-id]
+    (let-do [result (the (Array (Box CoreExpr)) [])
+             next next-call-id
+             n (Array.length expressions)]
+      (for [i 0 n]
+        (let-do [indexed (index-call-sites-in-expression
+                   (Box.peek (Array.unsafe-nth expressions i))
+                   next)]
+          (set! result
+                (Array.push-back result @(IndexedCoreExpr.expression &indexed)))
+          (set! next @(IndexedCoreExpr.next-call-id &indexed))))
+      (IndexedCoreExpressions.init result next)))
+
+  (defn index-call-sites-in-branches [branches next-call-id]
+    (let-do [result (the (Array CoreMatchBranch) [])
+             next next-call-id
+             n (Array.length branches)]
+      (for [i 0 n]
+        (let-do [branch (Array.unsafe-nth branches i)
+                 indexed (index-call-sites-in-expression (Box.peek (CoreMatchBranch.body branch))
+                                                         next)]
+          (set! result
+                (Array.push-back result
+                                 (CoreMatchBranch.init @(CoreMatchBranch.pattern branch)
+                                                       @(CoreMatchBranch.bindings branch)
+                                                       @(IndexedCoreExpr.expression &indexed))))
+          (set! next @(IndexedCoreExpr.next-call-id &indexed))))
+      (IndexedCoreBranches.init result next)))
+
+  (defn index-call-sites-in-expression [expression next-call-id]
+    (match-ref expression
+      (CoreExpr.IntLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.IntLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.ByteLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.ByteLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.LongLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.LongLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.FloatLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.FloatLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.DoubleLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.DoubleLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.CharLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.CharLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.StringLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.StringLit next-call-id (String.copy value)))
+          (Int.inc next-call-id))
+      (CoreExpr.PatternLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.PatternLit next-call-id (String.copy value)))
+          (Int.inc next-call-id))
+      (CoreExpr.BoolLit _ value)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.BoolLit next-call-id @value))
+          (Int.inc next-call-id))
+      (CoreExpr.UnitLit _)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.UnitLit next-call-id))
+          (Int.inc next-call-id))
+      (CoreExpr.ArrayLit _ expressions)
+        (let [indexed (index-call-sites-in-expressions expressions
+                                                       (Int.inc next-call-id))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.ArrayLit next-call-id
+                                 @(IndexedCoreExpressions.expressions &indexed)))
+            @(IndexedCoreExpressions.next-call-id &indexed)))
+      (CoreExpr.StaticArrayLit _ expressions)
+        (let [indexed (index-call-sites-in-expressions expressions
+                                                       (Int.inc next-call-id))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.StaticArrayLit next-call-id
+                                       @(IndexedCoreExpressions.expressions &indexed)))
+            @(IndexedCoreExpressions.next-call-id &indexed)))
+      (CoreExpr.Reference _ reference)
+        (IndexedCoreExpr.init
+          (Box.init (CoreExpr.Reference next-call-id (CoreRef.copy reference)))
+          (Int.inc next-call-id))
+      (CoreExpr.Call _ callee arguments)
+        (let [call-id next-call-id
+              indexed-callee (index-call-sites-in-expression (Box.peek callee)
+                                                             (Int.inc next-call-id))
+              indexed-arguments (index-call-sites-in-expressions arguments
+                                                                 @(IndexedCoreExpr.next-call-id &indexed-callee))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Call call-id
+                             @(IndexedCoreExpr.expression &indexed-callee)
+                             @(IndexedCoreExpressions.expressions &indexed-arguments)))
+            @(IndexedCoreExpressions.next-call-id &indexed-arguments)))
+      (CoreExpr.Do _ expressions)
+        (let [indexed (index-call-sites-in-expressions expressions
+                                                       (Int.inc next-call-id))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Do next-call-id
+                           @(IndexedCoreExpressions.expressions &indexed)))
+            @(IndexedCoreExpressions.next-call-id &indexed)))
+      (CoreExpr.If _ condition then-branch else-branch)
+        (let [indexed-condition (index-call-sites-in-expression (Box.peek condition)
+                                                                (Int.inc next-call-id))
+              indexed-then (index-call-sites-in-expression (Box.peek then-branch)
+                                                           @(IndexedCoreExpr.next-call-id &indexed-condition))
+              indexed-else (index-call-sites-in-expression (Box.peek else-branch)
+                                                           @(IndexedCoreExpr.next-call-id &indexed-then))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.If next-call-id
+                           @(IndexedCoreExpr.expression &indexed-condition)
+                           @(IndexedCoreExpr.expression &indexed-then)
+                           @(IndexedCoreExpr.expression &indexed-else)))
+            @(IndexedCoreExpr.next-call-id &indexed-else)))
+      (CoreExpr.Let _ reference value body)
+        (let [indexed-value (index-call-sites-in-expression (Box.peek value)
+                                                            (Int.inc next-call-id))
+              indexed-body (index-call-sites-in-expression (Box.peek body)
+                                                           @(IndexedCoreExpr.next-call-id &indexed-value))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Let next-call-id
+                            (CoreRef.copy reference)
+                            @(IndexedCoreExpr.expression &indexed-value)
+                            @(IndexedCoreExpr.expression &indexed-body)))
+            @(IndexedCoreExpr.next-call-id &indexed-body)))
+      (CoreExpr.Set _ reference value)
+        (let [indexed (index-call-sites-in-expression (Box.peek value)
+                                                      (Int.inc next-call-id))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Set next-call-id
+                            (CoreRef.copy reference)
+                            @(IndexedCoreExpr.expression &indexed)))
+            @(IndexedCoreExpr.next-call-id &indexed)))
+      (CoreExpr.While _ condition body)
+        (let [indexed-condition (index-call-sites-in-expression (Box.peek condition)
+                                                                (Int.inc next-call-id))
+              indexed-body (index-call-sites-in-expression (Box.peek body)
+                                                           @(IndexedCoreExpr.next-call-id &indexed-condition))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.While next-call-id
+                              @(IndexedCoreExpr.expression &indexed-condition)
+                              @(IndexedCoreExpr.expression &indexed-body)))
+            @(IndexedCoreExpr.next-call-id &indexed-body)))
+      (CoreExpr.Break _)
+        (IndexedCoreExpr.init (Box.init (CoreExpr.Break next-call-id))
+                              (Int.inc next-call-id))
+      (CoreExpr.Lambda _ parameters body)
+        (let [indexed (index-call-sites-in-expression (Box.peek body)
+                                                      (Int.inc next-call-id))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Lambda next-call-id
+                               (Array.copy parameters)
+                               @(IndexedCoreExpr.expression &indexed)))
+            @(IndexedCoreExpr.next-call-id &indexed)))
+      (CoreExpr.Match _ by-reference scrutinee branches)
+        (let [indexed-scrutinee (index-call-sites-in-expression (Box.peek scrutinee)
+                                                                (Int.inc next-call-id))
+              indexed-branches (index-call-sites-in-branches branches
+                                                             @(IndexedCoreExpr.next-call-id &indexed-scrutinee))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Match next-call-id
+                              @by-reference
+                              @(IndexedCoreExpr.expression &indexed-scrutinee)
+                              @(IndexedCoreBranches.branches &indexed-branches)))
+            @(IndexedCoreBranches.next-call-id &indexed-branches)))
+      (CoreExpr.Annotation _ inner annotation)
+        (let [indexed (index-call-sites-in-expression (Box.peek inner)
+                                                      (Int.inc next-call-id))]
+          (IndexedCoreExpr.init
+            (Box.init
+              (CoreExpr.Annotation next-call-id
+                                   @(IndexedCoreExpr.expression &indexed)
+                                   (Box.init (CoreType.copy (Box.peek annotation)))))
+            @(IndexedCoreExpr.next-call-id &indexed)))))
+
+  (doc index-call-sites "assigns call IDs once in resolved IR. IDs are unique
+within a function/value owner and across all root expressions.")
+  (defn index-call-sites [core]
+    (let-do [functions (the (Array CoreFunction) [])
+             values (the (Array CoreValue) [])
+             source-functions (CoreModule.functions core)
+             source-values (CoreModule.values core)
+             function-count (Array.length source-functions)
+             value-count (Array.length source-values)]
+      (for [i 0 function-count]
+        (let [function (Array.unsafe-nth source-functions i)
+              indexed (index-call-sites-in-expression (Box.peek (CoreFunction.body function))
+                                                      0)]
+          (set! functions
+                (Array.push-back functions
+                                 (CoreFunction.init @(CoreFunction.reference function)
+                                                    @(CoreFunction.parameters function)
+                                                    @(IndexedCoreExpr.expression &indexed))))))
+      (for [i 0 value-count]
+        (let [value (Array.unsafe-nth source-values i)
+              indexed (index-call-sites-in-expression (Box.peek (CoreValue.body value))
+                                                      0)]
+          (set! values
+                (Array.push-back values
+                                 (CoreValue.init @(CoreValue.reference value)
+                                                 @(IndexedCoreExpr.expression &indexed))))))
+      (let [indexed-roots (index-call-sites-in-expressions (CoreModule.expressions core)
+                                                           0)]
+        (CoreModule.init functions
+                         values
+                         @(CoreModule.builtins core)
+                         @(CoreModule.builtin-sources core)
+                         @(CoreModule.signatures core)
+                         @(CoreModule.type-declarations core)
+                         @(CoreModule.constructors core)
+                         @(CoreModule.interfaces core)
+                         @(CoreModule.implementations core)
+                         @(CoreModule.system-includes core)
+                         @(IndexedCoreExpressions.expressions &indexed-roots))))))

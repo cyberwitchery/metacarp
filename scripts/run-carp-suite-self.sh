@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Mirrors the reference scripts/run_carp_tests.sh section-by-section:
+#   examples + produces-output  build (--log-memory), run, diff vs .output.expected
+#   test/*.carp                 -x --log-memory (exit 0 = pass)
+#   test/test-for-errors        compilation must be rejected
+#   bench + compile-only        -b builds
+# Error-text POLICY: rejection is the gate; error TEXT parity with the
+# reference is reported, never gated. Our diagnostics are deliberately our own
+# (different wording and spans), so byte-matching the reference's messages
+# would freeze us to its phrasing without making the compiler more correct.
+# Set CARP_CHECK_ERRORS=1 to also write a per-file divergence report
+# (our first diagnostic line vs the reference's expected first line) to
+# $out_root/error-text-report.txt — visibility without brittleness.
+# Not covered: SDL examples, doc generation.
+set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+
+compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
+carp_root=${CARP_ROOT:-"$repo_root/../../carp"}
+core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
+out_root=${CARP_SELF_SUITE_OUT:-"${TMPDIR:-/tmp}/carp-self-suite"}
+
+mkdir -p "$out_root/c" "$out_root/bin" "$out_root/log"
+
+if [ ! -x "$compiler" ]; then
+  echo "compiler not executable: $compiler" >&2
+  exit 2
+fi
+
+if [ ! -d "$carp_root/test" ]; then
+  echo "carp root not found: $carp_root" >&2
+  exit 2
+fi
+
+safe_name() {
+  printf '%s' "$1" | tr '/.' '__'
+}
+
+passed=0
+failed=0
+
+fail() {
+  file=$1
+  why=$2
+  failed=$((failed + 1))
+  printf 'FAIL %s (%s) log=%s\n' "$file" "$why" "$out_root/log/$(safe_name "$file").log" \
+    | tee -a "$out_root/failures.txt"
+}
+
+# build with --log-memory, run, diff output against test/output/<file>.output.expected
+check_output() {
+  file=$1
+  kind=$2
+  name=$(safe_name "$file")
+  log="$out_root/log/$name.log"
+  bin="$out_root/bin/$name"
+  actual="$out_root/log/$name.actual"
+
+  printf '[%s] %s\n' "$kind" "$file"
+  if ! "$compiler" -b --log-memory -c "$core_dir" -o "$bin" "$file" >"$log" 2>&1; then
+    fail "$file" compile
+    return
+  fi
+  "$bin" >"$actual" 2>&1
+  if diff --strip-trailing-cr "$actual" "$carp_root/test/output/$file.output.expected" >>"$log" 2>&1; then
+    passed=$((passed + 1))
+  else
+    fail "$file" output-diff
+  fi
+}
+
+run_test() {
+  file=$1
+  name=$(safe_name "$file")
+  log="$out_root/log/$name.log"
+
+  printf '[test] %s\n' "$file"
+  if "$compiler" -x --log-memory -c "$core_dir" "$file" >"$log" 2>&1; then
+    passed=$((passed + 1))
+  else
+    fail "$file" run
+  fi
+}
+
+build_only() {
+  file=$1
+  kind=$2
+  name=$(safe_name "$file")
+  log="$out_root/log/$name.log"
+
+  printf '[%s] %s\n' "$kind" "$file"
+  if "$compiler" -b -c "$core_dir" -o "$out_root/bin/$name" "$file" >"$log" 2>&1; then
+    passed=$((passed + 1))
+  else
+    fail "$file" build
+  fi
+}
+
+expect_reject() {
+  file=$1
+  name=$(safe_name "$file")
+  log="$out_root/log/$name.log"
+
+  printf '[reject] %s\n' "$file"
+  if "$compiler" -c "$core_dir" -o "$out_root/c/$name.c" "$file" >"$log" 2>&1; then
+    fail "$file" accepted
+  else
+    passed=$((passed + 1))
+    if [ "${CARP_CHECK_ERRORS:-0}" = "1" ]; then
+      ours=$(head -n1 "$log")
+      expected_file="$carp_root/test/output/$file.output.expected"
+      theirs=$([ -f "$expected_file" ] && head -n1 "$expected_file" || echo "<no expected file>")
+      printf '%s\n  ours:   %s\n  theirs: %s\n' "$file" "$ours" "$theirs" \
+        >>"$out_root/error-text-report.txt"
+    fi
+  fi
+}
+
+no_core_build() {
+  file=$1
+  name=$(safe_name "$file")
+  log="$out_root/log/$name.log"
+
+  printf '[no-core] %s\n' "$file"
+  if "$compiler" -b --no-core -c "$core_dir" -o "$out_root/bin/$name" "$file" >"$log" 2>&1; then
+    passed=$((passed + 1))
+  else
+    fail "$file" no-core-build
+  fi
+}
+
+cd "$carp_root" || exit 2
+: >"$out_root/failures.txt"
+: >"$out_root/error-text-report.txt"
+
+for file in \
+  ./examples/functor.carp \
+  ./examples/external_struct.carp \
+  ./examples/updating.carp \
+  ./examples/sorting.carp \
+  ./examples/generic_structs.carp \
+  ./examples/maps.carp \
+  ./examples/sumtypes.carp \
+  ./examples/json_parser.carp
+do
+  check_output "$file" example-output
+done
+
+for file in \
+  ./test/produces-output/basics.carp \
+  ./test/produces-output/function_members.carp \
+  ./test/produces-output/globals.carp \
+  ./test/produces-output/lambdas.carp \
+  ./test/produces-output/recursive_types.carp \
+  ./test/produces-output/recursive_type_decl_only.carp \
+  ./test/produces-output/maybe_custom_member_decl_only.carp \
+  ./test/produces-output/setting_variables.carp \
+  ./test/produces-output/set_ref_valid.carp \
+  ./test/produces-output/forward_references.carp \
+  ./test/produces-output/explicit_lifetimes.carp \
+  ./test/produces-output/repl.carp
+do
+  check_output "$file" output
+done
+
+for file in ./test/*.carp; do
+  run_test "$file"
+done
+
+for file in ./test/test-for-errors/*.carp; do
+  expect_reject "$file"
+done
+
+for file in ./bench/*.carp; do
+  build_only "$file" bench
+done
+
+for file in \
+  ./examples/mutual_recursion.carp \
+  ./examples/guessing_game.carp \
+  ./examples/unicode.carp \
+  ./examples/benchmark_*.carp \
+  ./examples/nested_lambdas.carp
+do
+  build_only "$file" example-compile
+done
+
+no_core_build ./examples/no_core.carp
+
+if [ "${CARP_CHECK_ERRORS:-0}" = "1" ]; then
+  printf 'error-text report: %s\n' "$out_root/error-text-report.txt"
+fi
+
+printf 'passed=%s failed=%s out=%s\n' "$passed" "$failed" "$out_root"
+[ "$failed" -eq 0 ]

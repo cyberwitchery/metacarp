@@ -1,0 +1,348 @@
+(load "../carp-ownership.carp")
+(load "../../carp-resolve/carp-resolve.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn prepare-source [source]
+  (match (Surface.parse source)
+    (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core)
+          (match (Infer.module &core)
+            (Result.Success inferred)
+              (match (Specialize.module &core &inferred)
+                (Result.Success specialized)
+                  (Ownership.prepare &specialized
+                                     &(OwnershipClassify.facts-from-module &core))
+                (Result.Error error)
+                  (Result.Error
+                    (OwnershipError.init @(SpecializeError.message &error))))
+            (Result.Error error)
+              (Result.Error (OwnershipError.init @(InferError.message &error))))
+        (Result.Error error)
+          (Result.Error (OwnershipError.init @(ResolveError.message &error))))
+    (Result.Error _) (Result.Error (OwnershipError.init @"parse error"))))
+
+(defn creates-specialization-aware-contexts? []
+  (match (prepare-source "(defn identity [x] x)
+(identity 1)
+(identity \"borrowed\")") (Result.Success plan)
+      (let-do [contexts (OwnershipPlan.contexts &plan)
+               definitions 0
+               int-instance false
+               string-ref-instance false
+               root-nodes 0
+               n (Array.length contexts)]
+        (for [i 0 n]
+          (match-ref (Array.unsafe-nth contexts i)
+            (OwnershipContext.Definition reference signature _ nodes)
+              (when-do (= (CoreRef.name reference) "identity")
+                (set! definitions (Int.inc definitions))
+                (when (Int.= @nodes 1)
+                  (match-ref (Box.peek signature)
+                    (MonoType.Function arguments _)
+                      (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+                        (MonoType.Integer) (set! int-instance true)
+                        (MonoType.Reference inner _)
+                          (match-ref (Box.peek inner)
+                            (MonoType.String) (set! string-ref-instance true)
+                            _ ())
+                        _ ())
+                    _ ())))
+            (OwnershipContext.Roots nodes) (set! root-nodes @nodes)))
+        (and (Int.= definitions 2)
+             (and int-instance
+                  (and string-ref-instance
+                       (and (Int.= root-nodes 6)
+                            (and
+                              (Int.= 0
+                                     (Array.length (OwnershipPlan.actions &plan)))
+                              (Int.= 0
+                                     (Array.length (OwnershipPlan.requirements &plan))))))))) (Result.Error _)
+      false))
+
+(defn rejects-duplicate-expression-ids? []
+  (let [first-root (SpecializedExpr.IntLit 0 (Box.init (Type.integer)) 1)
+        second-root (SpecializedExpr.IntLit 0 (Box.init (Type.integer)) 2)
+        specialized (SpecializationModule.init []
+                                               []
+                                               []
+                                               [(Box.init first-root)
+                                                (Box.init second-root)]
+                                               []
+                                               [])]
+    (Result.error?
+      &(Ownership.prepare &specialized &(OwnershipTypeFacts.init [] [])))))
+
+(defn ownership-facts []
+  (let [string-key (CAbi.type-key &(MonoType.String))
+        widget-key (CAbi.type-key &(MonoType.Named @"Widget" []))
+        handle-key (CAbi.type-key &(MonoType.Named @"Handle" []))]
+    (OwnershipTypeFacts.init [string-key widget-key @&handle-key] [handle-key])))
+
+(defn classified [type facts]
+  (match (OwnershipClassify.classify type facts)
+    (OwnershipClass.Unmanaged) 0
+    (OwnershipClass.Owned) 1
+    (OwnershipClass.Borrowed) 2))
+
+(defn classify-cases-pass? []
+  (let [facts (ownership-facts)
+        string-t (MonoType.String)
+        widget-t (MonoType.Named @"Widget" [])
+        gadget-t (MonoType.Named @"Gadget" [])
+        handle-t (MonoType.Named @"Handle" [])
+        byte-t (MonoType.Named @"Byte" [])
+        int-t (MonoType.Integer)
+        ref-t (MonoType.Reference (Box.init (MonoType.String))
+                                  (MonoLifetime.Static))]
+    (and (Int.= 1 (classified &string-t &facts))
+         (and (Int.= 1 (classified &widget-t &facts))
+              (and (Int.= 2 (classified &ref-t &facts))
+                   (and (Int.= 0 (classified &int-t &facts))
+                        (and (Int.= 0 (classified &byte-t &facts))
+                             (and (Int.= 0 (classified &gadget-t &facts))
+                                  (Int.= 0 (classified &handle-t &facts))))))))))
+
+(defn facts-derivation? [] (match (Surface.parse "(register-type Widget)
+(defmodule Widget (register delete (Fn [Widget] ()) \"Widget_delete\"))
+(implements delete Widget.delete)") (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core)
+          (let [facts (OwnershipClassify.facts-from-module &core)
+                widget-t (MonoType.Named @"Widget" [])
+                gadget-t (MonoType.Named @"Gadget" [])]
+            (and (Int.= 1 (classified &widget-t &facts))
+                 (Int.= 0 (classified &gadget-t &facts))))
+        (Result.Error _) false) (Result.Error _) false))
+
+(defn count-deletes [plan]
+  (let-do [actions (OwnershipPlan.actions plan)
+           count 0
+           n (Array.length actions)]
+    (for [i 0 n]
+      (match-ref (Array.unsafe-nth actions i)
+        (OwnershipAction.Delete _ _ _) (set! count (Int.inc count))
+        _ ()))
+    count))
+
+(defn count-binding-deletes [plan]
+  (let-do [actions (OwnershipPlan.actions plan)
+           count 0
+           n (Array.length actions)]
+    (for [i 0 n]
+      (match-ref (Array.unsafe-nth actions i)
+        (OwnershipAction.Delete _ resource _)
+          (match-ref resource
+            (OwnershipResource.Binding _) (set! count (Int.inc count))
+            _ ())
+        _ ()))
+    count))
+
+(def owned-widget-prelude "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+")
+
+(defn plans-delete-requirement? []
+  (match (prepare-source
+      &(String.append owned-widget-prelude
+                      "(defn drop-it [] (let [w (make-widget)] 0))
+(drop-it)"))
+    (Result.Success plan)
+      (and (Int.= 1 (count-deletes &plan))
+           (Int.= 1 (Array.length (OwnershipPlan.requirements &plan))))
+    (Result.Error _) false))
+
+(defn plans-delete-for-unused-owned? []
+  (match (prepare-source
+      &(String.append owned-widget-prelude
+                      "(defn drop-it [] (let [w (make-widget)] 0))
+(drop-it)"))
+    (Result.Success plan) (Int.= 1 (count-deletes &plan))
+    (Result.Error _) false))
+
+(defn no-delete-when-moved-out? []
+  (match (prepare-source
+      &(String.append owned-widget-prelude
+                      "(defn keep-it [] (let [w (make-widget)] w))
+(keep-it)"))
+    (Result.Success plan)
+      (and (Int.= 0 (count-binding-deletes &plan))
+           (Int.= 1 (count-deletes &plan)))
+    (Result.Error _) false))
+
+(defn count-moves [plan]
+  (let-do [actions (OwnershipPlan.actions plan)
+           count 0
+           n (Array.length actions)]
+    (for [i 0 n]
+      (match-ref (Array.unsafe-nth actions i)
+        (OwnershipAction.Move _ _ _ _) (set! count (Int.inc count))
+        _ ()))
+    count))
+
+(defn plans-move-for-aliased-owned? []
+  (match (prepare-source
+      &(String.append owned-widget-prelude "(defn alias [w] (let [a w] a))
+(alias (make-widget))"))
+    (Result.Success plan)
+      (and (Int.= 1 (count-moves &plan)) (Int.= 0 (count-binding-deletes &plan)))
+    (Result.Error _) false))
+
+(defn accepts-parameter-borrow? []
+  (Result.success?
+    &(prepare-source &(String.append owned-widget-prelude "(defn borrow [w] &w)
+(borrow (make-widget))"))))
+
+(defn rejects-escaped-borrow? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(defn escaped [] (let [local (make-widget)] &local))
+(escaped)"))))
+
+(defn rejects-indirect-escaped-borrow? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(defn indirect [] (let [local (make-widget) r &local] r))
+(indirect)"))))
+
+(defn accepts-indirect-parameter-borrow? []
+  (Result.success?
+    &(prepare-source
+      &(String.append owned-widget-prelude "(defn indirect [w] (let [r &w] r))
+(indirect (make-widget))"))))
+
+(defn accepts-call-returned-borrow? []
+  (Result.success?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register peek (Fn [(Ref Widget)] (Ref Widget)) \"peek\")
+(defn via-call [w] (let [r (peek &w)] r))
+(via-call (make-widget))"))))
+
+(defn rejects-accessor-into-local? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register peek (Fn [(Ref Widget a)] (Ref Widget a)) \"peek\")
+(defn f [] (let [local (make-widget)] (peek &local)))
+(f)"))))
+
+(def borrow-move-prelude "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register consume (Fn [Widget] ()) \"consume\")
+(register inspect (Fn [(Ref Widget)] ()) \"inspect\")
+")
+
+(defn rejects-borrow-after-move? []
+  (Result.error?
+    &(prepare-source
+      &(String.append borrow-move-prelude
+                      "(defn bad [] (let [s (make-widget) r &s] (do (consume s) (inspect r))))
+(bad)"))))
+
+(defn accepts-borrow-before-move? []
+  (Result.success?
+    &(prepare-source
+      &(String.append borrow-move-prelude
+                      "(defn ok [] (let [s (make-widget) r &s] (do (inspect r) (consume s))))
+(ok)"))))
+
+(defn accepts-unmanaged-borrow-after-pass? []
+  (Result.success? &(prepare-source "(register-type Gauge)
+(register make-gauge (Fn [] Gauge) \"mg\")
+(register take-gauge (Fn [Gauge] ()) \"tg\")
+(register read-gauge (Fn [(Ref Gauge)] ()) \"rg\")
+(defn f [] (let [g (make-gauge) r &g] (do (take-gauge g) (read-gauge r))))
+(f)")))
+
+(defn rejects-mutation-escape? []
+  (Result.error?
+    &(prepare-source
+      &(String.append borrow-move-prelude
+                      "(defn m [w] (let-do [local (make-widget) r &w] (set! r &local) r))
+(m (make-widget))"))))
+
+(defn rejects-branch-borrow-after-move? []
+  (Result.error?
+    &(prepare-source
+      &(String.append borrow-move-prelude
+                      "(defn b [c] (let [s (make-widget) r &s] (do (if c (consume s) ()) (inspect r))))
+(b true)"))))
+
+(defn accepts-branch-move-after-use? []
+  (Result.success?
+    &(prepare-source
+      &(String.append borrow-move-prelude
+                      "(defn ok2 [c] (let [s (make-widget) r &s] (do (inspect r) (if c (consume s) ()))))
+(ok2 true)"))))
+
+(deftest t
+  (assert-true t
+    (creates-specialization-aware-contexts?)
+    "ownership contexts distinguish concrete instances and share the root ID space")
+  (assert-true t
+    (rejects-duplicate-expression-ids?)
+    "ownership preparation rejects duplicate specialized expression IDs")
+  (assert-true t
+    (classify-cases-pass?)
+    "type ownership is classified from declared delete/blit, not from spelling")
+  (assert-true t
+    (facts-derivation?)
+    "ownership facts are derived from a module's declared delete implementations")
+  (assert-true t
+    (plans-delete-for-unused-owned?)
+    "an unused owned local is scheduled for deletion at scope exit")
+  (assert-true t
+    (plans-delete-requirement?)
+    "a planned delete reports a DeleteFunction requirement for its type")
+  (assert-true t
+    (plans-move-for-aliased-owned?)
+    "an owned value aliased into a let binding is planned as a move")
+  (assert-true t
+    (accepts-parameter-borrow?)
+    "a reference to a parameter may be returned")
+  (assert-true t
+    (rejects-escaped-borrow?)
+    "a reference to a local value that escapes its scope is rejected")
+  (assert-true t
+    (rejects-indirect-escaped-borrow?)
+    "a local borrow escaping through a binding is rejected")
+  (assert-true t
+    (accepts-indirect-parameter-borrow?)
+    "a parameter borrow passed through a binding may be returned")
+  (assert-true t
+    (accepts-call-returned-borrow?)
+    "a borrow obtained from a call is not falsely rejected as an escape")
+  (assert-true t
+    (rejects-accessor-into-local?)
+    "a reference returned from a call that borrows a local (shared lifetime) is rejected")
+  (assert-true t
+    (rejects-borrow-after-move?)
+    "a borrow used after its owner is moved is rejected")
+  (assert-true t
+    (accepts-borrow-before-move?)
+    "a borrow used before its owner is moved is accepted")
+  (assert-true t
+    (accepts-unmanaged-borrow-after-pass?)
+    "borrowing an unmanaged value and using it after passing it (a copy) is accepted")
+  (assert-true t
+    (rejects-mutation-escape?)
+    "a set! that repoints a returned reference at a local is rejected")
+  (assert-true t
+    (rejects-branch-borrow-after-move?)
+    "a borrow used after its owner is moved in one branch is rejected")
+  (assert-true t
+    (accepts-branch-move-after-use?)
+    "using a borrow before a branch that moves its owner is accepted")
+  (assert-true t
+    (no-delete-when-moved-out?)
+    "an owned local moved to the result is not deleted in its body; the discarding root deletes it"))

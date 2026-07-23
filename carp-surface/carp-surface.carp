@@ -1,0 +1,304 @@
+;; TEMPORARY local path: needs carp-reader 0.3.8 (named char literals from
+;; 0.3.6 plus reference-faithful escape pass-through, patched locally but not
+;; yet released); repin to git@github.com:carpentry-org/carp-reader@0.3.8 once
+;; tagged.
+(load "../../carp-reader/carp-reader.carp")
+
+(doc SurfaceSpan
+  "is the half-open source range of a syntax node. It deliberately
+reuses carp-reader's `Info` values, so diagnostics can be reported without
+depending on a compiler driver or file system API.")
+(deftype SurfaceSpan [start Info
+                      end Info])
+
+(defmodule SurfaceSpan
+  (doc from-located "creates a span from a `Reader.Located` node.")
+  (defn from-located [located]
+    (SurfaceSpan.init @(Located.info located) @(Located.end located))))
+
+(doc SurfaceForm "is a source-level Carp form after reading. Unlike
+`Form`, recursive children use `SurfaceNode` and every node has one
+uniform `SurfaceSpan`. This is a lossless syntax boundary: it does not resolve
+names, interpret special forms, or discard comments.")
+(deftype SurfaceForm
+  (IntLit [Int])
+  (ByteLit [Byte])
+  (LongLit [Long])
+  (FloatLit [Float])
+  (DoubleLit [Double])
+  (BoolLit [Bool])
+  (CharLit [Char])
+  (StringLit [String])
+  (PatternLit [String])
+  (Symbol [(Array String)])
+  (List [(Array (Box SurfaceNode))])
+  (Array [(Array (Box SurfaceNode))])
+  (StaticArray [(Array (Box SurfaceNode))])
+  (Dictionary [(Array (Box SurfaceNode))])
+  (Comment [String]))
+
+(doc SurfaceNode "is a `SurfaceForm` with the exact source range it came from.")
+(deftype SurfaceNode [span SurfaceSpan
+                      form SurfaceForm])
+
+(doc SurfaceModule "is the lossless, ordered set of forms in one source file.")
+(deftype SurfaceModule [forms (Array (Box SurfaceNode))])
+
+(defmodule Surface
+  (private append-escaped-string)
+  (hidden append-escaped-string)
+  (defn append-escaped-string [buffer text]
+    (let-do [n (String.length text)
+             i 0]
+      (while-do (Int.< i n)
+        (let-do [c (String.char-at text i)
+                 crlf? (and (Char.= c \return)
+                            (and (Int.< (Int.inc i) n)
+                                 (Char.= (String.char-at text (Int.inc i))
+                                         \newline)))]
+          (if crlf?
+            (do (StringBuf.append-str buffer "\\r\\n") (set! i (Int.+ i 2)))
+            (do
+              (cond
+                (Char.= c \\) (StringBuf.append-str buffer "\\\\")
+                (Char.= c \") (StringBuf.append-str buffer "\\\"")
+                (Char.= c \tab) (StringBuf.append-str buffer "\\t")
+                (Char.= c \return) (StringBuf.append-str buffer "\\r")
+                (StringBuf.append-char buffer c))
+              (set! i (Int.inc i))))))))
+
+  (private append-char)
+  (hidden append-char)
+  (defn append-char [buffer c]
+    (let [text (cond
+            (Char.= c \space) @"\\space"
+            (Char.= c \tab) @"\\tab"
+            (Char.= c \newline) @"\\newline"
+            (Char.= c \return) @"\\return"
+            (Char.= c \backspace) @"\\backspace"
+            (Char.= c \formfeed) @"\\formfeed"
+            (Char.= c \") @"\\\""
+            (Int.> (Char.to-int c) 127) (fmt "\\u%04x" (Char.to-int c))
+            (fmt "\\%c" c))]
+      (StringBuf.append-str buffer &text)))
+
+  (private double-round-trips?)
+  (hidden double-round-trips?)
+  (defn double-round-trips? [text value]
+    (match (Double.from-string text)
+      (Maybe.Just parsed) (Double.= parsed value)
+      (Maybe.Nothing) false))
+
+  (private decimal-only?)
+  (hidden decimal-only?)
+  (defn decimal-only? [text]
+    (not (or (String.contains? text \e) (String.contains? text \E))))
+
+  (private strip-trailing-zeros)
+  (hidden strip-trailing-zeros)
+  (defn strip-trailing-zeros [text]
+    (if (not (String.contains? text \.))
+      @text
+      (let-do [chars (String.chars text)
+               n (Array.length &chars)
+               end n]
+        (while-do (and (Int.> end 2)
+                       (Char.= @(Array.unsafe-nth &chars (Int.dec end)) \0))
+          (set! end (Int.dec end)))
+        (when (Char.= @(Array.unsafe-nth &chars (Int.dec end)) \.)
+          (set! end (Int.inc end)))
+        (String.from-chars &(Array.prefix &chars end)))))
+
+  (private double-text)
+  (hidden double-text)
+  (defn double-text [value]
+    (let-do [text (Double.str value)]
+      (when (or (not (decimal-only? &text))
+                (not (double-round-trips? &text value)))
+        (set! text (Double.format "%.17g" value)))
+      (unless-do (decimal-only? &text)
+        (let-do [precisions [17 21 25 30 40 50 70 100 150 220 330]
+                 n (Array.length &precisions)
+                 i 0]
+          (while-do (Int.< i n)
+            (let-do [precision @(Array.unsafe-nth &precisions i)
+                     format (fmt "%%.%df" precision)
+                     candidate (strip-trailing-zeros &(Double.format &format
+                                                                     value))]
+              (when-do (double-round-trips? &candidate value)
+                (set! text candidate)
+                (set! i n))
+              (set! i (Int.inc i))))))
+      (if (String.contains? &text \.) text (String.append &text ".0"))))
+
+  (private append-children)
+  (hidden append-children)
+  (private append-node)
+  (hidden append-node)
+  (defn append-children [buffer items]
+    (let [n (Array.length items)]
+      (for [i 0 n]
+        (do
+          (when (Int.> i 0) (StringBuf.append-char buffer \space))
+          (append-node buffer (Box.peek (Array.unsafe-nth items i)))))))
+
+  (defn append-node [buffer node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.IntLit value) (StringBuf.append-str buffer &(Int.str @value))
+      (SurfaceForm.ByteLit value)
+        (StringBuf.append-str buffer &(Byte.str @value))
+      (SurfaceForm.LongLit value)
+        (StringBuf.append-str buffer &(String.append &(Long.str @value) "l"))
+      (SurfaceForm.FloatLit value)
+        (StringBuf.append-str buffer &(Float.str @value))
+      (SurfaceForm.DoubleLit value)
+        (StringBuf.append-str buffer &(double-text @value))
+      (SurfaceForm.BoolLit value)
+        (StringBuf.append-str buffer (if @value "true" "false"))
+      (SurfaceForm.CharLit value) (append-char buffer @value)
+      (SurfaceForm.StringLit value)
+        (do
+          (StringBuf.append-char buffer \")
+          (append-escaped-string buffer value)
+          (StringBuf.append-char buffer \"))
+      (SurfaceForm.PatternLit value)
+        (do
+          (StringBuf.append-str buffer "#\"")
+          (StringBuf.append-str buffer value)
+          (StringBuf.append-char buffer \"))
+      (SurfaceForm.Symbol segments)
+        (StringBuf.append-str buffer &(String.join "." segments))
+      (SurfaceForm.List items)
+        (do
+          (StringBuf.append-char buffer \()
+          (append-children buffer items)
+          (StringBuf.append-char buffer \)))
+      (SurfaceForm.Array items)
+        (do
+          (StringBuf.append-char buffer \[)
+          (append-children buffer items)
+          (StringBuf.append-char buffer \]))
+      (SurfaceForm.StaticArray items)
+        (do
+          (StringBuf.append-str buffer "$[")
+          (append-children buffer items)
+          (StringBuf.append-char buffer \]))
+      (SurfaceForm.Dictionary items)
+        (do
+          (StringBuf.append-char buffer \{)
+          (append-children buffer items)
+          (StringBuf.append-char buffer \}))
+      (SurfaceForm.Comment value)
+        (do
+          (StringBuf.append-char buffer \;)
+          (StringBuf.append-str buffer value)
+          (StringBuf.append-char buffer \newline))))
+
+  (doc render "renders one `SurfaceNode` as source-level Carp syntax. Source
+spans and implementation boxes are deliberately omitted.")
+  (defn render [node]
+    (let-do [buffer (StringBuf.create)]
+      (append-node &buffer node)
+      (StringBuf.to-string &buffer)))
+
+  (doc render-module "renders a `SurfaceModule` as newline-separated
+source-level forms.")
+  (defn render-module [module]
+    (let-do [buffer (StringBuf.create)
+             forms (SurfaceModule.forms module)
+             n (Array.length forms)]
+      (for [i 0 n]
+        (do
+          (when (Int.> i 0) (StringBuf.append-char &buffer \newline))
+          (append-node &buffer (Box.peek (Array.unsafe-nth forms i)))))
+      (StringBuf.to-string &buffer)))
+
+  (doc lower-located "lowers one `Reader.Located` concrete-syntax node to a
+lossless `SurfaceNode`. It is total: source validity is Reader's responsibility;
+semantic validity belongs to later compiler libraries.")
+  (defn lower-located [located]
+    (let [span (SurfaceSpan.from-located located)]
+      (match-ref (Located.form located)
+        (Form.Itg value) (SurfaceNode.init span (SurfaceForm.IntLit @value))
+        (Form.Byt value) (SurfaceNode.init span (SurfaceForm.ByteLit @value))
+        (Form.Lng value) (SurfaceNode.init span (SurfaceForm.LongLit @value))
+        (Form.Flt value) (SurfaceNode.init span (SurfaceForm.FloatLit @value))
+        (Form.Dbl value) (SurfaceNode.init span (SurfaceForm.DoubleLit @value))
+        (Form.Bol value) (SurfaceNode.init span (SurfaceForm.BoolLit @value))
+        (Form.Chr value) (SurfaceNode.init span (SurfaceForm.CharLit @value))
+        (Form.Str value) (SurfaceNode.init span (SurfaceForm.StringLit @value))
+        (Form.Pat value) (SurfaceNode.init span (SurfaceForm.PatternLit @value))
+        (Form.Sym segments)
+          (SurfaceNode.init span (SurfaceForm.Symbol @segments))
+        (Form.Lst forms)
+          (let-do [children (the (Array (Box SurfaceNode)) [])
+                   n (Array.length forms)]
+            (for [i 0 n]
+              (set! children
+                    (Array.push-back children
+                                     (Box.init
+                                       (lower-located (Box.peek (Array.unsafe-nth forms
+                                                                                  i)))))))
+            (SurfaceNode.init span (SurfaceForm.List children)))
+        (Form.Arr forms)
+          (let-do [children (the (Array (Box SurfaceNode)) [])
+                   n (Array.length forms)]
+            (for [i 0 n]
+              (set! children
+                    (Array.push-back children
+                                     (Box.init
+                                       (lower-located (Box.peek (Array.unsafe-nth forms
+                                                                                  i)))))))
+            (SurfaceNode.init span (SurfaceForm.Array children)))
+        (Form.StaticArr forms)
+          (let-do [children (the (Array (Box SurfaceNode)) [])
+                   n (Array.length forms)]
+            (for [i 0 n]
+              (set! children
+                    (Array.push-back children
+                                     (Box.init
+                                       (lower-located (Box.peek (Array.unsafe-nth forms
+                                                                                  i)))))))
+            (SurfaceNode.init span (SurfaceForm.StaticArray children)))
+        (Form.Dict forms)
+          (let-do [children (the (Array (Box SurfaceNode)) [])
+                   n (Array.length forms)]
+            (for [i 0 n]
+              (set! children
+                    (Array.push-back children
+                                     (Box.init
+                                       (lower-located (Box.peek (Array.unsafe-nth forms
+                                                                                  i)))))))
+            (SurfaceNode.init span (SurfaceForm.Dictionary children)))
+        (Form.Cmt value) (SurfaceNode.init span (SurfaceForm.Comment @value)))))
+
+  (doc lower "lowers top-level reader forms into a `SurfaceModule`. Comments are
+retained so tools that need source fidelity can share this representation.")
+  (defn lower [forms]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length forms)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (lower-located (Box.peek (Array.unsafe-nth forms
+                                                                            i)))))))
+      (SurfaceModule.init result)))
+
+  (doc parse "parses source and lowers it to a standalone surface-syntax
+module. Parser errors are passed through unchanged.")
+  (defn parse [source]
+    (match (Reader.parse source)
+      (Result.Success forms) (Result.Success (lower &forms))
+      (Result.Error error) (Result.Error error))))
+
+(defmodule SurfaceNode
+  (doc str "renders a surface node as source-level Carp syntax, omitting its
+source span.")
+  (defn str [node] (Surface.render node))
+  (implements str SurfaceNode.str))
+
+(defmodule SurfaceModule
+  (doc str "renders a surface module as newline-separated source-level forms.")
+  (defn str [module] (Surface.render-module module))
+  (implements str SurfaceModule.str))

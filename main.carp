@@ -1,0 +1,758 @@
+(load "carp-compiler.carp")
+(Project.config "title" "carp-compiler")
+(Project.no-echo)
+;; the compile-time evaluator recurses deeply through `apply-builtin`'s large
+;; frame (dynamic Map code); give the binary a 512MB main stack like the
+;; reference gets from Haskell's growable runtime stack. Pages commit lazily,
+;; so the reservation costs address space, not memory.
+(add-cflag "-Wl,-stack_size,0x20000000")
+
+(def version "0.1.0")
+
+(defn print-help []
+  (do
+    (IO.println "carp-compiler — a self-hosting Carp compiler (Carp → C)")
+    (IO.println "")
+    (IO.println "usage:")
+    (IO.println "  carp-compiler [options] <source.carp>")
+    (IO.println "")
+    (IO.println "options:")
+    (IO.println
+      "  -b, --build           compile to an executable instead of C (needs --core)")
+    (IO.println
+      "  -x, --execute         compile to an executable and run it (needs --core)")
+    (IO.println
+      "  -c, --core <dir>      compile against the Carp standard library in <dir>")
+    (IO.println
+      "  -o, --output <file>   output path — the C file, or the executable under -b")
+    (IO.println
+      "  --no-core             skip the implicit Core load; the source's own")
+    (IO.println
+      "                        (load \"X.carp\") directives still resolve in --core")
+    (IO.println "  -h, --help            show this help and exit")
+    (IO.println "  -v, --version         show version and exit")
+    (IO.println "")
+    (IO.println
+      "with no -b/-x the C translation unit is written to stdout (or -o). --core loads")
+    (IO.println
+      "the standard library so the source may use Array, String, IO, …; it also holds")
+    (IO.println
+      "the runtime headers clang needs, so -b/-x require it. diagnostics go to stderr.")))
+
+; the standard-library load set, resolved by the module loader from Core.carp.
+(def core-files
+  [@"Core.carp"
+   @"Interfaces.carp"
+   @"Blitable.carp"
+   @"Bool.carp"
+   @"Box.carp"
+   @"Macros.carp"
+   @"BoolExtras.carp"
+   @"List.carp"
+   @"Derive.carp"
+   @"Gensym.carp"
+   @"ControlMacros.carp"
+   @"Project.carp"
+   @"Platform.carp"
+   @"Introspect.carp"
+   @"Quasiquote.carp"
+   @"Pointer.carp"
+   @"Unsafe.carp"
+   @"Function.carp"
+   @"Generics.carp"
+   @"Maybe.carp"
+   @"Result.carp"
+   @"Dynamic.carp"
+   @"Format.carp"
+   @"Byte.carp"
+   @"Int.carp"
+   @"Long.carp"
+   @"Double.carp"
+   @"Float.carp"
+   @"Tuples.carp"
+   @"Array.carp"
+   @"StaticArray.carp"
+   @"StdInt.carp"
+   @"Char.carp"
+   @"String.carp"
+   @"ArrayExt.carp"
+   @"System.carp"
+   @"IO.carp"
+   @"Pattern.carp"
+   @"Debug.carp"
+   @"Random.carp"
+   @"Map.carp"
+   @"Heap.carp"
+   @"Sort.carp"
+   @"Binary.carp"
+   @"Control.carp"
+   @"Opaque.carp"
+   @"Unit.carp"])
+
+(defn read-core [dir]
+  (let-do [result (the (Array ModuleSource) [])]
+    (for [i 0 (Array.length &core-files)]
+      (let [name @(Array.unsafe-nth &core-files i)
+            file (String.concat &[@dir @"/" @&name])
+            text (IO.unsafe-read-file &file)]
+        (Array.push-back! &result (ModuleSource.init name file text))))
+    result))
+
+(defn parsed-forms [src]
+  (match (Surface.parse src)
+    (Result.Success m) @(SurfaceModule.forms &m)
+    (Result.Error _) (the (Array (Box SurfaceNode)) [])))
+
+(defn append-forms [left right]
+  (let-do [result (Array.copy left)]
+    (for [i 0 (Array.length right)]
+      (set! result
+            (Array.push-back result
+                             (Box.init
+                               (SurfaceNode.copy (Box.peek (Array.unsafe-nth right
+                                                                             i)))))))
+    result))
+
+; compiles a single standalone source (primitives only) to a C string, or prints
+; the error and returns Nothing.
+(defn compile-standalone [input]
+  (match (IO.read-file input)
+    (Result.Success source)
+      (let [sources [(ModuleSource.init (String.copy input)
+                                        (String.copy input)
+                                        source)]]
+        (match (CarpCompiler.compile-sources &sources input)
+          (Result.Success c) (Maybe.Just c)
+          (Result.Error error)
+            (do
+              (IO.errorln &(CompileError.render &error))
+              (the (Maybe String) (Maybe.Nothing)))))
+    (Result.Error e)
+      (do
+        (IO.errorln &(fmt "carp-compiler: cannot read '%s': %s" input &e))
+        (the (Maybe String) (Maybe.Nothing)))))
+
+; is `node` a `(load "X")` or `(load-once "X")` head symbol?
+(defn symbol-named? [node name]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.Symbol segments)
+      (and (Int.= 1 (Array.length segments))
+           (String.= (Array.unsafe-nth segments 0) name))
+    _ false))
+
+(defn load-symbol? [node]
+  (or (symbol-named? node "load") (symbol-named? node "load-once")))
+
+; returns the file a load directive names: `(load "X.carp")`/`(load-once "X.carp")`
+; give the literal string; `(load-and-use X)` gives "X.carp".
+(defn form-load-target [node]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.List items)
+      (if (Int.= 2 (Array.length items))
+        (let [head (Box.peek (Array.unsafe-nth items 0))
+              arg (Box.peek (Array.unsafe-nth items 1))]
+          (cond
+            (load-symbol? head)
+              (match-ref (SurfaceNode.form arg)
+                ;; `(load "core/Foo.carp")` names a Core file relative to the Carp
+                ;; root; the core dir already IS core, so drop the prefix (this
+                ;; also dedups against the same file loaded plainly as "Foo.carp").
+                (SurfaceForm.StringLit path)
+                (Maybe.Just
+                  (if (String.starts-with? path "core/")
+                    (String.suffix path 5)
+                    @path))
+                _
+                (the (Maybe String) (Maybe.Nothing)))
+            (symbol-named? head "load-and-use")
+              (match-ref (SurfaceNode.form arg)
+                (SurfaceForm.Symbol segments)
+                  (if (Int.= 1 (Array.length segments))
+                    (Maybe.Just
+                      (String.concat &[@(Array.unsafe-nth segments 0) @".carp"]))
+                    (the (Maybe String) (Maybe.Nothing)))
+                _ (the (Maybe String) (Maybe.Nothing)))
+            (the (Maybe String) (Maybe.Nothing))))
+        (the (Maybe String) (Maybe.Nothing)))
+    _ (the (Maybe String) (Maybe.Nothing))))
+
+(defn collect-load-targets [forms]
+  (let-do [result (the (Array String) [])]
+    (for [i 0 (Array.length forms)]
+      (match (form-load-target (Box.peek (Array.unsafe-nth forms i)))
+        (Maybe.Just name) (Array.push-back! &result name)
+        (Maybe.Nothing) ()))
+    result))
+
+; the name a `(defn name ...)`/`(defn- name ...)` form defines, if any.
+(defn defn-name [node]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.List items)
+      (if (Int.< 2 (Array.length items))
+        (let [head (Box.peek (Array.unsafe-nth items 0))
+              name-node (Box.peek (Array.unsafe-nth items 1))]
+          (if (or (symbol-named? head "defn") (symbol-named? head "defn-"))
+            (match-ref (SurfaceNode.form name-node)
+              (SurfaceForm.Symbol segments)
+                (if (Int.= 1 (Array.length segments))
+                  (Maybe.Just @(Array.unsafe-nth segments 0))
+                  (the (Maybe String) (Maybe.Nothing)))
+              _ (the (Maybe String) (Maybe.Nothing)))
+            (the (Maybe String) (Maybe.Nothing))))
+        (the (Maybe String) (Maybe.Nothing)))
+    _ (the (Maybe String) (Maybe.Nothing))))
+
+; collects the qualified name of every defn in the user's own source (walking
+; defmodule nesting), so the driver can demand-check those definitions even
+; when nothing calls them (the reference checks every definition it loads).
+(sig collect-check-names!
+     (Fn [(Ref (Array (Box SurfaceNode))) String (Ref (Array String))] ()))
+(defn collect-check-names! [forms prefix acc]
+  (for [i 0 (Array.length forms)]
+    (let-do [node (Box.peek (Array.unsafe-nth forms i))]
+      (match (defn-name node)
+        (Maybe.Just name)
+          (Array.push-back! acc (String.concat &[@&prefix @&name]))
+        (Maybe.Nothing) ())
+      ;; `(derive T f)` expands to a `T.f` defn implementing interface `f`;
+      ;; seed it so the derived body is checked even when nothing calls it.
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List items)
+          (when (and (Int.= 3 (Array.length items))
+                     (symbol-named? (Box.peek (Array.unsafe-nth items 0))
+                                    "derive"))
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 1)))
+              (SurfaceForm.Symbol type-segments)
+                (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 2)))
+                  (SurfaceForm.Symbol fn-segments)
+                    (when (and (Int.= 1 (Array.length type-segments))
+                               (Int.= 1 (Array.length fn-segments)))
+                      (Array.push-back! acc
+                                        (String.concat
+                                          &[@&prefix
+                                            @(Array.unsafe-nth type-segments 0)
+                                            @"."
+                                            @(Array.unsafe-nth fn-segments 0)])))
+                  _ ())
+              _ ()))
+        _ ())
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List items)
+          (when (and (Int.< 2 (Array.length items))
+                     (symbol-named? (Box.peek (Array.unsafe-nth items 0))
+                                    "defmodule"))
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 1)))
+              (SurfaceForm.Symbol segments)
+                (when (Int.= 1 (Array.length segments))
+                  (let-do [inner-prefix (String.concat
+                             &[@&prefix @(Array.unsafe-nth segments 0) @"."])
+                           body (the (Array (Box SurfaceNode)) [])]
+                    (for [j 2 (Array.length items)]
+                      (Array.push-back! &body
+                                        (Box.init
+                                          (SurfaceNode.copy (Box.peek (Array.unsafe-nth items
+                                                                                        j))))))
+                    (collect-check-names! &body inner-prefix acc)))
+              _ ()))
+        _ ()))))
+
+(defn collect-check-names [source]
+  (let-do [acc (the (Array String) [])]
+    (match (Surface.parse source)
+      (Result.Success user-module)
+        (collect-check-names! (SurfaceModule.forms &user-module) @"" &acc)
+      (Result.Error _) ())
+    acc))
+
+; whether the user source keeps top-level result echo on. The reference echoes
+; every top-level expression result unless the program calls (Project.no-echo).
+(defn echo-enabled? [forms]
+  (let-do [echo true]
+    (for [i 0 (Array.length forms)]
+      (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth forms i)))
+        (SurfaceForm.List items)
+          (when (Int.> (Array.length items) 0)
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 0)))
+              (SurfaceForm.Symbol segments)
+                (when (and (Int.= 2 (Array.length segments))
+                           (and
+                             (String.= (Array.unsafe-nth segments 0) "Project")
+                             (String.= (Array.unsafe-nth segments 1) "no-echo")))
+                  (set! echo false))
+              _ ()))
+        _ ()))
+    echo))
+
+(defn source-echo-enabled? [source]
+  (match (Surface.parse source)
+    (Result.Success user-module)
+      (echo-enabled? (SurfaceModule.forms &user-module))
+    (Result.Error _) false))
+
+(defn source-present? [registry name]
+  (let-do [found false]
+    (for [i 0 (Array.length registry)]
+      (when (String.= (ModuleSource.path (Array.unsafe-nth registry i)) name)
+        (set! found true)))
+    found))
+
+(defn read-core-file [core-dir name]
+  (match (IO.read-file &(String.concat &[@core-dir @"/" @name]))
+    (Result.Success text) (Maybe.Just text)
+    (Result.Error _) (the (Maybe String) (Maybe.Nothing))))
+
+; --- git-reference loads ---
+; a load target containing `@` names a git checkout, the reference compiler's
+; install semantics: the part after the LAST `@` is the tag, the rest the
+; remote. Checkouts live under `<cache>/carp/libs/<dir>/<tag>` where `<dir>`
+; strips the user prefix or URL scheme and turns `:` into `_COLON_`
+; (e.g. git@github.com:carpentry-org/strbuf -> github.com_COLON_carpentry-org/strbuf).
+; The file loaded from the checkout is `<repo>.carp`, falling back to
+; `main.carp`; a missing checkout is installed with git.
+
+(defn git-ref? [name]
+  (Int.> (String.index-of name \@) -1))
+
+(defn last-at-index [name]
+  (let-do [result -1
+           i 0
+           n (String.length name)]
+    (while (Int.< i n)
+      (do
+        (when (Char.= (String.char-at name i) \@) (set! result i))
+        (set! i (Int.inc i))))
+    result))
+
+(defn git-ref-url [name]
+  (String.prefix name (last-at-index name)))
+
+(defn git-ref-tag [name]
+  (String.suffix name (Int.inc (last-at-index name))))
+
+(defn git-ref-cache-dir [url]
+  (cond
+    (String.starts-with? url "https://") (String.suffix url 8)
+    (String.starts-with? url "http://") (String.suffix url 7)
+    (let [after-user (if (git-ref? url)
+                       (String.suffix url (Int.inc (String.index-of url \@)))
+                       @url)]
+      (String.join "_COLON_" &(String.split-by &after-user &[\:])))))
+
+(defn git-ref-repo-file [url]
+  (let-do [segments (String.split-by url &[\/ \:])
+           repo (if (Int.> (Array.length &segments) 0)
+                  @(Array.unsafe-nth &segments
+                                     (Int.dec (Array.length &segments)))
+                  @"main")]
+    (when (String.ends-with? &repo ".git")
+      (set! repo (String.prefix &repo (Int.- (String.length &repo) 4))))
+    (unless (String.ends-with? &repo ".carp")
+      (set! repo (String.append &repo ".carp")))
+    repo))
+
+(defn git-cache-root []
+  (match (IO.getenv "XDG_CACHE_HOME")
+    (Maybe.Just cache) (String.append &cache "/carp/libs")
+    (Maybe.Nothing)
+      (match (IO.getenv "HOME")
+        (Maybe.Just home) (String.append &home "/.cache/carp/libs")
+        (Maybe.Nothing) @"/tmp/carp-libs")))
+
+(defn git-install! [dir url tag]
+  (ignore
+    (System.system
+      &(fmt "mkdir -p '%s' && cd '%s' && git init -q && git remote add origin '%s' && git fetch -q --all --tags && git checkout -q '%s'"
+            dir
+            dir
+            url
+            tag))))
+
+; reads a git-referenced module out of the cache, installing the checkout
+; first when it is missing.
+(defn read-git-source [name]
+  (let [url (git-ref-url name)
+        dir (String.concat &[(git-cache-root)
+                             @"/"
+                             (git-ref-cache-dir &url)
+                             @"/"
+                             (git-ref-tag name)])
+        lib-file (String.concat &[(String.copy &dir)
+                                  @"/"
+                                  (git-ref-repo-file &url)])
+        main-file (String.append &dir "/main.carp")]
+    (match (IO.read-file &lib-file)
+      (Result.Success text) (Maybe.Just (Pair.init @&lib-file text))
+      (Result.Error _)
+        (match (IO.read-file &main-file)
+          (Result.Success text) (Maybe.Just (Pair.init @&main-file text))
+          (Result.Error _)
+            (do
+              (git-install! &dir &url &(git-ref-tag name))
+              (match (IO.read-file &lib-file)
+                (Result.Success text) (Maybe.Just (Pair.init @&lib-file text))
+                (Result.Error _)
+                  (match (IO.read-file &main-file)
+                    (Result.Success text)
+                      (Maybe.Just (Pair.init @&main-file text))
+                    (Result.Error _)
+                      (the (Maybe (Pair String String)) (Maybe.Nothing)))))))))
+
+; the directory portion of a path ("." when there is none).
+(defn dir-of [path]
+  (let-do [slash -1
+           i 0
+           n (String.length path)]
+    (while (Int.< i n)
+      (do
+        (when (Char.= (String.char-at path i) \/) (set! slash i))
+        (set! i (Int.inc i))))
+    (if (Int.< slash 0) @"." (String.prefix path slash))))
+
+; collapses "." and ".." segments textually so the same file reached through
+; different load spellings gets one canonical path (the loader dedups by it).
+(defn normalize-path [path]
+  (let-do [segments (String.split-by path &[\/])
+           kept (the (Array String) [])
+           absolute (String.starts-with? path "/")]
+    (for [i 0 (Array.length &segments)]
+      (let [segment (Array.unsafe-nth &segments i)]
+        (cond
+          (or (String.= segment "") (String.= segment ".")) ()
+          (String.= segment "..")
+            (if (and (Int.> (Array.length &kept) 0)
+                     (not (String.= (Array.unsafe-nth &kept
+                                                      (Int.dec (Array.length &kept)))
+                                    "..")))
+              (ignore (Array.pop-back! &kept))
+              (Array.push-back! &kept @segment))
+          (Array.push-back! &kept @segment))))
+    (if absolute
+      (String.append "/" &(String.join "/" &kept))
+      (String.join "/" &kept))))
+
+; reads every file transitively named by a `(load ...)` in `seed` (and in the
+; files those name): git references from the cache, plain names relative to the
+; REQUESTING file's directory first, then core-dir. Files already present (the
+; Core set) are left untouched; the loader dedups shared files reached through
+; different spellings by their canonical path.
+; byte-wise ASCII case-insensitive path equality: on a case-insensitive
+; filesystem a file can resolve to ITSELF through a load name differing only
+; by case (test/filepath.carp loading "Filepath.carp" means core's, not the
+; test), so self-resolution must fall through to core-dir.
+(defn same-path-ignoring-case? [a b]
+  (let-do [n (String.length a)
+           equal (Int.= n (String.length b))
+           i 0]
+    (while (and equal (Int.< i n))
+      (do
+        (let [ca (Char.to-int (String.char-at a i))
+              cb (Char.to-int (String.char-at b i))
+              la (if (and (Int.>= ca 65) (Int.<= ca 90)) (Int.+ ca 32) ca)
+              lb (if (and (Int.>= cb 65) (Int.<= cb 90)) (Int.+ cb 32) cb)]
+          (unless (Int.= la lb) (set! equal false)))
+        (set! i (Int.inc i))))
+    equal))
+
+; resolves one plain load target against the requesting file's directory, then
+; core-dir; git references go to the cache. The Pair is (canonical file, text).
+(defn resolve-load-target [core-dir requester-file name]
+  (if (git-ref? name)
+    (read-git-source name)
+    (let [requester-dir (dir-of requester-file)
+          local (normalize-path &(String.concat &[(String.copy &requester-dir)
+                                                  @"/"
+                                                  (String.copy name)]))]
+      (match (if (same-path-ignoring-case? &local
+                                           &(normalize-path requester-file))
+               (Result.Error @"self")
+               (IO.read-file &local))
+        (Result.Success text) (Maybe.Just (Pair.init @&local text))
+        (Result.Error _)
+          (match (read-core-file core-dir name)
+            (Maybe.Just found)
+              (Maybe.Just
+                (Pair.init (String.concat &[@core-dir @"/" (String.copy name)])
+                           found))
+            (Maybe.Nothing)
+              (the (Maybe (Pair String String)) (Maybe.Nothing)))))))
+
+(defn ensure-sources [registry core-dir seed]
+  (let-do [result registry
+           work @seed]
+    (while (Int.< 0 (Array.length &work))
+      (let-do [item (Array.pop-back! &work)
+               requester-file (Pair.a &item)
+               name (Pair.b &item)]
+        (unless (source-present? &result name)
+          (match (resolve-load-target core-dir requester-file name)
+            (Maybe.Just entry)
+              (let-do [file @(Pair.a &entry)
+                       text @(Pair.b &entry)]
+                (set! result
+                      (Array.push-back result
+                                       (ModuleSource.init (String.copy name)
+                                                          (String.copy &file)
+                                                          (String.copy &text))))
+                (match (Surface.parse &text)
+                  (Result.Success m)
+                    (let-do [targets (collect-load-targets (SurfaceModule.forms &m))]
+                      (for [i 0 (Array.length &targets)]
+                        (set! work
+                              (Array.push-back work
+                                               (Pair.init (String.copy &file)
+                                                          @(Array.unsafe-nth &targets
+                                                                             i))))))
+                  (Result.Error _) ()))
+            (Maybe.Nothing) ()))))
+    result))
+
+; compiles a source with the standard library from core-dir loaded ahead of it.
+; host arch/os are stamped for this machine (aarch64/darwin). The source's own
+; `(load "X.carp")` directives are honored against core-dir, so a file that
+; loads Test.carp (or Vector, SafeInt, ...) pulls those in like the reference
+; compiler does.
+(defn phase! [name]
+  (match (IO.getenv "CARP_DEBUG_PHASES")
+    (Maybe.Just _) (IO.errorln &(String.append "phase: " name))
+    (Maybe.Nothing) ()))
+
+(defn compile-with-core [input core-dir no-core]
+  (match (IO.read-file input)
+    (Result.Error e)
+      (do
+        (IO.errorln &(fmt "carp-compiler: cannot read '%s': %s" input &e))
+        (the (Maybe String) (Maybe.Nothing)))
+    (Result.Success source)
+      (match (if no-core
+          (Result.Success @"")
+          (IO.read-file &(String.concat &[@core-dir @"/Core.carp"])))
+        (Result.Error _)
+          (do
+            (IO.errorln &(fmt "carp-compiler: no Core.carp under '%s'" core-dir))
+            (the (Maybe String) (Maybe.Nothing)))
+        (Result.Success _)
+          (let [boot (String.concat &[@"(defndynamic host-arch [] \"aarch64\")
+(defndynamic host-os [] \"darwin\")
+(def target-arch \"aarch64\")
+(def target-os \"darwin\")
+(def target-abi \"unknown\")
+(defmodule Project
+  (defndynamic config [key value] ())
+  (defndynamic no-echo [] ())
+  (defndynamic get-config [key]
+    (cond
+      (= key \"echo-c\") false
+      (= key \"title\") \"Untitled\"
+      (= key \"output-directory\") \"out\"
+      (= key \"load-stack\") (Unsafe.load-stack)
+      (= key \"cflag\") '()
+      (= key \"libflag\") '()
+      (= key \"pkgconfigflag\") '()
+      \"native\")))"])
+                root-name "__carp-compiler-main__.carp"
+                ;; `add-c` must be redefined AFTER Core loads (core's Dynamic.carp
+                ;; defines it via the Project \"cmod\" config we do not track);
+                ;; this variant textually includes the C module instead.
+                root-text (String.concat &[@&boot (if no-core @"
+" @"
+(load \"Core.carp\")
+") @"(defmacro add-c [relpath]
+  (list (quote Unsafe.preproc)
+        (list (quote Unsafe.emit-c)
+              (String.concat [\"#include \\\"\" (relative-to (current-file) relpath) \"\\\"\"]))))
+(defmacro relative-include [path]
+  (list (quote Unsafe.preproc)
+        (list (quote Unsafe.emit-c)
+              (String.concat [\"#include \\\"\" (relative-to (current-file) path) \"\\\"\"]))))
+" @&source])] (match (Surface.parse &root-text)
+              (Result.Error _)
+                (do
+                  (IO.errorln "carp-compiler: cannot parse input")
+                  (the (Maybe String) (Maybe.Nothing)))
+              (Result.Success root-module)
+                (let-do [targets (collect-load-targets (SurfaceModule.forms &root-module))
+                         seed (the (Array (Pair String String)) [])
+                         ignored-seed (for [i 0 (Array.length &targets)]
+                           (Array.push-back! &seed
+                                             (Pair.init (String.copy input)
+                                                        @(Array.unsafe-nth &targets
+                                                                           i))))
+                         registry (ensure-sources (read-core core-dir)
+                                                  core-dir
+                                                  &seed)]
+                  (set! registry
+                        (Array.push-back registry
+                                         (ModuleSource.init @root-name
+                                                            (String.copy input)
+                                                            @&root-text)))
+                  (phase! "sources-ready")
+                  (match (ModuleLoader.load &registry &(String.copy root-name))
+                    (Result.Error e)
+                      (do
+                        (IO.errorln
+                          &(String.append "carp-compiler: cannot load: "
+                                          (ModuleError.message &e)))
+                        (the (Maybe String) (Maybe.Nothing)))
+                    (Result.Success loaded)
+                      (let-do [ignored-phase (phase! "loaded")
+                               module (ModuleLoader.with-compiler-prelude &loaded)]
+                        (match (CarpCompiler.compile-module-full &module
+                                                                 &(ExpandConfig.init [@"Dynamic"])
+                                                                 &(collect-check-names &source)
+                                                                 (source-echo-enabled? &source))
+                          (Result.Success c) (Maybe.Just c)
+                          (Result.Error error)
+                            (do
+                              (IO.errorln &(CompileError.render &error))
+                              (the (Maybe String) (Maybe.Nothing))))))))))))
+
+(defn produce-c [input core-dir no-core]
+  (match-ref core-dir
+    (Maybe.Just dir) (compile-with-core input dir no-core)
+    (Maybe.Nothing) (compile-standalone input)))
+
+; --- emitting / building ---
+
+(def temp-c "/tmp/carp-compiler-out.c")
+;; `-x` builds to the reference compiler's default output path, so programs
+;; observing their own argv (System.args) see the same value.
+(def temp-bin "out/Untitled")
+
+(defn write-temp-c [c]
+  (match (IO.write-file c temp-c)
+    (Result.Success _) true
+    (Result.Error e)
+      (do
+        (IO.errorln &(fmt "carp-compiler: cannot write temporary C: %s" &e))
+        false)))
+
+; clang the temp C into `binary`, linking against the runtime headers in core-dir.
+(defn clang-build [core-dir binary log-memory]
+  (let [cmd (String.concat
+          &[@"clang "
+            (if log-memory @"-D LOG_MEMORY " @"")
+            ;; `-I .` lets `relative-include`/`add-c` quoted includes resolve
+            ;; against the directory the compiler was invoked from.
+            @"-I . -I "
+            @core-dir
+            @" -lm -o "
+            @binary
+            @" "
+            @temp-c])]
+    (if (Int.= 0 (System.system &cmd))
+      true
+      (do (IO.errorln "carp-compiler: clang failed") false))))
+
+(defn emit-c [c output]
+  (match-ref output
+    (Maybe.Just path)
+      (match (IO.write-file c path)
+        (Result.Success _) 0
+        (Result.Error e)
+          (do
+            (IO.errorln &(fmt "carp-compiler: cannot write '%s': %s" path &e))
+            1))
+    (Maybe.Nothing) (do (IO.print c) 0)))
+
+(defn build [c core-dir output log-memory]
+  (match-ref core-dir
+    (Maybe.Nothing)
+      (do (IO.errorln "carp-compiler: -b requires --core <dir>") 1)
+    (Maybe.Just dir)
+      (let [binary (match-ref output (Maybe.Just p) @p (Maybe.Nothing) @"a.out")]
+        (if (and (write-temp-c c) (clang-build dir &binary log-memory))
+          (do
+            (IO.println
+              &(String.append "carp-compiler: wrote executable " &binary))
+            0)
+          1))))
+
+(defn execute [c core-dir log-memory]
+  (match-ref core-dir
+    (Maybe.Nothing)
+      (do (IO.errorln "carp-compiler: -x requires --core <dir>") 1)
+    (Maybe.Just dir)
+      (do
+        (ignore (System.system "mkdir -p out"))
+        (if (and (write-temp-c c)
+                 (clang-build dir &(String.copy temp-bin) log-memory))
+          ;; bind the raw status first: get-exit-status is the WEXITSTATUS
+          ;; macro, which needs an lvalue argument on macOS.
+          (let [status (System.system &(String.copy temp-bin))]
+            (System.get-exit-status status))
+          1))))
+
+(defn usage-hint []
+  (do (IO.errorln "try 'carp-compiler --help' for usage.") (System.exit 2)))
+
+; action: 0 = emit C, 1 = build executable, 2 = build and run.
+(defn run [input core-dir output action log-memory no-core]
+  (match (produce-c input core-dir no-core)
+    (Maybe.Nothing) 1
+    (Maybe.Just c)
+      (cond
+        (Int.= action 1) (build &c core-dir output log-memory)
+        (Int.= action 2) (execute &c core-dir log-memory)
+        (emit-c &c output))))
+
+(defn main []
+  (let-do [args &System.args
+           n (StaticArray.length args)
+           input (the (Maybe String) (Maybe.Nothing))
+           output (the (Maybe String) (Maybe.Nothing))
+           core-dir (the (Maybe String) (Maybe.Nothing))
+           have-input false
+           log-memory false
+           no-core false
+           action 0
+           ; 0 = compile, 1 = help, 2 = version, 3 = argument error
+           mode 0
+           i 1]
+    (while-do (and (Int.< i n) (Int.= mode 0))
+      (let-do [arg @(StaticArray.unsafe-nth args i)]
+        (cond
+          (or (String.= &arg "-h") (String.= &arg "--help")) (set! mode 1)
+          (or (String.= &arg "-v") (String.= &arg "--version")) (set! mode 2)
+          (or (String.= &arg "-b") (String.= &arg "--build")) (set! action 1)
+          (or (String.= &arg "-x") (String.= &arg "--execute")) (set! action 2)
+          (String.= &arg "--log-memory") (set! log-memory true)
+          (String.= &arg "--no-core") (set! no-core true)
+          (or (String.= &arg "-o") (String.= &arg "--output"))
+            (if (Int.< (Int.inc i) n)
+              (do
+                (set! output
+                      (Maybe.Just @(StaticArray.unsafe-nth args (Int.inc i))))
+                (set! i (Int.inc i)))
+              (do
+                (IO.errorln
+                  "carp-compiler: option '-o' requires a file argument")
+                (set! mode 3)))
+          (or (String.= &arg "-c") (String.= &arg "--core"))
+            (if (Int.< (Int.inc i) n)
+              (do
+                (set! core-dir
+                      (Maybe.Just @(StaticArray.unsafe-nth args (Int.inc i))))
+                (set! i (Int.inc i)))
+              (do
+                (IO.errorln
+                  "carp-compiler: option '-c' requires a directory argument")
+                (set! mode 3)))
+          (String.starts-with? &arg "-")
+            (do
+              (IO.errorln &(fmt "carp-compiler: unknown option '%s'" &arg))
+              (set! mode 3))
+          have-input
+            (do
+              (IO.errorln "carp-compiler: more than one input file given")
+              (set! mode 3))
+          (do (set! input (Maybe.Just @&arg)) (set! have-input true))))
+      (set! i (Int.inc i)))
+    (cond
+      (Int.= mode 1) (print-help)
+      (Int.= mode 2) (IO.println &(String.append "carp-compiler " version))
+      (Int.= mode 3) (usage-hint)
+      (match input
+        (Maybe.Just path)
+          (System.exit (run &path &core-dir &output action log-memory no-core))
+        (Maybe.Nothing)
+          (do (IO.errorln "carp-compiler: no input file") (usage-hint))))))

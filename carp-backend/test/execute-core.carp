@@ -1,0 +1,117 @@
+;; Execution harness: compiles a Core-using program all the way to C through the
+;; self-hosting compiler, so the shell driver (execute.sh) can clang + run it and
+;; check the result. Unlike core-declarations.carp (which only string-matches the
+;; emitted C), this exercises real Core end to end at runtime.
+;;
+;; Run from carp-backend/:  carp -x test/execute-core.carp
+;; It writes the translation unit to test/execution-out.c.
+
+(load "../carp-compiler.carp")
+(Project.no-echo)
+
+(def core-files
+  [@"Core.carp"
+   @"Interfaces.carp"
+   @"Blitable.carp"
+   @"Bool.carp"
+   @"Box.carp"
+   @"Macros.carp"
+   @"BoolExtras.carp"
+   @"List.carp"
+   @"Derive.carp"
+   @"Gensym.carp"
+   @"ControlMacros.carp"
+   @"Project.carp"
+   @"Platform.carp"
+   @"Introspect.carp"
+   @"Quasiquote.carp"
+   @"Pointer.carp"
+   @"Unsafe.carp"
+   @"Function.carp"
+   @"Generics.carp"
+   @"Maybe.carp"
+   @"Result.carp"
+   @"Dynamic.carp"
+   @"Format.carp"
+   @"Byte.carp"
+   @"Int.carp"
+   @"Long.carp"
+   @"Double.carp"
+   @"Float.carp"
+   @"Tuples.carp"
+   @"Array.carp"
+   @"StaticArray.carp"
+   @"StdInt.carp"
+   @"Char.carp"
+   @"String.carp"
+   @"ArrayExt.carp"
+   @"System.carp"
+   @"IO.carp"
+   @"Pattern.carp"
+   @"Debug.carp"
+   @"Random.carp"
+   @"Map.carp"
+   @"Heap.carp"
+   @"Sort.carp"
+   @"Binary.carp"
+   @"Control.carp"
+   @"Opaque.carp"
+   @"Unit.carp"])
+
+;; The program under test. `probe-check` smuggles a computed Int out through the
+;; process exit code, so the shell driver can assert on it (keep values < 256).
+(def test-program
+  "(deftemplate probe-check (Fn [Int] ()) \"void $NAME(int r)\" \"$DECL { exit(r); }\")
+(defn compute []
+  (let [n 10
+        ys (Array.copy-map &(fn [x] (Int.+ ~x n)) &[10 12 12])]
+    (Array.sum &ys)))
+(probe-check (compute))")
+
+(def out-path "test/execution-out.c")
+
+(defn parsed-forms [src]
+  (match (Surface.parse src)
+    (Result.Success m) @(SurfaceModule.forms &m)
+    (Result.Error _) []))
+
+(defn append-forms [left right]
+  (let-do [result (Array.copy left)
+           n (Array.length right)]
+    (for [i 0 n]
+      (set! result
+            (Array.push-back result
+                             (Box.init
+                               (SurfaceNode.copy (Box.peek (Array.unsafe-nth right
+                                                                             i)))))))
+    result))
+
+(defn core-module-sources []
+  (let-do [result (the (Array ModuleSource) [])]
+    (for [i 0 (Array.length &core-files)]
+      (let [name @(Array.unsafe-nth &core-files i)
+            file (String.concat &[@"../../../carp/core/" @&name])
+            text (IO.unsafe-read-file &file)]
+        (Array.push-back! &result (ModuleSource.init name file text))))
+    result))
+
+(defn main []
+  (let [sources (core-module-sources)
+        root (String.copy "Core.carp")]
+    (match (ModuleLoader.load &sources &root)
+      (Result.Success core-mod)
+        (let [bootstrap (parsed-forms "(defndynamic host-arch [] 'aarch64)
+(defndynamic host-os [] 'darwin)
+(defmodule Project (defndynamic get-config [key] \"native\"))")
+              with-core (append-forms &bootstrap (SurfaceModule.forms &core-mod))
+              test-forms (parsed-forms test-program)
+              all-forms (append-forms &with-core &test-forms)
+              module (ModuleLoader.with-compiler-prelude &(SurfaceModule.init all-forms))] (match (CarpCompiler.compile-module-with &module
+                                                                                                                                    &(ExpandConfig.init [@"Dynamic"]))
+            (Result.Success c)
+              (do (ignore (IO.write-file &c out-path)) (IO.println "COMPILED"))
+            (Result.Error e)
+              (IO.println
+                &(String.append "COMPILE-ERROR " &(CompileError.render &e)))))
+      (Result.Error e)
+        (IO.println &(String.append "LOAD-ERROR " (ModuleError.message &e))))))

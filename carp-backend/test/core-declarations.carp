@@ -1,0 +1,282 @@
+(load "../carp-backend.carp")
+(load "../../carp-expand/carp-expand.carp")
+(load "../../carp-module/carp-module.carp")
+(load "../../carp-resolve/carp-resolve.carp")
+(Project.no-echo)
+(Project.config "title" "core-backend-checkpoint")
+(load "Test.carp")
+
+(use-all Test)
+
+(defn contains-text? [text fragment]
+  (Int.>= (String.index-of-string text fragment) 0))
+
+(sig report-time (Fn [(Ref String) Uint64] ()))
+(defn report-time [label start]
+  (let-do [elapsed (Uint64.- (System.nanotime) start)
+           rendered (Uint64.str elapsed)]
+    (IO.print label)
+    (IO.println &rendered)))
+
+(sig report-int (Fn [(Ref String) Int] ()))
+(defn report-int [label value]
+  (let-do [rendered (Int.str value)] (IO.print label) (IO.println &rendered)))
+
+(defn core-source [path]
+  (let [prefix "../../../carp/core/"
+        file (String.append prefix path)]
+    (ModuleSource.init (String.copy path)
+                       (String.copy &file)
+                       (IO.unsafe-read-file &file))))
+
+(defn core-sources []
+  (let-do [result (the (Array ModuleSource) [])
+           paths (String.split-by "Core.carp
+Interfaces.carp
+Blitable.carp
+Bool.carp
+Box.carp
+Macros.carp
+BoolExtras.carp
+List.carp
+Derive.carp
+Gensym.carp
+ControlMacros.carp
+Project.carp
+Platform.carp
+Introspect.carp
+Quasiquote.carp
+Pointer.carp
+Unsafe.carp
+Function.carp
+Generics.carp
+Maybe.carp
+Result.carp
+Dynamic.carp
+Format.carp
+Byte.carp
+Int.carp
+Long.carp
+Double.carp
+Float.carp
+Tuples.carp
+Array.carp
+StaticArray.carp
+StdInt.carp
+Char.carp
+String.carp
+ArrayExt.carp
+System.carp
+IO.carp
+Pattern.carp
+Debug.carp
+Random.carp
+Map.carp
+Heap.carp
+Sort.carp
+Binary.carp
+Control.carp
+Opaque.carp
+Unit.carp
+Vector.carp
+Geometry.carp
+Color.carp
+Statistics.carp
+Phantom.carp
+Filepath.carp" &[\newline])
+           n (Array.length &paths)]
+    (for [i 0 n]
+      (set! result
+            (Array.push-back result (core-source (Array.unsafe-nth &paths i)))))
+    result))
+
+(defn append-forms [left right]
+  (let-do [result (Array.copy left)
+           n (Array.length right)]
+    (for [i 0 n]
+      (set! result
+            (Array.push-back result
+                             (Box.init
+                               (SurfaceNode.copy (Box.peek (Array.unsafe-nth right
+                                                                             i)))))))
+    result))
+
+(defn parsed [source]
+  (Result.from-success (Surface.parse source) (SurfaceModule.init [])))
+
+(defn input-module [core]
+  (let [bootstrap (parsed "(defndynamic host-arch [] 'aarch64)
+(defndynamic host-os [] 'darwin)
+(defmodule Project (defndynamic get-config [key] \"native\"))")
+        probe (parsed "(def compiler-probe-runtime
+  (let [value 250]
+    (do
+      (while (Int.< value 256)
+        (set! value (Int.inc value)))
+      (if (Int.= value 256) value 0))))
+(defn compiler-probe-forward [x] (Int.inc x))
+(deftemplate compiler-probe-check
+             (Fn [Int Int Int] ())
+             \"void $NAME(int result, int maximum, int runtime_global)\"
+             \"$DECL { if(result != 256 || maximum <= result || runtime_global != 256) exit(1); puts(\\\"P\\\"); }\")
+(compiler-probe-forward 1)
+(compiler-probe-check (Int.pow 2 8) Int.MAX compiler-probe-runtime)")
+        with-core (append-forms (SurfaceModule.forms &bootstrap)
+                                (SurfaceModule.forms core))] (ModuleLoader.with-compiler-prelude
+      &(SurfaceModule.init
+        (append-forms &with-core (SurfaceModule.forms &probe))))))
+
+(defn emits-int-pow? [backend]
+  (let [pow-signature (Type.function
+          [(Box.init (Type.integer)) (Box.init (Type.integer))]
+          (Type.integer))
+        not-equal-signature (Type.function
+          [(Box.init (Type.integer)) (Box.init (Type.integer))]
+          (Type.boolean))
+        pow-symbol (CAbi.mangle "Int.pow" &pow-signature)
+        not-equal-symbol (CAbi.mangle "Int./=" &not-equal-signature)
+        definition-result (CBackend.function-definitions backend)
+        prototype-result (CBackend.prototypes backend)
+        template-result (CBackend.template-definitions backend)]
+    (match definition-result
+      (Result.Success rendered-definitions)
+        (match prototype-result
+          (Result.Success rendered-prototypes)
+            (match template-result
+              (Result.Success rendered-templates)
+                (let-do [valid true]
+                  (unless-do (contains-text? &rendered-definitions
+                                             &(String.concat
+                                               &[@"int "
+                                                 (String.copy &pow-symbol)
+                                                 @"("]))
+                    (set! valid false))
+                  (unless-do (contains-text? &rendered-definitions "while (")
+                    (set! valid false))
+                  (unless-do (contains-text? &rendered-definitions "Int__MUL_(")
+                    (set! valid false))
+                  (unless-do (contains-text? &rendered-definitions "Int__DIV_(")
+                    (set! valid false))
+                  (unless-do (contains-text? &rendered-definitions
+                                             "Int_bit_MINUS_and(")
+                    (set! valid false))
+                  (unless-do (contains-text? &rendered-prototypes
+                                             &(String.concat
+                                               &[@"bool "
+                                                 (String.copy &not-equal-symbol)
+                                                 @"("]))
+                    (set! valid false))
+                  ;; `Int.MAX` (CARP_INT_MAX) is a `register`ed external declared
+                  ;; by carp_int.h; like the reference, we no longer emit a
+                  ;; (conflicting) declaration for it.
+                  (unless-do (contains-text? &rendered-templates
+                                             &not-equal-symbol)
+                    (set! valid false))
+                  (unless-do (contains-text? &rendered-templates
+                                             "return arg0 != arg1;")
+                    (set! valid false))
+                  valid)
+              (Result.Error _) false)
+          (Result.Error _) false)
+      (Result.Error _) false)))
+
+(defn preserves-core-includes? [backend]
+  (match (CBackend.system-includes backend)
+    (Result.Success rendered) (contains-text? &rendered "#include <carp_int.h>")
+    (Result.Error _) false))
+
+(defn emits-runtime-global-initialization? [backend]
+  (match (CBackend.global-initializers backend)
+    (Result.Success rendered)
+      (and
+        (contains-text? &rendered "while (Int__LT_(")
+        (and
+          (contains-text? &rendered "if (Int__EQ_(")
+          (contains-text? &rendered "compiler_x45_probe_x45_runtime")))
+    (Result.Error _) false))
+
+(defn writes-executable-checkpoint? [backend]
+  (match (CBackend.executable-translation-unit backend)
+    (Result.Success c)
+      (if (Int.> (StaticArray.length &System.args) 1)
+        (let [path @(StaticArray.unsafe-nth &System.args 1)]
+          (Result.success? &(IO.write-file &c &path)))
+        true)
+    (Result.Error _) false))
+
+(defn core-declarations-render? []
+  (let [started (System.nanotime)
+        sources (core-sources)
+        root (String.copy "Core.carp")]
+    (match (ModuleLoader.load &sources &root)
+      (Result.Success loaded-core)
+        (let [loaded-at (System.nanotime)
+              _load-time (report-time "load: " started)
+              input (input-module &loaded-core)
+              config (ExpandConfig.init [@"Dynamic"])]
+          (match (MacroExpand.expand-module-with &input &config)
+            (Result.Success expanded)
+              (let [expanded-at (System.nanotime)
+                    _expand-time (report-time "expand: " loaded-at)]
+                (match (Resolve.module &expanded)
+                  (Result.Success core)
+                    (let [resolved-at (System.nanotime)
+                          _resolve-time (report-time "resolve: " expanded-at)
+                          _function-count (report-int "functions: "
+                                                      (Array.length (CoreModule.functions &core)))
+                          _value-count (report-int "values: "
+                                                   (Array.length (CoreModule.values &core)))
+                          _builtin-count (report-int "builtins: "
+                                                     (Array.length (CoreModule.builtins &core)))]
+                      (match (Infer.module &core)
+                        (Result.Success inferred)
+                          (let [inferred-at (System.nanotime)
+                                _infer-time (report-time "infer: " resolved-at)
+                                _node-count (report-int "nodes: "
+                                                        (Array.length (InferredModule.node-types &inferred)))
+                                _binding-count (report-int "bindings: "
+                                                           (Array.length
+                                                             (TypeSubstitution.bindings (InferredModule.substitution &inferred))))]
+                            (match (Specialize.module &core &inferred)
+                              (Result.Success specialized)
+                                (let [specialized-at (System.nanotime)
+                                      _specialize-time (report-time "specialize: "
+                                                                    inferred-at)]
+                                  (match (Ownership.prepare &specialized
+                                                            &(OwnershipClassify.facts-from-module &core))
+                                    (Result.Success ownership)
+                                      (let [owned-at (System.nanotime)
+                                            _ownership-time (report-time "ownership: "
+                                                                         specialized-at)]
+                                        (match (BackendLower.module-with-ownership &specialized
+                                                                                   &ownership
+                                                                                   &(the (Array (Pair String
+                                                                                                      String))
+                                                                                         []))
+                                          (Result.Success backend)
+                                            (let-do [backend-at (System.nanotime)
+                                                     _backend-time (report-time "backend: "
+                                                                                owned-at)
+                                                     result (and
+                                                       (Int.>
+                                                         (Array.length (BackendModule.declarations &backend))
+                                                         0)
+                                                       (and (emits-int-pow? &backend)
+                                                            (and (preserves-core-includes? &backend)
+                                                                 (and
+                                                                   (emits-runtime-global-initialization? &backend)
+                                                                   (writes-executable-checkpoint? &backend)))))]
+                                              (report-time "render: " backend-at)
+                                              result)
+                                          (Result.Error _) false))
+                                    (Result.Error _) false))
+                              (Result.Error _) false))
+                        (Result.Error _) false))
+                  (Result.Error _) false))
+            (Result.Error _) false))
+      (Result.Error _) false)))
+
+(deftest t
+  (assert-true t
+    (core-declarations-render?)
+    "expanded Core lowers to concrete C declarations"))
