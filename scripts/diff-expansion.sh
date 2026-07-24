@@ -9,6 +9,16 @@ set -u
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
+# stock macOS has no `timeout`; use it when present, else a perl alarm.
+run_limited() {
+  secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    perl -e 'alarm shift @ARGV; exec @ARGV or die "exec: $!"' "$secs" "$@"
+  fi
+}
+
 compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
 reference=${CARP_REFERENCE:-"$(command -v carp || echo "$HOME/.local/bin/carp")"}
 carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
@@ -35,7 +45,7 @@ for file in "$repo_root"/test/expansion-corpus/*.carp; do
   fi
   "$ours_bin" > "$ours_out" 2>&1
 
-  if ! (cd "$carp_root" && timeout 120 "$reference" -x "$file") \
+  if ! (cd "$carp_root" && run_limited 120 "$reference" -x "$file") \
       > "$ref_out" 2> "$out_root/$name.ref.log"; then
     printf 'FAIL %s (reference compile)\n' "$name"
     failed=$((failed + 1))
