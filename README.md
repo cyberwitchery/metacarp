@@ -167,10 +167,6 @@ Two pinned Carpentry packages, loaded as git references:
 (load "git@github.com:carpentry-org/strbuf@0.2.0")
 ```
 
-(Until carp-reader 0.3.8 is tagged, `carp-surface` temporarily loads the
-reader from a sibling checkout — see the note at the top of
-`carp-surface/carp-surface.carp`.)
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
