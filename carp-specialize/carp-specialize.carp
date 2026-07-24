@@ -98,6 +98,13 @@
 ;; full environment scan per call site.
 (def *scheme-id-index* (the (Array Int) []))
 
+;; reference-id→instance-positions buckets over the worklist's instance
+;; array; primed by the worklist and consulted by contains-instance? and
+;; instance-for so instance lookups scan one reference's bucket, not every
+;; instance. Empty buckets (an unprimed standalone call) fall back to the
+;; linear scan.
+(def *instance-buckets* (the (Array (Array Int)) []))
+
 ;; per-trace-position memo of node types with the module substitution applied,
 ;; filled lazily on first touch (normalization is instance-independent, so a
 ;; node touched by many instances pays the full-substitution apply once; nodes
@@ -457,18 +464,55 @@ locals). `cursor` is a one-element counter array the recursion advances.")
   (hidden concrete-signature?)
   (defn concrete-signature? [signature] (Type.concrete? signature))
 
+  (private buckets-reset!)
+  (hidden buckets-reset!)
+  (defn buckets-reset! [max-id]
+    (set! *instance-buckets*
+          (Array.replicate (Int.inc (Int.max 0 max-id)) &(the (Array Int) []))))
+
+  (private buckets-note!)
+  (hidden buckets-note!)
+  (defn buckets-note! [reference position]
+    (let-do [id @(CoreRef.id reference)]
+      (when-do (Int.>= id 0)
+        (while-do (Int.<= (Array.length &*instance-buckets*) id)
+          (Array.push-back! &*instance-buckets* (the (Array Int) [])))
+        (Array.push-back! (Array.unsafe-nth &*instance-buckets* id) position))))
+
+  (private bucket-instance-at)
+  (hidden bucket-instance-at)
+  ;; position of the instance matching (reference, signature) inside the
+  ;; reference's bucket, or -1. Only valid when the buckets are primed.
+  (defn bucket-instance-at [instances reference signature]
+    (let-do [result -1
+             id @(CoreRef.id reference)]
+      (when (and (Int.>= id 0) (Int.< id (Array.length &*instance-buckets*)))
+        (let-do [bucket (Array.unsafe-nth &*instance-buckets* id)
+                 n (Array.length bucket)]
+          (for [i 0 n]
+            (when (Int.= result -1)
+              (let [at @(Array.unsafe-nth bucket i)]
+                (when (Type.same-representation?
+                    (Box.peek
+                      (Specialization.signature (Array.unsafe-nth instances at)))
+                    signature)
+                  (set! result at)))))))
+      result))
+
   (defn contains-instance? [instances reference signature]
-    (let-do [found false
-             n (Array.length instances)]
-      (for [i 0 n]
-        (let [instance (Array.unsafe-nth instances i)]
-          (when (and
-              (CoreIR.same-ref? (Specialization.reference instance) reference)
-              (Type.same-representation?
-                (Box.peek (Specialization.signature instance))
-                signature))
-            (set! found true))))
-      found))
+    (if (Int.> (Array.length &*instance-buckets*) 0)
+      (Int.>= (bucket-instance-at instances reference signature) 0)
+      (let-do [found false
+               n (Array.length instances)]
+        (for [i 0 n]
+          (let [instance (Array.unsafe-nth instances i)]
+            (when (and
+                (CoreIR.same-ref? (Specialization.reference instance) reference)
+                (Type.same-representation?
+                  (Box.peek (Specialization.signature instance))
+                  signature))
+              (set! found true))))
+        found)))
 
   (private symbol-for)
   (hidden symbol-for)
@@ -1338,17 +1382,22 @@ move it out of the borrowed container.")
   (private instance-for)
   (hidden instance-for)
   (defn instance-for [instances reference signature]
-    (let-do [result (the (Maybe Specialization) (Maybe.Nothing))
-             n (Array.length instances)]
-      (for [i 0 n]
-        (let [instance (Array.unsafe-nth instances i)]
-          (when (and
-              (CoreIR.same-ref? (Specialization.reference instance) reference)
-              (Type.same-representation?
-                (Box.peek (Specialization.signature instance))
-                signature))
-            (set! result (Maybe.Just @instance)))))
-      result))
+    (if (Int.> (Array.length &*instance-buckets*) 0)
+      (let [at (bucket-instance-at instances reference signature)]
+        (if (Int.>= at 0)
+          (Maybe.Just @(Array.unsafe-nth instances at))
+          (the (Maybe Specialization) (Maybe.Nothing))))
+      (let-do [result (the (Maybe Specialization) (Maybe.Nothing))
+               n (Array.length instances)]
+        (for [i 0 n]
+          (let [instance (Array.unsafe-nth instances i)]
+            (when (and
+                (CoreIR.same-ref? (Specialization.reference instance) reference)
+                (Type.same-representation?
+                  (Box.peek (Specialization.signature instance))
+                  signature))
+              (set! result (Maybe.Just @instance)))))
+        result)))
 
   (private concrete-call)
   (hidden concrete-call)
@@ -2399,6 +2448,7 @@ the same interface selection and instance deduplication as user calls.")
   (defn module-with [core inferred extra-requests]
     (let-do [ignored-index (prime-schemes! (InferredModule.environment inferred))
              ignored-trace (prime-trace! inferred)
+             ignored-buckets (buckets-reset! (CoreIR.max-declared-global-id core))
              instances (the (Array Specialization) [])
              failed false
              failure (String.copy "")
@@ -2463,6 +2513,8 @@ the same interface selection and instance deduplication as user calls.")
                                                  (Specialization.init (CoreRef.copy &reference)
                                                                       (Box.init (MonoType.copy &signature))
                                                                       symbol)))
+                          (buckets-note! &reference
+                                         (Int.dec (Array.length &instances)))
                           (let [n (Array.length &dependencies)]
                             (for [i 0 n]
                               (set! queue

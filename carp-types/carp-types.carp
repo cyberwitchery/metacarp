@@ -29,8 +29,10 @@ and results are boxed only to represent recursive type structure.")
 (deftype TypeSolver
   [bindings (Array TypeBinding)
    indexes (Array Int)
+   negative-indexes (Array Int)
    lifetime-bindings (Array LifetimeBinding)
    lifetime-indexes (Array Int)
+   negative-lifetime-indexes (Array Int)
    constructor-bindings (Array (Pair String String))])
 
 (deftype TypeScheme
@@ -99,9 +101,11 @@ lowercase convention as ordinary type variables.")
   (sig resolve-constructor-in
        (Fn [(Ref (Array (Pair String String))) (Ref String)] String))
   (defn resolve-constructor-in [bindings name]
-    (match (constructor-binding-in bindings name)
-      (Maybe.Just bound) (resolve-constructor-in bindings &bound)
-      (Maybe.Nothing) (String.copy name)))
+    (if (Int.= 0 (Array.length bindings))
+      (String.copy name)
+      (match (constructor-binding-in bindings name)
+        (Maybe.Just bound) (resolve-constructor-in bindings &bound)
+        (Maybe.Nothing) (String.copy name))))
 
   (private binding-for)
   (hidden binding-for)
@@ -152,15 +156,15 @@ lowercase convention as ordinary type variables.")
   (private apply-internal)
   (hidden apply-internal)
   (defn apply-arguments [substitution arguments]
-    (let-do [result (the (Array (Box MonoType)) [])
-             n (Array.length arguments)]
+    (let-do [n (Array.length arguments)
+             result (the (Array (Box MonoType)) (Array.allocate n))]
       (for [i 0 n]
-        (set! result
-              (Array.push-back result
-                               (Box.init
-                                 (apply-internal substitution
-                                                 (Box.peek (Array.unsafe-nth arguments
-                                                                             i)))))))
+        (Array.aset-uninitialized! &result
+                                   i
+                                   (Box.init
+                                     (apply-internal substitution
+                                                     (Box.peek (Array.unsafe-nth arguments
+                                                                                 i))))))
       result))
 
   (defn apply-internal [substitution type]
@@ -621,19 +625,23 @@ check for recursive types.")
   (defn unify-strict [left right substitution]
     (unify-owned left right (TypeSubstitution.copy substitution)))
 
-  (doc solver "creates an empty mutable solver. Variable bindings are indexed
-by non-negative inference-variable ID; negative declaration variables fall back
-to the small linear binding table.")
-  (defn solver [] (TypeSolver.init [] [] [] [] []))
+  (doc solver "creates an empty mutable solver. Type and lifetime bindings are
+indexed by variable ID on both sides of zero (negative declaration variables
+index their own arrays at `(- -1 id)`), so lookups never scan.")
+  (defn solver [] (TypeSolver.init [] [] [] [] [] [] []))
 
   (private solver-binding-for)
   (hidden solver-binding-for)
   (private solver-binding-index!)
   (hidden solver-binding-index!)
   (defn solver-binding-index! [solver variable]
-    (let [indexes (TypeSolver.indexes solver)]
-      (if (and (Int.>= variable 0) (Int.< variable (Array.length indexes)))
-        (let [index @(Array.unsafe-nth indexes variable)]
+    (let [non-negative (Int.>= variable 0)
+          offset (if non-negative variable (Int.- -1 variable))
+          indexes (if non-negative
+            (TypeSolver.indexes solver)
+            (TypeSolver.negative-indexes solver))]
+      (if (Int.< offset (Array.length indexes))
+        (let [index @(Array.unsafe-nth indexes offset)]
           (if (Int.>= index 0)
             (match-ref (Box.peek
                 (TypeBinding.value
@@ -642,7 +650,11 @@ to the small linear binding table.")
                 (let [resolved (solver-binding-index! solver @next-variable)]
                   (if (Int.>= resolved 0)
                     (do
-                      (Array.aset! (TypeSolver.indexes solver) variable resolved)
+                      (if non-negative
+                        (Array.aset! (TypeSolver.indexes solver) offset resolved)
+                        (Array.aset! (TypeSolver.negative-indexes solver)
+                                     offset
+                                     resolved))
                       resolved)
                     index))
               _ index)
@@ -650,41 +662,35 @@ to the small linear binding table.")
         -1)))
 
   (defn solver-binding-for [solver variable]
-    (let [indexes (TypeSolver.indexes solver)]
-      (if (and (Int.>= variable 0) (Int.< variable (Array.length indexes)))
-        (let [index (solver-binding-index! solver variable)]
-          (if (Int.>= index 0)
-            (Maybe.Just
-              (Pointer.address
-                (Box.peek
-                  (TypeBinding.value
-                    (Array.unsafe-nth (TypeSolver.bindings solver) index)))))
-            (Maybe.Nothing)))
-        (let-do [result (the (Maybe (Ptr MonoType)) (Maybe.Nothing))
-                 found false
-                 bindings (TypeSolver.bindings solver)
-                 n (Array.length bindings)]
-          (for [i 0 n]
-            (let [binding (Array.unsafe-nth bindings i)]
-              (when-do (and (not found)
-                            (Int.= @(TypeBinding.variable binding) variable))
-                (set! found true)
-                (set! result
-                      (Maybe.Just
-                        (Pointer.address (Box.peek (TypeBinding.value binding))))))))
-          result))))
+    (let [index (solver-binding-index! solver variable)]
+      (if (Int.>= index 0)
+        (Maybe.Just
+          (Pointer.address
+            (Box.peek
+              (TypeBinding.value
+                (Array.unsafe-nth (TypeSolver.bindings solver) index)))))
+        (Maybe.Nothing))))
 
   (private solver-add-binding!)
   (hidden solver-add-binding!)
   (defn solver-add-binding! [solver variable type]
-    (let-do [binding-index (Array.length (TypeSolver.bindings solver))]
+    (let-do [binding-index (Array.length (TypeSolver.bindings solver))
+             non-negative (Int.>= variable 0)
+             offset (if non-negative variable (Int.- -1 variable))]
       (Array.push-back! (TypeSolver.bindings solver)
                         (TypeBinding.init variable
                                           (Box.init (MonoType.copy type))))
-      (when-do (Int.>= variable 0)
-        (while-do (Int.<= (Array.length (TypeSolver.indexes solver)) variable)
-          (Array.push-back! (TypeSolver.indexes solver) -1))
-        (Array.aset! (TypeSolver.indexes solver) variable binding-index))))
+      (if non-negative
+        (do
+          (while-do (Int.<= (Array.length (TypeSolver.indexes solver)) offset)
+            (Array.push-back! (TypeSolver.indexes solver) -1))
+          (Array.aset! (TypeSolver.indexes solver) offset binding-index))
+        (do
+          (while-do (Int.<=
+              (Array.length (TypeSolver.negative-indexes solver))
+              offset)
+            (Array.push-back! (TypeSolver.negative-indexes solver) -1))
+          (Array.aset! (TypeSolver.negative-indexes solver) offset binding-index)))))
 
   (private solver-occurs?)
   (hidden solver-occurs?)
@@ -738,19 +744,20 @@ to the small linear binding table.")
   (private solver-lifetime-binding-for)
   (hidden solver-lifetime-binding-for)
   (defn solver-lifetime-binding-for [solver variable]
-    (let-do [result (the (Maybe MonoLifetime) (Maybe.Nothing))
-             found false
-             bindings (TypeSolver.lifetime-bindings solver)
-             n (Array.length bindings)]
-      (for [i 0 n]
-        (let [binding (Array.unsafe-nth bindings i)]
-          (when-do (and (not found)
-                        (Int.= @(LifetimeBinding.variable binding) variable))
-            (set! found true)
-            (set! result
-                  (Maybe.Just
-                    (MonoLifetime.copy (LifetimeBinding.value binding)))))))
-      result))
+    (let [non-negative (Int.>= variable 0)
+          offset (if non-negative variable (Int.- -1 variable))
+          indexes (if non-negative
+            (TypeSolver.lifetime-indexes solver)
+            (TypeSolver.negative-lifetime-indexes solver))]
+      (if (Int.< offset (Array.length indexes))
+        (let [index @(Array.unsafe-nth indexes offset)]
+          (if (Int.>= index 0)
+            (Maybe.Just
+              (MonoLifetime.copy
+                (LifetimeBinding.value
+                  (Array.unsafe-nth (TypeSolver.lifetime-bindings solver) index))))
+            (Maybe.Nothing)))
+        (Maybe.Nothing))))
 
   (private solver-apply-lifetime)
   (hidden solver-apply-lifetime)
@@ -765,9 +772,28 @@ to the small linear binding table.")
   (private solver-bind-lifetime!)
   (hidden solver-bind-lifetime!)
   (defn solver-bind-lifetime! [solver variable lifetime]
-    (Array.push-back! (TypeSolver.lifetime-bindings solver)
-                      (LifetimeBinding.init variable
-                                            (MonoLifetime.copy lifetime))))
+    (let-do [binding-index (Array.length (TypeSolver.lifetime-bindings solver))
+             non-negative (Int.>= variable 0)
+             offset (if non-negative variable (Int.- -1 variable))]
+      (Array.push-back! (TypeSolver.lifetime-bindings solver)
+                        (LifetimeBinding.init variable
+                                              (MonoLifetime.copy lifetime)))
+      (if non-negative
+        (do
+          (while-do (Int.<=
+              (Array.length (TypeSolver.lifetime-indexes solver))
+              offset)
+            (Array.push-back! (TypeSolver.lifetime-indexes solver) -1))
+          (Array.aset! (TypeSolver.lifetime-indexes solver) offset binding-index))
+        (do
+          (while-do (Int.<=
+              (Array.length (TypeSolver.negative-lifetime-indexes solver))
+              offset)
+            (Array.push-back! (TypeSolver.negative-lifetime-indexes solver) -1))
+          (Array.aset!
+            (TypeSolver.negative-lifetime-indexes solver)
+            offset
+            binding-index)))))
 
   (private solver-unify-lifetimes!)
   (hidden solver-unify-lifetimes!)
@@ -980,15 +1006,15 @@ The caller must keep the solver alive for the complete operation.")
   (private solver-apply-internal)
   (hidden solver-apply-internal)
   (defn solver-apply-arguments [solver arguments]
-    (let-do [result (the (Array (Box MonoType)) [])
-             n (Array.length arguments)]
+    (let-do [n (Array.length arguments)
+             result (the (Array (Box MonoType)) (Array.allocate n))]
       (for [i 0 n]
-        (set! result
-              (Array.push-back result
-                               (Box.init
-                                 (solver-apply-internal solver
-                                                        (Box.peek (Array.unsafe-nth arguments
-                                                                                    i)))))))
+        (Array.aset-uninitialized! &result
+                                   i
+                                   (Box.init
+                                     (solver-apply-internal solver
+                                                            (Box.peek (Array.unsafe-nth arguments
+                                                                                        i))))))
       result))
 
   (defn solver-apply-internal [solver type]
