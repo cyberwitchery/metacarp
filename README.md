@@ -77,14 +77,15 @@ The bootstrap chain, from the repository root:
 ```sh
 carp -b --optimize main.carp                                    # gen 1
 ./out/carp-compiler -c "$CARP_DIR/core" -o self.c main.carp     # gen 1 emits itself
-clang -O2 -o self-cc self.c -I "$CARP_DIR/core"                 # link gen 2
+clang -O3 -D NDEBUG -o self-cc self.c -I "$CARP_DIR/core"      # link gen 2
 ./self-cc -c "$CARP_DIR/core" -o self2.c main.carp              # gen 2 emits itself
 cmp self.c self2.c                                              # fixed point
 ```
 
 On an M-class laptop, the reference-built generation compiles the compiler in
-roughly 68 seconds and gen 2 in roughly 73 seconds. Gen 2 is currently about
-8 percent slower and uses about 20 percent more peak memory.
+roughly 69 seconds and gen 2 in roughly 70 seconds when both are linked with
+the reference compiler's `-O3 -D NDEBUG` optimization flags. Gen 2 is currently
+within about 2 percent on time and uses roughly 20--30 percent more peak memory.
 
 Two harnesses keep the self-host honest:
 

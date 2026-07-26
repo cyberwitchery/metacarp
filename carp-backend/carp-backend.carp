@@ -1061,6 +1061,132 @@ builtin with no runtime deleter function; the backend inlines this sentinel to a
        (Fn
          [(Ref SpecializedExpr) (Ref (Array (Pair String String)))]
          SpecializedExpr))
+  (sig cleanup-after
+       (Fn
+         [SpecializedExpr (Ref CoreRef) (Ref MonoType) (Ref String)]
+         SpecializedExpr))
+  (sig insert-path-cleanup
+       (Fn
+         [(Ref SpecializedExpr) (Ref CoreRef) (Ref MonoType) (Ref String)]
+         SpecializedExpr))
+
+  (doc cleanup-after "evaluates an expression, deletes one still-owned
+binding, then yields the expression's result.")
+  (defn cleanup-after [expr binder value-type symbol]
+    (let [body-type (tail-expression-type &expr)
+          delete-node (make-delete-node binder value-type symbol)]
+      (if (match-ref &body-type (MonoType.Unit) true _ false)
+        (SpecializedExpr.Do -1
+                            (Box.init (MonoType.Unit))
+                            [(Box.init expr) (Box.init delete-node)])
+        (let [temp (CoreRef.init (next-backend-local!) @"path-cleanup" false)]
+          (SpecializedExpr.Let -1
+                               (Box.init (MonoType.copy &body-type))
+                               (CoreRef.copy &temp)
+                               (Box.init expr)
+                               (Box.init
+                                 (SpecializedExpr.Do -1
+                                                     (Box.init (MonoType.copy &body-type))
+                                                     [(Box.init delete-node)
+                                                      (Box.init
+                                                        (SpecializedExpr.Reference
+                                                          -1
+                                                          (Box.init (MonoType.copy &body-type))
+                                                          (CoreRef.copy &temp)))])))))))
+
+  (doc insert-path-cleanup "inserts a delete on exactly the exits where
+`binder` has not been moved. Conditional tail expressions are rewritten
+branch-by-branch; an expression that never consumes the binder gets one
+ordinary scope-exit cleanup.")
+  (defn insert-path-cleanup [expr binder value-type symbol]
+    (if (not (Ownership.consumed? binder expr))
+      (cleanup-after (SpecializedExpr.copy expr) binder value-type symbol)
+      (match-ref expr
+        (SpecializedExpr.If id type c t e)
+          (if (Ownership.consumed? binder (Box.peek c))
+            (SpecializedExpr.copy expr)
+            (SpecializedExpr.If @id
+                                (Box.init (MonoType.copy (Box.peek type)))
+                                (Box.init (SpecializedExpr.copy (Box.peek c)))
+                                (Box.init
+                                  (insert-path-cleanup (Box.peek t)
+                                                       binder
+                                                       value-type
+                                                       symbol))
+                                (Box.init
+                                  (insert-path-cleanup (Box.peek e)
+                                                       binder
+                                                       value-type
+                                                       symbol))))
+        (SpecializedExpr.Match id type by-reference scrutinee branches)
+          (if (Ownership.consumed? binder (Box.peek scrutinee))
+            (SpecializedExpr.copy expr)
+            (let-do [new-branches (the (Array SpecializedMatchBranch) [])
+                     n (Array.length branches)]
+              (for [i 0 n]
+                (let [branch (Array.unsafe-nth branches i)]
+                  (Array.push-back!
+                    &new-branches
+                    (SpecializedMatchBranch.init
+                      @(SpecializedMatchBranch.pattern branch)
+                      @(SpecializedMatchBranch.bindings branch)
+                      (Box.init
+                        (insert-path-cleanup
+                          (Box.peek (SpecializedMatchBranch.body branch))
+                          binder
+                          value-type
+                          symbol))))))
+              (SpecializedExpr.Match @id
+                                     (Box.init (MonoType.copy (Box.peek type)))
+                                     @by-reference
+                                     (Box.init
+                                       (SpecializedExpr.copy (Box.peek scrutinee)))
+                                     new-branches)))
+        (SpecializedExpr.Let id type inner-binder value body)
+          (if (Ownership.consumed? binder (Box.peek value))
+            (SpecializedExpr.copy expr)
+            (SpecializedExpr.Let @id
+                                 (Box.init (MonoType.copy (Box.peek type)))
+                                 (CoreRef.copy inner-binder)
+                                 (Box.init (SpecializedExpr.copy (Box.peek value)))
+                                 (Box.init
+                                   (insert-path-cleanup (Box.peek body)
+                                                        binder
+                                                        value-type
+                                                        symbol))))
+        (SpecializedExpr.Do id type es)
+          (let-do [n (Array.length es)
+                   prefix-consumes false]
+            (when (Int.> n 1)
+              (for [i 0 (Int.dec n)]
+                (when (Ownership.consumed? binder
+                                            (Box.peek (Array.unsafe-nth es i)))
+                  (set! prefix-consumes true))))
+            (if (or prefix-consumes (Int.= n 0))
+              (SpecializedExpr.copy expr)
+              (let-do [new-es (the (Array (Box SpecializedExpr)) [])]
+                (for [i 0 n]
+                  (Array.push-back!
+                    &new-es
+                    (Box.init
+                      (if (Int.= i (Int.dec n))
+                        (insert-path-cleanup (Box.peek (Array.unsafe-nth es i))
+                                             binder
+                                             value-type
+                                             symbol)
+                        (SpecializedExpr.copy
+                          (Box.peek (Array.unsafe-nth es i)))))))
+                (SpecializedExpr.Do @id
+                                    (Box.init (MonoType.copy (Box.peek type)))
+                                    new-es))))
+        (SpecializedExpr.Annotation id type inner core-type)
+          (SpecializedExpr.Annotation
+            @id
+            (Box.init (MonoType.copy (Box.peek type)))
+            (Box.init
+              (insert-path-cleanup (Box.peek inner) binder value-type symbol))
+            @core-type)
+        _ (SpecializedExpr.copy expr))))
 
   (doc map-recurse "applies cleanup insertion to each element of an expression
 list without treating any element as discarded (used for positions like call
@@ -1096,40 +1222,17 @@ arguments and array literals whose values are consumed, not dropped).")
               body-type (tail-expression-type &new-body)]
           (match (cleanup-for binder @id body-deletes)
             (Maybe.Just sd)
-              (let [value-type (Specialize.expression-type (Box.peek value))
-                    delete-node (make-delete-node binder
-                                                  &value-type
-                                                  (ScopeDelete.symbol &sd))]
-                (if (match-ref &body-type (MonoType.Unit) true _ false)
-                  (SpecializedExpr.Let @id
-                                       (Box.init (MonoType.copy &body-type))
-                                       (CoreRef.copy binder)
-                                       (Box.init new-value)
-                                       (Box.init
-                                         (SpecializedExpr.Do -1
-                                                             (Box.init (MonoType.Unit))
-                                                             [(Box.init new-body)
-                                                              (Box.init delete-node)])))
-                  (let [temp (CoreRef.init (next-backend-local!)
-                                           @"cleanup"
-                                           false)]
-                    (SpecializedExpr.Let @id
-                                         (Box.init (MonoType.copy &body-type))
-                                         (CoreRef.copy binder)
-                                         (Box.init new-value)
-                                         (Box.init
-                                           (SpecializedExpr.Let -1
-                                                                (Box.init (MonoType.copy &body-type))
-                                                                (CoreRef.copy &temp)
-                                                                (Box.init new-body)
-                                                                (Box.init
-                                                                  (SpecializedExpr.Do -1
-                                                                                      (Box.init (MonoType.copy &body-type))
-                                                                                      [(Box.init delete-node)
-                                                                                       (Box.init
-                                                                                         (SpecializedExpr.Reference -1
-                                                                                                                    (Box.init (MonoType.copy &body-type))
-                                                                                                                    (CoreRef.copy &temp)))]))))))))
+              (let [value-type (Specialize.expression-type (Box.peek value))]
+                (SpecializedExpr.Let
+                  @id
+                  (Box.init (MonoType.copy &body-type))
+                  (CoreRef.copy binder)
+                  (Box.init new-value)
+                  (Box.init
+                    (insert-path-cleanup &new-body
+                                         binder
+                                         &value-type
+                                         (ScopeDelete.symbol &sd)))))
             (Maybe.Nothing)
               (SpecializedExpr.Let @id
                                    (Box.init (MonoType.copy (Box.peek type)))
@@ -1196,21 +1299,24 @@ arguments and array literals whose values are consumed, not dropped).")
                                              body-deletes
                                              delete-symbols
                                              constructors)
+                     path-cleaned cleaned
                      bindings (SpecializedMatchBranch.bindings branch)
                      pattern @(SpecializedMatchBranch.pattern branch)
                      deletes (the (Array (Box SpecializedExpr)) [])]
-              ;; by-value pattern bindings the branch body does not consume are
-              ;; scheduled (keyed to the branch body's id) — append their
-              ;; deletes at branch exit.
+              ;; A by-value binding can be moved on only some exits. Rewrite
+              ;; its body so the scheduled delete lands only on exits that
+              ;; retain ownership; an unconditional append would double-free
+              ;; the paths that do move it.
               (for [j 0 (Array.length bindings)]
                 (let [b (Array.unsafe-nth bindings j)]
                   (match (cleanup-for b body-id body-deletes)
                     (Maybe.Just sd)
-                      (Array.push-back! &deletes
-                                        (Box.init
-                                          (make-delete-node b
-                                                            (Box.peek (ScopeDelete.type &sd))
-                                                            (ScopeDelete.symbol &sd))))
+                      (set! path-cleaned
+                            (insert-path-cleanup
+                              &path-cleaned
+                              b
+                              (Box.peek (ScopeDelete.type &sd))
+                              (ScopeDelete.symbol &sd)))
                     (Maybe.Nothing) ())))
               ;; unbound (`_`) slots of a by-value match drop owned payloads:
               ;; bind each slot with a deleter to a fresh local and free it
@@ -1260,10 +1366,10 @@ arguments and array literals whose values are consumed, not dropped).")
                                                                     symbol)))
                             (Maybe.Nothing) ())))))))
               (let [final-body (if (Int.= 0 (Array.length &deletes))
-                      cleaned
-                      (let [body-type (tail-expression-type &cleaned)]
+                      path-cleaned
+                      (let [body-type (tail-expression-type &path-cleaned)]
                         (if (match-ref &body-type (MonoType.Unit) true _ false)
-                          (let-do [elements [(Box.init cleaned)]]
+                          (let-do [elements [(Box.init path-cleaned)]]
                             (for [k 0 (Array.length &deletes)]
                               (Array.push-back! &elements
                                                 @(Array.unsafe-nth &deletes k)))
@@ -1286,7 +1392,7 @@ arguments and array literals whose values are consumed, not dropped).")
                             (SpecializedExpr.Let -1
                                                  (Box.init (MonoType.copy &body-type))
                                                  (CoreRef.copy &temp)
-                                                 (Box.init cleaned)
+                                                 (Box.init path-cleaned)
                                                  (Box.init
                                                    (SpecializedExpr.Do -1
                                                                        (Box.init (MonoType.copy &body-type))
@@ -1615,44 +1721,17 @@ always discards its result. Roots that produce unmanaged values are left as-is."
   (private wrap-params)
   (hidden wrap-params)
   (doc wrap-params "wraps a function body so its owned parameters are deleted at
-function exit, after the result is computed. Owners the body already consumed
-are not in `param-deletes` and so are untouched.")
+function exit on exactly the paths that do not consume them.")
   (defn wrap-params [body param-deletes]
-    (if (Int.= 0 (Array.length param-deletes))
-      body
-      (let-do [body-type (Specialize.expression-type &body)
-               is-unit (match-ref &body-type (MonoType.Unit) true _ false)
-               temp (CoreRef.init (next-backend-local!) @"param" false)
-               elements (the (Array (Box SpecializedExpr)) [])]
-        (when is-unit
-          (set! elements
-                (Array.push-back elements
-                                 (Box.init (SpecializedExpr.copy &body)))))
-        (for [i 0 (Array.length param-deletes)]
-          (let [pd (Array.unsafe-nth param-deletes i)]
-            (set! elements
-                  (Array.push-back elements
-                                   (Box.init
-                                     (make-delete-node (ScopeDelete.binder pd)
-                                                       (Box.peek (ScopeDelete.type pd))
-                                                       (ScopeDelete.symbol pd)))))))
-        (if is-unit
-          (SpecializedExpr.Do -1 (Box.init (MonoType.Unit)) elements)
-          (do
-            (set! elements
-                  (Array.push-back elements
-                                   (Box.init
-                                     (SpecializedExpr.Reference -1
-                                                                (Box.init (MonoType.copy &body-type))
-                                                                (CoreRef.copy &temp)))))
-            (SpecializedExpr.Let -1
-                                 (Box.init (MonoType.copy &body-type))
-                                 (CoreRef.copy &temp)
-                                 (Box.init (SpecializedExpr.copy &body))
-                                 (Box.init
-                                   (SpecializedExpr.Do -1
-                                                       (Box.init (MonoType.copy &body-type))
-                                                       elements))))))))
+    (let-do [result body]
+      (for [i 0 (Array.length param-deletes)]
+        (let [pd (Array.unsafe-nth param-deletes i)]
+          (set! result
+                (insert-path-cleanup &result
+                                     (ScopeDelete.binder pd)
+                                     (Box.peek (ScopeDelete.type pd))
+                                     (ScopeDelete.symbol pd)))))
+      result))
 
   (private rewrite-bodies)
   (hidden rewrite-bodies)
@@ -2678,11 +2757,13 @@ managed forms still require dedicated lowering.")
                             (String.copy &count)
                             @", .capacity = "
                             (String.copy &count)
-                            @", .data = CARP_MALLOC(sizeof("
+                            @", .data = (("
+                            (String.copy &count)
+                            @") == 0 ? NULL : CARP_MALLOC(sizeof("
                             element
                             @") * ("
                             (String.copy &count)
-                            @")) })"]))
+                            @"))) })"]))
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
             _
@@ -3093,12 +3174,16 @@ binding so the value is the binding itself.")
             (StringBuf.append-str buffer &(Int.str count))
             (StringBuf.append-str buffer ", .capacity = ")
             (StringBuf.append-str buffer &(Int.str count))
-            (StringBuf.append-str buffer ", .data = CARP_MALLOC(sizeof(")
-            (StringBuf.append-str buffer &rendered-element)
-            (StringBuf.append-str buffer ") * ")
-            (StringBuf.append-str buffer &(Int.str count))
-            (StringBuf.append-str buffer ") };
+            (if (Int.= count 0)
+              (StringBuf.append-str buffer ", .data = NULL };
 ")
+              (do
+                (StringBuf.append-str buffer ", .data = CARP_MALLOC(sizeof(")
+                (StringBuf.append-str buffer &rendered-element)
+                (StringBuf.append-str buffer ") * ")
+                (StringBuf.append-str buffer &(Int.str count))
+                (StringBuf.append-str buffer ") };
+")))
             (for [i 0 count]
               (match-ref &result
                 (Result.Success _)
@@ -5529,7 +5614,7 @@ selected by specialization.")
   Array copy;
   copy.len = arg0->len;
   copy.capacity = arg0->capacity;
-  copy.data = CARP_MALLOC(sizeof(")
+  copy.data = arg0->capacity == 0 ? NULL : CARP_MALLOC(sizeof(")
                           (StringBuf.append-str &buffer &rendered-element)
                           (StringBuf.append-str &buffer ") * arg0->capacity);
   for(size_t i = 0; i < arg0->len; i++) {

@@ -25,6 +25,37 @@
           (Result.Error (BackendError.init @(ResolveError.message &error))))
     (Result.Error _) (Result.Error (BackendError.init @"parse error"))))
 
+(defn lower-owned-widget-source [source]
+  (match (Surface.parse source)
+    (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core)
+          (match (Infer.module &core)
+            (Result.Success inferred)
+              (match (Specialize.module &core &inferred)
+                (Result.Success specialized)
+                  (match (Ownership.prepare
+                           &specialized
+                           &(OwnershipClassify.facts-from-module &core))
+                    (Result.Success ownership)
+                      (let [widget (MonoType.Named @"Widget" [])
+                            symbols [(Pair.init (CAbi.type-key &widget)
+                                                @"widget_delete")]]
+                        (BackendLower.module-with-ownership &specialized
+                                                            &ownership
+                                                            &symbols))
+                    (Result.Error error)
+                      (Result.Error
+                        (BackendError.init @(OwnershipError.message &error))))
+                (Result.Error error)
+                  (Result.Error
+                    (BackendError.init @(SpecializeError.message &error))))
+            (Result.Error error)
+              (Result.Error (BackendError.init @(InferError.message &error))))
+        (Result.Error error)
+          (Result.Error (BackendError.init @(ResolveError.message &error))))
+    (Result.Error _) (Result.Error (BackendError.init @"parse error"))))
+
 (defn lowers-concrete-function-declarations? []
   (match (lower-source "(defn forward [x] (identity x))
 (defn identity [x] x)
@@ -36,6 +67,25 @@
 
 (defn contains-text? [text fragment]
   (Int.>= (String.index-of-string text fragment) 0))
+
+(defn deletes-conditionally-unmoved-match-bindings? []
+  (match (lower-owned-widget-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(deftype Holder (Held [Widget]))
+(deftype Choice (Keep [Widget]) (Drop))
+(defn choose [holder keep]
+  (match holder
+    (Holder.Held widget)
+      (if keep (Choice.Keep widget) (Choice.Drop))))
+(choose (Holder.Held (make-widget)) true)")
+    (Result.Success backend)
+      (match (CBackend.function-definitions &backend)
+        (Result.Success rendered)
+          (contains-text? &rendered "widget_delete(widget);")
+        (Result.Error _) false)
+    (Result.Error _) false))
 
 (defn renders-unmanaged-user-function-bodies? []
   (match (lower-source "(defn identity [x] x)
@@ -418,6 +468,33 @@ answer") (Result.Success backend)
 }"])]
           (= &rendered &expected))) (Result.Error _) false))
 
+(defn array-copy-skips-empty-allocation? []
+  (let [int-type (Type.integer)
+        array-type (Type.named "Array" [(Box.init (MonoType.copy &int-type))])
+        copy-signature (Type.function
+                         [(Box.init
+                            (Type.reference (MonoType.copy &array-type)
+                                            (Type.lifetime 0)))]
+                         (MonoType.copy &array-type))
+        element-copy-signature (Type.function
+                                 [(Box.init
+                                    (Type.reference (MonoType.copy &int-type)
+                                                    (Type.lifetime 0)))]
+                                 int-type)
+        declaration (BackendDeclaration.Template
+                      (String.copy "Array.copy")
+                      (Box.init copy-signature)
+                      (PrimitiveTemplate.ArrayCopy
+                        (PrimitiveRegistry.reference 0 "copy"))
+                      [(BackendDependency.init
+                         @"Int.copy"
+                         (Box.init element-copy-signature))])]
+    (match (CBackend.template-definition &declaration)
+      (Result.Success rendered)
+        (contains-text? &rendered
+                        "copy.data = arg0->capacity == 0 ? NULL : CARP_MALLOC")
+      (Result.Error _) false)))
+
 (defn renders-pointer-copy-template? []
   (let [pointer-type (Type.named "Ptr" [(Box.init (Type.integer))])
         signature (Type.function
@@ -641,6 +718,9 @@ answer") (Result.Success backend)
     (renders-box-copy-template?)
     "Box copy templates call their selected element-copy dependency")
   (assert-true t
+    (array-copy-skips-empty-allocation?)
+    "Array copy templates represent empty storage as NULL")
+  (assert-true t
     (renders-pointer-copy-template?)
     "Pointer copy templates dereference without dependencies")
   (assert-true t
@@ -660,4 +740,7 @@ answer") (Result.Success backend)
     "C backend lowers nested unmanaged constructor patterns")
   (assert-true t
     (discovers-signature-only-nominal-layouts?)
-    "C backend discovers dependency-ordered nominal layouts from signatures"))
+    "C backend discovers dependency-ordered nominal layouts from signatures")
+  (assert-true t
+    (deletes-conditionally-unmoved-match-bindings?)
+    "C backend deletes owned match bindings only on branches that retain them"))
