@@ -82,9 +82,9 @@ clang -O2 -o self-cc self.c -I "$CARP_DIR/core"                 # link gen 2
 cmp self.c self2.c                                              # fixed point
 ```
 
-Each generation compiles the compiler in roughly seventy seconds on an M-class
-laptop, on par with the reference-built compiler and at a peak resident set
-within ten percent of it.
+On an M-class laptop, the reference-built generation compiles the compiler in
+roughly 68 seconds and gen 2 in roughly 73 seconds. Gen 2 is currently about
+8 percent slower and uses about 20 percent more peak memory.
 
 Two harnesses keep the self-host honest:
 
