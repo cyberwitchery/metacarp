@@ -1910,6 +1910,8 @@ concrete type key to deleter C symbol).")
   (hidden constructor-for-reference)
   (private pattern-condition)
   (hidden pattern-condition)
+  (private single-constructor-name?)
+  (hidden single-constructor-name?)
   (sig pattern-condition
        (Fn
          [(Ref (Array CoreConstructorDeclaration))
@@ -2611,15 +2613,22 @@ managed forms still require dedicated lowering.")
                     (Result.Success (String.concat &[@"(*" operand @").len"])))
                 _ (Result.Success (String.concat &[@"(*" operand @").len"])))
             (Result.Error error) (Result.Error error))
-          ;; `get-tag` (id 48) reads the `.tag` field of the sum type behind the
-          ;; reference it is passed; no runtime function exists.
+          ;; `get-tag` (id 48) reads the `.tag` field of a sum type. A
+          ;; single-constructor nominal has no stored tag; its logical tag is
+          ;; the constant zero.
           (and (Int.= @(CoreRef.id reference) 48)
                (Int.= (Array.length arguments) 1))
           (match (render-value-expression constructors
                                           (Box.peek (Array.unsafe-nth arguments
                                                                       0)))
             (Result.Success operand)
-              (Result.Success (String.concat &[@"(*" operand @").tag"]))
+              (match-ref &(deref-type
+                  &(specialized-type (Box.peek (Array.unsafe-nth arguments 0))))
+                (MonoType.Named name _)
+                  (if (single-constructor-name? constructors name)
+                    (Result.Success (String.copy "0"))
+                    (Result.Success (String.concat &[@"(*" operand @").tag"])))
+                _ (Result.Success (String.concat &[@"(*" operand @").tag"])))
             (Result.Error error) (Result.Error error))
           ;; `field-set!` (id 49) writes a struct field in place behind a ref:
           ;; args are [self, IntLit tag, IntLit member-index, value].
@@ -3495,6 +3504,25 @@ choice the reference's multisym resolution makes.")
               result)
           _ (the (Maybe CoreConstructorDeclaration) (Maybe.Nothing))))))
 
+(defn single-constructor-name? [constructors name]
+  (let-do [count 0
+           previous-tag -1
+           n (Array.length constructors)]
+    ;; Tags restart when a later declaration shadows an earlier type. Keep
+    ;; only the size of the last declaration group, matching layout lookup.
+    (for [i 0 n]
+      (let [constructor (Array.unsafe-nth constructors i)]
+        (match-ref (Box.peek (CoreConstructorDeclaration.result constructor))
+          (CoreType.Named result-name _)
+            (when-do (String.= result-name name)
+              (if (Int.<= @(CoreConstructorDeclaration.tag constructor)
+                           previous-tag)
+                (set! count 1)
+                (set! count (Int.inc count)))
+              (set! previous-tag @(CoreConstructorDeclaration.tag constructor)))
+          _ ())))
+    (Int.= count 1)))
+
 (defn pattern-condition [constructors pattern subject-type expression]
   (match-ref pattern
     (CorePattern.Ignore) (Result.Success (String.copy ""))
@@ -3518,11 +3546,25 @@ choice the reference's multisym resolution makes.")
                           (BackendError.init
                             @"match constructor pattern arity mismatch")))
                   (do
-                    (StringBuf.append-str &buffer expression)
-                    (StringBuf.append-str &buffer ".tag == ")
-                    (StringBuf.append-str &buffer
-                                          &(Int.str
-                                            @(CoreConstructorDeclaration.tag &constructor)))
+                    (match-ref subject-type
+                      (MonoType.Named subject-name _)
+                        (if (single-constructor-name? constructors subject-name)
+                          (StringBuf.append-str &buffer "true")
+                          (do
+                            (StringBuf.append-str &buffer expression)
+                            (StringBuf.append-str &buffer ".tag == ")
+                            (StringBuf.append-str &buffer
+                                                  &(Int.str
+                                                    @(CoreConstructorDeclaration.tag
+                                                      &constructor)))))
+                      _
+                        (do
+                          (StringBuf.append-str &buffer expression)
+                          (StringBuf.append-str &buffer ".tag == ")
+                          (StringBuf.append-str &buffer
+                                                &(Int.str
+                                                  @(CoreConstructorDeclaration.tag
+                                                    &constructor)))))
                     (for [i 0 n]
                       (match-ref &result
                         (Result.Success _)
@@ -4451,6 +4493,7 @@ the later declaration is the one later code means.")
           (let-do [result (the (Result Unit BackendError) (Result.Success ()))
                    buffer (StringBuf.create)
                    group-start (last-declaration-start constructors source-name)
+                   single-constructor (single-constructor-name? constructors source-name)
                    constructor-count (Array.length constructors)]
             ;; the payload union comes FIRST and the tag LAST, matching the
             ;; reference layout: `Unsafe.coerce` of a sum reference to a payload
@@ -4477,10 +4520,18 @@ the later declaration is the one later code means.")
                       _ ()))
                 (Result.Error _) ()))
             (match result
-              (Result.Success _) (do (StringBuf.append-str &buffer "  } data;
-  int tag;
-} ") (StringBuf.append-str &buffer &c-name) (StringBuf.append-str &buffer ";
-") (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Success _)
+                (do
+                  (StringBuf.append-str &buffer "  } data;
+")
+                  (unless single-constructor
+                    (StringBuf.append-str &buffer "  int tag;
+"))
+                  (StringBuf.append-str &buffer "} ")
+                  (StringBuf.append-str &buffer &c-name)
+                  (StringBuf.append-str &buffer ";
+")
+                  (Result.Success (StringBuf.to-string &buffer)))
               (Result.Error error) (Result.Error error)))
         (Result.Error error) (Result.Error error))
     _
@@ -4535,7 +4586,7 @@ concrete application. Each constructor receives its stable source-order tag.")
     (Result.Error error) (Result.Error error)))
 
 (doc constructor-definition "renders one reachable nominal constructor.")
-(defn constructor-definition [declaration]
+(defn constructor-definition [constructors declaration]
   (match-ref declaration
     (BackendDeclaration.Constructor _ signature constructor)
       (match (prototype-head declaration)
@@ -4550,12 +4601,19 @@ concrete application. Each constructor receives its stable source-order tag.")
   ")
                     (StringBuf.append-str &buffer &c-name)
                     (StringBuf.append-str &buffer " value;
-  value.tag = ")
-                    (StringBuf.append-str &buffer
-                                          &(Int.str
-                                            @(CoreConstructorDeclaration.tag constructor)))
-                    (StringBuf.append-str &buffer ";
 ")
+                    (match-ref (Box.peek
+                        (CoreConstructorDeclaration.result constructor))
+                      (CoreType.Named source-name _)
+                        (unless-do (single-constructor-name? constructors source-name)
+                          (StringBuf.append-str &buffer "  value.tag = ")
+                          (StringBuf.append-str &buffer
+                                                &(Int.str
+                                                  @(CoreConstructorDeclaration.tag
+                                                    constructor)))
+                          (StringBuf.append-str &buffer ";
+"))
+                      _ ())
                     (let [n (Array.length arguments)]
                       (for [i 0 n]
                         ;; unit members have no C storage and no C parameter
@@ -4599,7 +4657,8 @@ concrete application. Each constructor receives its stable source-order tag.")
           (let [declaration (Array.unsafe-nth declarations i)]
             (match-ref declaration
               (BackendDeclaration.Constructor _ _ _)
-                (match (constructor-definition declaration)
+                (match (constructor-definition (BackendModule.constructors module)
+                                               declaration)
                   (Result.Success rendered)
                     (do
                       (when rendered-any (StringBuf.append-str &buffer "
