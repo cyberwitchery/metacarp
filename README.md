@@ -82,7 +82,7 @@ clang -O2 -o self-cc self.c -I "$CARP_DIR/core"                 # link gen 2
 cmp self.c self2.c                                              # fixed point
 ```
 
-Each generation compiles the compiler in roughly six minutes on an M-class
+Each generation compiles the compiler in roughly three and a half minutes on an M-class
 laptop, at a peak resident set within ten percent of the reference-built
 binary's.
 

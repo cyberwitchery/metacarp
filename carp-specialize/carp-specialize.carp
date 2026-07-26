@@ -2201,22 +2201,18 @@ per-expression trace scan becomes an array lookup.")
   (private materialize-output)
   (hidden materialize-output)
   (defn materialize-output [core inferred instances]
-    (let-do [result (the
-               (Result SpecializationModule SpecializeError)
-               (Result.Success
-                 (SpecializationModule.init (Array.copy instances)
-                                            []
-                                            []
-                                            []
-                                            @(CoreModule.constructors core)
-                                            @(CoreModule.system-includes core))))
+    ;; Accumulate payload arrays directly. Rebuilding a SpecializationModule
+    ;; through a borrowed Result on every iteration copies all earlier bodies.
+    (let-do [bodies (the (Array SpecializedBody) [])
+             primitives (the (Array SpecializedPrimitive) [])
+             failure (the (Maybe SpecializeError) (Maybe.Nothing))
              functions (CoreModule.functions core)
              values (CoreModule.values core)
              builtins (CoreModule.builtins core)
              n (Array.length instances)]
       (for [i 0 n]
-        (match-ref &result
-          (Result.Success output)
+        (match-ref &failure
+          (Maybe.Nothing)
             (let [instance (Array.unsafe-nth instances i)
                   reference (Specialization.reference instance)
                   signature (Box.peek (Specialization.signature instance))]
@@ -2234,20 +2230,14 @@ per-expression trace scan becomes an array lookup.")
                                            reference
                                            signature)
                         (Result.Success body)
-                          (set! result
-                                (Result.Success
-                                  (SpecializationModule.init @(SpecializationModule.instances output)
-                                                             (Array.push-back @(SpecializationModule.bodies output)
-                                                                              (SpecializedBody.init @instance
-                                                                                                    @(CoreFunction.parameters &function)
-                                                                                                    (Box.init body)
-                                                                                                    false))
-                                                             @(SpecializationModule.primitives output)
-                                                             @(SpecializationModule.roots output)
-                                                             @(SpecializationModule.constructors output)
-                                                             @(SpecializationModule.system-includes output))))
-                        (Result.Error error) (set! result (Result.Error error)))
-                    (Result.Error error) (set! result (Result.Error error)))
+                          (Array.push-back! &bodies
+                                            (SpecializedBody.init @instance
+                                                                  @(CoreFunction.parameters &function)
+                                                                  (Box.init body)
+                                                                  false))
+                        (Result.Error error)
+                          (set! failure (Maybe.Just error)))
+                    (Result.Error error) (set! failure (Maybe.Just error)))
                 (Maybe.Nothing)
                   (match (value-for values reference)
                     (Maybe.Just value)
@@ -2263,21 +2253,14 @@ per-expression trace scan becomes an array lookup.")
                                                reference
                                                signature)
                             (Result.Success body)
-                              (set! result
-                                    (Result.Success
-                                      (SpecializationModule.init @(SpecializationModule.instances output)
-                                                                 (Array.push-back @(SpecializationModule.bodies output)
-                                                                                  (SpecializedBody.init @instance
-                                                                                                        []
-                                                                                                        (Box.init body)
-                                                                                                        true))
-                                                                 @(SpecializationModule.primitives output)
-                                                                 @(SpecializationModule.roots output)
-                                                                 @(SpecializationModule.constructors output)
-                                                                 @(SpecializationModule.system-includes output))))
+                              (Array.push-back! &bodies
+                                                (SpecializedBody.init @instance
+                                                                      []
+                                                                      (Box.init body)
+                                                                      true))
                             (Result.Error error)
-                              (set! result (Result.Error error)))
-                        (Result.Error error) (set! result (Result.Error error)))
+                              (set! failure (Maybe.Just error)))
+                        (Result.Error error) (set! failure (Maybe.Just error)))
                     (Maybe.Nothing)
                       (when (has-builtin? builtins reference)
                         (let [lowering (match (PrimitiveRegistry.lowering-for reference)
@@ -2289,25 +2272,17 @@ per-expression trace scan becomes an array lookup.")
                                                     reference
                                                     signature)
                             (Result.Success dependencies)
-                              (set! result
-                                    (Result.Success
-                                      (SpecializationModule.init @(SpecializationModule.instances output)
-                                                                 @(SpecializationModule.bodies output)
-                                                                 (Array.push-back
-                                                                   @(SpecializationModule.primitives output)
-                                                                   (SpecializedPrimitive.init @instance
-                                                                                              lowering
-                                                                                              dependencies
-                                                                                              (builtin-source-for core
-                                                                                                                  reference)))
-                                                                 @(SpecializationModule.roots output)
-                                                                 @(SpecializationModule.constructors output)
-                                                                 @(SpecializationModule.system-includes output))))
+                              (Array.push-back! &primitives
+                                                (SpecializedPrimitive.init
+                                                  @instance
+                                                  lowering
+                                                  dependencies
+                                                  (builtin-source-for core reference)))
                             (Result.Error error)
-                              (set! result (Result.Error error))))))))
-          (Result.Error _) ()))
-      (match result
-        (Result.Success output)
+                              (set! failure (Maybe.Just error))))))))
+          (Maybe.Just _) ()))
+      (match failure
+        (Maybe.Nothing)
           (match (materialize-root-calls core inferred instances)
             (Result.Success calls)
               (let [empty (Type.empty-substitution)
@@ -2320,15 +2295,15 @@ per-expression trace scan becomes an array lookup.")
                   (Result.Success roots)
                     (Result.Success
                       (SpecializationModule.init
-                        @(SpecializationModule.instances &output)
-                        @(SpecializationModule.bodies &output)
-                        @(SpecializationModule.primitives &output)
+                        (Array.copy instances)
+                        bodies
+                        primitives
                         roots
-                        @(SpecializationModule.constructors &output)
-                        @(SpecializationModule.system-includes &output)))
+                        @(CoreModule.constructors core)
+                        @(CoreModule.system-includes core)))
                   (Result.Error error) (Result.Error error)))
             (Result.Error error) (Result.Error error))
-        (Result.Error error) (Result.Error error))))
+        (Maybe.Just error) (Result.Error error))))
 
   (doc module "starts from top-level global calls, creates one instance per
 function/signature pair, and traverses the global calls recorded in each newly
@@ -2469,8 +2444,7 @@ the same interface selection and instance deduplication as user calls.")
             (set! failure (String.copy (SpecializeError.message error)))))
       (let-do [extra-count (Array.length extra-requests)]
         (for [i 0 extra-count]
-          (set! queue
-                (Array.push-back queue @(Array.unsafe-nth extra-requests i)))))
+          (Array.push-back! &queue @(Array.unsafe-nth extra-requests i))))
       (while-do (Int.< cursor (Array.length &queue))
         (unless-do failed
           (let [request (Array.unsafe-nth &queue cursor)
@@ -2488,10 +2462,9 @@ the same interface selection and instance deduplication as user calls.")
                 (Result.Success implementation)
                   (when (concrete-signature?
                       (Box.peek (CallSite.type &implementation)))
-                    (set! queue
-                          (Array.push-back queue
-                                           (SpecializationRequest.init implementation
-                                                                       (String.copy &origin)))))
+                    (Array.push-back! &queue
+                                      (SpecializationRequest.init implementation
+                                                                  (String.copy &origin))))
                 (Result.Error error)
                   (when-do (concrete-signature? &signature)
                     (set! failed true)
@@ -2508,23 +2481,22 @@ the same interface selection and instance deduplication as user calls.")
                     (match (dependencies-for core inferred &reference &signature)
                       (Result.Success dependencies)
                         (let-do [symbol (symbol-for core &reference &signature)]
-                          (set! instances
-                                (Array.push-back instances
-                                                 (Specialization.init (CoreRef.copy &reference)
-                                                                      (Box.init (MonoType.copy &signature))
-                                                                      symbol)))
+                          (Array.push-back! &instances
+                                            (Specialization.init
+                                              (CoreRef.copy &reference)
+                                              (Box.init (MonoType.copy &signature))
+                                              symbol))
                           (buckets-note! &reference
                                          (Int.dec (Array.length &instances)))
                           (let [n (Array.length &dependencies)]
                             (for [i 0 n]
-                              (set! queue
-                                    (Array.push-back queue
-                                                     (SpecializationRequest.init @(Array.unsafe-nth &dependencies
-                                                                                                    i)
-                                                                                 (String.concat
-                                                                                   &[(String.copy (CoreRef.name &reference))
-                                                                                     @" at "
-                                                                                     (Type.name &signature)])))))))
+                              (Array.push-back! &queue
+                                                (SpecializationRequest.init
+                                                  @(Array.unsafe-nth &dependencies i)
+                                                  (String.concat
+                                                    &[(String.copy (CoreRef.name &reference))
+                                                      @" at "
+                                                      (Type.name &signature)]))))))
                       (Result.Error error)
                         (do
                           (set! failed true)
