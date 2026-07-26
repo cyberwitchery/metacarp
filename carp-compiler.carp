@@ -3070,10 +3070,94 @@ REPL results.")
       (Maybe.Just _) (IO.errorln name)
       (Maybe.Nothing) ()))
 
+  ;; Each derivation pass currently returns a copied CoreModule. Keep the
+  ;; passes behind owned function boundaries so the predecessor is destroyed
+  ;; as soon as its successor has been produced, instead of retaining every
+  ;; full-module snapshot until compile-module-full returns.
+  (private resolve-owned)
+  (hidden resolve-owned)
+  (defn resolve-owned [expanded] (Resolve.module &expanded))
+
+  (private typedefs-owned)
+  (hidden typedefs-owned)
+  (defn typedefs-owned [core]
+    (let-do [next (register-type-typedefs &core)
+             ignored (phase-mark! "phase: typedefs")]
+      next))
+
+  (private accessors-owned)
+  (hidden accessors-owned)
+  (defn accessors-owned [core]
+    (let-do [next (Derive.accessors &core)
+             ignored (phase-mark! "phase: accessors")]
+      next))
+
+  (private pair-refs-owned)
+  (hidden pair-refs-owned)
+  (defn pair-refs-owned [core] (Derive.pair-refs &core))
+
+  (private copies-owned)
+  (hidden copies-owned)
+  (defn copies-owned [core]
+    (let-do [next (Derive.copies &core)
+             ignored (phase-mark! "phase: copies")]
+      next))
+
+  (private deletes-owned)
+  (hidden deletes-owned)
+  (defn deletes-owned [core]
+    (let-do [next (Derive.deletes &core)
+             ignored (phase-mark! "phase: deletes")]
+      next))
+
+  (private strs-owned)
+  (hidden strs-owned)
+  (defn strs-owned [core]
+    (let-do [next (Derive.strs &core)
+             ignored (phase-mark! "phase: strs")]
+      next))
+
+  (private close-generics-owned)
+  (hidden close-generics-owned)
+  (defn close-generics-owned [core]
+    (let-do [next (Derive.close-generics &core)
+             ignored (phase-mark! "phase: close-generics")]
+      next))
+
+  (private derive-core-owned)
+  (hidden derive-core-owned)
+  (defn derive-core-owned [core]
+    (close-generics-owned
+      (strs-owned
+        (deletes-owned
+          (copies-owned
+            (pair-refs-owned
+              (accessors-owned
+                (typedefs-owned core))))))))
+
+  ;; Lowering and rendering each construct another large whole-program
+  ;; representation. Consume their inputs at function boundaries so the
+  ;; specialized Core IR, backend IR, and final C string do not all overlap.
+  (private lower-owned)
+  (hidden lower-owned)
+  (defn lower-owned [closed-with-echo delete-symbols]
+    (let [final (Pair.a &closed-with-echo)
+          echo-plan (Pair.b &closed-with-echo)]
+      (BackendLower.module-with-ownership-echoed (Pair.a final)
+                                                  (Pair.b final)
+                                                  &delete-symbols
+                                                  echo-plan)))
+
+  (private render-owned)
+  (hidden render-owned)
+  (defn render-owned [backend]
+    (let-do [ignored (phase-mark! "phase: lowered")]
+      (CBackend.executable-translation-unit &backend)))
+
   (defn compile-module-full [module config check-names echo]
     (match (MacroExpand.expand-module-with module config)
       (Result.Success expanded)
-        (match (Resolve.module &expanded)
+        (match (resolve-owned expanded)
           (Result.Success resolved)
             (let-do [ignored-dump (match (IO.getenv "CARP_DEBUG_RESOLVED")
                        (Maybe.Just _)
@@ -3102,19 +3186,7 @@ REPL results.")
                 ;; strs runs before close-generics so the generic fallback exists
                 ;; for uncovered instances while per-instance strs (specific, so
                 ;; preferred by dispatch) render constructor name plus fields.
-                (let-do [typedefed (register-type-typedefs &resolved)
-                         ignored-p1 (phase-mark! "phase: typedefs")
-                         accessed (Derive.accessors &typedefed)
-                         ignored-p2 (phase-mark! "phase: accessors")
-                         paired (Derive.pair-refs &accessed)
-                         copied (Derive.copies &paired)
-                         ignored-p3 (phase-mark! "phase: copies")
-                         deleted (Derive.deletes &copied)
-                         ignored-p4 (phase-mark! "phase: deletes")
-                         strd (Derive.strs &deleted)
-                         ignored-p5 (phase-mark! "phase: strs")
-                         core (Derive.close-generics &strd)
-                         ignored-p6 (phase-mark! "phase: close-generics")]
+                (let-do [core (derive-core-owned resolved)]
                   (match (CoreIR.duplicate-global-id &core)
                     (Maybe.Just bad)
                       (Result.Error
@@ -3163,15 +3235,11 @@ REPL results.")
                                                         (Maybe.Nothing))))))
                                   (Result.Success closed-with-echo)
                                     (let [final (Pair.a &closed-with-echo)
-                                          echo-plan (Pair.b &closed-with-echo)]
-                                      (match (BackendLower.module-with-ownership-echoed (Pair.a final)
-                                                                                        (Pair.b final)
-                                                                                        &(delete-symbols-for &core
-                                                                                                             (Pair.a final))
-                                                                                        echo-plan)
+                                          delete-symbols (delete-symbols-for &core
+                                                                             (Pair.a final))]
+                                      (match (lower-owned closed-with-echo delete-symbols)
                                         (Result.Success backend)
-                                          (match (let-do [ignored-p9 (phase-mark! "phase: lowered")]
-                                              (CBackend.executable-translation-unit &backend))
+                                          (match (render-owned backend)
                                             (Result.Success c)
                                               (do
                                                 (phase-mark! "phase: rendered")
