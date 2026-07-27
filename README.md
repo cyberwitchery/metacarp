@@ -85,7 +85,8 @@ cmp self.c self2.c                                              # fixed point
 On an M-class laptop, the reference-built generation compiles the compiler in
 roughly 69 seconds and gen 2 in roughly 70 seconds when both are linked with
 the reference compiler's `-O3 -D NDEBUG` optimization flags. Gen 2 is currently
-within about 2 percent on time and uses roughly 20--30 percent more peak memory.
+within about 2 percent on time and has essentially the same peak memory
+footprint as gen 1 (about 284--285 MB in a full self-compile).
 
 Two harnesses keep the self-host honest:
 

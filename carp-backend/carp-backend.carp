@@ -64,7 +64,8 @@ an environment struct of the captured values.")
    roots (Array (Box SpecializedExpr))
    constructors (Array CoreConstructorDeclaration)
    system-includes (Array String)
-   closure-functions (Array ClosureFunction)])
+   closure-functions (Array ClosureFunction)
+   delete-symbols (Array (Pair String String))])
 
 (deftype BackendError [message String])
 
@@ -162,7 +163,7 @@ reflift wrapper's binding type, which would mislabel the result.")
   (doc module "converts specialization output into concrete backend
   declarations. It rejects residual type variables rather than delegating them
   to a backend.")
-  (defn module [specialized closures]
+  (defn module [specialized closures delete-symbols]
     (let-do [declarations (the (Array BackendDeclaration) [])
              failure (the (Maybe BackendError) (Maybe.Nothing))
              bodies (SpecializationModule.bodies specialized)
@@ -263,7 +264,8 @@ reflift wrapper's binding type, which would mislabel the result.")
                                 @(SpecializationModule.roots specialized)
                                 @(SpecializationModule.constructors specialized)
                                 @(SpecializationModule.system-includes specialized)
-                                @closures)))))
+                                @closures
+                                (Array.copy delete-symbols))))))
 
   (private lookup-delete-symbol)
   (hidden lookup-delete-symbol)
@@ -1807,7 +1809,8 @@ REPL-echo semantics compiled into `main`).")
                                  ownership
                                  delete-symbols
                                  echo)
-            (Result.Success rewritten) (module &rewritten (Pair.b &lifted-pair))
+            (Result.Success rewritten)
+              (module &rewritten (Pair.b &lifted-pair) delete-symbols)
             (Result.Error e) (Result.Error e))
           (Result.Error
             (BackendError.init @"ownership plan has no root context"))))))
@@ -3068,8 +3071,8 @@ values (block-scoped, valid for non-escaping closures).")
 
 (doc render-closure-construction-heap "renders a closure construction whose
 Lambda escapes the constructing function (return position): the environment
-must outlive the stack frame, so it is heap-allocated. The env is not freed —
-matching the stack variant, Lambda values carry no deleter yet.")
+must outlive the stack frame, so it is heap-allocated and carries its generated
+environment deleter.")
 (defn render-closure-construction-heap [constructors symbol arguments]
   (let [lambda-symbol (String.concat
           &[@"_carp_lambda_" (String.suffix symbol 14)])
@@ -3088,7 +3091,9 @@ matching the stack variant, Lambda values carry no deleter yet.")
               (String.copy &env-type)
               @"){ "
               fields
-              @" }); (void*)_carp_env; }), .delete = NULL, .copy = NULL })"]))
+              @" }); (void*)_carp_env; }), .delete = (void*)"
+              (String.copy &env-type)
+              @"_delete, .copy = NULL })"]))
       (Result.Error error) (Result.Error error))))
 
 (defn append-indent! [buffer depth]
@@ -4813,6 +4818,46 @@ signature and every emitted expression are in the unmanaged scalar subset.")
         (Result.Error error) (Result.Error error))
     _ (Result.Error (BackendError.init @"closure has a non-function signature"))))
 
+(defn closure-delete-symbol [delete-symbols value-type]
+  (let-do [result (the (Maybe String) (Maybe.Nothing))
+           key (CAbi.type-key value-type)
+           n (Array.length delete-symbols)]
+    (for [i 0 n]
+      (let [entry (Array.unsafe-nth delete-symbols i)]
+        (when (String.= (Pair.a entry) &key)
+          (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
+    result))
+
+(doc closure-env-delete-definition "renders the callback stored in
+`Lambda.delete`: it releases every managed capture. `Function.delete` invokes
+this callback and then frees the environment cell itself.")
+(defn closure-env-delete-definition [closure-fn delete-symbols]
+  (let-do [env-type (String.concat
+             &[(sanitize (ClosureFunction.symbol closure-fn)) @"_env"])
+           captures (ClosureFunction.captures closure-fn)
+           buffer (StringBuf.create)]
+    (StringBuf.append-str &buffer "void ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "_delete(void* _raw) {
+  ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "* _env = _raw;
+")
+    (for [i 0 (Array.length captures)]
+      (let [capture (Array.unsafe-nth captures i)]
+        (match (closure-delete-symbol delete-symbols (Box.peek (Pair.b capture)))
+          (Maybe.Just symbol)
+            (do
+              (StringBuf.append-str &buffer "  ")
+              (StringBuf.append-str &buffer &symbol)
+              (StringBuf.append-str &buffer "(_env->f")
+              (StringBuf.append-str &buffer &(Int.str i))
+              (StringBuf.append-str &buffer ");
+"))
+          (Maybe.Nothing) ())))
+    (StringBuf.append-char &buffer \})
+    (StringBuf.to-string &buffer)))
+
 (defn closure-function-definition [constructors closure-fn]
   (let-do [signature (Box.peek (ClosureFunction.signature closure-fn))
            captures (ClosureFunction.captures closure-fn)
@@ -4897,6 +4942,10 @@ sites and callback definitions can refer to them.")
                     (do
                       (StringBuf.append-str &buffer &typedef)
                       (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer "void ")
+                      (StringBuf.append-str &buffer &env-type)
+                      (StringBuf.append-str &buffer "_delete(void* _raw);")
+                      (StringBuf.append-char &buffer \newline)
                       (StringBuf.append-str &buffer &head)
                       (StringBuf.append-char &buffer \;)
                       (StringBuf.append-char &buffer \newline))
@@ -4917,14 +4966,24 @@ with a leading environment pointer and captured-value unpacking.")
     (for [i 0 n]
       (match-ref &result
         (Result.Success _)
-          (match (closure-function-definition (BackendModule.constructors module)
-                                              (Array.unsafe-nth closures i))
-            (Result.Success rendered)
-              (do
-                (StringBuf.append-char &buffer \newline)
-                (StringBuf.append-char &buffer \newline)
-                (StringBuf.append-str &buffer &rendered))
-            (Result.Error error) (set! result (Result.Error error)))
+          (let [closure-fn (Array.unsafe-nth closures i)]
+            (do
+              (StringBuf.append-char &buffer \newline)
+              (StringBuf.append-char &buffer \newline)
+              (StringBuf.append-str
+                &buffer
+                &(closure-env-delete-definition
+                   closure-fn
+                   (BackendModule.delete-symbols module)))
+              (match (closure-function-definition
+                       (BackendModule.constructors module)
+                       closure-fn)
+                (Result.Success rendered)
+                  (do
+                    (StringBuf.append-char &buffer \newline)
+                    (StringBuf.append-char &buffer \newline)
+                    (StringBuf.append-str &buffer &rendered))
+                (Result.Error error) (set! result (Result.Error error)))))
         (Result.Error _) ()))
     (match result
       (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
@@ -5359,6 +5418,20 @@ selected by specialization.")
               (Result.Error
                 (BackendError.init
                   @"function copy template must not have dependencies")))
+            (PrimitiveTemplate.FunctionDelete _)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  if(arg0.delete) {
+    ((void(*)(void*))arg0.delete)(arg0.env);
+    CARP_FREE(arg0.env);
+  }
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"function delete template must not have dependencies")))
             (PrimitiveTemplate.BoxCopy _)
             (if (Int.= 1 (Array.length dependencies))
               (match (template-element-type (Box.peek signature))
