@@ -1,5 +1,6 @@
 (load "../carp-compiler.carp")
 (load "carp-core-loader.carp")
+(load "git@github.com:carpentry-org/rc@0.3.0")
 
 (deftype SessionDefKind
   (Function [])
@@ -27,16 +28,30 @@
    locals (Array SessionTypedEntity)
    expressions (Array SessionTypedEntity)])
 
+(deftype UpsertReport [definition SessionDefInfo
+                       invalidated (Array String)])
+
+(deftype RemoveReport [name String
+                       invalidated (Array String)])
+
+(deftype SessionOverlay
+  [expansion (Rc ExpandSnapshot)
+   resolution ResolveSnapshot
+   inferred InferredModule
+   node-allocator IdAllocator
+   inputs (Array SourceInput)
+   definitions (Array SessionDefInfo)])
+
 (doc CompilerSession "holds the immutable warm compiler base used by transient
 notebook cells. Mutable identity allocation is the only state changed by
 `infer-cell`; failed calls may consume IDs but cannot alter the warm semantic
 environment.")
 (deftype CompilerSession
-  [expansion ExpandSnapshot
-   resolution ResolveSnapshot
+  [base-expansion (Rc ExpandSnapshot)
+   base-resolution ResolveSnapshot
    base-core CoreModule
    base-inferred InferredModule
-   node-allocator IdAllocator])
+   overlay (Array SessionOverlay)])
 
 (defmodule Session
   (doc api-version "is the stable carp-session API revision.")
@@ -44,6 +59,7 @@ environment.")
 
   (private expand-diagnostic)
   (hidden expand-diagnostic)
+  (sig expand-diagnostic (Fn [(Ref CtError) (Ref String)] Diagnostic))
   (defn expand-diagnostic [error source-id]
     (Diagnostic.init (String.copy "expand")
                      (String.copy (CtError.message error))
@@ -81,6 +97,13 @@ environment.")
 
   (private definitions-report)
   (hidden definitions-report)
+  (sig definitions-report
+       (Fn
+         [(Ref SourceInput)
+          (Ref CoreModule)
+          (Ref InferredModule)
+          (Ref CoreProvenance)]
+         (Array SessionDefInfo)))
   (defn definitions-report [input core inferred provenance]
     (let-do [result (the (Array SessionDefInfo) [])
              definitions (Infer.spanned-definition-schemes inferred provenance)]
@@ -164,6 +187,172 @@ environment.")
                        (locals-report inferred provenance)
                        (expressions-report inferred provenance))))
 
+  (private session-diagnostic)
+  (hidden session-diagnostic)
+  (sig session-diagnostic (Fn [String (Maybe SourceSpan)] Diagnostic))
+  (defn session-diagnostic [message span]
+    (Diagnostic.init (String.copy "session") message span))
+
+  (private finish-overlay)
+  (hidden finish-overlay)
+  (sig finish-overlay
+       (Fn
+         [(Ref SessionOverlay)
+          (Ref SourceInput)
+          (Ref PreparedExpansion)
+          (Ref ProvenancedCoreModule)
+          (Ref CoreModule)
+          (Ref InferredModule)]
+         (Result SessionOverlay Diagnostic)))
+  (defn finish-overlay [overlay input prepared resolved core inferred]
+    (let [found (definitions-report input
+                                    core
+                                    inferred
+                                    (ProvenancedCoreModule.provenance resolved))]
+      (if (Int.= 1 (Array.length &found))
+        (let-do [inputs (Array.copy (SessionOverlay.inputs overlay))
+                 definitions (Array.copy (SessionOverlay.definitions overlay))
+                 ignored-input (Array.push-back! &inputs
+                                                 (SourceInput.copy input))
+                 ignored-definition (Array.push-back! &definitions
+                                                      (SessionDefInfo.copy (Array.unsafe-nth &found
+                                                                                             0)))
+                 resolution (Resolve.snapshot-with-module (SessionOverlay.resolution overlay)
+                                                          core)]
+          (Result.Success
+            (SessionOverlay.init
+              (Rc.new
+                (ExpandSnapshot.copy (PreparedExpansion.snapshot prepared)))
+              resolution
+              (Infer.append-environment (SessionOverlay.inferred overlay)
+                                        inferred)
+              (IdAllocator.copy (SessionOverlay.node-allocator overlay))
+              inputs
+              definitions)))
+        (Result.Error
+          (session-diagnostic
+            (String.copy "upsert expects exactly one runtime definition")
+            (the (Maybe SourceSpan) (Maybe.Nothing)))))))
+
+  (private infer-overlay)
+  (hidden infer-overlay)
+  (sig infer-overlay
+       (Fn
+         [(Ref SessionOverlay)
+          (Ref SourceInput)
+          (Ref PreparedExpansion)
+          (Ref ProvenancedCoreModule)]
+         (Result SessionOverlay Diagnostic)))
+  (defn infer-overlay [overlay input prepared resolved]
+    (match (CarpCompiler.derive-module-for-inference (ProvenancedCoreModule.core resolved))
+      (Result.Success core)
+        (match (Infer.module-against-diagnosed &core
+                                               (ProvenancedCoreModule.provenance resolved)
+                                               (SessionOverlay.inferred overlay))
+          (Result.Success inferred)
+            (finish-overlay overlay input prepared resolved &core &inferred)
+          (Result.Error diagnostic) (Result.Error diagnostic))
+      (Result.Error error)
+        (Result.Error
+          (Diagnostic.init
+            (String.copy (CompileError.phase &error))
+            (String.copy (CompileError.message &error))
+            (Maybe.Nothing)))))
+
+  (private resolve-overlay)
+  (hidden resolve-overlay)
+  (sig resolve-overlay
+       (Fn
+         [(Ref SessionOverlay) (Ref SourceInput) (Ref PreparedExpansion)]
+         (Result SessionOverlay Diagnostic)))
+  (defn resolve-overlay [overlay input prepared]
+    (let [sourced (SourcedSurfaceModule.init (SourceInput.copy input)
+                                             (SurfaceModule.copy (PreparedExpansion.module prepared)))]
+      (match (Resolve.module-with-provenance-against &sourced
+                                                     (SessionOverlay.node-allocator overlay)
+                                                     (SessionOverlay.resolution overlay))
+        (Result.Success resolved)
+          (infer-overlay overlay input prepared &resolved)
+        (Result.Error error)
+          (Result.Error (Resolve.diagnostic &error (SourceInput.id input))))))
+
+  (private expand-overlay)
+  (hidden expand-overlay)
+  (sig expand-overlay
+       (Fn
+         [(Ref SessionOverlay) (Ref SourceInput) (Ref SourcedSurfaceModule)]
+         (Result SessionOverlay Diagnostic)))
+  (defn expand-overlay [overlay input parsed]
+    (match (MacroExpand.prepare-module-against (SourcedSurfaceModule.module parsed)
+                                               (Rc.value-ref (SessionOverlay.expansion overlay)))
+      (Result.Success prepared) (resolve-overlay overlay input &prepared)
+      (Result.Error error)
+        (Result.Error (expand-diagnostic &error (SourceInput.id input)))))
+
+  (private extend-overlay)
+  (hidden extend-overlay)
+  (sig extend-overlay
+       (Fn [(Ref SessionOverlay) (Ref SourceInput)]
+           (Result SessionOverlay Diagnostic)))
+  (defn extend-overlay [overlay input]
+    (match (Surface.parse-input-diagnosed input)
+      (Result.Success parsed) (expand-overlay overlay input &parsed)
+      (Result.Error diagnostic) (Result.Error diagnostic)))
+
+  (private rebuild-overlay-at)
+  (hidden rebuild-overlay-at)
+  (sig rebuild-overlay-at
+       (Fn
+         [(Ref CompilerSession)
+          (Ref (Array SourceInput))
+          Int
+          (Ref SessionOverlay)]
+         (Result SessionOverlay Diagnostic)))
+  (defn rebuild-overlay-at [session inputs index overlay]
+    (if (Int.= index (Array.length inputs))
+      (Result.Success (SessionOverlay.copy overlay))
+      (match (extend-overlay overlay (Array.unsafe-nth inputs index))
+        (Result.Success next)
+          (rebuild-overlay-at session inputs (Int.inc index) &next)
+        (Result.Error diagnostic) (Result.Error diagnostic))))
+
+  (private rebuild-overlay)
+  (hidden rebuild-overlay)
+  (sig rebuild-overlay
+       (Fn
+         [(Ref CompilerSession) (Ref (Array SourceInput)) Int]
+         (Result SessionOverlay Diagnostic)))
+  (defn rebuild-overlay [session inputs next-id]
+    (let [initial (SessionOverlay.init
+            (Rc.copy (CompilerSession.base-expansion session))
+            (ResolveSnapshot.copy (CompilerSession.base-resolution session))
+            (Infer.compact-environment (CompilerSession.base-inferred session))
+            (IdAllocator.init [next-id])
+            []
+            [])]
+      (rebuild-overlay-at session inputs 0 &initial)))
+
+  (private definition-index)
+  (hidden definition-index)
+  (defn definition-index [definitions name]
+    (let-do [result -1]
+      (for [i 0 (Array.length definitions)]
+        (when (String.=
+            (SessionDefInfo.name (Array.unsafe-nth definitions i))
+            name)
+          (set! result i)))
+      result))
+
+  (private names-after)
+  (hidden names-after)
+  (defn names-after [definitions index]
+    (let-do [result (the (Array String) [])]
+      (for [i (Int.inc index) (Array.length definitions)]
+        (Array.push-back! &result
+                          (String.copy
+                            (SessionDefInfo.name (Array.unsafe-nth definitions i)))))
+      result))
+
   (doc create-from-module "creates a warm session from an already loaded base
 module. Loading files remains a host concern in this initial library slice;
 the expensive expansion, resolution, and inference happen exactly once here.")
@@ -185,12 +374,20 @@ the expensive expansion, resolution, and inference happen exactly once here.")
                     (match (Infer.module-diagnosed &core
                                                    (ProvenancedCoreModule.provenance &resolved))
                       (Result.Success inferred)
-                        (Result.Success
-                          (CompilerSession.init @(PreparedExpansion.snapshot &prepared)
-                                                resolution
-                                                core
-                                                inferred
-                                                allocator))
+                        (let-do [base-expansion (Rc.new @(PreparedExpansion.snapshot &prepared))
+                                 base-resolution resolution
+                                 current (SessionOverlay.init (Rc.copy &base-expansion)
+                                                              (ResolveSnapshot.copy &base-resolution)
+                                                              (Infer.compact-environment &inferred)
+                                                              (IdAllocator.copy &allocator)
+                                                              []
+                                                              [])]
+                          (Result.Success
+                            (CompilerSession.init base-expansion
+                                                  base-resolution
+                                                  core
+                                                  inferred
+                                                  [current])))
                       (Result.Error diagnostic) (Result.Error diagnostic)))
                 (Result.Error error)
                   (Result.Error
@@ -219,37 +416,124 @@ library under `core-dir` once, producing a warm compiler session.")
           (create-from-module &sourced &config))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
-  (doc reset "drops committed user definitions while retaining the warm core.
-The milestone-1 session has no committed overlay yet, so reset is a no-op.")
-  (defn reset [session] ())
+  (doc reset "drops committed user definitions while retaining the warm core.")
+  (defn reset [session]
+    (let-do [old (Array.unsafe-nth (CompilerSession.overlay session) 0)
+             next-id @(Array.unsafe-nth
+               (IdAllocator.cell (SessionOverlay.node-allocator old))
+               0)
+             fresh (SessionOverlay.init
+               (Rc.copy (CompilerSession.base-expansion session))
+               (ResolveSnapshot.copy (CompilerSession.base-resolution session))
+               (Infer.compact-environment (CompilerSession.base-inferred session))
+               (IdAllocator.init [next-id])
+               []
+               [])]
+      (Array.aset! (CompilerSession.overlay session) 0 fresh)))
+
+  (doc definitions "returns committed user definitions in dependency order.")
+  (defn definitions [session]
+    (Array.copy
+      (SessionOverlay.definitions
+        (Array.unsafe-nth (CompilerSession.overlay session) 0))))
+
+  (doc upsert "atomically inserts or replaces one runtime definition. The
+current implementation conservatively rechecks every later definition.")
+  (defn upsert [session input]
+    (let [current (Array.unsafe-nth (CompilerSession.overlay session) 0)
+          probe (SessionOverlay.copy current)]
+      (match (extend-overlay &probe input)
+        (Result.Success probed)
+          (let [candidate (Array.unsafe-nth (SessionOverlay.definitions &probed)
+                                            (Int.dec
+                                              (Array.length (SessionOverlay.definitions &probed))))
+                name (SessionDefInfo.name candidate)
+                old-index (definition-index (SessionOverlay.definitions current)
+                                            name)
+                inputs (Array.copy (SessionOverlay.inputs current))
+                invalidated (if (Int.>= old-index 0)
+                  (names-after (SessionOverlay.definitions current) old-index)
+                  (the (Array String) []))
+                ignored-candidate (if (Int.>= old-index 0)
+                  (Array.aset! &inputs old-index (SourceInput.copy input))
+                  (Array.push-back! &inputs (SourceInput.copy input)))
+                next-id @(Array.unsafe-nth
+                  (IdAllocator.cell (SessionOverlay.node-allocator current))
+                  0)]
+            (let [rebuilt-result (rebuild-overlay session &inputs next-id)]
+              (match-ref &rebuilt-result
+                (Result.Success rebuilt)
+                  (let-do [committed (Array.unsafe-nth (SessionOverlay.definitions rebuilt)
+                                                       (if (Int.>= old-index 0)
+                                                         old-index
+                                                         (Int.dec
+                                                           (Array.length (SessionOverlay.definitions rebuilt)))))]
+                    (Array.aset! (CompilerSession.overlay session)
+                                 0
+                                 (SessionOverlay.copy rebuilt))
+                    (Result.Success
+                      (UpsertReport.init (SessionDefInfo.copy committed)
+                                         invalidated)))
+                (Result.Error diagnostic)
+                  (Result.Error (Diagnostic.copy diagnostic)))))
+        (Result.Error diagnostic) (Result.Error diagnostic))))
+
+  (doc remove "removes a definition and conservatively invalidates every
+later committed definition.")
+  (defn remove [session name]
+    (let [current (Array.unsafe-nth (CompilerSession.overlay session) 0)
+          index (definition-index (SessionOverlay.definitions current) name)]
+      (if (Int.< index 0)
+        (Result.Error
+          (session-diagnostic
+            (String.concat &[@"unknown session definition: " (String.copy name)])
+            (the (Maybe SourceSpan) (Maybe.Nothing))))
+        (let [inputs (Array.prefix (SessionOverlay.inputs current) index)
+              invalidated (names-after (SessionOverlay.definitions current)
+                                       index)
+              next-id @(Array.unsafe-nth
+                (IdAllocator.cell (SessionOverlay.node-allocator current))
+                0)]
+          (let [rebuilt-result (rebuild-overlay session &inputs next-id)]
+            (match-ref &rebuilt-result
+              (Result.Success rebuilt)
+                (do
+                  (Array.aset! (CompilerSession.overlay session)
+                               0
+                               (SessionOverlay.copy rebuilt))
+                  (Result.Success
+                    (RemoveReport.init (String.copy name) invalidated)))
+              (Result.Error diagnostic)
+                (Result.Error (Diagnostic.copy diagnostic))))))))
 
   (doc infer-cell "expands, resolves, and infers transient caller source
 against the warm base without committing compile-time or semantic changes.")
   (defn infer-cell [session input]
-    (match (Surface.parse-input-diagnosed input)
-      (Result.Success parsed)
-        (match (MacroExpand.expand-module-against (SourcedSurfaceModule.module &parsed)
-                                                  (CompilerSession.expansion session))
-          (Result.Success expanded)
-            (let [sourced (SourcedSurfaceModule.init (SourceInput.copy input)
-                                                     expanded)]
-              (match (Resolve.module-with-provenance-against &sourced
-                                                             (CompilerSession.node-allocator session)
-                                                             (CompilerSession.resolution session))
-                (Result.Success resolved)
-                  (match (Infer.module-against-diagnosed (ProvenancedCoreModule.core &resolved)
-                                                         (ProvenancedCoreModule.provenance &resolved)
-                                                         (CompilerSession.base-inferred session))
-                    (Result.Success inferred)
-                      (Result.Success
-                        (report input
-                                (ProvenancedCoreModule.core &resolved)
-                                &inferred
-                                (ProvenancedCoreModule.provenance &resolved)))
-                    (Result.Error diagnostic) (Result.Error diagnostic))
-                (Result.Error error)
-                  (Result.Error
-                    (Resolve.diagnostic &error (SourceInput.id input)))))
-          (Result.Error error)
-            (Result.Error (expand-diagnostic &error (SourceInput.id input))))
-      (Result.Error diagnostic) (Result.Error diagnostic))))
+    (let [overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)]
+      (match (Surface.parse-input-diagnosed input)
+        (Result.Success parsed)
+          (match (MacroExpand.expand-module-against (SourcedSurfaceModule.module &parsed)
+                                                    (Rc.value-ref (SessionOverlay.expansion overlay)))
+            (Result.Success expanded)
+              (let [sourced (SourcedSurfaceModule.init (SourceInput.copy input)
+                                                       expanded)]
+                (match (Resolve.module-with-provenance-against &sourced
+                                                               (SessionOverlay.node-allocator overlay)
+                                                               (SessionOverlay.resolution overlay))
+                  (Result.Success resolved)
+                    (match (Infer.module-against-diagnosed (ProvenancedCoreModule.core &resolved)
+                                                           (ProvenancedCoreModule.provenance &resolved)
+                                                           (SessionOverlay.inferred overlay))
+                      (Result.Success inferred)
+                        (Result.Success
+                          (report input
+                                  (ProvenancedCoreModule.core &resolved)
+                                  &inferred
+                                  (ProvenancedCoreModule.provenance &resolved)))
+                      (Result.Error diagnostic) (Result.Error diagnostic))
+                  (Result.Error error)
+                    (Result.Error
+                      (Resolve.diagnostic &error (SourceInput.id input)))))
+            (Result.Error error)
+              (Result.Error (expand-diagnostic &error (SourceInput.id input))))
+        (Result.Error diagnostic) (Result.Error diagnostic)))))
