@@ -40,7 +40,8 @@
    inferred InferredModule
    node-allocator IdAllocator
    inputs (Array SourceInput)
-   definitions (Array SessionDefInfo)])
+   definitions (Array SessionDefInfo)
+   dependencies (Array (Array String))])
 
 (doc CompilerSession "holds the immutable warm compiler base used by transient
 notebook cells. Mutable identity allocation is the only state changed by
@@ -208,15 +209,29 @@ environment.")
     (let [found (definitions-report input
                                     core
                                     inferred
-                                    (ProvenancedCoreModule.provenance resolved))]
+                                    (ProvenancedCoreModule.provenance resolved))
+          schemes (Infer.spanned-definition-schemes inferred
+                                                    (ProvenancedCoreModule.provenance resolved))]
       (if (Int.= 1 (Array.length &found))
         (let-do [inputs (Array.copy (SessionOverlay.inputs overlay))
                  definitions (Array.copy (SessionOverlay.definitions overlay))
+                 dependencies (Array.copy (SessionOverlay.dependencies overlay))
                  ignored-input (Array.push-back! &inputs
                                                  (SourceInput.copy input))
                  ignored-definition (Array.push-back! &definitions
                                                       (SessionDefInfo.copy (Array.unsafe-nth &found
                                                                                              0)))
+                 references (CoreIR.global-dependencies core
+                                                        (SpannedSchemeBinding.reference (Array.unsafe-nth &schemes
+                                                                                                          0)))
+                 dependency-names (the (Array String) [])
+                 ignored-dependency-names (for [i 0 (Array.length &references)]
+                   (Array.push-back! &dependency-names
+                                     (String.copy
+                                       (CoreRef.name (Array.unsafe-nth &references
+                                                                       i)))))
+                 ignored-dependency (Array.push-back! &dependencies
+                                                      dependency-names)
                  resolution (Resolve.snapshot-with-module (SessionOverlay.resolution overlay)
                                                           core)]
           (Result.Success
@@ -228,7 +243,8 @@ environment.")
                                         inferred)
               (IdAllocator.copy (SessionOverlay.node-allocator overlay))
               inputs
-              definitions)))
+              definitions
+              dependencies)))
         (Result.Error
           (session-diagnostic
             (String.copy "upsert expects exactly one runtime definition")
@@ -329,6 +345,7 @@ environment.")
             (Infer.compact-environment (CompilerSession.base-inferred session))
             (IdAllocator.init [next-id])
             []
+            []
             [])]
       (rebuild-overlay-at session inputs 0 &initial)))
 
@@ -343,14 +360,46 @@ environment.")
           (set! result i)))
       result))
 
-  (private names-after)
-  (hidden names-after)
-  (defn names-after [definitions index]
-    (let-do [result (the (Array String) [])]
-      (for [i (Int.inc index) (Array.length definitions)]
-        (Array.push-back! &result
-                          (String.copy
-                            (SessionDefInfo.name (Array.unsafe-nth definitions i)))))
+  (private string-in?)
+  (hidden string-in?)
+  (sig string-in? (Fn [(Ref (Array String)) (Ref String)] Bool))
+  (defn string-in? [items value]
+    (let-do [found false]
+      (for [i 0 (Array.length items)]
+        (when (String.= (Array.unsafe-nth items i) value) (set! found true)))
+      found))
+
+  (private depends-on-any?)
+  (hidden depends-on-any?)
+  (sig depends-on-any? (Fn [(Ref (Array String)) (Ref (Array String))] Bool))
+  (defn depends-on-any? [dependencies affected]
+    (let-do [found false]
+      (for [i 0 (Array.length dependencies)]
+        (when (string-in? affected (Array.unsafe-nth dependencies i))
+          (set! found true)))
+      found))
+
+  (private invalidated-by)
+  (hidden invalidated-by)
+  (sig invalidated-by (Fn [(Ref SessionOverlay) Int] (Array String)))
+  (defn invalidated-by [overlay index]
+    (let-do [definitions (SessionOverlay.definitions overlay)
+             dependencies (SessionOverlay.dependencies overlay)
+             target (SessionDefInfo.name (Array.unsafe-nth definitions index))
+             affected [(String.copy target)]
+             result (the (Array String) [])
+             changed true]
+      (while-do changed
+        (set! changed false)
+        (for [i 0 (Array.length definitions)]
+          (let [name (SessionDefInfo.name (Array.unsafe-nth definitions i))]
+            (when-do (and (Int./= i index)
+                          (and (not (string-in? &affected name))
+                               (depends-on-any? (Array.unsafe-nth dependencies i)
+                                                &affected)))
+              (Array.push-back! &affected (String.copy name))
+              (Array.push-back! &result (String.copy name))
+              (set! changed true)))))
       result))
 
   (doc create-from-module "creates a warm session from an already loaded base
@@ -380,6 +429,7 @@ the expensive expansion, resolution, and inference happen exactly once here.")
                                                               (ResolveSnapshot.copy &base-resolution)
                                                               (Infer.compact-environment &inferred)
                                                               (IdAllocator.copy &allocator)
+                                                              []
                                                               []
                                                               [])]
                           (Result.Success
@@ -428,6 +478,7 @@ library under `core-dir` once, producing a warm compiler session.")
                (Infer.compact-environment (CompilerSession.base-inferred session))
                (IdAllocator.init [next-id])
                []
+               []
                [])]
       (Array.aset! (CompilerSession.overlay session) 0 fresh)))
 
@@ -437,8 +488,8 @@ library under `core-dir` once, producing a warm compiler session.")
       (SessionOverlay.definitions
         (Array.unsafe-nth (CompilerSession.overlay session) 0))))
 
-  (doc upsert "atomically inserts or replaces one runtime definition. The
-current implementation conservatively rechecks every later definition.")
+  (doc upsert "atomically inserts or replaces one runtime definition and
+reports its transitive resolved dependents.")
   (defn upsert [session input]
     (let [current (Array.unsafe-nth (CompilerSession.overlay session) 0)
           probe (SessionOverlay.copy current)]
@@ -452,7 +503,7 @@ current implementation conservatively rechecks every later definition.")
                                             name)
                 inputs (Array.copy (SessionOverlay.inputs current))
                 invalidated (if (Int.>= old-index 0)
-                  (names-after (SessionOverlay.definitions current) old-index)
+                  (invalidated-by current old-index)
                   (the (Array String) []))
                 ignored-candidate (if (Int.>= old-index 0)
                   (Array.aset! &inputs old-index (SourceInput.copy input))
@@ -478,8 +529,7 @@ current implementation conservatively rechecks every later definition.")
                   (Result.Error (Diagnostic.copy diagnostic)))))
         (Result.Error diagnostic) (Result.Error diagnostic))))
 
-  (doc remove "removes a definition and conservatively invalidates every
-later committed definition.")
+  (doc remove "removes a definition and its transitive resolved dependents.")
   (defn remove [session name]
     (let [current (Array.unsafe-nth (CompilerSession.overlay session) 0)
           index (definition-index (SessionOverlay.definitions current) name)]
@@ -488,12 +538,23 @@ later committed definition.")
           (session-diagnostic
             (String.concat &[@"unknown session definition: " (String.copy name)])
             (the (Maybe SourceSpan) (Maybe.Nothing))))
-        (let [inputs (Array.prefix (SessionOverlay.inputs current) index)
-              invalidated (names-after (SessionOverlay.definitions current)
-                                       index)
-              next-id @(Array.unsafe-nth
-                (IdAllocator.cell (SessionOverlay.node-allocator current))
-                0)]
+        (let-do [invalidated (invalidated-by current index)
+                 inputs (the (Array SourceInput) [])
+                 ignored-input-filter (for [i
+                                            0
+                                            (Array.length (SessionOverlay.inputs current))]
+                   (let [candidate-name (SessionDefInfo.name
+                           (Array.unsafe-nth (SessionOverlay.definitions current)
+                                             i))]
+                     (when (and (Int./= i index)
+                                (not (string-in? &invalidated candidate-name)))
+                       (Array.push-back! &inputs
+                                         (SourceInput.copy
+                                           (Array.unsafe-nth (SessionOverlay.inputs current)
+                                                             i))))))
+                 next-id @(Array.unsafe-nth
+                   (IdAllocator.cell (SessionOverlay.node-allocator current))
+                   0)]
           (let [rebuilt-result (rebuild-overlay session &inputs next-id)]
             (match-ref &rebuilt-result
               (Result.Success rebuilt)

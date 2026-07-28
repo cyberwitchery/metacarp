@@ -13,11 +13,11 @@ The immutable base expansion snapshot is shared with the current overlay via
 `Rc`; it is copied only when expansion actually commits a user definition.
 This keeps cheap reset support without duplicating the resident Core state.
 
-Replacement is atomic: the candidate and every later definition are rebuilt
-before the overlay is committed. Failed replacement leaves the previous
-overlay untouched. Removal currently conservatively invalidates every later
-definition; direct dependency indexes and compile-time/type definitions remain
-follow-up work under issue #21.
+Replacement is atomic: the candidate overlay is rebuilt before it is committed,
+and resolved global-reference edges identify its transitive dependents. Failed
+replacement leaves the previous overlay untouched. Removal drops only the
+named definition and that transitive closure, preserving unrelated definitions.
+Compile-time/type definitions remain follow-up work under issue #21.
 
 On an Apple arm64 host, the real-Core benchmark in `test/benchmark.carp`
 currently creates a session in about 1.88 seconds and checks 100 43-byte cells
