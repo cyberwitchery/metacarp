@@ -118,7 +118,33 @@
 ;; pass before it descends into a shape.
 (def *resolve-stamp* 0)
 
+;; Session-aware resolution is opt-in. The ordinary compiler path retains its
+;; historical owner-relative expression numbering; a session supplies one
+;; monotonic allocator and receives these provenance tables with the core IR.
+(def *provenance-enabled* false)
+(def *provenance-source-id* (String.copy ""))
+(def *provenance-next-node-id* 0)
+(def *provenance-nodes* (the (Array NodeProvenance) []))
+(def *provenance-bindings* (the (Array BindingProvenance) []))
+(def *provenance-definitions* (the (Array BindingProvenance) []))
+
 (defmodule Resolve
+  (private source-span)
+  (hidden source-span)
+  (defn source-span [span] (SurfaceSpan.in-source span &*provenance-source-id*))
+
+  (private record-binding!)
+  (hidden record-binding!)
+  (defn record-binding! [reference span definition]
+    (when-do *provenance-enabled*
+      (Array.push-back! &*provenance-bindings*
+                        (BindingProvenance.init (CoreRef.copy reference)
+                                                (source-span span)))
+      (when definition
+        (Array.push-back! &*provenance-definitions*
+                          (BindingProvenance.init (CoreRef.copy reference)
+                                                  (source-span span))))))
+
   (private error-at)
   (hidden error-at)
   (defn error-at [node message]
@@ -1910,14 +1936,16 @@ no-redefinition case pays no second walk.")
   ;; macro synthesizes several bindings that share one source span (e.g. the
   ;; repeated `_` bindings `ignore-do` expands to).
   (defn local-reference [node name]
-    (let [position @(Info.pos (SurfaceSpan.start (SurfaceNode.span node)))
-          serial (do
-            (set! *local-binder-serial* (Int.inc *local-binder-serial*))
-            *local-binder-serial*)]
-      (CoreRef.init
-        (Int.- 0 (Int.+ (Int.* serial 1048576) (Int.inc position)))
-        (String.copy name)
-        false)))
+    (let-do [position @(Info.pos (SurfaceSpan.start (SurfaceNode.span node)))
+             serial (do
+               (set! *local-binder-serial* (Int.inc *local-binder-serial*))
+               *local-binder-serial*)
+             reference (CoreRef.init
+               (Int.- 0 (Int.+ (Int.* serial 1048576) (Int.inc position)))
+               (String.copy name)
+               false)]
+      (record-binding! &reference (SurfaceNode.span node) false)
+      reference))
 
   (private scoped-global-by-name)
   (hidden scoped-global-by-name)
@@ -2046,6 +2074,10 @@ no-redefinition case pays no second walk.")
   (hidden resolve-arguments)
   (private resolve-expression)
   (hidden resolve-expression)
+  (private resolve-expression-raw)
+  (hidden resolve-expression-raw)
+  (private identify-expression)
+  (hidden identify-expression)
   (private resolve-parameters)
   (hidden resolve-parameters)
   (private resolve-type)
@@ -3175,7 +3207,8 @@ back to plain reference resolution.")
                                       imports
                                       scope)
               (Result.Success reference)
-                (Result.Success (CoreExpr.Reference -1 reference))
+                (Result.Success
+                  (identify-expression head &(CoreExpr.Reference -1 reference)))
               (Result.Error error) (Result.Error error))
           (Maybe.Nothing) (resolve-expression head locals globals imports scope))
         (Result.Success callee)
@@ -3200,7 +3233,7 @@ back to plain reference resolution.")
         (Result.Error error) (Result.Error error))
       (Result.Error (error-at node @"unquote call expects a callee"))))
 
-  (defn resolve-expression [node locals globals imports scope]
+  (defn resolve-expression-raw [node locals globals imports scope]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.IntLit value)
       (Result.Success (CoreExpr.IntLit -1 @value))
@@ -3314,6 +3347,23 @@ back to plain reference resolution.")
                         scope)))
       (SurfaceForm.Comment _)
       (Result.Success (CoreExpr.UnitLit -1))))
+
+  (defn identify-expression [node expression]
+    (if *provenance-enabled*
+      (let-do [id *provenance-next-node-id*
+               ignored-next (set! *provenance-next-node-id* (Int.inc id))
+               identified (CoreIR.with-expression-id expression id)
+               origin (NodeProvenance.init id
+                                           (source-span (SurfaceNode.span node)))]
+        (Array.push-back! &*provenance-nodes* origin)
+        identified)
+      (CoreExpr.copy expression)))
+
+  (defn resolve-expression [node locals globals imports scope]
+    (match (resolve-expression-raw node locals globals imports scope)
+      (Result.Success expression)
+        (Result.Success (identify-expression node &expression))
+      (Result.Error error) (Result.Error error)))
 
   (defn resolve-parameters [nodes start]
     (let-do [result (the (Result (Array CoreRef) ResolveError)
@@ -4383,11 +4433,89 @@ name-matched function that does not fit the interface is never selected.")
           (Result.Error _) ()))
       result))
 
-  (doc module "lowers expanded surface syntax to resolved core IR. The first
+  (private record-collected-definitions!)
+  (hidden record-collected-definitions!)
+  (defn record-collected-definitions! [collected globals]
+    (when-do *provenance-enabled*
+      (let [functions (CollectedForms.functions collected)]
+        (for [i 0 (Array.length functions)]
+          (let [shape (Array.unsafe-nth functions i)
+                ignored-stamp (set! *resolve-stamp* @(FunctionShape.stamp shape))]
+            (match (global-by-name globals (FunctionShape.name shape))
+              (Maybe.Just reference)
+                (record-binding! &reference (FunctionShape.span shape) true)
+              (Maybe.Nothing) ()))))
+      (let [values (CollectedForms.values collected)]
+        (for [i 0 (Array.length values)]
+          (let [shape (Array.unsafe-nth values i)
+                ignored-stamp (set! *resolve-stamp* @(ValueShape.stamp shape))]
+            (match (global-by-name globals (ValueShape.name shape))
+              (Maybe.Just reference)
+                (record-binding! &reference (ValueShape.span shape) true)
+              (Maybe.Nothing) ()))))
+      (let [builtins (CollectedForms.builtins collected)]
+        (for [i 0 (Array.length builtins)]
+          (let [shape (Array.unsafe-nth builtins i)
+                ignored-stamp (set! *resolve-stamp* @(TypedShape.stamp shape))]
+            (match (global-by-name globals (TypedShape.name shape))
+              (Maybe.Just reference)
+                (record-binding! &reference (TypedShape.span shape) true)
+              (Maybe.Nothing) ()))))
+      (let [interfaces (CollectedForms.interfaces collected)]
+        (for [i 0 (Array.length interfaces)]
+          (let [shape (Array.unsafe-nth interfaces i)
+                ignored-stamp (set! *resolve-stamp* @(TypedShape.stamp shape))]
+            (match (first-global-by-name globals (TypedShape.name shape))
+              (Maybe.Just reference)
+                (record-binding! &reference (TypedShape.span shape) true)
+              (Maybe.Nothing) ()))))))
+
+  (private module-inner)
+  (hidden module-inner)
+  (sig module-inner (Fn [(Ref SurfaceModule)] (Result CoreModule ResolveError)))
+  (sig module (Fn [(Ref SurfaceModule)] (Result CoreModule ResolveError)))
+  (sig module-with-provenance
+       (Fn
+         [(Ref SourcedSurfaceModule) (Ref IdAllocator)]
+         (Result ProvenancedCoreModule ResolveError)))
+
+  (doc module "lowers expanded surface syntax to resolved core IR using the
+historical owner-relative expression IDs.")
+  (defn module [surface]
+    (let-do [ignored-provenance (set! *provenance-enabled* false)]
+      (module-inner surface)))
+
+  (doc module-with-provenance "resolves caller-identified syntax with node IDs
+from a caller-owned monotonic allocator, returning the core IR and source map.")
+  (defn module-with-provenance [sourced allocator]
+    (let-do [start (IdAllocator.next-up! allocator)
+             ignored-enabled (set! *provenance-enabled* true)
+             ignored-source (set! *provenance-source-id*
+                                  (String.copy
+                                    (SourceInput.id (SourcedSurfaceModule.input sourced))))
+             ignored-next (set! *provenance-next-node-id* start)
+             ignored-nodes (set! *provenance-nodes* [])
+             ignored-bindings (set! *provenance-bindings* [])
+             ignored-definitions (set! *provenance-definitions* [])
+             result (module-inner (SourcedSurfaceModule.module sourced))
+             provenance (CoreProvenance.init (Array.copy &*provenance-nodes*)
+                                             (Array.copy &*provenance-bindings*)
+                                             (Array.copy &*provenance-definitions*))
+             ignored-allocator (Array.aset! (IdAllocator.cell allocator)
+                                            0
+                                            *provenance-next-node-id*)
+             ignored-disabled (set! *provenance-enabled* false)]
+      (match result
+        (Result.Success core)
+          (Result.Success (ProvenancedCoreModule.init core provenance))
+        (Result.Error error) (Result.Error error))))
+
+  (doc module-inner
+    "lowers expanded surface syntax to resolved core IR. The first
 typed gate supports functions, builtins, interfaces, literals, references, and
 calls; unsupported forms produce a source-spanned error rather than being
 guessed at.")
-  (defn module [surface]
+  (defn module-inner [surface]
     ;; per-module reset of the visibility channel, which `collect` fills.
     ;; (The overload channel is reset later, in populate-arities!, which runs
     ;; AFTER collection — resetting private names there would wipe them.)
@@ -4408,6 +4536,8 @@ guessed at.")
                          (ResolvedConstructors.builtins &constructor-state))
                        ignored-arities (populate-arities! &collected
                                                           &constructor-builtins)
+                       ignored-provenance (record-collected-definitions! &collected
+                                                                         &all-globals)
                        type-declarations (resolve-type-declarations
                          (CollectedForms.type-declarations &collected))
                        constructor-declarations (Array.copy
@@ -4505,7 +4635,9 @@ guessed at.")
                                                                                       final-implementations
                                                                                       @(CollectedForms.system-includes &collected)
                                                                                       expressions)]
-                                                          (Result.Success (CoreIR.index-call-sites &module)))
+                                                          (if *provenance-enabled*
+                                                            (Result.Success module)
+                                                            (Result.Success (CoreIR.index-call-sites &module))))
                                                       (Result.Error error)
                                                         (Result.Error error)))
                                                 (Result.Error error)
