@@ -1,0 +1,230 @@
+(load "../carp-expand/carp-expand.carp")
+(load "../carp-resolve/carp-resolve.carp")
+(load "../carp-infer/carp-infer.carp")
+
+(deftype SessionDefKind
+  (Function [])
+  (Value [])
+  (External [])
+  (Interface [])
+  (Other [String]))
+
+(deftype SessionDefInfo
+  [name String
+   kind SessionDefKind
+   scheme String
+   source SourceInput
+   span SourceSpan])
+
+(deftype SessionTypedEntity
+  [kind String
+   name (Maybe String)
+   type String
+   span SourceSpan])
+
+(deftype CellReport
+  [forms (Array SessionTypedEntity)
+   definitions (Array SessionDefInfo)
+   locals (Array SessionTypedEntity)
+   expressions (Array SessionTypedEntity)])
+
+(doc CompilerSession "holds the immutable warm compiler base used by transient
+notebook cells. Mutable identity allocation is the only state changed by
+`infer-cell`; failed calls may consume IDs but cannot alter the warm semantic
+environment.")
+(deftype CompilerSession
+  [expansion ExpandSnapshot
+   resolution ResolveSnapshot
+   base-core CoreModule
+   base-inferred InferredModule
+   node-allocator IdAllocator])
+
+(defmodule Session
+  (doc api-version "is the stable carp-session API revision.")
+  (defn api-version [] 1)
+
+  (private expand-diagnostic)
+  (hidden expand-diagnostic)
+  (defn expand-diagnostic [error source-id]
+    (Diagnostic.init (String.copy "expand")
+                     (String.copy (CtError.message error))
+                     (Maybe.Just
+                       (SurfaceSpan.in-source (CtError.span error) source-id))))
+
+  (private definition-kind)
+  (hidden definition-kind)
+  (defn definition-kind [core reference]
+    (let-do [result (the SessionDefKind (SessionDefKind.Other @"definition"))]
+      (for [i 0 (Array.length (CoreModule.functions core))]
+        (when (CoreIR.same-ref?
+            (CoreFunction.reference
+              (Array.unsafe-nth (CoreModule.functions core) i))
+            reference)
+          (set! result (SessionDefKind.Function))))
+      (for [i 0 (Array.length (CoreModule.values core))]
+        (when (CoreIR.same-ref?
+            (CoreValue.reference (Array.unsafe-nth (CoreModule.values core) i))
+            reference)
+          (set! result (SessionDefKind.Value))))
+      (for [i 0 (Array.length (CoreModule.builtins core))]
+        (when (CoreIR.same-ref?
+            (CoreBuiltin.reference
+              (Array.unsafe-nth (CoreModule.builtins core) i))
+            reference)
+          (set! result (SessionDefKind.External))))
+      (for [i 0 (Array.length (CoreModule.interfaces core))]
+        (when (CoreIR.same-ref?
+            (CoreInterface.reference
+              (Array.unsafe-nth (CoreModule.interfaces core) i))
+            reference)
+          (set! result (SessionDefKind.Interface))))
+      result))
+
+  (private definitions-report)
+  (hidden definitions-report)
+  (defn definitions-report [input core inferred provenance]
+    (let-do [result (the (Array SessionDefInfo) [])
+             definitions (Infer.spanned-definition-schemes inferred provenance)]
+      (for [i 0 (Array.length &definitions)]
+        (let [definition (Array.unsafe-nth &definitions i)
+              reference (SpannedSchemeBinding.reference definition)]
+          (Array.push-back! &result
+                            (SessionDefInfo.init (String.copy (CoreRef.name reference))
+                                                 (definition-kind core reference)
+                                                 (Type.name
+                                                   (Box.peek
+                                                     (TypeScheme.body (SpannedSchemeBinding.scheme definition))))
+                                                 (SourceInput.copy input)
+                                                 (SourceSpan.copy (SpannedSchemeBinding.span definition))))))
+      result))
+
+  (private expressions-report)
+  (hidden expressions-report)
+  (defn expressions-report [inferred provenance]
+    (let-do [result (the (Array SessionTypedEntity) [])
+             nodes (Infer.spanned-node-types inferred provenance)]
+      (for [i 0 (Array.length &nodes)]
+        (let [node (Array.unsafe-nth &nodes i)]
+          (Array.push-back! &result
+                            (SessionTypedEntity.init (String.copy "expression")
+                                                     (Maybe.Nothing)
+                                                     (Type.name (Box.peek (SpannedNodeType.type node)))
+                                                     (SourceSpan.copy (SpannedNodeType.span node))))))
+      result))
+
+  (private forms-report)
+  (hidden forms-report)
+  (defn forms-report [core inferred provenance]
+    (let-do [result (the (Array SessionTypedEntity) [])
+             nodes (Infer.spanned-node-types inferred provenance)
+             roots (CoreModule.expressions core)]
+      (for [i 0 (Array.length roots)]
+        (let [id (CoreIR.expression-id (Box.peek (Array.unsafe-nth roots i)))]
+          (for [j 0 (Array.length &nodes)]
+            (let [node (Array.unsafe-nth &nodes j)]
+              (when (Int.= id @(SpannedNodeType.id node))
+                (Array.push-back! &result
+                                  (SessionTypedEntity.init (String.copy "form")
+                                                           (Maybe.Nothing)
+                                                           (Type.name (Box.peek (SpannedNodeType.type node)))
+                                                           (SourceSpan.copy (SpannedNodeType.span node)))))))))
+      result))
+
+  (private locals-report)
+  (hidden locals-report)
+  (defn locals-report [inferred provenance]
+    (let-do [result (the (Array SessionTypedEntity) [])
+             bindings (Infer.spanned-binding-types inferred provenance)]
+      (for [i 0 (Array.length &bindings)]
+        (let [binding (Array.unsafe-nth &bindings i)]
+          (Array.push-back! &result
+                            (SessionTypedEntity.init (String.copy "local")
+                                                     (Maybe.Just
+                                                       (String.copy
+                                                         (CoreRef.name (SpannedBindingType.reference binding))))
+                                                     (Type.name
+                                                       (Box.peek (SpannedBindingType.type binding)))
+                                                     (SourceSpan.copy (SpannedBindingType.span binding))))))
+      result))
+
+  (private report)
+  (hidden report)
+  (defn report [input core inferred provenance]
+    (let-do [definitions (definitions-report input core inferred provenance)
+             forms (forms-report core inferred provenance)]
+      (for [i 0 (Array.length &definitions)]
+        (let [definition (Array.unsafe-nth &definitions i)]
+          (Array.push-back! &forms
+                            (SessionTypedEntity.init (String.copy "definition")
+                                                     (Maybe.Just
+                                                       (String.copy (SessionDefInfo.name definition)))
+                                                     (String.copy (SessionDefInfo.scheme definition))
+                                                     (SourceSpan.copy (SessionDefInfo.span definition))))))
+      (CellReport.init forms
+                       definitions
+                       (locals-report inferred provenance)
+                       (expressions-report inferred provenance))))
+
+  (doc create-from-module "creates a warm session from an already loaded base
+module. Loading files remains a host concern in this initial library slice;
+the expensive expansion, resolution, and inference happen exactly once here.")
+  (defn create-from-module [base config]
+    (match (MacroExpand.prepare-module-with (SourcedSurfaceModule.module base)
+                                            config)
+      (Result.Success prepared)
+        (let-do [allocator (IdAllocator.init [0])
+                 expanded-base (SourcedSurfaceModule.init
+                   (SourceInput.copy (SourcedSurfaceModule.input base))
+                   @(PreparedExpansion.module &prepared))]
+          (match (Resolve.module-with-provenance &expanded-base &allocator)
+            (Result.Success resolved)
+              (let [resolution (Resolve.last-snapshot)]
+                (match (Infer.module-diagnosed (ProvenancedCoreModule.core &resolved)
+                                               (ProvenancedCoreModule.provenance &resolved))
+                  (Result.Success inferred)
+                    (Result.Success
+                      (CompilerSession.init @(PreparedExpansion.snapshot &prepared)
+                                            resolution
+                                            @(ProvenancedCoreModule.core &resolved)
+                                            inferred
+                                            allocator))
+                  (Result.Error diagnostic) (Result.Error diagnostic)))
+            (Result.Error error)
+              (Result.Error
+                (Resolve.diagnostic &error
+                                    (SourceInput.id (SourcedSurfaceModule.input base))))))
+      (Result.Error error)
+        (Result.Error
+          (expand-diagnostic &error
+                             (SourceInput.id (SourcedSurfaceModule.input base))))))
+
+  (doc infer-cell "expands, resolves, and infers transient caller source
+against the warm base without committing compile-time or semantic changes.")
+  (defn infer-cell [session input]
+    (match (Surface.parse-input-diagnosed input)
+      (Result.Success parsed)
+        (match (MacroExpand.expand-module-against (SourcedSurfaceModule.module &parsed)
+                                                  (CompilerSession.expansion session))
+          (Result.Success expanded)
+            (let [sourced (SourcedSurfaceModule.init (SourceInput.copy input)
+                                                     expanded)]
+              (match (Resolve.module-with-provenance-against &sourced
+                                                             (CompilerSession.node-allocator session)
+                                                             (CompilerSession.resolution session))
+                (Result.Success resolved)
+                  (match (Infer.module-against-diagnosed (ProvenancedCoreModule.core &resolved)
+                                                         (ProvenancedCoreModule.provenance &resolved)
+                                                         (CompilerSession.base-inferred session))
+                    (Result.Success inferred)
+                      (Result.Success
+                        (report input
+                                (ProvenancedCoreModule.core &resolved)
+                                &inferred
+                                (ProvenancedCoreModule.provenance &resolved)))
+                    (Result.Error diagnostic) (Result.Error diagnostic))
+                (Result.Error error)
+                  (Result.Error
+                    (Resolve.diagnostic &error (SourceInput.id input)))))
+          (Result.Error error)
+            (Result.Error (expand-diagnostic &error (SourceInput.id input))))
+      (Result.Error diagnostic) (Result.Error diagnostic))))

@@ -26,12 +26,18 @@
                            owner (Maybe CoreRef)
                            type (Box MonoType)])
 
+(deftype InferredBindingType
+  [reference CoreRef
+   owner (Maybe CoreRef)
+   type (Box MonoType)])
+
 ; `Infer.module` owns the solver and trace for the complete inference phase.
 ; InferState's pointers are non-owning and must never escape that function; the
 ; final module receives owned snapshots of all three mutable stores.
 (deftype InferenceTrace
   [calls (Array CallSite)
-   node-types (Array InferredNodeType)])
+   node-types (Array InferredNodeType)
+   binding-types (Array InferredBindingType)])
 
 (deftype InferState
   [next-variable Int
@@ -73,6 +79,7 @@
    expression-types (Array (Box MonoType))
    calls (Array CallSite)
    node-types (Array InferredNodeType)
+   binding-types (Array InferredBindingType)
    substitution TypeSubstitution])
 
 (doc SpannedNodeType "is an inferred expression type with final substitution
@@ -90,6 +97,12 @@ of its source definition.")
    scheme TypeScheme
    span SourceSpan])
 
+(deftype SpannedBindingType
+  [reference CoreRef
+   owner (Maybe CoreRef)
+   type (Box MonoType)
+   span SourceSpan])
+
 (deftype InferError [message String])
 
 ;; The public error remains compact for compatibility. The wrapper around
@@ -97,6 +110,7 @@ of its source definition.")
 ;; session-facing API can attach provenance without changing every helper's
 ;; error type.
 (def *infer-failure-node* (the (Maybe Int) (Maybe.Nothing)))
+(def *infer-base-bindings* (the (Array SchemeBinding) []))
 
 (defmodule Infer
   (private state-copy)
@@ -105,6 +119,18 @@ of its source definition.")
     (InferState.init @(InferState.next-variable state)
                      @(InferState.solver state)
                      @(InferState.trace state)))
+
+  (private record-binding-type!)
+  (hidden record-binding-type!)
+  (defn record-binding-type! [state environment reference type]
+    (Array.push-back!
+      (InferenceTrace.binding-types (Pointer.to-ref @(InferState.trace state)))
+      (InferredBindingType.init (CoreRef.copy reference)
+                                (match-ref (InferEnvironment.owner environment)
+                                  (Maybe.Just owner)
+                                    (Maybe.Just (CoreRef.copy owner))
+                                  (Maybe.Nothing) (Maybe.Nothing))
+                                (Box.init (MonoType.copy type)))))
 
   (private fresh)
   (hidden fresh)
@@ -247,6 +273,22 @@ of its source definition.")
 
   (private binding-for)
   (hidden binding-for)
+  (private base-binding-for)
+  (hidden base-binding-for)
+  (defn base-binding-for [reference]
+    (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
+             found false
+             n (Array.length &*infer-base-bindings*)
+             i 0]
+      (while-do (and (not found) (Int.< i n))
+        (let [binding (Array.unsafe-nth &*infer-base-bindings* i)]
+          (when-do (CoreIR.same-ref? (SchemeBinding.reference binding) reference)
+            (set! found true)
+            (set! result
+                  (Maybe.Just (TypeScheme.copy (SchemeBinding.scheme binding))))))
+        (set! i (Int.inc i)))
+      result))
+
   (defn binding-for [environment reference]
     (if @(CoreRef.global reference)
       (let [global-environment (Pointer.to-ref @(InferEnvironment.globals environment))
@@ -261,8 +303,8 @@ of its source definition.")
                     (Array.unsafe-nth
                       (InferGlobalEnvironment.bindings global-environment)
                       index))))
-              (Maybe.Nothing)))
-          (Maybe.Nothing)))
+              (base-binding-for reference)))
+          (base-binding-for reference)))
       (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
                found false
                bindings (InferEnvironment.locals environment)
@@ -442,11 +484,24 @@ of its source definition.")
   (hidden instantiate-tagged)
   (defn instantiate-tagged [scheme state tag]
     (let-do [mapping (Type.empty-substitution)
-             next-variable @(InferState.next-variable state)
              variables (TypeScheme.variables scheme)
              lifetimes (TypeScheme.lifetime-variables scheme)
+             next-variable @(InferState.next-variable state)
              n (Array.length variables)
              lifetime-count (Array.length lifetimes)
+             ;; A warm base was inferred by a different solver, so its
+             ;; quantified IDs can overlap this cell's fresh-ID counter. Never
+             ;; build a self-substitution such as 1 -> 1: `Type.apply` would
+             ;; recurse forever and, more importantly, the two solver worlds
+             ;; must remain disjoint.
+             ignored-type-watermark (for [i 0 n]
+               (let [variable @(Array.unsafe-nth variables i)]
+                 (when (Int.>= variable next-variable)
+                   (set! next-variable (Int.inc variable)))))
+             ignored-lifetime-watermark (for [i 0 lifetime-count]
+               (let [variable @(Array.unsafe-nth lifetimes i)]
+                 (when (Int.>= variable next-variable)
+                   (set! next-variable (Int.inc variable)))))
              ignored-trace (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
                (Maybe.Just _)
                  (IO.errorln
@@ -733,20 +788,26 @@ monomorphic sharing the array relies on.")
                 &placeholder
                 (Box.peek (InferredExpression.type &inferred-value)))
               (Result.Success _)
-                (let [value-type (Type.solver-apply-at
-                        @(InferState.solver
-                          (InferredExpression.state &inferred-value))
-                        &placeholder)
-                      ;; lambdas are MONOMORPHIC (as in the reference): a
-                      ;; generalized scheme would instantiate fresh variables at
-                      ;; the call site, leaving the lambda body's own node types
-                      ;; unsolved for specialization.
-                      scheme (TypeScheme.init []
-                                              []
-                                              (Box.init (MonoType.copy &value-type)))
-                      extended (extend-environment environment reference &scheme)
-                      body-state (InferState.copy
-                        (InferredExpression.state &inferred-value))]
+                (let-do [value-type (Type.solver-apply-at
+                           @(InferState.solver
+                             (InferredExpression.state &inferred-value))
+                           &placeholder)
+                         ;; lambdas are MONOMORPHIC (as in the reference): a
+                         ;; generalized scheme would instantiate fresh variables at
+                         ;; the call site, leaving the lambda body's own node types
+                         ;; unsolved for specialization.
+                         scheme (TypeScheme.init []
+                                                 []
+                                                 (Box.init (MonoType.copy &value-type)))
+                         extended (extend-environment environment
+                                                      reference
+                                                      &scheme)
+                         body-state (InferState.copy
+                           (InferredExpression.state &inferred-value))]
+                  (record-binding-type! &body-state
+                                        environment
+                                        reference
+                                        &value-type)
                   (infer-expression &extended (Box.peek body) &body-state))
               (Result.Error error)
                 (Result.Error (InferError.init @(TypeError.message &error))))
@@ -754,21 +815,25 @@ monomorphic sharing the array relies on.")
       (let [value-state (InferState.copy state)]
         (match (infer-expression environment (Box.peek value) &value-state)
           (Result.Success inferred-value)
-            (let [value-type (Type.solver-apply-at
-                    @(InferState.solver
-                      (InferredExpression.state &inferred-value))
-                    (Box.peek (InferredExpression.type &inferred-value)))
-                  scheme (if (and (generalizable-value? (Box.peek value))
-                                  (not
-                                    (assigns-reference? (Box.peek body)
-                                                        reference)))
-                    (generalize-local environment &value-type)
-                    (TypeScheme.init []
-                                     []
-                                     (Box.init (MonoType.copy &value-type))))
-                  extended (extend-environment environment reference &scheme)
-                  body-state (InferState.copy
-                    (InferredExpression.state &inferred-value))]
+            (let-do [value-type (Type.solver-apply-at
+                       @(InferState.solver
+                         (InferredExpression.state &inferred-value))
+                       (Box.peek (InferredExpression.type &inferred-value)))
+                     scheme (if (and (generalizable-value? (Box.peek value))
+                                     (not
+                                       (assigns-reference? (Box.peek body)
+                                                           reference)))
+                       (generalize-local environment &value-type)
+                       (TypeScheme.init []
+                                        []
+                                        (Box.init (MonoType.copy &value-type))))
+                     extended (extend-environment environment reference &scheme)
+                     body-state (InferState.copy
+                       (InferredExpression.state &inferred-value))]
+              (record-binding-type! &body-state
+                                    environment
+                                    reference
+                                    &value-type)
               (infer-expression &extended (Box.peek body) &body-state))
           (Result.Error error) (Result.Error error)))))
 
@@ -928,13 +993,17 @@ monomorphic sharing the array relies on.")
       (for [i 0 n]
         (match-ref &result
           (Result.Success pair)
-            (let [fresh-result (fresh (Pair.b pair))
-                  binding (Array.unsafe-nth bindings i)
-                  scheme (TypeScheme.init []
-                                          []
-                                          (Box.init
-                                            (MonoType.copy
-                                              (Box.peek (FreshType.type &fresh-result)))))]
+            (let-do [fresh-result (fresh (Pair.b pair))
+                     binding (Array.unsafe-nth bindings i)
+                     scheme (TypeScheme.init []
+                                             []
+                                             (Box.init
+                                               (MonoType.copy
+                                                 (Box.peek (FreshType.type &fresh-result)))))]
+              (record-binding-type! (FreshType.state &fresh-result)
+                                    (Pair.a pair)
+                                    binding
+                                    (Box.peek (FreshType.type &fresh-result)))
               (set! result
                     (Result.Success
                       (Pair.init
@@ -1222,13 +1291,17 @@ monomorphic sharing the array relies on.")
       (for [i 0 n]
         (match-ref &result
           (Result.Success pair)
-            (let [fresh-result (fresh (Pair.b pair))
-                  parameter (Array.unsafe-nth parameters i)
-                  scheme (TypeScheme.init []
-                                          []
-                                          (Box.init
-                                            (MonoType.copy
-                                              (Box.peek (FreshType.type &fresh-result)))))]
+            (let-do [fresh-result (fresh (Pair.b pair))
+                     parameter (Array.unsafe-nth parameters i)
+                     scheme (TypeScheme.init []
+                                             []
+                                             (Box.init
+                                               (MonoType.copy
+                                                 (Box.peek (FreshType.type &fresh-result)))))]
+              (record-binding-type! (FreshType.state &fresh-result)
+                                    (Pair.a pair)
+                                    parameter
+                                    (Box.peek (FreshType.type &fresh-result)))
               (set! result
                     (Result.Success
                       (Pair.init
@@ -1458,13 +1531,17 @@ monomorphic sharing the array relies on.")
       (for [i 0 n]
         (match-ref &result
           (Result.Success pair)
-            (let [fresh-result (fresh (Pair.b pair))
-                  parameter (Array.unsafe-nth parameters i)
-                  scheme (TypeScheme.init []
-                                          []
-                                          (Box.init
-                                            (MonoType.copy
-                                              (Box.peek (FreshType.type &fresh-result)))))]
+            (let-do [fresh-result (fresh (Pair.b pair))
+                     parameter (Array.unsafe-nth parameters i)
+                     scheme (TypeScheme.init []
+                                             []
+                                             (Box.init
+                                               (MonoType.copy
+                                                 (Box.peek (FreshType.type &fresh-result)))))]
+              (record-binding-type! (FreshType.state &fresh-result)
+                                    (Pair.a pair)
+                                    parameter
+                                    (Box.peek (FreshType.type &fresh-result)))
               (set! result
                     (Result.Success
                       (Pair.init
@@ -2100,13 +2177,46 @@ that have no user provenance.")
               (Maybe.Nothing) ()))))
       result))
 
+  (doc spanned-binding-types "joins inferred lexical bindings to their source
+spans and applies the final substitution.")
+  (defn spanned-binding-types [inferred provenance]
+    (let-do [result (the (Array SpannedBindingType) [])
+             bindings (InferredModule.binding-types inferred)]
+      (for [i 0 (Array.length bindings)]
+        (let [binding (Array.unsafe-nth bindings i)
+              reference (InferredBindingType.reference binding)]
+          (match (CoreProvenance.binding-span provenance reference)
+            (Maybe.Just span)
+              (Array.push-back! &result
+                                (SpannedBindingType.init (CoreRef.copy reference)
+                                                         (match-ref (InferredBindingType.owner binding)
+                                                           (Maybe.Just owner)
+                                                             (Maybe.Just (CoreRef.copy owner))
+                                                           (Maybe.Nothing)
+                                                             (Maybe.Nothing))
+                                                         (Box.init
+                                                           (Type.apply (InferredModule.substitution inferred)
+                                                                       (Box.peek (InferredBindingType.type binding))))
+                                                         span))
+            (Maybe.Nothing) ())))
+      result))
+
   (doc module "infers principal schemes for the resolved core subset and
   records global call signatures for specialization. A top-level definition group
 is predeclared, inferred monomorphically, unified, then generalized together.")
+  (private module-with-bindings)
+  (hidden module-with-bindings)
   (sig module (Fn [(Ref CoreModule)] (Result InferredModule InferError)))
+  (sig module-against
+       (Fn [(Ref CoreModule) (Ref InferredModule)]
+           (Result InferredModule InferError)))
   (sig module-diagnosed
        (Fn [(Ref CoreModule) (Ref CoreProvenance)]
            (Result InferredModule Diagnostic)))
+  (sig module-against-diagnosed
+       (Fn
+         [(Ref CoreModule) (Ref CoreProvenance) (Ref InferredModule)]
+         (Result InferredModule Diagnostic)))
   (doc module-diagnosed "infers a provenanced module and attaches the innermost
 failing expression's source span to inference errors.")
   (defn module-diagnosed [core provenance]
@@ -2121,10 +2231,36 @@ failing expression's source span to inference errors.")
                              (String.copy (InferError.message &error))
                              span)))))
 
+  (doc module-against-diagnosed "infers a provenanced transient module against
+a warm inferred base and attaches source spans to failures.")
+  (defn module-against-diagnosed [core provenance base]
+    (match (module-against core base)
+      (Result.Success inferred) (Result.Success inferred)
+      (Result.Error error)
+        (let [span (match-ref &*infer-failure-node*
+                (Maybe.Just id) (CoreProvenance.node-span provenance @id)
+                (Maybe.Nothing) (the (Maybe SourceSpan) (Maybe.Nothing)))]
+          (Result.Error
+            (Diagnostic.init (String.copy "infer")
+                             (String.copy (InferError.message &error))
+                             span)))))
+
   (defn module [core]
+    (let-do [ignored-base (set! *infer-base-bindings* [])]
+      (module-with-bindings core)))
+
+  (doc module-against "infers only `core` while seeding global schemes from a
+previously inferred warm base. The base's functions and expressions are not
+visited again.")
+  (defn module-against [core base]
+    (let-do [ignored-base (set! *infer-base-bindings*
+                                (Array.copy (InferredModule.environment base)))]
+      (module-with-bindings core)))
+
+  (defn module-with-bindings [core]
     (let-do [ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
              solver (Type.solver)
-             trace (InferenceTrace.init [] [])
+             trace (InferenceTrace.init [] [] [])
              globals (InferGlobalEnvironment.init [] [] [])
              initial-environment (InferEnvironment.init (Pointer.address &globals)
                                                         []
@@ -2153,6 +2289,7 @@ failing expression's source span to inference errors.")
                   @(Pair.a &expression-result)
                   (Array.copy (InferenceTrace.calls &trace))
                   (Array.copy (InferenceTrace.node-types &trace))
+                  (Array.copy (InferenceTrace.binding-types &trace))
                   (Type.solver-snapshot &solver)))
             (Result.Error error) (Result.Error error))
         (Result.Error error) (Result.Error error)))))

@@ -81,6 +81,12 @@
    expressions (Array ScopedExpression)
    globals (Array CoreRef)])
 
+(doc ResolveSnapshot "is the immutable name-resolution environment retained
+from a warm base module. Cell declarations receive fresh global identities;
+references can resolve to all globals and imports visible in the base.")
+(deftype ResolveSnapshot [globals (Array CoreRef)
+                          imports (Array ScopedImport)])
+
 ;; process-wide serial for local binder identity; see `local-reference`.
 (def *local-binder-serial* 0)
 
@@ -127,6 +133,13 @@
 (def *provenance-nodes* (the (Array NodeProvenance) []))
 (def *provenance-bindings* (the (Array BindingProvenance) []))
 (def *provenance-definitions* (the (Array BindingProvenance) []))
+
+;; Resolver collection is parameterized through these short-lived seeds. The
+;; ordinary module entry point restores the primitive-only defaults; warm cell
+;; resolution installs a base snapshot for the duration of one call.
+(def *resolve-seed-globals* (PrimitiveRegistry.globals))
+(def *resolve-seed-imports* (the (Array ScopedImport) []))
+(def *last-resolve-snapshot* (ResolveSnapshot.init [] []))
 
 (defmodule Resolve
   (private source-span)
@@ -1899,10 +1912,10 @@ then reuse a reserved id.")
                                          []
                                          []
                                          []
+                                         (Array.copy &*resolve-seed-imports*)
                                          []
                                          []
-                                         []
-                                         (PrimitiveRegistry.globals))]
+                                         (Array.copy &*resolve-seed-globals*))]
       (match (collect-scoped! forms "" &collected)
         (Result.Success _) (Result.Success collected)
         (Result.Error error) (Result.Error error))))
@@ -4481,6 +4494,8 @@ name-matched function that does not fit the interface is never selected.")
 
   (private module-inner)
   (hidden module-inner)
+  (private module-with-provenance-seeded)
+  (hidden module-with-provenance-seeded)
   (sig module-inner (Fn [(Ref SurfaceModule)] (Result CoreModule ResolveError)))
   (sig module (Fn [(Ref SurfaceModule)] (Result CoreModule ResolveError)))
   (sig module-with-provenance
@@ -4488,15 +4503,42 @@ name-matched function that does not fit the interface is never selected.")
          [(Ref SourcedSurfaceModule) (Ref IdAllocator)]
          (Result ProvenancedCoreModule ResolveError)))
 
+  (sig module-with-provenance-against
+       (Fn
+         [(Ref SourcedSurfaceModule) (Ref IdAllocator) (Ref ResolveSnapshot)]
+         (Result ProvenancedCoreModule ResolveError)))
+  (sig module-with-provenance-seeded
+       (Fn
+         [(Ref SourcedSurfaceModule) (Ref IdAllocator)]
+         (Result ProvenancedCoreModule ResolveError)))
+
   (doc module "lowers expanded surface syntax to resolved core IR using the
 historical owner-relative expression IDs.")
   (defn module [surface]
-    (let-do [ignored-provenance (set! *provenance-enabled* false)]
+    (let-do [ignored-provenance (set! *provenance-enabled* false)
+             ignored-globals (set! *resolve-seed-globals*
+                                   (PrimitiveRegistry.globals))
+             ignored-imports (set! *resolve-seed-imports* [])]
       (module-inner surface)))
 
   (doc module-with-provenance "resolves caller-identified syntax with node IDs
 from a caller-owned monotonic allocator, returning the core IR and source map.")
   (defn module-with-provenance [sourced allocator]
+    (let-do [ignored-globals (set! *resolve-seed-globals*
+                                   (PrimitiveRegistry.globals))
+             ignored-imports (set! *resolve-seed-imports* [])]
+      (module-with-provenance-seeded sourced allocator)))
+
+  (doc module-with-provenance-against "resolves caller syntax against a warm
+base snapshot without collecting or resolving the base module again.")
+  (defn module-with-provenance-against [sourced allocator snapshot]
+    (let-do [ignored-globals (set! *resolve-seed-globals*
+                                   (Array.copy (ResolveSnapshot.globals snapshot)))
+             ignored-imports (set! *resolve-seed-imports*
+                                   (Array.copy (ResolveSnapshot.imports snapshot)))]
+      (module-with-provenance-seeded sourced allocator)))
+
+  (defn module-with-provenance-seeded [sourced allocator]
     (let-do [start (IdAllocator.next-up! allocator)
              ignored-enabled (set! *provenance-enabled* true)
              ignored-source (set! *provenance-source-id*
@@ -4518,6 +4560,10 @@ from a caller-owned monotonic allocator, returning the core IR and source map.")
         (Result.Success core)
           (Result.Success (ProvenancedCoreModule.init core provenance))
         (Result.Error error) (Result.Error error))))
+
+  (doc last-snapshot "returns the name-resolution environment produced by the
+most recent successful module resolution.")
+  (defn last-snapshot [] (ResolveSnapshot.copy &*last-resolve-snapshot*))
 
   (doc module-inner
     "lowers expanded surface syntax to resolved core IR. The first
@@ -4547,6 +4593,9 @@ guessed at.")
                                                           &constructor-builtins)
                        ignored-provenance (record-collected-definitions! &collected
                                                                          &all-globals)
+                       ignored-snapshot (set! *last-resolve-snapshot*
+                                              (ResolveSnapshot.init (Array.copy &all-globals)
+                                                                    (Array.copy (CollectedForms.imports &collected))))
                        type-declarations (resolve-type-declarations
                          (CollectedForms.type-declarations &collected))
                        constructor-declarations (Array.copy

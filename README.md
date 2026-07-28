@@ -135,8 +135,9 @@ source registry
 
 Supporting libraries: `carp-primitives` (the declarative primitive registry) and
 `carp-graph` (strongly-connected-component ordering), plus `carp-source`
-(caller-owned source identities and byte spans). Each phase reports failures
-tagged with its own name.
+(caller-owned source identities and byte spans) and `carp-session` (warm,
+transactional notebook inference). Each phase reports failures tagged with its
+own name.
 
 Ownership is real: the compiler derives `delete`/`copy` for managed `deftype`s
 (concrete and generic), runs a sound flow-sensitive borrow check (escape, move,

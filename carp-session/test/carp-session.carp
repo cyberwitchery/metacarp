@@ -1,0 +1,123 @@
+(load "../carp-session.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn diagnostic-false [diagnostic]
+  (do
+    (IO.println
+      &(String.concat
+        &[(String.copy (Diagnostic.phase diagnostic))
+          @": "
+          (String.copy (Diagnostic.message diagnostic))]))
+    false))
+
+(defn make-session []
+  (let [input (SourceInput.init (String.copy "base:test")
+                                (String.copy "(defdynamic n 0)
+(defmacro next [] (do (set! n (+ n 1)) n))
+(defn warm-id [x] x)"))]
+    (match (Surface.parse-input &input)
+      (Result.Success base)
+        (let [config (ExpandConfig.init [])]
+          (Session.create-from-module &base &config))
+      (Result.Error error)
+        (Result.Error
+          (Diagnostic.init (String.copy "parse")
+                           (Parser.format-error &error)
+                           (Maybe.Nothing))))))
+
+(defn warm-cells-are-transactional-and-spanned? []
+  (match (make-session)
+    (Result.Success session)
+      (let [input (SourceInput.init (String.copy "cell:one")
+                                    (String.copy "(warm-id (next))"))]
+        (match (Session.infer-cell &session &input)
+          (Result.Success first)
+            (match (Session.infer-cell &session &input)
+              (Result.Success second)
+                (and
+                  (Int.= 1 (Array.length (CellReport.forms &first)))
+                  (and
+                    (Int.> (Array.length (CellReport.expressions &first)) 0)
+                    (and
+                      (String.=
+                        (SessionTypedEntity.type
+                          (Array.unsafe-nth (CellReport.forms &first) 0))
+                        "Int")
+                      (and
+                        (String.=
+                          (SourceSpan.source-id
+                            (SessionTypedEntity.span
+                              (Array.unsafe-nth (CellReport.forms &first) 0)))
+                          "cell:one")
+                        (String.=
+                          (SessionTypedEntity.type
+                            (Array.unsafe-nth (CellReport.forms &second) 0))
+                          "Int")))))
+              (Result.Error diagnostic) (diagnostic-false &diagnostic))
+          (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+    (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+
+(defn failed-cell-does-not-poison-session? []
+  (match (make-session)
+    (Result.Success session)
+      (let [bad (SourceInput.init (String.copy "cell:bad")
+                                  (String.copy "(defn bad [] (if 1 true false))"))
+            good (SourceInput.init (String.copy "cell:good")
+                                   (String.copy "(warm-id 7)"))]
+        (match (Session.infer-cell &session &bad)
+          (Result.Success _) false
+          (Result.Error diagnostic)
+            (and
+              (String.= (Diagnostic.phase &diagnostic) "infer")
+              (match (Session.infer-cell &session &good)
+                (Result.Success report)
+                  (String.=
+                    (SessionTypedEntity.type
+                      (Array.unsafe-nth (CellReport.forms &report) 0))
+                    "Int")
+                (Result.Error next-diagnostic)
+                  (diagnostic-false &next-diagnostic)))))
+    (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+
+(defn definition-cell-has-structured-report? []
+  (match (make-session)
+    (Result.Success session)
+      (let [input (SourceInput.init (String.copy "cell:def")
+                                    (String.copy "(defn cell-value [x] (warm-id x))"))]
+        (match (Session.infer-cell &session &input)
+          (Result.Success report)
+            (and
+              (Int.= 1 (Array.length (CellReport.forms &report)))
+              (and
+                (Int.= 1 (Array.length (CellReport.definitions &report)))
+                (and
+                  (Int.= 1 (Array.length (CellReport.locals &report)))
+                  (let [definition (Array.unsafe-nth (CellReport.definitions &report)
+                                                     0)
+                        local (Array.unsafe-nth (CellReport.locals &report) 0)]
+                    (and
+                      (String.= (SessionDefInfo.name definition) "cell-value")
+                      (and
+                        (match-ref (SessionTypedEntity.name local)
+                          (Maybe.Just name) (String.= name "x")
+                          (Maybe.Nothing) false)
+                        (String.=
+                          (SourceSpan.source-id (SessionDefInfo.span definition))
+                          "cell:def")))))))
+          (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+    (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+
+(deftest t
+  (assert-equal t 1 (Session.api-version) "session API version is explicit")
+  (assert-true t
+    (definition-cell-has-structured-report?)
+    "definition cells report their name, scheme, kind, and caller span")
+  (assert-true t
+    (warm-cells-are-transactional-and-spanned?)
+    "warm cells reuse the base, discard effects, and report caller spans")
+  (assert-true t
+    (failed-cell-does-not-poison-session?)
+    "a failed cell leaves the warm session usable"))
