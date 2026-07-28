@@ -75,7 +75,28 @@
    node-types (Array InferredNodeType)
    substitution TypeSubstitution])
 
+(doc SpannedNodeType "is an inferred expression type with final substitution
+applied and its caller-facing source span attached.")
+(deftype SpannedNodeType
+  [id Int
+   owner (Maybe CoreRef)
+   type (Box MonoType)
+   span SourceSpan])
+
+(doc SpannedSchemeBinding "is one inferred global scheme joined with the span
+of its source definition.")
+(deftype SpannedSchemeBinding
+  [reference CoreRef
+   scheme TypeScheme
+   span SourceSpan])
+
 (deftype InferError [message String])
+
+;; The public error remains compact for compatibility. The wrapper around
+;; recursive expression inference remembers the innermost failing node so the
+;; session-facing API can attach provenance without changing every helper's
+;; error type.
+(def *infer-failure-node* (the (Maybe Int) (Maybe.Nothing)))
 
 (defmodule Infer
   (private state-copy)
@@ -1416,7 +1437,14 @@ monomorphic sharing the array relies on.")
                                        @(InferState.next-variable inferred-state)
                                        @(InferState.solver inferred-state)
                                        @(InferState.trace inferred-state)))))
-      (Result.Error error) (Result.Error error)))
+      (Result.Error error)
+        (do
+          (match-ref &*infer-failure-node*
+            (Maybe.Nothing)
+              (set! *infer-failure-node*
+                    (Maybe.Just (CoreIR.expression-id expression)))
+            (Maybe.Just _) ())
+          (Result.Error error))))
 
   (private infer-parameters)
   (hidden infer-parameters)
@@ -2033,24 +2061,82 @@ monomorphic sharing the array relies on.")
           (Result.Error _) ()))
       result))
 
+  (doc spanned-node-types "joins inferred node types with source provenance and
+applies the inference module's final substitution.")
+  (defn spanned-node-types [inferred provenance]
+    (let-do [result (the (Array SpannedNodeType) [])
+             nodes (InferredModule.node-types inferred)]
+      (for [i 0 (Array.length nodes)]
+        (let [node (Array.unsafe-nth nodes i)]
+          (match (CoreProvenance.node-span provenance
+                                           @(InferredNodeType.id node))
+            (Maybe.Just span)
+              (Array.push-back! &result
+                                (SpannedNodeType.init @(InferredNodeType.id node)
+                                                      @(InferredNodeType.owner node)
+                                                      (Box.init
+                                                        (Type.apply (InferredModule.substitution inferred)
+                                                                    (Box.peek (InferredNodeType.type node))))
+                                                      span))
+            (Maybe.Nothing) ())))
+      result))
+
+  (doc spanned-definition-schemes "joins inferred global definitions with
+their declaration spans, omitting compiler-generated and builtin-only entries
+that have no user provenance.")
+  (defn spanned-definition-schemes [inferred provenance]
+    (let-do [result (the (Array SpannedSchemeBinding) [])
+             bindings (InferredModule.environment inferred)]
+      (for [i 0 (Array.length bindings)]
+        (let [binding (Array.unsafe-nth bindings i)
+              reference (SchemeBinding.reference binding)]
+          (when @(CoreRef.global reference)
+            (match (CoreProvenance.binding-span provenance reference)
+              (Maybe.Just span)
+                (Array.push-back! &result
+                                  (SpannedSchemeBinding.init (CoreRef.copy reference)
+                                                             (TypeScheme.copy (SchemeBinding.scheme binding))
+                                                             span))
+              (Maybe.Nothing) ()))))
+      result))
+
   (doc module "infers principal schemes for the resolved core subset and
   records global call signatures for specialization. A top-level definition group
 is predeclared, inferred monomorphically, unified, then generalized together.")
+  (sig module (Fn [(Ref CoreModule)] (Result InferredModule InferError)))
+  (sig module-diagnosed
+       (Fn [(Ref CoreModule) (Ref CoreProvenance)]
+           (Result InferredModule Diagnostic)))
+  (doc module-diagnosed "infers a provenanced module and attaches the innermost
+failing expression's source span to inference errors.")
+  (defn module-diagnosed [core provenance]
+    (match (module core)
+      (Result.Success inferred) (Result.Success inferred)
+      (Result.Error error)
+        (let [span (match-ref &*infer-failure-node*
+                (Maybe.Just id) (CoreProvenance.node-span provenance @id)
+                (Maybe.Nothing) (the (Maybe SourceSpan) (Maybe.Nothing)))]
+          (Result.Error
+            (Diagnostic.init (String.copy "infer")
+                             (String.copy (InferError.message &error))
+                             span)))))
+
   (defn module [core]
-    (let [solver (Type.solver)
-          trace (InferenceTrace.init [] [])
-          globals (InferGlobalEnvironment.init [] [] [])
-          initial-environment (InferEnvironment.init (Pointer.address &globals)
-                                                     []
-                                                     []
-                                                     (Maybe.Nothing))
-          builtin-environment (extend-builtins &initial-environment
-                                               (CoreModule.builtins core))
-          declaration-environment (extend-interfaces &builtin-environment
-                                                     (CoreModule.interfaces core))
-          initial-state (InferState.init 0
-                                         (Pointer.address &solver)
-                                         (Pointer.address &trace))]
+    (let-do [ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
+             solver (Type.solver)
+             trace (InferenceTrace.init [] [])
+             globals (InferGlobalEnvironment.init [] [] [])
+             initial-environment (InferEnvironment.init (Pointer.address &globals)
+                                                        []
+                                                        []
+                                                        (Maybe.Nothing))
+             builtin-environment (extend-builtins &initial-environment
+                                                  (CoreModule.builtins core))
+             declaration-environment (extend-interfaces &builtin-environment
+                                                        (CoreModule.interfaces core))
+             initial-state (InferState.init 0
+                                            (Pointer.address &solver)
+                                            (Pointer.address &trace))]
       (match (infer-functions (CoreModule.functions core)
                               (CoreModule.values core)
                               (CoreModule.signatures core)
