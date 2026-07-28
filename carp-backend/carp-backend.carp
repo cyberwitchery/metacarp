@@ -65,7 +65,8 @@ an environment struct of the captured values.")
    constructors (Array CoreConstructorDeclaration)
    system-includes (Array String)
    closure-functions (Array ClosureFunction)
-   delete-symbols (Array (Pair String String))])
+   delete-symbols (Array (Pair String String))
+   copy-symbols (Array (Pair String String))])
 
 (deftype BackendError [message String])
 
@@ -163,7 +164,7 @@ reflift wrapper's binding type, which would mislabel the result.")
   (doc module "converts specialization output into concrete backend
   declarations. It rejects residual type variables rather than delegating them
   to a backend.")
-  (defn module [specialized closures delete-symbols]
+  (defn module [specialized closures delete-symbols copy-symbols]
     (let-do [declarations (the (Array BackendDeclaration) [])
              failure (the (Maybe BackendError) (Maybe.Nothing))
              bodies (SpecializationModule.bodies specialized)
@@ -265,7 +266,8 @@ reflift wrapper's binding type, which would mislabel the result.")
                                 @(SpecializationModule.constructors specialized)
                                 @(SpecializationModule.system-includes specialized)
                                 @closures
-                                (Array.copy delete-symbols))))))
+                                (Array.copy delete-symbols)
+                                (Array.copy copy-symbols))))))
 
   (private lookup-delete-symbol)
   (hidden lookup-delete-symbol)
@@ -1791,7 +1793,11 @@ function exit on exactly the paths that do not consume them.")
   (doc module-with-ownership-echoed "like module-with-ownership, additionally
 echoing each non-unit root result through the driver's echo plan (top-level
 REPL-echo semantics compiled into `main`).")
-  (defn module-with-ownership-echoed [specialized ownership delete-symbols echo]
+  (defn module-with-ownership-echoed [specialized
+                                      ownership
+                                      delete-symbols
+                                      copy-symbols
+                                      echo]
     (do
       (seed-backend-locals! specialized)
       ;; the hoist stream also names lifted-lambda globals: keep it above both
@@ -1807,7 +1813,10 @@ REPL-echo semantics compiled into `main`).")
                                  delete-symbols
                                  echo)
             (Result.Success rewritten)
-              (module &rewritten (Pair.b &lifted-pair) delete-symbols)
+              (module &rewritten
+                      (Pair.b &lifted-pair)
+                      delete-symbols
+                      copy-symbols)
             (Result.Error e) (Result.Error e))
           (Result.Error
             (BackendError.init @"ownership plan has no root context"))))))
@@ -1816,10 +1825,11 @@ REPL-echo semantics compiled into `main`).")
 phase has established its side table, rewriting each body to insert the concrete
 delete calls its plan schedules (resolved through `delete-symbols`, a table from
 concrete type key to deleter C symbol).")
-  (defn module-with-ownership [specialized ownership delete-symbols]
+  (defn module-with-ownership [specialized ownership delete-symbols copy-symbols]
     (module-with-ownership-echoed specialized
                                   ownership
                                   delete-symbols
+                                  copy-symbols
                                   &(the (Maybe EchoPlan) (Maybe.Nothing)))))
 
 ;; binder ids granted their plain Carp name as C identifier in the function
@@ -3046,6 +3056,73 @@ relies on C block scoping (nested statement expressions shadow it).")
       (Maybe.Just error) (Result.Error @error)
       (Maybe.Nothing) (Result.Success rendered))))
 
+(defn render-recursive-env-fields [constructors arguments self]
+  (let-do [fields (the String (String.copy ""))
+           assignments (the String (String.copy ""))
+           failure (the (Maybe BackendError) (Maybe.Nothing))
+           n (Array.length arguments)]
+    (for [i 0 n]
+      (match-ref &failure
+        (Maybe.Nothing)
+          (let-do [argument (Box.peek (Array.unsafe-nth arguments i))
+                   field-name (String.concat &[@"f" (Int.str i)])
+                   field (String.concat &[@"." (String.copy &field-name)])]
+            (when (Int.> i 0) (set! fields (String.append &fields ", ")))
+            (if (match-ref argument
+                (SpecializedExpr.Reference _ _ reference)
+                  (CoreIR.same-ref? reference self)
+                _ false)
+              (do
+                (set! fields
+                      (String.concat
+                        &[(String.copy &fields) field @" = ((Lambda){0})"]))
+                (set! assignments
+                      (String.concat
+                        &[(String.copy &assignments)
+                          @" _carp_env->"
+                          field-name
+                          @" = ((Lambda){ .callback = _carp_self.callback, .env = _carp_self.env, .delete = NULL, .copy = NULL });"])))
+              (match (render-value-expression constructors argument)
+                (Result.Success value)
+                  (set! fields
+                        (String.concat
+                          &[(String.copy &fields)
+                            field
+                            @" = "
+                            (String.copy &value)]))
+                (Result.Error error) (set! failure (Maybe.Just error)))))
+        (Maybe.Just _) ()))
+    (match-ref &failure
+      (Maybe.Just error) (Result.Error @error)
+      (Maybe.Nothing) (Result.Success (Pair.init fields assignments)))))
+
+(defn render-recursive-closure-construction [constructors symbol arguments self]
+  (let [lambda-symbol (String.concat
+          &[@"_carp_lambda_" (String.suffix symbol 14)])
+        env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])]
+    (match (render-recursive-env-fields constructors arguments self)
+      (Result.Success rendered)
+        (Result.Success
+          (String.concat
+            &[@"({ "
+              (String.copy &env-type)
+              @"* _carp_env = CARP_MALLOC(sizeof("
+              (String.copy &env-type)
+              @")); *_carp_env = (("
+              (String.copy &env-type)
+              @"){ "
+              (String.copy (Pair.a &rendered))
+              @" }); Lambda _carp_self = ((Lambda){ .callback = (void*)"
+              (String.copy &lambda-symbol)
+              @", .env = (void*)_carp_env, .delete = (void*)"
+              (String.copy &env-type)
+              @"_delete, .copy = (void*)"
+              (String.copy &env-type)
+              @"_copy });"
+              (String.copy (Pair.b &rendered))
+              @" _carp_self; })"]))
+      (Result.Error error) (Result.Error error))))
+
 (doc render-closure-construction "renders a capturing lambda's closure site: a
 `Lambda` struct whose environment points at a compound literal of the captured
 values (block-scoped, valid for non-escaping closures).")
@@ -3090,7 +3167,9 @@ environment deleter.")
               fields
               @" }); (void*)_carp_env; }), .delete = (void*)"
               (String.copy &env-type)
-              @"_delete, .copy = NULL })"]))
+              @"_delete, .copy = (void*)"
+              (String.copy &env-type)
+              @"_copy })"]))
       (Result.Error error) (Result.Error error))))
 
 (defn append-indent! [buffer depth]
@@ -3236,7 +3315,15 @@ binding so the value is the binding itself.")
           (Result.Error error) (Result.Error error))
         (match (render-type &value-type)
           (Result.Success rendered-type)
-            (match (render-value-expression constructors value)
+            (match (match-ref value
+                (SpecializedExpr.GlobalCall _ _ _ _ symbol arguments)
+                  (if (String.starts-with? symbol "_carp_closure_")
+                    (render-recursive-closure-construction constructors
+                                                           symbol
+                                                           arguments
+                                                           reference)
+                    (render-value-expression constructors value))
+                _ (render-value-expression constructors value))
               (Result.Success rendered-value)
                 (do
                   (append-indent! buffer depth)
@@ -4813,6 +4900,117 @@ signature and every emitted expression are in the unmanaged scalar subset.")
           (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
     result))
 
+(defn closure-copy-symbol [copy-symbols value-type]
+  (let-do [result (the (Maybe String) (Maybe.Nothing))
+           key (CAbi.type-key value-type)
+           n (Array.length copy-symbols)]
+    (for [i 0 n]
+      (let [entry (Array.unsafe-nth copy-symbols i)]
+        (when (String.= (Pair.a entry) &key)
+          (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
+    result))
+
+(doc closure-env-copy-definition "renders the callback stored in `Lambda.copy`:
+it allocates a fresh environment and deep-copies managed captures. A recursive
+self edge is rebuilt as a non-owning view of the fresh environment.")
+(defn closure-env-copy-definition [closure-fn delete-symbols copy-symbols]
+  (let-do [lambda-symbol (sanitize (ClosureFunction.symbol closure-fn))
+           env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])
+           captures (ClosureFunction.captures closure-fn)
+           buffer (StringBuf.create)]
+    (StringBuf.append-str &buffer "void* ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "_copy(void* _raw) {
+  ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "* _env = _raw;
+  ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "* _copy = CARP_MALLOC(sizeof(")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "));
+")
+    (for [i 0 (Array.length captures)]
+      (let [capture (Array.unsafe-nth captures i)
+            capture-type (Box.peek (Pair.b capture))
+            field (String.concat &[@"f" (Int.str i)])]
+        (if (match-ref capture-type (MonoType.Function _ _) true _ false)
+          (do
+            (StringBuf.append-str &buffer "  if (_env->")
+            (StringBuf.append-str &buffer &field)
+            (StringBuf.append-str &buffer ".env == _env && _env->")
+            (StringBuf.append-str &buffer &field)
+            (StringBuf.append-str &buffer ".callback == (void*)")
+            (StringBuf.append-str &buffer &lambda-symbol)
+            (StringBuf.append-str &buffer ") {
+    _copy->")
+            (StringBuf.append-str &buffer &field)
+            (StringBuf.append-str &buffer " = (Lambda){ .callback = (void*)")
+            (StringBuf.append-str &buffer &lambda-symbol)
+            (StringBuf.append-str &buffer
+                                  ", .env = _copy, .delete = NULL, .copy = NULL };
+  } else ")
+            (match (closure-copy-symbol copy-symbols capture-type)
+              (Maybe.Just symbol)
+                (do
+                  (StringBuf.append-str &buffer "if (_env->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer ".env) {
+    _copy->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer " = ")
+                  (StringBuf.append-str &buffer &symbol)
+                  (StringBuf.append-str &buffer "(&_env->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer ");
+  } else {
+    _copy->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer " = _env->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer ";
+  }
+"))
+              (Maybe.Nothing) (do (StringBuf.append-str &buffer "{
+    _copy->") (StringBuf.append-str &buffer &field) (StringBuf.append-str &buffer
+                                                                          " = _env->") (StringBuf.append-str &buffer
+                                                                                                             &field) (StringBuf.append-str &buffer
+                                                                                                                                           ";
+  }
+"))))
+          (match (closure-delete-symbol delete-symbols capture-type)
+            (Maybe.Just _)
+              (match (closure-copy-symbol copy-symbols capture-type)
+                (Maybe.Just symbol)
+                  (do
+                    (StringBuf.append-str &buffer "  _copy->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer " = ")
+                    (StringBuf.append-str &buffer &symbol)
+                    (StringBuf.append-str &buffer "(&_env->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer ");
+"))
+                (Maybe.Nothing)
+                  (do
+                    (StringBuf.append-str &buffer "  _copy->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer " = _env->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer ";
+")))
+            (Maybe.Nothing)
+              (do
+                (StringBuf.append-str &buffer "  _copy->")
+                (StringBuf.append-str &buffer &field)
+                (StringBuf.append-str &buffer " = _env->")
+                (StringBuf.append-str &buffer &field)
+                (StringBuf.append-str &buffer ";
+"))))))
+    (StringBuf.append-str &buffer "  return _copy;
+}")
+    (StringBuf.to-string &buffer)))
+
 (doc closure-env-delete-definition "renders the callback stored in
 `Lambda.delete`: it releases every managed capture. `Function.delete` invokes
 this callback and then frees the environment cell itself.")
@@ -4931,6 +5129,10 @@ sites and callback definitions can refer to them.")
                       (StringBuf.append-str &buffer &env-type)
                       (StringBuf.append-str &buffer "_delete(void* _raw);")
                       (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer "void* ")
+                      (StringBuf.append-str &buffer &env-type)
+                      (StringBuf.append-str &buffer "_copy(void* _raw);")
+                      (StringBuf.append-char &buffer \newline)
                       (StringBuf.append-str &buffer &head)
                       (StringBuf.append-char &buffer \;)
                       (StringBuf.append-char &buffer \newline))
@@ -4957,6 +5159,12 @@ with a leading environment pointer and captured-value unpacking.")
             (StringBuf.append-str &buffer
                                   &(closure-env-delete-definition closure-fn
                                                                   (BackendModule.delete-symbols module)))
+            (StringBuf.append-char &buffer \newline)
+            (StringBuf.append-char &buffer \newline)
+            (StringBuf.append-str &buffer
+                                  &(closure-env-copy-definition closure-fn
+                                                                (BackendModule.delete-symbols module)
+                                                                (BackendModule.copy-symbols module)))
             (match (closure-function-definition (BackendModule.constructors module)
                                                 closure-fn)
               (Result.Success rendered)
