@@ -63,9 +63,15 @@ known_gap() {
 fail() {
   file=$1
   why=$2
+  log="$out_root/log/$(safe_name "$file").log"
   failed=$((failed + 1))
-  printf 'FAIL %s (%s) log=%s\n' "$file" "$why" "$out_root/log/$(safe_name "$file").log" \
+  printf 'FAIL %s (%s) log=%s\n' "$file" "$why" "$log" \
     | tee -a "$out_root/failures.txt"
+  if [ -f "$log" ]; then
+    printf '%s\n' "--- failure log: $file ---"
+    tail -n 200 "$log"
+    printf '%s\n' "--- end failure log: $file ---"
+  fi
 }
 
 # build with --log-memory, run, diff output against test/output/<file>.output.expected
