@@ -194,6 +194,54 @@ environment.")
   (defn session-diagnostic [message span]
     (Diagnostic.init (String.copy "session") message span))
 
+  (private macro-definition-info)
+  (hidden macro-definition-info)
+  (sig macro-definition-info
+       (Fn
+         [(Ref SessionOverlay) (Ref SourceInput) (Ref PreparedExpansion)]
+         (Array SessionDefInfo)))
+  (defn macro-definition-info [overlay input prepared]
+    (let-do [before (ExpandSnapshot.macros
+               (Rc.value-ref (SessionOverlay.expansion overlay)))
+             after (ExpandSnapshot.macros (PreparedExpansion.snapshot prepared))
+             result (the (Array SessionDefInfo) [])]
+      (when (Int.= (Array.length after) (Int.inc (Array.length before)))
+        (let [macro (Array.unsafe-nth after (Int.dec (Array.length after)))]
+          (Array.push-back! &result
+                            (SessionDefInfo.init (String.copy (ExpandMacro.name macro))
+                                                 (SessionDefKind.Other (String.copy "macro"))
+                                                 (String.copy "macro")
+                                                 (SourceInput.copy input)
+                                                 (SourceSpan.init (String.copy (SourceInput.id input))
+                                                                  0
+                                                                  (String.length (SourceInput.source input)))))))
+      result))
+
+  (private finish-macro-overlay)
+  (hidden finish-macro-overlay)
+  (sig finish-macro-overlay
+       (Fn
+         [(Ref SessionOverlay)
+          (Ref SourceInput)
+          (Ref PreparedExpansion)
+          SessionDefInfo]
+         SessionOverlay))
+  (defn finish-macro-overlay [overlay input prepared info]
+    (let-do [inputs (Array.copy (SessionOverlay.inputs overlay))
+             definitions (Array.copy (SessionOverlay.definitions overlay))
+             dependencies (Array.copy (SessionOverlay.dependencies overlay))
+             ignored-input (Array.push-back! &inputs (SourceInput.copy input))
+             ignored-definition (Array.push-back! &definitions info)
+             ignored-dependency (Array.push-back! &dependencies [])]
+      (SessionOverlay.init
+        (Rc.new (ExpandSnapshot.copy (PreparedExpansion.snapshot prepared)))
+        (ResolveSnapshot.copy (SessionOverlay.resolution overlay))
+        (Infer.compact-environment (SessionOverlay.inferred overlay))
+        (IdAllocator.copy (SessionOverlay.node-allocator overlay))
+        inputs
+        definitions
+        dependencies)))
+
   (private finish-overlay)
   (hidden finish-overlay)
   (sig finish-overlay
@@ -301,7 +349,16 @@ environment.")
   (defn expand-overlay [overlay input parsed]
     (match (MacroExpand.prepare-module-against (SourcedSurfaceModule.module parsed)
                                                (Rc.value-ref (SessionOverlay.expansion overlay)))
-      (Result.Success prepared) (resolve-overlay overlay input &prepared)
+      (Result.Success prepared)
+        (let [macro-infos (macro-definition-info overlay input &prepared)]
+          (if (Int.= 1 (Array.length &macro-infos))
+            (Result.Success
+              (finish-macro-overlay overlay
+                                    input
+                                    &prepared
+                                    (SessionDefInfo.copy (Array.unsafe-nth &macro-infos
+                                                                           0))))
+            (resolve-overlay overlay input &prepared)))
       (Result.Error error)
         (Result.Error (expand-diagnostic &error (SourceInput.id input)))))
 
@@ -388,18 +445,29 @@ environment.")
              target (SessionDefInfo.name (Array.unsafe-nth definitions index))
              affected [(String.copy target)]
              result (the (Array String) [])
+             macro? (match-ref (SessionDefInfo.kind (Array.unsafe-nth definitions
+                                                                      index))
+               (SessionDefKind.Other label) (String.= label "macro")
+               _ false)
              changed true]
-      (while-do changed
-        (set! changed false)
-        (for [i 0 (Array.length definitions)]
-          (let [name (SessionDefInfo.name (Array.unsafe-nth definitions i))]
-            (when-do (and (Int./= i index)
-                          (and (not (string-in? &affected name))
-                               (depends-on-any? (Array.unsafe-nth dependencies i)
-                                                &affected)))
-              (Array.push-back! &affected (String.copy name))
-              (Array.push-back! &result (String.copy name))
-              (set! changed true)))))
+      (if macro?
+        (for [i (Int.inc index) (Array.length definitions)]
+          (Array.push-back! &result
+                            (String.copy
+                              (SessionDefInfo.name (Array.unsafe-nth definitions
+                                                                     i)))))
+        (while-do changed
+          (set! changed false)
+          (for [i 0 (Array.length definitions)]
+            (let [name (SessionDefInfo.name (Array.unsafe-nth definitions i))]
+              (when-do (and (Int./= i index)
+                            (and (not (string-in? &affected name))
+                                 (depends-on-any? (Array.unsafe-nth dependencies
+                                                                    i)
+                                                  &affected)))
+                (Array.push-back! &affected (String.copy name))
+                (Array.push-back! &result (String.copy name))
+                (set! changed true))))))
       result))
 
   (doc create-from-module "creates a warm session from an already loaded base

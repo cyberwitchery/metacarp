@@ -4,7 +4,7 @@ Warm, transport-independent compiler sessions for notebook and editor hosts.
 
 The initial API provides `Session.api-version`, `Session.create`,
 `Session.create-from-module`, `Session.reset`, and transactional
-`Session.infer-cell`. Runtime definitions can be committed and queried with
+`Session.infer-cell`. Runtime definitions and macros can be committed and queried with
 `Session.upsert`, `Session.remove`, and `Session.definitions`. `Session.create`
 loads and checks Core once; subsequent cells and definition rebuilds reuse the
 warm Core expansion, resolution, and inference snapshots.
@@ -17,7 +17,9 @@ Replacement is atomic: the candidate overlay is rebuilt before it is committed,
 and resolved global-reference edges identify its transitive dependents. Failed
 replacement leaves the previous overlay untouched. Removal drops only the
 named definition and that transitive closure, preserving unrelated definitions.
-Compile-time/type definitions remain follow-up work under issue #21.
+Macro replacement/removal conservatively invalidates every later definition
+until the expander records macro-use edges. Type, interface, and implementation
+definitions remain follow-up work under issue #21.
 
 On an Apple arm64 host, the real-Core benchmark in `test/benchmark.carp`
 currently creates a session in about 1.88 seconds and checks 100 43-byte cells
