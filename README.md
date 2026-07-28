@@ -33,6 +33,7 @@ carp-compiler [options] <source.carp>
   -x, --execute         compile to an executable and run it (needs --core)
   -c, --core <dir>      compile against the Carp standard library in <dir>
   -o, --output <file>   output path — the C file, or the executable under -b
+  --optimize            build -b/-x executables with clang -O3 -D NDEBUG
   --no-core             skip the implicit Core load; the source's own
                         (load "X.carp") directives still resolve in --core
   -h, --help            show this help and exit
