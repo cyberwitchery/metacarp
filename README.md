@@ -149,6 +149,14 @@ The reusable entry point is `CarpCompiler.compile-source`, or
 `CarpCompiler.compile-sources` when the caller already holds an in-memory source
 registry.
 
+## Library roadmap
+
+The proposed [`carp-session`](docs/carp-session.md) API keeps an inferred core
+resident for notebook and editor clients, then provides transactional
+definition updates, cell-relative typed reports, ownership queries, completion,
+and incremental code generation. The design deliberately leaves transport and
+value hosting to clients such as Lepiter and GT.
+
 ## Limitations
 
 - The host architecture and OS are stamped for the build machine
