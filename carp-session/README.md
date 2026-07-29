@@ -18,6 +18,8 @@ Replacement is atomic: the candidate overlay is rebuilt before it is committed,
 and resolved global-reference edges identify its transitive dependents. Failed
 replacement leaves the previous overlay untouched. Removal drops only the
 named definition and that transitive closure, preserving unrelated definitions.
+Unchanged definitions and same-kind function, value, external, or interface
+replacements retain their compatible global identities across the rebuild.
 Macro, type, interface, and implementation replacement/removal conservatively
 invalidate every later definition until the compiler records precise semantic
 use edges. A committed type exposes its generated constructors and lifecycle
