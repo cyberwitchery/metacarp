@@ -343,7 +343,7 @@ be configurable rather than embedded in the notebook protocol.
 
 ### Milestone 4: code generation
 
-- Implement `emit-cell`.
+- [x] Implement `emit-cell`.
 - Define a separable core/user codegen boundary.
 - Implement cached core objects and `build-cell`.
 
@@ -377,4 +377,3 @@ be configurable rather than embedded in the notebook protocol.
   provenance is broader than diagnostic wording.
 - Overall compiler performance remains tracked by issue #14; notebook latency
   needs separate warm-session measurements.
-

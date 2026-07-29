@@ -255,6 +255,21 @@ committed user definitions while extending the compact warm environment.")
                            binding-types
                            (Type.empty-substitution))))
 
+  (private inferred-environment-with-analysis)
+  (hidden inferred-environment-with-analysis)
+  (doc inferred-environment-with-analysis "uses the visible warm schemes with
+an explicitly assembled set of inference traces. This keeps the resident
+overlay compact while allowing transient code generation to restore the base
+traces retained once by `CompilerSession`.")
+  (defn inferred-environment-with-analysis [environment analysis]
+    (InferredModule.init
+      (Array.copy (InferredModule.environment environment))
+      (Array.copy (InferredModule.expression-types analysis))
+      (Array.copy (InferredModule.calls analysis))
+      (Array.copy (InferredModule.node-types analysis))
+      (Array.copy (InferredModule.binding-types analysis))
+      (Type.empty-substitution)))
+
   (private session-surface-items)
   (hidden session-surface-items)
   (defn session-surface-items [items]
@@ -1600,6 +1615,73 @@ top-level form. Returns `Nothing` when no top-level form is a macro call.")
                 (Maybe.Just expanded)
                   (Result.Success (rendered-expansion &expanded))
                 (Maybe.Nothing) (Result.Success (Maybe.Nothing)))
+            (Result.Error error)
+              (Result.Error (expand-diagnostic &error (SourceInput.id input))))
+        (Result.Error diagnostic) (Result.Error diagnostic))))
+
+  (private compile-diagnostic)
+  (hidden compile-diagnostic)
+  (defn compile-diagnostic [error input]
+    (Diagnostic.init (String.copy (CompileError.phase error))
+                     (String.copy (CompileError.message error))
+                     (Maybe.Just
+                       (SourceSpan.init (String.copy (SourceInput.id input))
+                                        0
+                                        (String.length (SourceInput.source input))))))
+
+  (doc emit-cell "emits a deterministic executable C translation unit for a
+transient cell against the warm committed environment. Expansion, identity
+allocation, inference, and code generation occur on private copies and cannot
+mutate the session.")
+  (defn emit-cell [session input]
+    (let [overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)]
+      (match (Surface.parse-input-diagnosed input)
+        (Result.Success parsed)
+          (match (MacroExpand.expand-module-against (SourcedSurfaceModule.module &parsed)
+                                                    (Rc.value-ref (SessionOverlay.expansion overlay)))
+            (Result.Success expanded)
+              (let-do [sourced (SourcedSurfaceModule.init (SourceInput.copy input)
+                                                          expanded)
+                       allocator (IdAllocator.copy (SessionOverlay.node-allocator overlay))]
+                (match (Resolve.module-with-provenance-against &sourced
+                                                               &allocator
+                                                               (SessionOverlay.resolution overlay))
+                  (Result.Success resolved)
+                    (let [origin (the (Maybe SourceSpan)
+                                      (Maybe.Just
+                                        (SourceSpan.init (String.copy (SourceInput.id input))
+                                                         0
+                                                         (String.length (SourceInput.source input)))))]
+                      (match (CarpCompiler.derive-module-for-inference-provenanced &resolved
+                                                                                   &allocator
+                                                                                   &origin)
+                        (Result.Success derived)
+                          (match (Infer.module-against-diagnosed (ProvenancedCoreModule.core &derived)
+                                                                 (ProvenancedCoreModule.provenance &derived)
+                                                                 (SessionOverlay.inferred overlay))
+                            (Result.Success inferred)
+                              (let-do [core (append-core (CompilerSession.base-core session)
+                                                         (SessionOverlay.core overlay))
+                                       complete-core (append-core &core
+                                                                  (ProvenancedCoreModule.core &derived))
+                                       base-and-overlay-analysis (append-inferred-analysis (CompilerSession.base-inferred session)
+                                                                                           (SessionOverlay.inferred overlay))
+                                       warm-inferred (inferred-environment-with-analysis (SessionOverlay.inferred overlay)
+                                                                                         &base-and-overlay-analysis)
+                                       complete-inferred (append-inferred-analysis &warm-inferred
+                                                                                   &inferred)]
+                                (match (CarpCompiler.compile-inferred-module &complete-core
+                                                                             &complete-inferred)
+                                  (Result.Success c) (Result.Success c)
+                                  (Result.Error error)
+                                    (Result.Error (compile-diagnostic &error
+                                                                      input))))
+                            (Result.Error diagnostic) (Result.Error diagnostic))
+                        (Result.Error error)
+                          (Result.Error (compile-diagnostic &error input))))
+                  (Result.Error error)
+                    (Result.Error
+                      (Resolve.diagnostic &error (SourceInput.id input)))))
             (Result.Error error)
               (Result.Error (expand-diagnostic &error (SourceInput.id input))))
         (Result.Error diagnostic) (Result.Error diagnostic))))

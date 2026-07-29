@@ -2,13 +2,16 @@
 
 Warm, transport-independent compiler sessions for notebook and editor hosts.
 
-The initial API provides `Session.api-version`, `Session.create`,
+The API provides `Session.api-version`, `Session.create`,
 `Session.create-from-module`, `Session.reset`, and transactional
 `Session.infer-cell`. Runtime definitions, macros, nominal types, interfaces,
 and implementations can be committed and queried with `Session.upsert`,
-`Session.remove`, and `Session.definitions`. `Session.create`
-loads and checks Core once; subsequent cells and definition rebuilds reuse the
-warm Core expansion, resolution, and inference snapshots.
+`Session.remove`, and `Session.definitions`. Warm editor queries expose
+ownership plans, macro expansion, completion, and structured documentation.
+`Session.emit-cell` emits a deterministic executable C translation unit without
+mutating the session. `Session.create` loads and checks Core once; subsequent
+cells and definition rebuilds reuse the warm Core expansion, resolution, and
+inference snapshots.
 
 The immutable base expansion snapshot is shared with the current overlay via
 `Rc`; it is copied only when expansion actually commits a user definition.
@@ -35,8 +38,8 @@ memory footprint is about 119 MB (`/usr/bin/time -l`; max RSS about 234 MB).
 
 `test/memory.carp` runs one explicit compiler warm-up, records the stabilized
 allocation balance, then performs 20 cycles containing successful and failed
-upserts, successful and failed cell checks, derived types, interface dispatch,
-and reset. With `--log-memory`, every measured cycle returns exactly to that
-baseline; this guards against per-edit leaks while allowing one-time lazy
-compiler caches to remain resident.
+upserts, successful and failed cell checks, editor queries, C emission, derived
+types, interface dispatch, and reset. With `--log-memory`, every measured cycle
+returns exactly to that baseline; this guards against per-edit leaks while
+allowing one-time lazy compiler caches to remain resident.
 See [`docs/carp-session.md`](../docs/carp-session.md) for the complete API plan.
