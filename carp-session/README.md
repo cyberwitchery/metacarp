@@ -25,6 +25,8 @@ invalidate every later definition until the compiler records precise semantic
 use edges. A committed type exposes its generated constructors and lifecycle
 functions to later cells. Committed interface/implementation pairs are retained
 in a deduplicated overlay dispatch table for later specialization and codegen.
+Syntax returned by a macro, and errors raised while evaluating its body, are
+anchored to the caller's invocation span before a cell diagnostic is produced.
 
 On an Apple arm64 host, the real-Core benchmark in `test/benchmark.carp`
 currently creates a session in about 1.88 seconds and checks 100 43-byte cells
