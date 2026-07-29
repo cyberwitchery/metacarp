@@ -28,4 +28,11 @@ On an Apple arm64 host, the real-Core benchmark in `test/benchmark.carp`
 currently creates a session in about 1.88 seconds and checks 100 43-byte cells
 in about 3.80 seconds: 38.0 ms per cell, with zero failures. The measured peak
 memory footprint is about 119 MB (`/usr/bin/time -l`; max RSS about 234 MB).
+
+`test/memory.carp` runs one explicit compiler warm-up, records the stabilized
+allocation balance, then performs 20 cycles containing successful and failed
+upserts, successful and failed cell checks, derived types, interface dispatch,
+and reset. With `--log-memory`, every measured cycle returns exactly to that
+baseline; this guards against per-edit leaks while allowing one-time lazy
+compiler caches to remain resident.
 See [`docs/carp-session.md`](../docs/carp-session.md) for the complete API plan.
