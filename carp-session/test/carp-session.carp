@@ -51,11 +51,34 @@
           (Maybe.Nothing) ())))
     result))
 
+(defn candidate-kind-is? [candidate expected]
+  (match-ref (Candidate.kind candidate)
+    (SessionDefKind.Function) (String.= expected "function")
+    (SessionDefKind.Value) (String.= expected "value")
+    (SessionDefKind.External) (String.= expected "external")
+    (SessionDefKind.Interface) (String.= expected "interface")
+    (SessionDefKind.Other label) (String.= label expected)))
+
+(defn has-candidate? [candidates name kind]
+  (let-do [found false]
+    (for [i 0 (Array.length candidates)]
+      (let [candidate (Array.unsafe-nth candidates i)]
+        (when (and
+            (String.= (Candidate.name candidate) name)
+            (candidate-kind-is? candidate kind))
+          (set! found true))))
+    found))
+
 (defn make-session []
   (let [input (SourceInput.init (String.copy "base:test")
                                 (String.copy "(defdynamic n 0)
 (defmacro next [] (do (set! n (+ n 1)) n))
-(defn warm-id [x] x)"))]
+(defn warm-id [x] x)
+(register-type OwnedWidget)
+(register make-owned-widget (Fn [] OwnedWidget) \"make_owned_widget\")
+(defmodule OwnedWidget
+  (register delete (Fn [OwnedWidget] ()) \"owned_widget_delete\"))
+(implements delete OwnedWidget.delete)"))]
     (match (Surface.parse-input &input)
       (Result.Success base)
         (let [config (ExpandConfig.init [])]
@@ -129,22 +152,22 @@
                resolve-input (SourceInput.init (String.copy "cell:resolve-error")
                                                (String.copy "(missing-name 1)"))
                infer-input (SourceInput.init (String.copy "cell:infer-error")
-                                             (String.copy "(if 1 true false)"))]
+                                             (String.copy "(defn cell-bad [] (if 1 true false))"))]
         (match (Session.infer-cell &session &parse-input)
           (Result.Success _) (set! ok false)
           (Result.Error diagnostic)
             (unless (diagnostic-from? &diagnostic "parse" "cell:parse-error")
-              (set! ok false)))
+              (set! ok (diagnostic-false &diagnostic))))
         (match (Session.infer-cell &session &resolve-input)
           (Result.Success _) (set! ok false)
           (Result.Error diagnostic)
             (unless (diagnostic-from? &diagnostic "resolve" "cell:resolve-error")
-              (set! ok false)))
+              (set! ok (diagnostic-false &diagnostic))))
         (match (Session.infer-cell &session &infer-input)
           (Result.Success _) (set! ok false)
           (Result.Error diagnostic)
             (unless (diagnostic-from? &diagnostic "infer" "cell:infer-error")
-              (set! ok false)))
+              (set! ok (diagnostic-false &diagnostic))))
         ok)
     (Result.Error diagnostic) (diagnostic-false &diagnostic)))
 
@@ -184,6 +207,107 @@
                 (Maybe.Nothing) ()
                 (Maybe.Just _) (set! ok false))
             (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic))))
+        ok)
+    (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+
+(defn completion-and-docs-track-session-lifecycle? []
+  (match (make-session)
+    (Result.Success session)
+      (let-do [ok true
+               first (SourceInput.init (String.copy "definition:noted:v1")
+                                       (String.copy
+                                         "(do (doc noted \"Notebook value v1.\") (defn noted [x] (warm-id x)))"))
+               second (SourceInput.init (String.copy "definition:noted:v2")
+                                        (String.copy
+                                          "(do (doc noted \"Notebook value v2.\") (defn noted [x] (warm-id x)))"))]
+        (match (Session.upsert &session &first)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (let [candidates (Session.complete &session "not")]
+          (unless (has-candidate? &candidates "noted" "function")
+            (set! ok false)))
+        (match (Session.doc &session "noted")
+          (Maybe.Just info)
+            (unless (and
+                (String.= (DocInfo.documentation &info) "Notebook value v1.")
+                (String.=
+                  (SourceSpan.source-id (DocInfo.span &info))
+                  "definition:noted:v1"))
+              (set! ok false))
+          (Maybe.Nothing) (set! ok false))
+        (match (Session.upsert &session &second)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.doc &session "noted")
+          (Maybe.Just info)
+            (unless (and
+                (String.= (DocInfo.documentation &info) "Notebook value v2.")
+                (String.=
+                  (SourceSpan.source-id (DocInfo.span &info))
+                  "definition:noted:v2"))
+              (set! ok false))
+          (Maybe.Nothing) (set! ok false))
+        (let [all (Session.complete &session "")]
+          (unless (and
+              (has-candidate? &all "warm-id" "function")
+              (has-candidate? &all "next" "macro"))
+            (set! ok false)))
+        (match (Session.remove &session "noted")
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (when (has-candidate? &(Session.complete &session "noted")
+                              "noted"
+                              "function")
+          (set! ok false))
+        (match (Session.doc &session "noted")
+          (Maybe.Nothing) ()
+          (Maybe.Just _) (set! ok false))
+        ok)
+    (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+
+(defn ownership-query-tracks-replacement-and-spans? []
+  (match (make-session)
+    (Result.Success session)
+      (let-do [ok true
+               owned (SourceInput.init
+                 (String.copy "definition:ownership:owned")
+                 (String.copy
+                   "(defn owns-widget [] (let [widget (make-owned-widget)] ()))"))
+               empty (SourceInput.init
+                 (String.copy "definition:ownership:empty")
+                 (String.copy "(defn owns-widget [] ())"))]
+        (match (Session.upsert &session &owned)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.ownership &session "owns-widget")
+          (Result.Success report)
+            (if (Int.= 0 (Array.length (OwnershipReport.actions &report)))
+              (set! ok false)
+              (for [i 0 (Array.length (OwnershipReport.actions &report))]
+                (match-ref (SpannedOwnershipAction.span
+                    (Array.unsafe-nth (OwnershipReport.actions &report) i))
+                  (Maybe.Just span)
+                    (unless (String.= (SourceSpan.source-id span)
+                                      "definition:ownership:owned")
+                      (set! ok false))
+                  (Maybe.Nothing) (set! ok false))))
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.upsert &session &empty)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.ownership &session "owns-widget")
+          (Result.Success report)
+            (unless (Int.= 0 (Array.length (OwnershipReport.actions &report)))
+              (set! ok false))
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.remove &session "owns-widget")
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.ownership &session "owns-widget")
+          (Result.Success _) (set! ok false)
+          (Result.Error diagnostic)
+            (unless (String.= (Diagnostic.phase &diagnostic) "session")
+              (set! ok false)))
         ok)
     (Result.Error diagnostic) (diagnostic-false &diagnostic)))
 
@@ -453,6 +577,11 @@
                   "type"))
               (set! ok false))
           (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (let [candidates (Session.complete &session "CellBox")]
+          (unless (and
+              (has-candidate? &candidates "CellBox" "type")
+              (has-candidate? &candidates "CellBox.init" "constructor"))
+            (set! ok false)))
         (match (Session.upsert &session &consumer)
           (Result.Success _) ()
           (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
@@ -531,6 +660,15 @@
                          (Array.unsafe-nth (CompilerSession.overlay &session) 0)))))
             (session-dispatch-pair? &session "choose" "choose-left"))
           (set! ok false))
+        (let [candidates (Session.complete &session "choose")]
+          (unless (and
+              (has-candidate? &candidates "choose" "interface")
+              (and
+                (has-candidate? &candidates "choose-left" "function")
+                (has-candidate? &candidates
+                                "choose -> choose-left"
+                                "implementation")))
+            (set! ok false)))
         (let [cell (SourceInput.init (String.copy "cell:interface")
                                      (String.copy "(choose 1 2)"))]
           (match (Session.infer-cell &session &cell)
@@ -582,6 +720,12 @@
   (assert-true t
     (warm-expansion-queries-are-transactional?)
     "full and one-step expansion share warm macros without committing effects")
+  (assert-true t
+    (completion-and-docs-track-session-lifecycle?)
+    "completion and structured docs track replacement and removal")
+  (assert-true t
+    (ownership-query-tracks-replacement-and-spans?)
+    "ownership queries track replacement and return caller-relative spans")
   (assert-true t
     (committed-overlay-lifecycle-is-transactional?)
     "upsert, replacement, rollback, removal, and reset are transactional")
