@@ -69,6 +69,19 @@
           (set! found true))))
     found))
 
+(defn candidate-count [candidates name]
+  (let-do [count 0]
+    (for [i 0 (Array.length candidates)]
+      (when (String.= (Candidate.name (Array.unsafe-nth candidates i)) name)
+        (set! count (Int.inc count))))
+    count))
+
+(defn has-string? [values expected]
+  (let-do [found false]
+    (for [i 0 (Array.length values)]
+      (when (String.= (Array.unsafe-nth values i) expected) (set! found true)))
+    found))
+
 (defn make-session []
   (let [input (SourceInput.init (String.copy "base:test")
                                 (String.copy "(defdynamic n 0)
@@ -262,6 +275,46 @@
         (match (Session.doc &session "noted")
           (Maybe.Nothing) ()
           (Maybe.Just _) (set! ok false))
+        ok)
+    (Result.Error diagnostic) (diagnostic-false &diagnostic)))
+
+(defn completion-prefers-and-removes-session-shadow? []
+  (match (make-session)
+    (Result.Success session)
+      (let-do [ok true
+               shadow (SourceInput.init
+                 (String.copy "definition:warm-id:shadow")
+                 (String.copy "(defn warm-id [x] true)"))
+               cell (SourceInput.init (String.copy "cell:warm-id:shadow")
+                                      (String.copy "(warm-id 1)"))]
+        (match (Session.upsert &session &shadow)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (let [candidates (Session.complete &session "warm-id")]
+          (unless (Int.= 1 (candidate-count &candidates "warm-id"))
+            (set! ok false)))
+        (match (Session.infer-cell &session &cell)
+          (Result.Success report)
+            (unless (String.=
+                (SessionTypedEntity.type
+                  (Array.unsafe-nth (CellReport.forms &report) 0))
+                "Bool")
+              (set! ok false))
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.remove &session "warm-id")
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (let [candidates (Session.complete &session "warm-id")]
+          (unless (Int.= 1 (candidate-count &candidates "warm-id"))
+            (set! ok false)))
+        (match (Session.infer-cell &session &cell)
+          (Result.Success report)
+            (unless (String.=
+                (SessionTypedEntity.type
+                  (Array.unsafe-nth (CellReport.forms &report) 0))
+                "Int")
+              (set! ok false))
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
         ok)
     (Result.Error diagnostic) (diagnostic-false &diagnostic)))
 
@@ -627,10 +680,16 @@
                                                   (String.copy "(definterface choose (Fn [a a] a))"))
                function-source (SourceInput.init
                  (String.copy "definition:implementation-function")
-                 (String.copy "(defn choose-left [x y] x)"))
+                 (String.copy "(defn choose-left [x y] (the Int x))"))
                implementation-source (SourceInput.init
                  (String.copy "definition:implementation")
-                 (String.copy "(implements choose choose-left)"))]
+                 (String.copy "(implements choose choose-left)"))
+               bool-function-source (SourceInput.init
+                 (String.copy "definition:bool-implementation-function")
+                 (String.copy "(defn choose-bool [x y] (the Bool x))"))
+               bool-implementation-source (SourceInput.init
+                 (String.copy "definition:bool-implementation")
+                 (String.copy "(implements choose choose-bool)"))]
         (match (Session.upsert &session &interface-source)
           (Result.Success report)
             (unless (match-ref (SessionDefInfo.kind (UpsertReport.definition &report))
@@ -652,22 +711,36 @@
                   _ false))
               (set! ok false))
           (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.upsert &session &bool-function-source)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
+        (match (Session.upsert &session &bool-implementation-source)
+          (Result.Success _) ()
+          (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
         (unless (and
-            (Int.= (Int.inc initial-implementation-count)
+            (Int.= (Int.+ initial-implementation-count 2)
                    (Array.length
                      (Rc.value-ref
                        (SessionOverlay.implementations
                          (Array.unsafe-nth (CompilerSession.overlay &session) 0)))))
             (session-dispatch-pair? &session "choose" "choose-left"))
           (set! ok false))
+        (unless (session-dispatch-pair? &session "choose" "choose-bool")
+          (set! ok false))
         (let [candidates (Session.complete &session "choose")]
           (unless (and
               (has-candidate? &candidates "choose" "interface")
               (and
                 (has-candidate? &candidates "choose-left" "function")
-                (has-candidate? &candidates
-                                "choose -> choose-left"
-                                "implementation")))
+                (and
+                  (has-candidate? &candidates
+                                  "choose -> choose-left"
+                                  "implementation")
+                  (and
+                    (has-candidate? &candidates "choose-bool" "function")
+                    (has-candidate? &candidates
+                                    "choose -> choose-bool"
+                                    "implementation")))))
             (set! ok false)))
         (let [cell (SourceInput.init (String.copy "cell:interface")
                                      (String.copy "(choose 1 2)"))]
@@ -679,16 +752,30 @@
                   "Int")
                 (set! ok false))
             (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic))))
+        (let [cell (SourceInput.init (String.copy "cell:bool-interface")
+                                     (String.copy "(choose true false)"))]
+          (match (Session.infer-cell &session &cell)
+            (Result.Success report)
+              (unless (String.=
+                  (SessionTypedEntity.type
+                    (Array.unsafe-nth (CellReport.forms &report) 0))
+                  "Bool")
+                (set! ok false))
+            (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic))))
         (match (Session.remove &session "choose")
           (Result.Success report)
             (unless (and
-                (Int.= 2 (Array.length (RemoveReport.invalidated &report)))
-                (String.=
-                  (Array.unsafe-nth (RemoveReport.invalidated &report) 0)
-                  "choose-left")
-                (String.=
-                  (Array.unsafe-nth (RemoveReport.invalidated &report) 1)
-                  "choose -> choose-left"))
+                (Int.= 4 (Array.length (RemoveReport.invalidated &report)))
+                (and
+                  (has-string? (RemoveReport.invalidated &report) "choose-left")
+                  (and
+                    (has-string? (RemoveReport.invalidated &report)
+                                 "choose -> choose-left")
+                    (and
+                      (has-string? (RemoveReport.invalidated &report)
+                                   "choose-bool")
+                      (has-string? (RemoveReport.invalidated &report)
+                                   "choose -> choose-bool")))))
               (set! ok false))
           (Result.Error diagnostic) (set! ok (diagnostic-false &diagnostic)))
         (unless (Int.= 0 (Array.length &(Session.definitions &session)))
@@ -723,6 +810,9 @@
   (assert-true t
     (completion-and-docs-track-session-lifecycle?)
     "completion and structured docs track replacement and removal")
+  (assert-true t
+    (completion-prefers-and-removes-session-shadow?)
+    "completion deterministically prefers a session shadow over its base name")
   (assert-true t
     (ownership-query-tracks-replacement-and-spans?)
     "ownership queries track replacement and return caller-relative spans")
