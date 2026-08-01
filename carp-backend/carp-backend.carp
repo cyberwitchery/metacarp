@@ -1980,6 +1980,28 @@ concrete type key to deleter C symbol).")
 ;; the C symbol whose declaration is currently being rendered; diagnostic
 ;; context only (set per declaration, read by render guards).
 (def *render-context* (the (Array String) []))
+(def *array-data-cache-refs* (the (Array CoreRef) []))
+(def *array-data-cache-symbols* (the (Array String) []))
+
+(defn cached-array-data-symbol-for-ref [reference]
+  (let-do [result (the (Maybe String) (Maybe.Nothing))
+           n (Array.length &*array-data-cache-refs*)]
+    (for [i 0 n]
+      (when (CoreIR.same-ref?
+          (Array.unsafe-nth &*array-data-cache-refs* i)
+          reference)
+        (set! result
+              (Maybe.Just
+                (String.copy (Array.unsafe-nth &*array-data-cache-symbols* i))))))
+    result))
+
+(defn cached-array-data-symbol [expression]
+  (match-ref expression
+    (SpecializedExpr.Reference _ _ reference)
+      (cached-array-data-symbol-for-ref reference)
+    (SpecializedExpr.Annotation _ _ inner _)
+      (cached-array-data-symbol (Box.peek inner))
+    _ (the (Maybe String) (Maybe.Nothing))))
 
 (defmodule CBackend
   (private sanitize)
@@ -2045,6 +2067,16 @@ concrete type key to deleter C symbol).")
   (hidden append-local-declaration!)
   (private append-statement!)
   (hidden append-statement!)
+  (private append-cached-while!)
+  (hidden append-cached-while!)
+  (sig append-cached-while!
+       (Fn
+         [(Ref (Array CoreConstructorDeclaration))
+          (Ref StringBuf)
+          (Ref SpecializedExpr)
+          (Ref SpecializedExpr)
+          Int]
+         (Result Unit BackendError)))
   (sig append-statement!
        (Fn
          [(Ref (Array CoreConstructorDeclaration))
@@ -2712,9 +2744,33 @@ managed forms still require dedicated lowering.")
           ;; here (the closure may be bound to a local before being returned).
           (String.starts-with? symbol "_carp_closure_")
           (render-closure-construction-heap constructors symbol arguments)
-          ;; `Array.unsafe-nth`/`StaticArray.unsafe-nth` (ids 12/13) point into
-          ;; the array's data; their result type is `(Ref elem)`, so the element
-          ;; C type is that reference's inner type.
+          ;; A loop may materialize a stable typed view of a borrowed array's
+          ;; backing allocation. Index through that local when available; the
+          ;; ordinary direct lowering remains the fallback outside such a
+          ;; proven non-reallocating loop.
+          (and
+            (or (Int.= @(CoreRef.id reference) 12)
+                (Int.= @(CoreRef.id reference) 13))
+            (and (Int.= (Array.length arguments) 2)
+                 (match (cached-array-data-symbol
+                     (Box.peek (Array.unsafe-nth arguments 0)))
+                   (Maybe.Just _) true
+                   (Maybe.Nothing) false)))
+          (match (cached-array-data-symbol
+              (Box.peek (Array.unsafe-nth arguments 0)))
+            (Maybe.Just data-symbol)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          1)))
+                (Result.Success index)
+                  (Result.Success
+                    (String.concat &[@"(&" data-symbol @"[" index @"])"]))
+                (Result.Error error) (Result.Error error))
+            (Maybe.Nothing)
+              (Result.Error
+                (BackendError.init @"missing array data cache during rendering")))
+          ;; Outside a proven stable loop, load the current backing pointer for
+          ;; every access so a preceding mutation or reallocation is observed.
           (and
             (or (Int.= @(CoreRef.id reference) 12)
                 (Int.= @(CoreRef.id reference) 13))
@@ -3495,6 +3551,246 @@ binding so the value is the binding itself.")
               (Result.Error error) (Result.Error error))
           (Result.Error error) (Result.Error error))))))
 
+(defn array-reference-expression? [expression]
+  (match-ref &(deref-type &(specialized-type expression))
+    (MonoType.Named name _)
+      (or (String.= name "Array") (String.= name "StaticArray"))
+    _ false))
+
+(defn index-or-length-primitive? [reference]
+  (let [id @(CoreRef.id reference)]
+    (or (Int.= id 8)
+        (or (Int.= id 9)
+            (or (Int.= id 10)
+                (or (Int.= id 11) (or (Int.= id 12) (Int.= id 13))))))))
+
+(defn arguments-contain-array-reference? [arguments]
+  (let-do [found false]
+    (for [i 0 (Array.length arguments)]
+      (when (array-reference-expression?
+          (Box.peek (Array.unsafe-nth arguments i)))
+        (set! found true)))
+    found))
+
+(defn loop-array-cache-safe? [expression]
+  (match-ref expression
+    (SpecializedExpr.GlobalCall _ _ reference _ _ arguments)
+    (let-do [safe (or (index-or-length-primitive? reference)
+                      (not (arguments-contain-array-reference? arguments)))]
+      (for [i 0 (Array.length arguments)]
+        (unless (loop-array-cache-safe?
+            (Box.peek (Array.unsafe-nth arguments i)))
+          (set! safe false)))
+      safe)
+    ;; A closure may mutate an array captured in its environment even when no
+    ;; array is among its explicit arguments, so dynamic calls invalidate the
+    ;; proof conservatively.
+    (SpecializedExpr.Call _ _ _ _)
+    false
+    (SpecializedExpr.Do _ _ expressions)
+    (let-do [safe true]
+      (for [i 0 (Array.length expressions)]
+        (unless (loop-array-cache-safe?
+            (Box.peek (Array.unsafe-nth expressions i)))
+          (set! safe false)))
+      safe)
+    (SpecializedExpr.Let _ _ _ value body)
+    (and
+      (loop-array-cache-safe? (Box.peek value))
+      (loop-array-cache-safe? (Box.peek body)))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+    (and
+      (loop-array-cache-safe? (Box.peek condition))
+      (and
+        (loop-array-cache-safe? (Box.peek then-branch))
+        (loop-array-cache-safe? (Box.peek else-branch))))
+    (SpecializedExpr.While _ _ condition body)
+    (and
+      (loop-array-cache-safe? (Box.peek condition))
+      (loop-array-cache-safe? (Box.peek body)))
+    (SpecializedExpr.Match _ _ _ scrutinee branches)
+    (let-do [safe (loop-array-cache-safe? (Box.peek scrutinee))]
+      (for [i 0 (Array.length branches)]
+        (unless (loop-array-cache-safe?
+            (Box.peek
+              (SpecializedMatchBranch.body (Array.unsafe-nth branches i))))
+          (set! safe false)))
+      safe)
+    (SpecializedExpr.Set _ _ _ value)
+    (loop-array-cache-safe? (Box.peek value))
+    (SpecializedExpr.Annotation _ _ inner _)
+    (loop-array-cache-safe? (Box.peek inner))
+    (SpecializedExpr.ArrayLit _ _ elements)
+    (let-do [safe true]
+      (for [i 0 (Array.length elements)]
+        (unless (loop-array-cache-safe? (Box.peek (Array.unsafe-nth elements i)))
+          (set! safe false)))
+      safe)
+    (SpecializedExpr.StaticArrayLit _ _ elements)
+    (let-do [safe true]
+      (for [i 0 (Array.length elements)]
+        (unless (loop-array-cache-safe? (Box.peek (Array.unsafe-nth elements i)))
+          (set! safe false)))
+      safe)
+    _
+    true))
+
+(defn index-candidate-listed? [candidates reference]
+  (let-do [found false]
+    (for [i 0 (Array.length candidates)]
+      (when (CoreIR.same-ref? (Pair.a (Array.unsafe-nth candidates i)) reference)
+        (set! found true)))
+    found))
+
+(sig collect-loop-index-candidates!
+     (Fn [(Ref SpecializedExpr) (Ref (Array (Pair CoreRef (Box MonoType))))] ()))
+(defn collect-loop-index-candidates! [expression candidates]
+  (match-ref expression
+    (SpecializedExpr.GlobalCall _ result-type reference _ _ arguments)
+      (do
+        (when-do (and
+            (or (Int.= @(CoreRef.id reference) 12)
+                (Int.= @(CoreRef.id reference) 13))
+            (Int.> (Array.length arguments) 0))
+          (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+            (SpecializedExpr.Reference _ _ container-reference)
+              (unless-do (or @(CoreRef.global container-reference)
+                             (index-candidate-listed? candidates
+                                                      container-reference))
+                (match-ref (Box.peek result-type)
+                  (MonoType.Reference element _)
+                    (Array.push-back! candidates
+                                      (Pair.init (CoreRef.copy container-reference)
+                                                 (Box.init (MonoType.copy (Box.peek element)))))
+                  _ ()))
+            _ ()))
+        (for [i 0 (Array.length arguments)]
+          (collect-loop-index-candidates!
+            (Box.peek (Array.unsafe-nth arguments i))
+            candidates)))
+    (SpecializedExpr.Call _ _ callee arguments)
+      (do
+        (collect-loop-index-candidates! (Box.peek callee) candidates)
+        (for [i 0 (Array.length arguments)]
+          (collect-loop-index-candidates!
+            (Box.peek (Array.unsafe-nth arguments i))
+            candidates)))
+    (SpecializedExpr.Do _ _ expressions)
+      (for [i 0 (Array.length expressions)]
+        (collect-loop-index-candidates!
+          (Box.peek (Array.unsafe-nth expressions i))
+          candidates))
+    (SpecializedExpr.Let _ _ _ value body)
+      (do
+        (collect-loop-index-candidates! (Box.peek value) candidates)
+        (collect-loop-index-candidates! (Box.peek body) candidates))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+      (do
+        (collect-loop-index-candidates! (Box.peek condition) candidates)
+        (collect-loop-index-candidates! (Box.peek then-branch) candidates)
+        (collect-loop-index-candidates! (Box.peek else-branch) candidates))
+    (SpecializedExpr.While _ _ condition body)
+      (do
+        (collect-loop-index-candidates! (Box.peek condition) candidates)
+        (collect-loop-index-candidates! (Box.peek body) candidates))
+    (SpecializedExpr.Match _ _ _ scrutinee branches)
+      (do
+        (collect-loop-index-candidates! (Box.peek scrutinee) candidates)
+        (for [i 0 (Array.length branches)]
+          (collect-loop-index-candidates!
+            (Box.peek
+              (SpecializedMatchBranch.body (Array.unsafe-nth branches i)))
+            candidates)))
+    (SpecializedExpr.Set _ _ _ value)
+      (collect-loop-index-candidates! (Box.peek value) candidates)
+    (SpecializedExpr.Annotation _ _ inner _)
+      (collect-loop-index-candidates! (Box.peek inner) candidates)
+    (SpecializedExpr.ArrayLit _ _ elements)
+      (for [i 0 (Array.length elements)]
+        (collect-loop-index-candidates! (Box.peek (Array.unsafe-nth elements i))
+                                        candidates))
+    (SpecializedExpr.StaticArrayLit _ _ elements)
+      (for [i 0 (Array.length elements)]
+        (collect-loop-index-candidates! (Box.peek (Array.unsafe-nth elements i))
+                                        candidates))
+    _ ()))
+
+(defn append-cached-while! [constructors buffer condition body depth]
+  (let-do [old-refs (Array.copy &*array-data-cache-refs*)
+           old-symbols (Array.copy &*array-data-cache-symbols*)
+           candidates (the (Array (Pair CoreRef (Box MonoType))) [])
+           free-references (the (Array (Pair CoreRef (Box MonoType))) [])
+           no-bindings (the (Array Int) [])
+           setup-result (the (Result Unit BackendError) (Result.Success ()))]
+    ;; A cached view is valid only while no operation in the loop can receive
+    ;; the array and mutate or reallocate it. Unknown calls are deliberately
+    ;; unsafe; length and indexing primitives are the allowed array operations.
+    (when-do (and (loop-array-cache-safe? condition)
+                  (loop-array-cache-safe? body))
+      ;; Only references free in the loop are in scope at the hoist site.
+      ;; This excludes arrays introduced by a let or match inside the loop.
+      (collect-free condition &no-bindings &free-references)
+      (collect-free body &no-bindings &free-references)
+      (collect-loop-index-candidates! condition &candidates)
+      (collect-loop-index-candidates! body &candidates))
+    (for [i 0 (Array.length &candidates)]
+      (match-ref &setup-result
+        (Result.Success _)
+          (let [candidate (Array.unsafe-nth &candidates i)
+                reference (Pair.a candidate)]
+            (when (capture-listed? &free-references @(CoreRef.id reference))
+              (match (cached-array-data-symbol-for-ref reference)
+                (Maybe.Just _) ()
+                (Maybe.Nothing)
+                  (match (render-type (Box.peek (Pair.b candidate)))
+                    (Result.Success element)
+                      (let-do [symbol (String.concat
+                                 &[@"L0_array_data_"
+                                   (CAbi.component &(Int.str @(CoreRef.id reference)))])]
+                        (append-indent! buffer depth)
+                        (StringBuf.append-str buffer &element)
+                        (StringBuf.append-str buffer "* ")
+                        (StringBuf.append-str buffer &symbol)
+                        (StringBuf.append-str buffer " = (")
+                        (StringBuf.append-str buffer &element)
+                        (StringBuf.append-str buffer "*)(*")
+                        (StringBuf.append-str buffer &(local-symbol reference))
+                        (StringBuf.append-str buffer ").data;
+")
+                        (Array.push-back! &*array-data-cache-refs*
+                                          (CoreRef.copy reference))
+                        (Array.push-back! &*array-data-cache-symbols* symbol))
+                    (Result.Error error)
+                      (set! setup-result (Result.Error error))))))
+        (Result.Error _) ()))
+    (let-do [result (match setup-result
+               (Result.Success _)
+                 (match (render-value-expression constructors condition)
+                   (Result.Success rendered-condition)
+                     (do
+                       (append-indent! buffer depth)
+                       (StringBuf.append-str buffer "while (")
+                       (StringBuf.append-str buffer &rendered-condition)
+                       (StringBuf.append-str buffer ") {
+")
+                       (match (the (Result Unit BackendError)
+                                   (append-statement! constructors
+                                                      buffer
+                                                      body
+                                                      (Int.inc depth)))
+                         (Result.Success _)
+                           (do
+                             (append-indent! buffer depth)
+                             (StringBuf.append-str buffer "}
+")
+                             (Result.Success ()))
+                         (Result.Error error) (Result.Error error)))
+                   (Result.Error error) (Result.Error error))
+               (Result.Error error) (Result.Error error))]
+      (set! *array-data-cache-refs* old-refs)
+      (set! *array-data-cache-symbols* old-symbols)
+      result)))
+
 (defn append-statement! [constructors buffer expression depth]
   (match-ref expression
     (SpecializedExpr.Do _ _ expressions)
@@ -3537,26 +3833,11 @@ binding so the value is the binding itself.")
             (Result.Success ()))
         (Result.Error error) (Result.Error error))
     (SpecializedExpr.While _ _ condition body)
-      (match (render-value-expression constructors (Box.peek condition))
-        (Result.Success rendered-condition)
-          (do
-            (append-indent! buffer depth)
-            (StringBuf.append-str buffer "while (")
-            (StringBuf.append-str buffer &rendered-condition)
-            (StringBuf.append-str buffer ") {
-")
-            (match (append-statement! constructors
-                                      buffer
-                                      (Box.peek body)
-                                      (Int.inc depth))
-              (Result.Success _)
-                (do
-                  (append-indent! buffer depth)
-                  (StringBuf.append-str buffer "}
-")
-                  (Result.Success ()))
-              (Result.Error error) (Result.Error error)))
-        (Result.Error error) (Result.Error error))
+      (append-cached-while! constructors
+                            buffer
+                            (Box.peek condition)
+                            (Box.peek body)
+                            depth)
     (SpecializedExpr.Break _ _)
       (do (append-indent! buffer depth) (StringBuf.append-str buffer "break;
 ") (Result.Success ()))
