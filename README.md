@@ -15,8 +15,8 @@ in Carp itself.
 ## Build
 
 Requires the reference [Carp](https://github.com/carp-lang/Carp) compiler and a
-C compiler (`clang`). Building bootstraps the ~29k lines of compiler source
-through reference Carp, which takes about ninety seconds:
+C compiler (`clang`). Building bootstraps the roughly 42,000 lines of compiler
+source through reference Carp:
 
 ```sh
 carp -b --optimize main.carp
@@ -83,13 +83,31 @@ clang -O3 -D NDEBUG -o self-cc self.c -I "$CARP_DIR/core"      # link gen 2
 cmp self.c self2.c                                              # fixed point
 ```
 
-On an M-class laptop, the reference-built generation compiles the compiler in
-roughly 69 seconds and gen 2 in roughly 70 seconds when both are linked with
-the reference compiler's `-O3 -D NDEBUG` optimization flags. Gen 2 is currently
-within about 2 percent on time and has essentially the same peak memory
-footprint as gen 1 (about 284--285 MB in a full self-compile).
+The canonical generation benchmark compares reference Carp, gen 1, and gen 2
+on the same workload (generating C for `main.carp`):
 
-Two harnesses keep the self-host honest:
+```sh
+CARP_BENCH_RUNS=3 ./bench/compiler-generations.sh
+```
+
+It reports wall time, user time, and maximum resident set size, writes the raw
+measurements as TSV, and checks that the C emitted by gen 1 and gen 2 reaches a
+fixed point. Linking each next-generation compiler is deliberately excluded
+from the timed region.
+
+`bench/nbody-codegen.sh` checks exact output parity with reference Carp and
+requires the generated hot loop to materialize its stable array data pointer.
+It also reports reference/generated executable runtime without imposing a
+noise-sensitive CI timing threshold.
+
+The assurance harness keeps the self-host honest:
+
+- `scripts/run-assurance.sh phase` runs every phase/session suite, lint, and
+  formatting. Set `CARP_SKIP_STYLE=1` when the two style tools are unavailable.
+- `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
+  checks the self-hosted fixed point, and compares expansion behavior.
+- `scripts/run-assurance.sh all` runs both groups and is the default. CI calls
+  the same phase and self groups rather than maintaining its own command list.
 
 - `scripts/run-carp-suite-self.sh` runs the reference repository's own test
   suite (examples, produces-output diffs, `test/*.carp`, error-rejection
@@ -151,13 +169,14 @@ The reusable entry point is `CarpCompiler.compile-source`, or
 `CarpCompiler.compile-sources` when the caller already holds an in-memory source
 registry.
 
-## Library roadmap
+## Session library
 
-The proposed [`carp-session`](docs/carp-session.md) API keeps an inferred core
-resident for notebook and editor clients, then provides transactional
-definition updates, cell-relative typed reports, ownership queries, completion,
-and incremental code generation. The design deliberately leaves transport and
-value hosting to clients such as Lepiter and GT.
+[`carp-session`](carp-session/README.md) keeps an inferred core resident for
+notebook and editor clients, then provides transactional definition updates,
+cell-relative typed reports, ownership queries, completion, and incremental
+code generation. The design deliberately leaves transport and value hosting to
+clients such as Lepiter and GT. [`docs/carp-session.md`](docs/carp-session.md)
+records the original design and implementation history.
 
 ## Limitations
 

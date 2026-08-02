@@ -1,7 +1,9 @@
 # carp-session
 
-Status: design proposal  
-API version: 1 (proposed)  
+Status: API version 1 implemented; this document retains the original design rationale
+
+API version: 1
+
 Primary client: incremental notebook environments such as Lepiter and GT
 
 ## Purpose
@@ -39,9 +41,9 @@ portable guarantee.
 - Making one `Session` concurrently mutable from multiple threads.
 - Replacing the CLI.
 
-## Existing compiler boundary
+## Original compiler boundary
 
-The current compiler already has useful tooling entry points:
+Before `carp-session`, the compiler already had useful tooling entry points:
 
 - `CarpCompiler.infer-module-with` returns `AnnotatedModule`.
 - `CarpCompiler.plan-module-checked` returns `PlannedModule`.
@@ -49,7 +51,7 @@ The current compiler already has useful tooling entry points:
   and the final substitution.
 - surface nodes carry `SurfaceSpan` values.
 
-They are not yet an incremental API:
+Those entry points alone were not an incremental API:
 
 - every call expands, resolves, derives, and infers a complete module;
 - `CoreExpr` stores an integer node ID but no source provenance;
@@ -60,13 +62,13 @@ They are not yet an incremental API:
 - the CLI's annotation and ownership payloads reconstruct names and omit
   source ranges.
 
-`carp-session` should reuse the compiler packages rather than wrapping the CLI
-or concatenating source text.
+The implemented `carp-session` reuses the compiler packages rather than
+wrapping the CLI or concatenating source text.
 
 ## Public data model
 
-Names below describe the stable semantic API. Exact Carp field spelling may
-change while API version 1 is being implemented.
+Names below describe the stable semantic API. See the library README and source
+for the exact exported Carp field spelling.
 
 ```clojure
 (deftype SourceInput [id String source String])
