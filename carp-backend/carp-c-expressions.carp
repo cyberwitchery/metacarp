@@ -1,0 +1,1961 @@
+;; Expression, control-flow, closure-construction, and pattern rendering.
+;; Loaded by carp-c-backend.carp after the shared CBackend API is declared.
+
+(defn unmanaged-type? [constructors type]
+  (if (CAbi.unmanaged-scalar? type)
+    true
+    (match-ref type
+      (MonoType.Named name _)
+        (let-do [found false
+                 supported true
+                 n (Array.length constructors)]
+          (for [i 0 n]
+            (let [constructor (Array.unsafe-nth constructors i)
+                  empty-bindings (the (Array TemplateTypeBinding) [])]
+              (match-ref (Box.peek
+                  (CoreConstructorDeclaration.result constructor))
+                (CoreType.Named candidate _)
+                  (when (= candidate name)
+                    (match (collect-template-bindings
+                        (Box.peek
+                          (CoreConstructorDeclaration.result constructor))
+                        type
+                        &empty-bindings)
+                      (Result.Success bindings)
+                        (do
+                          (set! found true)
+                          (let [fields (CoreConstructorDeclaration.arguments constructor)
+                                field-count (Array.length fields)]
+                            (for [j 0 field-count]
+                              (match (concretize-core-type &bindings
+                                                           (Box.peek (Array.unsafe-nth fields
+                                                                                       j)))
+                                (Result.Success field-type)
+                                  (unless-do (unmanaged-type? constructors
+                                                              &field-type)
+                                    (set! supported false))
+                                (Result.Error _) (set! supported false)))))
+                      (Result.Error _) ()))
+                _ ())))
+          (and found supported))
+      _ false)))
+
+;; unit-typed arguments are elided from the call, matching the elided unit
+;; parameters (`Unit__EQ_()`); trivial unit expressions vanish, side-effecting
+;; ones become prelude statements the caller runs before the call. The result
+;; pair is (prelude statements, argument list).
+(defn render-call-arguments [constructors arguments]
+  (let-do [result (the
+             (Result (Pair String String) BackendError)
+             (Result.Success (Pair.init @"" @"")))
+           emitted 0
+           n (Array.length arguments)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success rendered-pair)
+          (let [argument-expression (Box.peek (Array.unsafe-nth arguments i))]
+            (if (unit-type? &(specialized-type argument-expression))
+              (match-ref argument-expression
+                (SpecializedExpr.UnitLit _ _) ()
+                (SpecializedExpr.Reference _ _ _) ()
+                _
+                  (match (render-value-expression constructors
+                                                  argument-expression)
+                    (Result.Success statement)
+                      (set! result
+                            (Result.Success
+                              (Pair.init
+                                (String.concat
+                                  &[(String.copy (Pair.a rendered-pair))
+                                    statement
+                                    @"; "])
+                                (String.copy (Pair.b rendered-pair)))))
+                    (Result.Error error) (set! result (Result.Error error))))
+              (match (render-value-expression constructors argument-expression)
+                (Result.Success argument)
+                  (do
+                    (set! result
+                          (Result.Success
+                            (Pair.init (String.copy (Pair.a rendered-pair))
+                                       (String.concat
+                                         &[(String.copy (Pair.b rendered-pair))
+                                           (if (Int.> emitted 0) @", " @"")
+                                           argument]))))
+                    (set! emitted (Int.inc emitted)))
+                (Result.Error error) (set! result (Result.Error error)))))
+        (Result.Error _) ()))
+    result))
+
+(private managed-renderable?)
+(hidden managed-renderable?)
+(doc managed-renderable? "reports whether a managed-typed expression is safe to
+render directly as a C value. A local reference renders as its C variable (an
+ownership move, sound because the ownership phase has verified the use is
+linear); a global call renders as the call that produces the owned value. Other
+managed forms still require dedicated lowering.")
+(defn escape-c-string [value]
+  (let-do [buffer (StringBuf.create)
+           n (String.length value)]
+    (for [i 0 n]
+      (let [byte (String.char-at value i)]
+        (cond
+          (= byte (Char.from-int 92)) (StringBuf.append-str &buffer "\\\\")
+          (= byte (Char.from-int 34)) (StringBuf.append-str &buffer "\\\"")
+          (= byte (Char.from-int 10)) (StringBuf.append-str &buffer "\\n")
+          (= byte (Char.from-int 9)) (StringBuf.append-str &buffer "\\t")
+          (= byte (Char.from-int 13)) (StringBuf.append-str &buffer "\\r")
+          (StringBuf.append-char &buffer byte))))
+    (StringBuf.to-string &buffer)))
+
+(defn managed-renderable? [expression]
+  (match-ref expression
+    (SpecializedExpr.Reference _ _ reference)
+    (not @(CoreRef.global reference))
+    (SpecializedExpr.GlobalCall _ _ _ _ _ _)
+    true
+    (SpecializedExpr.StringLit _ _ _)
+    true
+    (SpecializedExpr.PatternLit _ _ _)
+    true
+    (SpecializedExpr.GlobalValue _ _ _ _ _ _)
+    true
+    (SpecializedExpr.Call _ _ _ _)
+    true
+    (SpecializedExpr.StaticArrayLit _ _ _)
+    true
+    ;; statement-shaped forms lower to a GNU statement expression via
+    ;; `render-statement-value`, which drives the ownership-aware `append-result!`
+    ;; and so is sound for managed results too.
+    (SpecializedExpr.Do _ _ _)
+    true
+    (SpecializedExpr.Let _ _ _ _ _)
+    true
+    (SpecializedExpr.While _ _ _ _)
+    true
+    (SpecializedExpr.Match _ _ _ _ _)
+    true
+    (SpecializedExpr.If _ _ _ _ _)
+    true
+    (SpecializedExpr.Annotation _ _ inner _)
+    (managed-renderable? (Box.peek inner))
+    _
+    false))
+
+;; the full-precision formatters print a bare mantissa (e.g. "2" or "3.14e5");
+;; ensure a decimal point so clang reads it as floating point, and add the `f`
+;; suffix for `float` literals.
+(defn has-dot? [s]
+  (let-do [found false]
+    (for [i 0 (String.length s)]
+      (let [c (String.char-at s i)]
+        (when (or (= c \.) (or (= c \e) (= c \E))) (set! found true))))
+    found))
+
+(defn c-float-literal [s]
+  (if (has-dot? s)
+    (String.concat &[(String.copy s) @"f"])
+    (String.concat &[(String.copy s) @".0f"])))
+
+(defn c-double-literal [s]
+  (if (has-dot? s) (String.copy s) (String.concat &[(String.copy s) @".0"])))
+
+(defn literal-int [expression]
+  (match-ref expression
+    (SpecializedExpr.IntLit _ _ value) @value
+    (SpecializedExpr.Annotation _ _ inner _) (literal-int (Box.peek inner))
+    _ -1))
+
+(defn render-value-expression [constructors expression]
+  (let [type (specialized-type expression)]
+    (if (and
+        (not (unmanaged-type? constructors &type))
+        (not (managed-renderable? expression)))
+      (Result.Error
+        (BackendError.init
+          (String.concat
+            &[@"expression requires ownership or lifetime lowering: "
+              (expression-form-name expression)
+              @" of type "
+              (Type.name &type)
+              @" (expr "
+              (Int.str (Specialize.expression-id expression))
+              @" in "
+              (if (Int.> (Array.length &*render-context*) 0)
+                (String.copy (Array.unsafe-nth &*render-context* 0))
+                @"<unknown>")
+              @")"])))
+      (match-ref expression
+        (SpecializedExpr.IntLit _ _ value)
+        (Result.Success (Int.str @value))
+        (SpecializedExpr.ByteLit _ _ value)
+        (Result.Success (Int.str (Byte.to-int @value)))
+        (SpecializedExpr.LongLit _ _ value)
+        (Result.Success (String.append &(Long.str @value) "LL"))
+        (SpecializedExpr.FloatLit _ _ value)
+        (Result.Success (c-float-literal &(full-float-string @value)))
+        (SpecializedExpr.DoubleLit _ _ value)
+        (Result.Success (c-double-literal &(full-double-string @value)))
+        (SpecializedExpr.CharLit _ _ value)
+        (Result.Success (Int.str (Char.to-int @value)))
+        (SpecializedExpr.BoolLit _ _ value)
+        (Result.Success (if @value (String.copy "true") (String.copy "false")))
+        ;; a string literal has type `(Ref String)`; `String` is `char*`, so the
+        ;; value is a `String*` to a static `char*` holding the literal (the
+        ;; reference emits `static String v = ...; &v`). A statement expression
+        ;; with a static local gives the same static storage inline, so the
+        ;; borrow stays valid even when it escapes (e.g. a returned constant).
+        (SpecializedExpr.StringLit _ _ value)
+        (Result.Success
+          (String.concat
+            &[@"({ static String _carp_strlit = \""
+              (escape-c-string value)
+              @"\"; &_carp_strlit; })"]))
+        ;; a pattern literal works exactly like a string literal: `Pattern` is
+        ;; also `char*`, so the value is a borrowed pointer to static storage.
+        (SpecializedExpr.PatternLit _ _ value)
+        (Result.Success
+          (String.concat
+            &[@"({ static Pattern _carp_patlit = \""
+              (escape-c-string value)
+              @"\"; &_carp_patlit; })"]))
+        (SpecializedExpr.StaticArrayLit _ array-type elements)
+        (render-static-array-literal constructors (Box.peek array-type) elements)
+        (SpecializedExpr.UnitLit _ _)
+        (Result.Success (String.copy "((void)0)"))
+        (SpecializedExpr.Reference _ reference-type reference)
+        (cond
+          ;; unit-typed bindings have no C storage (their parameters are
+          ;; elided); reading one is the unit value.
+          (unit-type? (Box.peek reference-type))
+          (Result.Success (String.copy "((void)0)"))
+          @(CoreRef.global reference)
+          ;; a global read reconstructs the definition's C symbol the same way
+          ;; specialization mangles it (name + concrete signature).
+          (Result.Success
+            (sanitize
+              &(CAbi.mangle (CoreRef.name reference) (Box.peek reference-type))))
+          (Result.Success (local-symbol reference)))
+        (SpecializedExpr.GlobalValue _ value-type value-reference _ symbol value)
+        (cond
+          ;; the `NULL` builtin (id 7) is C's own null literal, not a linkable
+          ;; global; every `(Ptr a)` instance renders to the same token.
+          (Int.= @(CoreRef.id value-reference) 7)
+          (Result.Success (String.copy "NULL"))
+          ;; a function-typed `def` global is a C `Lambda` variable already;
+          ;; only a lifted function symbol needs wrapping in a closure struct.
+          (and (not @value)
+               (match-ref (Box.peek value-type)
+                 (MonoType.Function _ _) true
+                 _ false))
+          (Result.Success
+            (String.concat
+              &[@"((Lambda){ .callback = (void*)"
+                (sanitize symbol)
+                @", .env = NULL, .delete = NULL, .copy = NULL })"]))
+          (Result.Success (sanitize symbol)))
+        (SpecializedExpr.GlobalCall _ result-type reference _ symbol arguments)
+        (cond
+          ;; a capturing lambda's closure-construction site: build a `Lambda`
+          ;; struct whose environment holds the captured values. The environment
+          ;; is always heap-allocated, like the reference (Emit.hs CARP_MALLOCs
+          ;; whenever a lambda captures) — a stack env dangles as soon as the
+          ;; Lambda outlives the constructing frame, and escape is not visible
+          ;; here (the closure may be bound to a local before being returned).
+          (String.starts-with? symbol "_carp_closure_")
+          (render-closure-construction-heap constructors symbol arguments)
+          ;; A loop may materialize a stable typed view of a borrowed array's
+          ;; backing allocation. Index through that local when available; the
+          ;; ordinary direct lowering remains the fallback outside such a
+          ;; proven non-reallocating loop.
+          (and
+            (or (Int.= @(CoreRef.id reference) 12)
+                (Int.= @(CoreRef.id reference) 13))
+            (and (Int.= (Array.length arguments) 2)
+                 (match (cached-array-data-symbol
+                     (Box.peek (Array.unsafe-nth arguments 0)))
+                   (Maybe.Just _) true
+                   (Maybe.Nothing) false)))
+          (match (cached-array-data-symbol
+              (Box.peek (Array.unsafe-nth arguments 0)))
+            (Maybe.Just data-symbol)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          1)))
+                (Result.Success index)
+                  (Result.Success
+                    (String.concat &[@"(&" data-symbol @"[" index @"])"]))
+                (Result.Error error) (Result.Error error))
+            (Maybe.Nothing)
+              (Result.Error
+                (BackendError.init @"missing array data cache during rendering")))
+          ;; Outside a proven stable loop, load the current backing pointer for
+          ;; every access so a preceding mutation or reallocation is observed.
+          (and
+            (or (Int.= @(CoreRef.id reference) 12)
+                (Int.= @(CoreRef.id reference) 13))
+            (Int.= (Array.length arguments) 2))
+          (match (render-type &(deref-type (Box.peek result-type)))
+            (Result.Success element)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          0)))
+                (Result.Success container)
+                  (match (render-value-expression constructors
+                                                  (Box.peek (Array.unsafe-nth arguments
+                                                                              1)))
+                    (Result.Success index)
+                      (Result.Success
+                        (String.concat
+                          &[@"(&(("
+                            element
+                            @"*)(*"
+                            container
+                            @").data)["
+                            index
+                            @"])"]))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+          ;; `unsafe-raw` (id 65) exposes a borrowed heap array's backing allocation as
+          ;; a raw pointer. It borrows the array storage; no ownership transfer
+          ;; or cleanup is attached to the returned `Ptr`.
+          (and (Int.= @(CoreRef.id reference) 65)
+               (Int.= (Array.length arguments) 1))
+          (match (render-type (Box.peek result-type))
+            (Result.Success pointer-type)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          0)))
+                (Result.Success container)
+                  (Result.Success
+                    (String.concat
+                      &[@"((" pointer-type @")(*" container @").data)"]))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+          ;; `Array.raw` (id 70) exposes an owned heap array value's backing
+          ;; allocation as a raw pointer.
+          (and (Int.= @(CoreRef.id reference) 70)
+               (Int.= (Array.length arguments) 1))
+          (match (render-type (Box.peek result-type))
+            (Result.Success pointer-type)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          0)))
+                (Result.Success container)
+                  (Result.Success
+                    (String.concat
+                      &[@"((" pointer-type @")(" container @").data)"]))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+          ;; Build-configuration commands are compile-time side effects in the
+          ;; reference compiler. The self compiler's C emission ignores them.
+          (and
+            (or (Int.= @(CoreRef.id reference) 73)
+                (or (Int.= @(CoreRef.id reference) 74)
+                    (Int.= @(CoreRef.id reference) 75)))
+            (Int.= (Array.length arguments) 1))
+          (Result.Success (String.copy "((void)0)"))
+          ;; the array-free sentinel frees the heap `data` of an `(Array a)`;
+          ;; Array is a builtin with no runtime deleter function.
+          (and (String.= symbol "__carp_array_free")
+               (Int.= (Array.length arguments) 1))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success operand)
+              (Result.Success
+                (String.concat
+                  &[@"if (("
+                    (String.copy &operand)
+                    @").data) CARP_FREE(("
+                    operand
+                    @").data)"]))
+            (Result.Error error) (Result.Error error))
+          ;; the `ref` (id 5) and `deref` (id 6) intrinsics are inline C address-of
+          ;; and dereference operators, not calls to runtime functions.
+          (and (Int.= @(CoreRef.id reference) 5)
+               (Int.= (Array.length arguments) 1))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success operand)
+              (Result.Success (String.concat &[@"(&" operand @")"]))
+            (Result.Error error) (Result.Error error))
+          (and (Int.= @(CoreRef.id reference) 6)
+               (Int.= (Array.length arguments) 1))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success operand)
+              (Result.Success (String.concat &[@"(*" operand @")"]))
+            (Result.Error error) (Result.Error error))
+          ;; `Array.length`/`StaticArray.length` (ids 9/10) read the `.len`
+          ;; field behind the reference they are passed; no runtime function
+          ;; exists.
+          (and
+            (or (Int.= @(CoreRef.id reference) 9)
+                (Int.= @(CoreRef.id reference) 10))
+            (Int.= (Array.length arguments) 1))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success operand)
+              (Result.Success (String.concat &[@"(*" operand @").len"]))
+            (Result.Error error) (Result.Error error))
+          ;; the generic `length` (id 8) lowers by argument type: char*-backed
+          ;; values (String, Pattern) via strlen, collections via `.len`.
+          (and (Int.= @(CoreRef.id reference) 8)
+               (Int.= (Array.length arguments) 1))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success operand)
+              (match-ref &(deref-type
+                  &(specialized-type (Box.peek (Array.unsafe-nth arguments 0))))
+                (MonoType.String)
+                  (Result.Success
+                    (String.concat &[@"((int)strlen(*" operand @"))"]))
+                (MonoType.Named length-type-name _)
+                  (if (String.= length-type-name "Pattern")
+                    (Result.Success
+                      (String.concat &[@"((int)strlen(*" operand @"))"]))
+                    (Result.Success (String.concat &[@"(*" operand @").len"])))
+                _ (Result.Success (String.concat &[@"(*" operand @").len"])))
+            (Result.Error error) (Result.Error error))
+          ;; `get-tag` (id 48) reads the `.tag` field of a sum type. A
+          ;; single-constructor nominal has no stored tag; its logical tag is
+          ;; the constant zero.
+          (and (Int.= @(CoreRef.id reference) 48)
+               (Int.= (Array.length arguments) 1))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success operand)
+              (match-ref &(deref-type
+                  &(specialized-type (Box.peek (Array.unsafe-nth arguments 0))))
+                (MonoType.Named name _)
+                  (if (single-constructor-name? constructors name)
+                    (Result.Success (String.copy "0"))
+                    (Result.Success (String.concat &[@"(*" operand @").tag"])))
+                _ (Result.Success (String.concat &[@"(*" operand @").tag"])))
+            (Result.Error error) (Result.Error error))
+          ;; `field-set!` (id 49) writes a struct field in place behind a ref:
+          ;; args are [self, IntLit tag, IntLit member-index, value].
+          (and (Int.= @(CoreRef.id reference) 49)
+               (Int.= (Array.length arguments) 4))
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      0)))
+            (Result.Success self-c)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          3)))
+                (Result.Success value-c)
+                  (Result.Success
+                    (String.concat
+                      &[@"((*"
+                        self-c
+                        @").data.variant_"
+                        (Int.str
+                          (literal-int (Box.peek (Array.unsafe-nth arguments 1))))
+                        @".member_"
+                        (Int.str
+                          (literal-int (Box.peek (Array.unsafe-nth arguments 2))))
+                        @" = "
+                        value-c
+                        @")"]))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+          ;; `allocate`/`Array.allocate` (ids 14/15) build an uninitialized heap
+          ;; array of the requested length; the element type comes from the
+          ;; `(Array a)` result type.
+          (and
+            (or (Int.= @(CoreRef.id reference) 14)
+                (Int.= @(CoreRef.id reference) 15))
+            (Int.= (Array.length arguments) 1))
+          (match-ref (Box.peek result-type)
+            (MonoType.Named _ type-arguments)
+              (match (render-type (Box.peek (Array.unsafe-nth type-arguments 0)))
+                (Result.Success element)
+                  (match (render-value-expression constructors
+                                                  (Box.peek (Array.unsafe-nth arguments
+                                                                              0)))
+                    (Result.Success count)
+                      (Result.Success
+                        (String.concat
+                          &[@"((Array){ .len = "
+                            (String.copy &count)
+                            @", .capacity = "
+                            (String.copy &count)
+                            @", .data = (("
+                            (String.copy &count)
+                            @") == 0 ? NULL : CARP_MALLOC(sizeof("
+                            element
+                            @") * ("
+                            (String.copy &count)
+                            @"))) })"]))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            _
+              (Result.Error
+                (BackendError.init @"allocate result is not an array type")))
+          ;; `aset-uninitialized!`/array and static-array indexed setters write a
+          ;; value into a slot in place; the element type is the value's type.
+          (and
+            (or (Int.= @(CoreRef.id reference) 16)
+                (or (Int.= @(CoreRef.id reference) 17)
+                    (or (Int.= @(CoreRef.id reference) 18)
+                        (Int.= @(CoreRef.id reference) 21))))
+            (Int.= (Array.length arguments) 3))
+          (match (render-type
+              &(specialized-type (Box.peek (Array.unsafe-nth arguments 2))))
+            (Result.Success element)
+              (match (render-value-expression constructors
+                                              (Box.peek (Array.unsafe-nth arguments
+                                                                          0)))
+                (Result.Success container)
+                  (match (render-value-expression constructors
+                                                  (Box.peek (Array.unsafe-nth arguments
+                                                                              1)))
+                    (Result.Success index)
+                      (match (render-value-expression constructors
+                                                      (Box.peek (Array.unsafe-nth arguments
+                                                                                  2)))
+                        (Result.Success value)
+                          (Result.Success
+                            (String.concat
+                              &[@"(("
+                                element
+                                @"*)(*"
+                                container
+                                @").data)["
+                                index
+                                @"] = "
+                                value]))
+                        (Result.Error error) (Result.Error error))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+          (match (render-call-arguments constructors arguments)
+            (Result.Success rendered-arguments)
+              (if (String.empty? (Pair.a &rendered-arguments))
+                (Result.Success
+                  (String.concat
+                    &[(sanitize symbol)
+                      @"("
+                      (String.copy (Pair.b &rendered-arguments))
+                      @")"]))
+                ;; elided unit arguments still run for their effects, in order,
+                ;; before the call.
+                (Result.Success
+                  (String.concat
+                    &[@"({ "
+                      (String.copy (Pair.a &rendered-arguments))
+                      (sanitize symbol)
+                      @"("
+                      (String.copy (Pair.b &rendered-arguments))
+                      @"); })"])))
+            (Result.Error error) (Result.Error error)))
+        (SpecializedExpr.If _ _ condition then-branch else-branch)
+        ;; a managed `if` cannot be a C ternary (a branch may need cleanup
+        ;; statements); lower it to a statement expression. Unmanaged ifs stay
+        ;; ternaries.
+        (if (not (unmanaged-type? constructors &(specialized-type expression)))
+          (render-statement-value constructors expression)
+          (match (render-value-expression constructors (Box.peek condition))
+            (Result.Success rendered-condition)
+              (match (render-value-expression constructors
+                                              (Box.peek then-branch))
+                (Result.Success rendered-then)
+                  (match (render-value-expression constructors
+                                                  (Box.peek else-branch))
+                    (Result.Success rendered-else)
+                      (Result.Success
+                        (String.concat
+                          &[@"("
+                            rendered-condition
+                            @" ? "
+                            rendered-then
+                            @" : "
+                            rendered-else
+                            @")"]))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error)))
+        (SpecializedExpr.Annotation _ _ inner _)
+        (render-value-expression constructors (Box.peek inner))
+        (SpecializedExpr.Call _ _ callee arguments)
+        (render-closure-call constructors (Box.peek callee) arguments)
+        ;; statement-shaped forms in value position (e.g. a cleanup-wrapped scope
+        ;; result) lower to a GNU statement expression via `append-result!`.
+        (SpecializedExpr.Do _ _ _)
+        (render-statement-value constructors expression)
+        (SpecializedExpr.Let _ _ _ _ _)
+        (render-statement-value constructors expression)
+        (SpecializedExpr.While _ _ _ _)
+        (render-statement-value constructors expression)
+        (SpecializedExpr.Match _ _ _ _ _)
+        (render-statement-value constructors expression)
+        ;; a `set!` in value position is a unit-typed assignment expression.
+        (SpecializedExpr.Set _ _ set-reference set-value)
+        (match (render-value-expression constructors (Box.peek set-value))
+          (Result.Success rendered-set-value)
+            (let [target (if @(CoreRef.global set-reference)
+                    (sanitize
+                      &(CAbi.mangle (CoreRef.name set-reference)
+                                    &(specialized-type (Box.peek set-value))))
+                    (local-symbol set-reference))]
+              (Result.Success
+                (String.concat
+                  &[@"({ " target @" = " rendered-set-value @"; ((void)0); })"])))
+          (Result.Error error) (Result.Error error))
+        _
+        (Result.Error
+          (BackendError.init
+            (String.concat
+              &[@"expression form is not supported in unmanaged bodies: "
+                (expression-form-name expression)])))))))
+
+(defn expression-form-name [expression]
+  (match-ref expression
+    (SpecializedExpr.Set _ _ _ _) (String.copy "set!")
+    (SpecializedExpr.Break _ _) (String.copy "break")
+    (SpecializedExpr.Lambda _ _ _ _) (String.copy "lambda")
+    (SpecializedExpr.PatternLit _ _ _) (String.copy "pattern literal")
+    (SpecializedExpr.ArrayLit _ _ _) (String.copy "array literal")
+    (SpecializedExpr.StaticArrayLit _ _ _) (String.copy "static array literal")
+    (SpecializedExpr.GlobalValue _ _ _ _ _ _) (String.copy "global value")
+    (SpecializedExpr.Reference _ _ _) (String.copy "reference")
+    _ (String.copy "unknown")))
+
+(defn render-argument-types [argument-types]
+  (let-do [rendered (the String (String.copy ""))
+           failure (the (Maybe BackendError) (Maybe.Nothing))
+           n (Array.length argument-types)]
+    (for [i 0 n]
+      (match-ref &failure
+        (Maybe.Nothing)
+          (match (render-type (Box.peek (Array.unsafe-nth argument-types i)))
+            (Result.Success piece)
+              (do
+                (when (Int.> i 0) (set! rendered (String.append &rendered ", ")))
+                (set! rendered (String.append &rendered &piece)))
+            (Result.Error error) (set! failure (Maybe.Just error)))
+        (Maybe.Just _) ()))
+    (match-ref &failure
+      (Maybe.Just error) (Result.Error @error)
+      (Maybe.Nothing) (Result.Success rendered))))
+
+(doc render-closure-call "renders an indirect call through a `Lambda` closure
+value: dispatches at runtime on the captured environment, calling
+`callback(env, args)` for capturing closures and `callback(args)` otherwise.")
+(defn render-closure-call [constructors callee arguments]
+  (let [callee-type (specialized-type callee)]
+    (match-ref &callee-type
+      (MonoType.Function argument-types result-type)
+        (match (render-value-expression constructors callee)
+          (Result.Success callee-c)
+            (match (render-type (Box.peek result-type))
+              (Result.Success ret-c)
+                (match (render-argument-types argument-types)
+                  (Result.Success args-c)
+                    (match (render-call-arguments constructors arguments)
+                      (Result.Success rendered-values)
+                        (let [values-c (String.copy (Pair.b &rendered-values))
+                              values-prelude (String.copy (Pair.a &rendered-values))
+                              type-comma (if (Int.= 0
+                                                    (Array.length argument-types))
+                                @""
+                                @", ")
+                              value-comma (if (String.empty? &values-c)
+                                @""
+                                @", ")
+                              dispose-callee (match-ref callee
+                                (SpecializedExpr.GlobalCall _ _ _ _ symbol _)
+                                  (String.starts-with? symbol "_carp_closure_")
+                                _ false)
+                              unit-result (match-ref (Box.peek result-type)
+                                (MonoType.Unit) true
+                                _ false)]
+                          (Result.Success
+                            (String.concat
+                              &[@"({ "
+                                (String.copy &values-prelude)
+                                @"Lambda _carp_call = "
+                                (String.copy &callee-c)
+                                @"; "
+                                (if (and dispose-callee (not unit-result))
+                                  (String.concat
+                                    &[(String.copy &ret-c)
+                                      @" _carp_call_result = "])
+                                  @"")
+                                @"_carp_call.env ? (("
+                                (String.copy &ret-c)
+                                @"(*)(void*"
+                                type-comma
+                                (String.copy &args-c)
+                                @"))_carp_call.callback)(_carp_call.env"
+                                value-comma
+                                (String.copy &values-c)
+                                @") : (("
+                                (String.copy &ret-c)
+                                @"(*)("
+                                (String.copy &args-c)
+                                @"))_carp_call.callback)("
+                                (String.copy &values-c)
+                                @")"
+                                (if dispose-callee
+                                  @"; if (_carp_call.delete) { ((void(*)(void*))_carp_call.delete)(_carp_call.env); CARP_FREE(_carp_call.env); } "
+                                  @";")
+                                (if (and dispose-callee (not unit-result))
+                                  @"_carp_call_result; "
+                                  @"")
+                                @"})"])))
+                      (Result.Error error) (Result.Error error))
+                  (Result.Error error) (Result.Error error))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error))
+      _ (Result.Error (BackendError.init @"call target is not a function type")))))
+
+(doc render-statement-value
+  "renders a statement-shaped form (do/let/while/match)
+used in value position as a GNU statement expression: the result is assigned to a
+temporary whose value the expression yields. The temporary name is fixed and
+relies on C block scoping (nested statement expressions shadow it).")
+;; the value a statement-shaped form yields is its tail: a `let` evaluates to its
+;; body, a `do` to its last element. The top node's own type field can lie (the
+;; hoist wrapper stamps a `let` with the hoisted binding's type), so recurse to
+;; the tail for the storage type of the `({ ... })` statement expression.
+(defn statement-result-type [expression] (tail-expression-type expression))
+
+(defn render-statement-value [constructors expression]
+  (let [result-type (statement-result-type expression)]
+    (if (match-ref &result-type (MonoType.Unit) true _ false)
+      ;; a unit-typed scope has no value to capture: run it for its effects as
+      ;; a void statement expression (`void _carp_sv;` would not compile).
+      (let-do [buffer (StringBuf.create)
+               ignored-open (StringBuf.append-str &buffer "({ ")]
+        (match (append-statement! constructors &buffer expression 0)
+          (Result.Success _)
+            (do
+              (StringBuf.append-str &buffer " })")
+              (Result.Success (StringBuf.to-string &buffer)))
+          (Result.Error error) (Result.Error error)))
+      (match (render-type &result-type)
+        (Result.Success type-c)
+          (let-do [buffer (StringBuf.create)
+                   ignored-open (StringBuf.append-str &buffer "({ ")
+                   ignored-type (StringBuf.append-str &buffer &type-c)
+                   ignored-space (StringBuf.append-char &buffer \space)
+                   ignored-name (StringBuf.append-str &buffer "_carp_sv; ")
+                   destination (ResultDestination.Assign (String.copy "_carp_sv")
+                                                         (Box.init (MonoType.copy &result-type)))]
+            (match (append-result! constructors
+                                   &buffer
+                                   expression
+                                   &destination
+                                   0)
+              (Result.Success _)
+                (do
+                  (StringBuf.append-str &buffer "_carp_sv; })")
+                  (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error)))))
+
+(defn render-env-fields [constructors arguments]
+  (let-do [rendered (the String (String.copy ""))
+           failure (the (Maybe BackendError) (Maybe.Nothing))
+           n (Array.length arguments)]
+    (for [i 0 n]
+      (match-ref &failure
+        (Maybe.Nothing)
+          (match (render-value-expression constructors
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      i)))
+            (Result.Success value)
+              (do
+                (when (Int.> i 0) (set! rendered (String.append &rendered ", ")))
+                (set! rendered
+                      (String.append &rendered
+                                     &(String.concat
+                                       &[@".f"
+                                         (Int.str i)
+                                         @" = "
+                                         (String.copy &value)]))))
+            (Result.Error error) (set! failure (Maybe.Just error)))
+        (Maybe.Just _) ()))
+    (match-ref &failure
+      (Maybe.Just error) (Result.Error @error)
+      (Maybe.Nothing) (Result.Success rendered))))
+
+(defn render-recursive-env-fields [constructors arguments self]
+  (let-do [fields (the String (String.copy ""))
+           assignments (the String (String.copy ""))
+           failure (the (Maybe BackendError) (Maybe.Nothing))
+           n (Array.length arguments)]
+    (for [i 0 n]
+      (match-ref &failure
+        (Maybe.Nothing)
+          (let-do [argument (Box.peek (Array.unsafe-nth arguments i))
+                   field-name (String.concat &[@"f" (Int.str i)])
+                   field (String.concat &[@"." (String.copy &field-name)])]
+            (when (Int.> i 0) (set! fields (String.append &fields ", ")))
+            (if (match-ref argument
+                (SpecializedExpr.Reference _ _ reference)
+                  (CoreIR.same-ref? reference self)
+                _ false)
+              (do
+                (set! fields
+                      (String.concat
+                        &[(String.copy &fields) field @" = ((Lambda){0})"]))
+                (set! assignments
+                      (String.concat
+                        &[(String.copy &assignments)
+                          @" _carp_env->"
+                          field-name
+                          @" = ((Lambda){ .callback = _carp_self.callback, .env = _carp_self.env, .delete = NULL, .copy = NULL });"])))
+              (match (render-value-expression constructors argument)
+                (Result.Success value)
+                  (set! fields
+                        (String.concat
+                          &[(String.copy &fields)
+                            field
+                            @" = "
+                            (String.copy &value)]))
+                (Result.Error error) (set! failure (Maybe.Just error)))))
+        (Maybe.Just _) ()))
+    (match-ref &failure
+      (Maybe.Just error) (Result.Error @error)
+      (Maybe.Nothing) (Result.Success (Pair.init fields assignments)))))
+
+(defn render-recursive-closure-construction [constructors symbol arguments self]
+  (let [lambda-symbol (String.concat
+          &[@"_carp_lambda_" (String.suffix symbol 14)])
+        env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])]
+    (match (render-recursive-env-fields constructors arguments self)
+      (Result.Success rendered)
+        (Result.Success
+          (String.concat
+            &[@"({ "
+              (String.copy &env-type)
+              @"* _carp_env = CARP_MALLOC(sizeof("
+              (String.copy &env-type)
+              @")); *_carp_env = (("
+              (String.copy &env-type)
+              @"){ "
+              (String.copy (Pair.a &rendered))
+              @" }); Lambda _carp_self = ((Lambda){ .callback = (void*)"
+              (String.copy &lambda-symbol)
+              @", .env = (void*)_carp_env, .delete = (void*)"
+              (String.copy &env-type)
+              @"_delete, .copy = (void*)"
+              (String.copy &env-type)
+              @"_copy });"
+              (String.copy (Pair.b &rendered))
+              @" _carp_self; })"]))
+      (Result.Error error) (Result.Error error))))
+
+(doc render-closure-construction "renders a capturing lambda's closure site: a
+`Lambda` struct whose environment points at a compound literal of the captured
+values (block-scoped, valid for non-escaping closures).")
+(defn render-closure-construction [constructors symbol arguments]
+  (let [lambda-symbol (String.concat
+          &[@"_carp_lambda_" (String.suffix symbol 14)])
+        env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])]
+    (match (render-env-fields constructors arguments)
+      (Result.Success fields)
+        (Result.Success
+          (String.concat
+            &[@"((Lambda){ .callback = (void*)"
+              (String.copy &lambda-symbol)
+              @", .env = &(("
+              (String.copy &env-type)
+              @"){ "
+              fields
+              @" }), .delete = NULL, .copy = NULL })"]))
+      (Result.Error error) (Result.Error error))))
+
+(doc render-closure-construction-heap "renders a closure construction whose
+Lambda escapes the constructing function (return position): the environment
+must outlive the stack frame, so it is heap-allocated and carries its generated
+environment deleter.")
+(defn render-closure-construction-heap [constructors symbol arguments]
+  (let [lambda-symbol (String.concat
+          &[@"_carp_lambda_" (String.suffix symbol 14)])
+        env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])]
+    (match (render-env-fields constructors arguments)
+      (Result.Success fields)
+        (Result.Success
+          (String.concat
+            &[@"((Lambda){ .callback = (void*)"
+              (String.copy &lambda-symbol)
+              @", .env = ({ "
+              (String.copy &env-type)
+              @"* _carp_env = CARP_MALLOC(sizeof("
+              (String.copy &env-type)
+              @")); *_carp_env = (("
+              (String.copy &env-type)
+              @"){ "
+              fields
+              @" }); (void*)_carp_env; }), .delete = (void*)"
+              (String.copy &env-type)
+              @"_delete, .copy = (void*)"
+              (String.copy &env-type)
+              @"_copy })"]))
+      (Result.Error error) (Result.Error error))))
+
+(defn append-indent! [buffer depth]
+  (for [i 0 depth] (StringBuf.append-str buffer "  ")))
+
+(defn array-element-type [array-type]
+  (let [storage-type (deref-type array-type)]
+    (match-ref &storage-type
+      (MonoType.Named _ arguments)
+        (if (Int.> (Array.length arguments) 0)
+          (Maybe.Just (MonoType.copy (Box.peek (Array.unsafe-nth arguments 0))))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing))))
+
+(defn render-static-array-literal [constructors array-type elements]
+  (match (array-element-type array-type)
+    (Maybe.Nothing)
+      (Result.Error
+        (BackendError.init @"static array literal has no element type"))
+    (Maybe.Just element-type)
+      (match (render-type &element-type)
+        (Result.Success rendered-element)
+          (let-do [buffer (StringBuf.create)
+                   count (Array.length elements)
+                   result (the (Result Unit BackendError) (Result.Success ()))]
+            ;; elements are assigned at runtime: they may be calls or hoisted
+            ;; heap values, which a `static` initializer cannot reference.
+            (StringBuf.append-str &buffer "({ static ")
+            (StringBuf.append-str &buffer &rendered-element)
+            (StringBuf.append-str &buffer " _carp_static_array_data[")
+            (StringBuf.append-str &buffer &(Int.str (Int.max 1 count)))
+            (StringBuf.append-str &buffer
+                                  "]; static Array _carp_static_array = { .len = ")
+            (StringBuf.append-str &buffer &(Int.str count))
+            (StringBuf.append-str &buffer ", .capacity = ")
+            (StringBuf.append-str &buffer &(Int.str count))
+            (StringBuf.append-str &buffer
+                                  ", .data = _carp_static_array_data }; ")
+            (for [i 0 count]
+              (match-ref &result
+                (Result.Success _)
+                  (match (render-value-expression constructors
+                                                  (Box.peek (Array.unsafe-nth elements
+                                                                              i)))
+                    (Result.Success rendered-value)
+                      (do
+                        (StringBuf.append-str &buffer "_carp_static_array_data[")
+                        (StringBuf.append-str &buffer &(Int.str i))
+                        (StringBuf.append-str &buffer "] = ")
+                        (StringBuf.append-str &buffer &rendered-value)
+                        (StringBuf.append-str &buffer "; "))
+                    (Result.Error error) (set! result (Result.Error error)))
+                (Result.Error _) ()))
+            (StringBuf.append-str &buffer "&_carp_static_array; })")
+            (match result
+              (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+              (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error))))
+
+(doc append-array-literal! "lowers a managed `(Array a)` literal to the
+reference form: a heap allocation sized to the elements, then one assignment per
+element into the malloc'd data. Emitted as the initializer statements of a local
+binding so the value is the binding itself.")
+(defn append-array-literal! [constructors
+                             buffer
+                             reference
+                             array-type
+                             elements
+                             depth]
+  (match (array-element-type array-type)
+    (Maybe.Nothing)
+      (Result.Error (BackendError.init @"array literal has no element type"))
+    (Maybe.Just element-type)
+      (match (render-type &element-type)
+        (Result.Success rendered-element)
+          (let-do [symbol (local-symbol reference)
+                   count (Array.length elements)
+                   result (the (Result Unit BackendError) (Result.Success ()))]
+            (append-indent! buffer depth)
+            (StringBuf.append-str buffer "Array ")
+            (StringBuf.append-str buffer &symbol)
+            (StringBuf.append-str buffer " = { .len = ")
+            (StringBuf.append-str buffer &(Int.str count))
+            (StringBuf.append-str buffer ", .capacity = ")
+            (StringBuf.append-str buffer &(Int.str count))
+            (if (Int.= count 0) (StringBuf.append-str buffer ", .data = NULL };
+") (do
+                (StringBuf.append-str buffer ", .data = CARP_MALLOC(sizeof(")
+                (StringBuf.append-str buffer &rendered-element)
+                (StringBuf.append-str buffer ") * ")
+                (StringBuf.append-str buffer &(Int.str count))
+                (StringBuf.append-str buffer ") };
+")))
+            (for [i 0 count]
+              (match-ref &result
+                (Result.Success _)
+                  (match (render-value-expression constructors
+                                                  (Box.peek (Array.unsafe-nth elements
+                                                                              i)))
+                    (Result.Success rendered-element-value)
+                      (do
+                        (append-indent! buffer depth)
+                        (StringBuf.append-str buffer "((")
+                        (StringBuf.append-str buffer &rendered-element)
+                        (StringBuf.append-str buffer "*)")
+                        (StringBuf.append-str buffer &symbol)
+                        (StringBuf.append-str buffer ".data)[")
+                        (StringBuf.append-str buffer &(Int.str i))
+                        (StringBuf.append-str buffer "] = ")
+                        (StringBuf.append-str buffer &rendered-element-value)
+                        (StringBuf.append-str buffer ";
+"))
+                    (Result.Error error) (set! result (Result.Error error)))
+                (Result.Error _) ()))
+            result)
+        (Result.Error error) (Result.Error error))))
+
+(defn append-local-declaration! [constructors buffer reference value depth]
+  (match-ref value
+    (SpecializedExpr.ArrayLit _ array-type elements)
+    (append-array-literal! constructors
+                           buffer
+                           reference
+                           (Box.peek array-type)
+                           elements
+                           depth)
+    _
+    ;; a scope-shaped value (e.g. RefLift's lifted `let`) evaluates to its tail,
+    ;; whose type is the true storage type; the node's own type field can be the
+    ;; hoist wrapper's binding type, which would mislabel the C local.
+    (let [value-type (statement-result-type value)]
+      (if (match-ref &value-type (MonoType.Unit) true _ false)
+        ;; a unit-typed binding has no C storage; evaluate the initializer for
+        ;; its side effects as an expression statement and bind nothing.
+        (match (render-value-expression constructors value)
+          (Result.Success rendered-value)
+            (do
+              (append-indent! buffer depth)
+              (StringBuf.append-str buffer &rendered-value)
+              (StringBuf.append-str buffer ";
+")
+              (Result.Success ()))
+          (Result.Error error) (Result.Error error))
+        (match (render-type &value-type)
+          (Result.Success rendered-type)
+            (match (match-ref value
+                (SpecializedExpr.GlobalCall _ _ _ _ symbol arguments)
+                  (if (String.starts-with? symbol "_carp_closure_")
+                    (render-recursive-closure-construction constructors
+                                                           symbol
+                                                           arguments
+                                                           reference)
+                    (render-value-expression constructors value))
+                _ (render-value-expression constructors value))
+              (Result.Success rendered-value)
+                (do
+                  (append-indent! buffer depth)
+                  (StringBuf.append-str buffer &rendered-type)
+                  (StringBuf.append-char buffer \space)
+                  (StringBuf.append-str buffer &(local-symbol reference))
+                  (StringBuf.append-str buffer " = ")
+                  (StringBuf.append-str buffer &rendered-value)
+                  (StringBuf.append-str buffer ";
+")
+                  (Result.Success ()))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error))))))
+
+(defn array-reference-expression? [expression]
+  (match-ref &(deref-type &(specialized-type expression))
+    (MonoType.Named name _)
+      (or (String.= name "Array") (String.= name "StaticArray"))
+    _ false))
+
+(defn index-or-length-primitive? [reference]
+  (let [id @(CoreRef.id reference)]
+    (or (Int.= id 8)
+        (or (Int.= id 9)
+            (or (Int.= id 10)
+                (or (Int.= id 11) (or (Int.= id 12) (Int.= id 13))))))))
+
+(defn arguments-contain-array-reference? [arguments]
+  (let-do [found false]
+    (for [i 0 (Array.length arguments)]
+      (when (array-reference-expression?
+          (Box.peek (Array.unsafe-nth arguments i)))
+        (set! found true)))
+    found))
+
+(defn loop-array-cache-safe? [expression]
+  (match-ref expression
+    (SpecializedExpr.GlobalCall _ _ reference _ _ arguments)
+    (let-do [safe (or (index-or-length-primitive? reference)
+                      (not (arguments-contain-array-reference? arguments)))]
+      (for [i 0 (Array.length arguments)]
+        (unless (loop-array-cache-safe?
+            (Box.peek (Array.unsafe-nth arguments i)))
+          (set! safe false)))
+      safe)
+    ;; A closure may mutate an array captured in its environment even when no
+    ;; array is among its explicit arguments, so dynamic calls invalidate the
+    ;; proof conservatively.
+    (SpecializedExpr.Call _ _ _ _)
+    false
+    (SpecializedExpr.Do _ _ expressions)
+    (let-do [safe true]
+      (for [i 0 (Array.length expressions)]
+        (unless (loop-array-cache-safe?
+            (Box.peek (Array.unsafe-nth expressions i)))
+          (set! safe false)))
+      safe)
+    (SpecializedExpr.Let _ _ _ value body)
+    (and
+      (loop-array-cache-safe? (Box.peek value))
+      (loop-array-cache-safe? (Box.peek body)))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+    (and
+      (loop-array-cache-safe? (Box.peek condition))
+      (and
+        (loop-array-cache-safe? (Box.peek then-branch))
+        (loop-array-cache-safe? (Box.peek else-branch))))
+    (SpecializedExpr.While _ _ condition body)
+    (and
+      (loop-array-cache-safe? (Box.peek condition))
+      (loop-array-cache-safe? (Box.peek body)))
+    (SpecializedExpr.Match _ _ _ scrutinee branches)
+    (let-do [safe (loop-array-cache-safe? (Box.peek scrutinee))]
+      (for [i 0 (Array.length branches)]
+        (unless (loop-array-cache-safe?
+            (Box.peek
+              (SpecializedMatchBranch.body (Array.unsafe-nth branches i))))
+          (set! safe false)))
+      safe)
+    (SpecializedExpr.Set _ _ _ value)
+    (loop-array-cache-safe? (Box.peek value))
+    (SpecializedExpr.Annotation _ _ inner _)
+    (loop-array-cache-safe? (Box.peek inner))
+    (SpecializedExpr.ArrayLit _ _ elements)
+    (let-do [safe true]
+      (for [i 0 (Array.length elements)]
+        (unless (loop-array-cache-safe? (Box.peek (Array.unsafe-nth elements i)))
+          (set! safe false)))
+      safe)
+    (SpecializedExpr.StaticArrayLit _ _ elements)
+    (let-do [safe true]
+      (for [i 0 (Array.length elements)]
+        (unless (loop-array-cache-safe? (Box.peek (Array.unsafe-nth elements i)))
+          (set! safe false)))
+      safe)
+    _
+    true))
+
+(defn index-candidate-listed? [candidates reference]
+  (let-do [found false]
+    (for [i 0 (Array.length candidates)]
+      (when (CoreIR.same-ref? (Pair.a (Array.unsafe-nth candidates i)) reference)
+        (set! found true)))
+    found))
+
+(sig collect-loop-index-candidates!
+     (Fn [(Ref SpecializedExpr) (Ref (Array (Pair CoreRef (Box MonoType))))] ()))
+(defn collect-loop-index-candidates! [expression candidates]
+  (match-ref expression
+    (SpecializedExpr.GlobalCall _ result-type reference _ _ arguments)
+      (do
+        (when-do (and
+            (or (Int.= @(CoreRef.id reference) 12)
+                (Int.= @(CoreRef.id reference) 13))
+            (Int.> (Array.length arguments) 0))
+          (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+            (SpecializedExpr.Reference _ _ container-reference)
+              (unless-do (or @(CoreRef.global container-reference)
+                             (index-candidate-listed? candidates
+                                                      container-reference))
+                (match-ref (Box.peek result-type)
+                  (MonoType.Reference element _)
+                    (Array.push-back! candidates
+                                      (Pair.init (CoreRef.copy container-reference)
+                                                 (Box.init (MonoType.copy (Box.peek element)))))
+                  _ ()))
+            _ ()))
+        (for [i 0 (Array.length arguments)]
+          (collect-loop-index-candidates!
+            (Box.peek (Array.unsafe-nth arguments i))
+            candidates)))
+    (SpecializedExpr.Call _ _ callee arguments)
+      (do
+        (collect-loop-index-candidates! (Box.peek callee) candidates)
+        (for [i 0 (Array.length arguments)]
+          (collect-loop-index-candidates!
+            (Box.peek (Array.unsafe-nth arguments i))
+            candidates)))
+    (SpecializedExpr.Do _ _ expressions)
+      (for [i 0 (Array.length expressions)]
+        (collect-loop-index-candidates!
+          (Box.peek (Array.unsafe-nth expressions i))
+          candidates))
+    (SpecializedExpr.Let _ _ _ value body)
+      (do
+        (collect-loop-index-candidates! (Box.peek value) candidates)
+        (collect-loop-index-candidates! (Box.peek body) candidates))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+      (do
+        (collect-loop-index-candidates! (Box.peek condition) candidates)
+        (collect-loop-index-candidates! (Box.peek then-branch) candidates)
+        (collect-loop-index-candidates! (Box.peek else-branch) candidates))
+    (SpecializedExpr.While _ _ condition body)
+      (do
+        (collect-loop-index-candidates! (Box.peek condition) candidates)
+        (collect-loop-index-candidates! (Box.peek body) candidates))
+    (SpecializedExpr.Match _ _ _ scrutinee branches)
+      (do
+        (collect-loop-index-candidates! (Box.peek scrutinee) candidates)
+        (for [i 0 (Array.length branches)]
+          (collect-loop-index-candidates!
+            (Box.peek
+              (SpecializedMatchBranch.body (Array.unsafe-nth branches i)))
+            candidates)))
+    (SpecializedExpr.Set _ _ _ value)
+      (collect-loop-index-candidates! (Box.peek value) candidates)
+    (SpecializedExpr.Annotation _ _ inner _)
+      (collect-loop-index-candidates! (Box.peek inner) candidates)
+    (SpecializedExpr.ArrayLit _ _ elements)
+      (for [i 0 (Array.length elements)]
+        (collect-loop-index-candidates! (Box.peek (Array.unsafe-nth elements i))
+                                        candidates))
+    (SpecializedExpr.StaticArrayLit _ _ elements)
+      (for [i 0 (Array.length elements)]
+        (collect-loop-index-candidates! (Box.peek (Array.unsafe-nth elements i))
+                                        candidates))
+    _ ()))
+
+(defn append-cached-while! [constructors buffer condition body depth]
+  (let-do [old-refs (Array.copy &*array-data-cache-refs*)
+           old-symbols (Array.copy &*array-data-cache-symbols*)
+           candidates (the (Array (Pair CoreRef (Box MonoType))) [])
+           free-references (the (Array (Pair CoreRef (Box MonoType))) [])
+           no-bindings (the (Array Int) [])
+           setup-result (the (Result Unit BackendError) (Result.Success ()))]
+    ;; A cached view is valid only while no operation in the loop can receive
+    ;; the array and mutate or reallocate it. Unknown calls are deliberately
+    ;; unsafe; length and indexing primitives are the allowed array operations.
+    (when-do (and (loop-array-cache-safe? condition)
+                  (loop-array-cache-safe? body))
+      ;; Only references free in the loop are in scope at the hoist site.
+      ;; This excludes arrays introduced by a let or match inside the loop.
+      (collect-free condition &no-bindings &free-references)
+      (collect-free body &no-bindings &free-references)
+      (collect-loop-index-candidates! condition &candidates)
+      (collect-loop-index-candidates! body &candidates))
+    (for [i 0 (Array.length &candidates)]
+      (match-ref &setup-result
+        (Result.Success _)
+          (let [candidate (Array.unsafe-nth &candidates i)
+                reference (Pair.a candidate)]
+            (when (capture-listed? &free-references @(CoreRef.id reference))
+              (match (cached-array-data-symbol-for-ref reference)
+                (Maybe.Just _) ()
+                (Maybe.Nothing)
+                  (match (render-type (Box.peek (Pair.b candidate)))
+                    (Result.Success element)
+                      (let-do [symbol (String.concat
+                                 &[@"L0_array_data_"
+                                   (CAbi.component &(Int.str @(CoreRef.id reference)))])]
+                        (append-indent! buffer depth)
+                        (StringBuf.append-str buffer &element)
+                        (StringBuf.append-str buffer "* ")
+                        (StringBuf.append-str buffer &symbol)
+                        (StringBuf.append-str buffer " = (")
+                        (StringBuf.append-str buffer &element)
+                        (StringBuf.append-str buffer "*)(*")
+                        (StringBuf.append-str buffer &(local-symbol reference))
+                        (StringBuf.append-str buffer ").data;
+")
+                        (Array.push-back! &*array-data-cache-refs*
+                                          (CoreRef.copy reference))
+                        (Array.push-back! &*array-data-cache-symbols* symbol))
+                    (Result.Error error)
+                      (set! setup-result (Result.Error error))))))
+        (Result.Error _) ()))
+    (let-do [result (match setup-result
+               (Result.Success _)
+                 (match (render-value-expression constructors condition)
+                   (Result.Success rendered-condition)
+                     (do
+                       (append-indent! buffer depth)
+                       (StringBuf.append-str buffer "while (")
+                       (StringBuf.append-str buffer &rendered-condition)
+                       (StringBuf.append-str buffer ") {
+")
+                       (match (the (Result Unit BackendError)
+                                   (append-statement! constructors
+                                                      buffer
+                                                      body
+                                                      (Int.inc depth)))
+                         (Result.Success _)
+                           (do
+                             (append-indent! buffer depth)
+                             (StringBuf.append-str buffer "}
+")
+                             (Result.Success ()))
+                         (Result.Error error) (Result.Error error)))
+                   (Result.Error error) (Result.Error error))
+               (Result.Error error) (Result.Error error))]
+      (set! *array-data-cache-refs* old-refs)
+      (set! *array-data-cache-symbols* old-symbols)
+      result)))
+
+(defn append-statement! [constructors buffer expression depth]
+  (match-ref expression
+    (SpecializedExpr.Do _ _ expressions)
+      (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+               n (Array.length expressions)]
+        (for [i 0 n]
+          (match-ref &result
+            (Result.Success _)
+              (set! result
+                    (append-statement! constructors
+                                       buffer
+                                       (Box.peek (Array.unsafe-nth expressions i))
+                                       depth))
+            (Result.Error _) ()))
+        result)
+    (SpecializedExpr.Let _ _ reference value body)
+      (match (append-local-declaration! constructors
+                                        buffer
+                                        reference
+                                        (Box.peek value)
+                                        depth)
+        (Result.Success _)
+          (append-statement! constructors buffer (Box.peek body) depth)
+        (Result.Error error) (Result.Error error))
+    (SpecializedExpr.Set _ _ reference value)
+      (match (render-value-expression constructors (Box.peek value))
+        (Result.Success rendered)
+          (let-do [target (if @(CoreRef.global reference)
+                     ;; assign the global through its reconstructed C symbol.
+                     (sanitize
+                       &(CAbi.mangle (CoreRef.name reference)
+                                     &(specialized-type (Box.peek value))))
+                     (local-symbol reference))]
+            (append-indent! buffer depth)
+            (StringBuf.append-str buffer &target)
+            (StringBuf.append-str buffer " = ")
+            (StringBuf.append-str buffer &rendered)
+            (StringBuf.append-str buffer ";
+")
+            (Result.Success ()))
+        (Result.Error error) (Result.Error error))
+    (SpecializedExpr.While _ _ condition body)
+      (append-cached-while! constructors
+                            buffer
+                            (Box.peek condition)
+                            (Box.peek body)
+                            depth)
+    (SpecializedExpr.Break _ _)
+      (do (append-indent! buffer depth) (StringBuf.append-str buffer "break;
+") (Result.Success ()))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+      (match (render-value-expression constructors (Box.peek condition))
+        (Result.Success rendered-condition)
+          (do
+            (append-indent! buffer depth)
+            (StringBuf.append-str buffer "if (")
+            (StringBuf.append-str buffer &rendered-condition)
+            (StringBuf.append-str buffer ") {
+")
+            (match (append-statement! constructors
+                                      buffer
+                                      (Box.peek then-branch)
+                                      (Int.inc depth))
+              (Result.Success _)
+                (do
+                  (append-indent! buffer depth)
+                  (StringBuf.append-str buffer "} else {
+")
+                  (match (append-statement! constructors
+                                            buffer
+                                            (Box.peek else-branch)
+                                            (Int.inc depth))
+                    (Result.Success _)
+                      (do
+                        (append-indent! buffer depth)
+                        (StringBuf.append-str buffer "}
+")
+                        (Result.Success ()))
+                    (Result.Error error) (Result.Error error)))
+              (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error))
+    (SpecializedExpr.Match id _ by-reference scrutinee branches)
+      (let [destination (ResultDestination.Return (Box.init (Type.unit)))]
+        (append-match! constructors
+                       buffer
+                       @id
+                       @by-reference
+                       (Box.peek scrutinee)
+                       branches
+                       depth
+                       false
+                       &destination))
+    _
+      (match (render-value-expression constructors expression)
+        (Result.Success rendered)
+          (do
+            (append-indent! buffer depth)
+            (StringBuf.append-str buffer &rendered)
+            (StringBuf.append-str buffer ";
+")
+            (Result.Success ()))
+        (Result.Error error) (Result.Error error))))
+
+(defn append-result! [constructors buffer expression destination depth]
+  (match-ref expression
+    (SpecializedExpr.Do _ _ expressions)
+      (let [n (Array.length expressions)]
+        (if (Int.= n 0)
+          (match-ref destination
+            (ResultDestination.Return result-type)
+              (if (match-ref (Box.peek result-type) (MonoType.Unit) true _ false)
+                (do
+                  (append-indent! buffer depth)
+                  (StringBuf.append-str buffer "return;
+")
+                  (Result.Success ()))
+                (Result.Error
+                  (BackendError.init @"empty do has a non-unit result")))
+            (ResultDestination.Assign _ _)
+              (Result.Error
+                (BackendError.init @"empty do cannot initialize a scalar global")))
+          (let-do [result (the (Result Unit BackendError) (Result.Success ()))]
+            (for [i 0 (Int.dec n)]
+              (match-ref &result
+                (Result.Success _)
+                  (set! result
+                        (append-statement! constructors
+                                           buffer
+                                           (Box.peek (Array.unsafe-nth expressions
+                                                                       i))
+                                           depth))
+                (Result.Error _) ()))
+            (match-ref &result
+              (Result.Success _)
+                (append-result! constructors
+                                buffer
+                                (Box.peek
+                                  (Array.unsafe-nth expressions (Int.dec n)))
+                                destination
+                                depth)
+              (Result.Error error) (Result.Error @error)))))
+    (SpecializedExpr.Let _ _ reference value body)
+      (match (append-local-declaration! constructors
+                                        buffer
+                                        reference
+                                        (Box.peek value)
+                                        depth)
+        (Result.Success _)
+          (append-result! constructors buffer (Box.peek body) destination depth)
+        (Result.Error error) (Result.Error error))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+      (match (render-value-expression constructors (Box.peek condition))
+        (Result.Success rendered-condition)
+          (do
+            (append-indent! buffer depth)
+            (StringBuf.append-str buffer "if (")
+            (StringBuf.append-str buffer &rendered-condition)
+            (StringBuf.append-str buffer ") {
+")
+            (match (append-result! constructors
+                                   buffer
+                                   (Box.peek then-branch)
+                                   destination
+                                   (Int.inc depth))
+              (Result.Success _)
+                (do
+                  (append-indent! buffer depth)
+                  (StringBuf.append-str buffer "} else {
+")
+                  (match (append-result! constructors
+                                         buffer
+                                         (Box.peek else-branch)
+                                         destination
+                                         (Int.inc depth))
+                    (Result.Success _)
+                      (do
+                        (append-indent! buffer depth)
+                        (StringBuf.append-str buffer "}
+")
+                        (Result.Success ()))
+                    (Result.Error error) (Result.Error error)))
+              (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error))
+    (SpecializedExpr.Match id _ by-reference scrutinee branches)
+      (append-match! constructors
+                     buffer
+                     @id
+                     @by-reference
+                     (Box.peek scrutinee)
+                     branches
+                     depth
+                     true
+                     destination)
+    _
+      (match-ref destination
+        (ResultDestination.Return return-type)
+          (if (match-ref (Box.peek return-type) (MonoType.Unit) true _ false)
+            (let [statement-result (the (Result Unit BackendError)
+                                        (append-statement! constructors
+                                                           buffer
+                                                           expression
+                                                           depth))]
+              (match statement-result
+                (Result.Success _)
+                  (do
+                    (append-indent! buffer depth)
+                    (StringBuf.append-str buffer "return;
+")
+                    (Result.Success ()))
+                (Result.Error error) (Result.Error error)))
+            ;; a closure constructed directly in return position escapes its
+            ;; frame: its environment moves to the heap.
+            (match (match-ref expression
+                (SpecializedExpr.GlobalCall _ _ _ _ call-symbol call-arguments)
+                  (if (String.starts-with? call-symbol "_carp_closure_")
+                    (render-closure-construction-heap constructors
+                                                      call-symbol
+                                                      call-arguments)
+                    (render-value-expression constructors expression))
+                _ (render-value-expression constructors expression))
+              (Result.Success rendered)
+                (do
+                  (append-indent! buffer depth)
+                  (StringBuf.append-str buffer "return ")
+                  (StringBuf.append-str buffer &rendered)
+                  (StringBuf.append-str buffer ";
+")
+                  (Result.Success ()))
+              (Result.Error error) (Result.Error error)))
+        (ResultDestination.Assign target result-type)
+          (let [expression-type (specialized-type expression)]
+            (if (Type.same-representation? &expression-type
+                                           (Box.peek result-type))
+              (match (render-value-expression constructors expression)
+                (Result.Success rendered)
+                  (do
+                    (append-indent! buffer depth)
+                    (StringBuf.append-str buffer target)
+                    (StringBuf.append-str buffer " = ")
+                    (StringBuf.append-str buffer &rendered)
+                    (StringBuf.append-str buffer ";
+")
+                    (Result.Success ()))
+                (Result.Error error) (Result.Error error))
+              (Result.Error
+                (BackendError.init
+                  @"global initializer result type does not match storage")))))))
+
+(defn unmanaged-signature? [constructors signature]
+  (match-ref signature
+    (MonoType.Function arguments result)
+      (let-do [supported (unmanaged-type? constructors (Box.peek result))
+               n (Array.length arguments)]
+        (for [i 0 n]
+          (unless-do (unmanaged-type? constructors
+                                      (Box.peek (Array.unsafe-nth arguments i)))
+            (set! supported false)))
+        supported)
+    _ false))
+
+(private renderable-signature?)
+(hidden renderable-signature?)
+(doc renderable-signature? "reports whether a function signature can be lowered.
+Managed parameters and a managed result are both allowed now: the ownership
+plan schedules a deleter for every owned parameter the body does not consume,
+and a managed result is a move-out to the caller. Only the function shape is
+required; concreteness is enforced separately.")
+(defn renderable-signature? [constructors signature]
+  (match-ref signature (MonoType.Function _ _) true _ false))
+
+(defn constructor-for-reference [constructors reference]
+  (let-do [result (the (Maybe CoreConstructorDeclaration) (Maybe.Nothing))
+           n (Array.length constructors)]
+    (for [i 0 n]
+      (let [constructor (Array.unsafe-nth constructors i)]
+        (when (CoreIR.same-ref?
+            (CoreConstructorDeclaration.reference constructor)
+            reference)
+          (set! result (Maybe.Just @constructor)))))
+    result))
+
+(defn unqualified-suffix [name]
+  (let-do [last-dot -1
+           n (String.length name)]
+    (for [i 0 n] (when (Char.= (String.char-at name i) \.) (set! last-dot i)))
+    (if (Int.< last-dot 0)
+      (String.copy name)
+      (String.suffix name (Int.inc last-dot)))))
+
+(doc constructor-for-pattern "the constructor a pattern names. An ambiguous
+bare pattern name (two sumtypes sharing a constructor name under `use`)
+resolves to a synthetic overload reference that names no constructor directly;
+the scrutinee's concrete type then picks the real one — the same type-directed
+choice the reference's multisym resolution makes.")
+(defn constructor-for-pattern [constructors reference subject-type]
+  (match (constructor-for-reference constructors reference)
+    (Maybe.Just constructor) (Maybe.Just constructor)
+    (Maybe.Nothing)
+      (let [subject (match-ref subject-type
+              (MonoType.Reference inner _) (MonoType.copy (Box.peek inner))
+              _ (MonoType.copy subject-type))]
+        (match-ref &subject
+          (MonoType.Named subject-name _)
+            (let-do [result (the (Maybe CoreConstructorDeclaration)
+                                 (Maybe.Nothing))
+                     want (unqualified-suffix (CoreRef.name reference))
+                     n (Array.length constructors)]
+              (for [i 0 n]
+                (let [candidate (Array.unsafe-nth constructors i)]
+                  (match-ref (Box.peek
+                      (CoreConstructorDeclaration.result candidate))
+                    (CoreType.Named rname _)
+                      (when (and (String.= rname subject-name)
+                                 (String.=
+                                   &(unqualified-suffix
+                                     (CoreRef.name
+                                       (CoreConstructorDeclaration.reference candidate)))
+                                   &want))
+                        (set! result (Maybe.Just @candidate)))
+                    _ ())))
+              result)
+          _ (the (Maybe CoreConstructorDeclaration) (Maybe.Nothing))))))
+
+(defn single-constructor-name? [constructors name]
+  (let-do [count 0
+           previous-tag -1
+           n (Array.length constructors)]
+    ;; Tags restart when a later declaration shadows an earlier type. Keep
+    ;; only the size of the last declaration group, matching layout lookup.
+    (for [i 0 n]
+      (let [constructor (Array.unsafe-nth constructors i)]
+        (match-ref (Box.peek (CoreConstructorDeclaration.result constructor))
+          (CoreType.Named result-name _)
+            (when-do (String.= result-name name)
+              (if (Int.<=
+                  @(CoreConstructorDeclaration.tag constructor)
+                  previous-tag)
+                (set! count 1)
+                (set! count (Int.inc count)))
+              (set! previous-tag @(CoreConstructorDeclaration.tag constructor)))
+          _ ())))
+    (Int.= count 1)))
+
+(defn pattern-condition [constructors pattern subject-type expression]
+  (match-ref pattern
+    (CorePattern.Ignore) (Result.Success (String.copy ""))
+    (CorePattern.Bind _) (Result.Success (String.copy ""))
+    (CorePattern.Constructor reference children)
+      (match (constructor-for-pattern constructors reference subject-type)
+        (Maybe.Just constructor)
+          (match (collect-template-bindings
+              (Box.peek (CoreConstructorDeclaration.result &constructor))
+              subject-type
+              &[])
+            (Result.Success layout-bindings)
+              (let-do [result (the (Result Unit BackendError)
+                                   (Result.Success ()))
+                       buffer (StringBuf.create)
+                       fields (CoreConstructorDeclaration.arguments &constructor)
+                       n (Array.length children)]
+                (if (/= n (Array.length fields))
+                  (set! result
+                        (Result.Error
+                          (BackendError.init
+                            @"match constructor pattern arity mismatch")))
+                  (do
+                    (match-ref subject-type
+                      (MonoType.Named subject-name _)
+                        (if (single-constructor-name? constructors subject-name)
+                          (StringBuf.append-str &buffer "true")
+                          (do
+                            (StringBuf.append-str &buffer expression)
+                            (StringBuf.append-str &buffer ".tag == ")
+                            (StringBuf.append-str &buffer
+                                                  &(Int.str
+                                                    @(CoreConstructorDeclaration.tag &constructor)))))
+                      _
+                        (do
+                          (StringBuf.append-str &buffer expression)
+                          (StringBuf.append-str &buffer ".tag == ")
+                          (StringBuf.append-str &buffer
+                                                &(Int.str
+                                                  @(CoreConstructorDeclaration.tag &constructor)))))
+                    (for [i 0 n]
+                      (match-ref &result
+                        (Result.Success _)
+                          (match (concretize-core-type &layout-bindings
+                                                       (Box.peek (Array.unsafe-nth fields
+                                                                                   i)))
+                            (Result.Success field-type)
+                              (let [child-expression (String.concat
+                                      &[(String.copy expression)
+                                        @".data.variant_"
+                                        (Int.str
+                                          @(CoreConstructorDeclaration.tag &constructor))
+                                        @".member_"
+                                        (Int.str i)])]
+                                (match (pattern-condition constructors
+                                                          (Box.peek (Array.unsafe-nth children
+                                                                                      i))
+                                                          &field-type
+                                                          &child-expression)
+                                  (Result.Success child-condition)
+                                    (unless-do (String.empty? &child-condition)
+                                      (StringBuf.append-str &buffer " && (")
+                                      (StringBuf.append-str &buffer
+                                                            &child-condition)
+                                      (StringBuf.append-char &buffer \)))
+                                  (Result.Error error)
+                                    (set! result (Result.Error error))))
+                            (Result.Error error)
+                              (set! result (Result.Error error)))
+                        (Result.Error _) ()))))
+                (match result
+                  (Result.Success _)
+                    (Result.Success (StringBuf.to-string &buffer))
+                  (Result.Error error) (Result.Error error)))
+            (Result.Error error) (Result.Error error))
+        (Maybe.Nothing)
+          (Result.Error
+            (BackendError.init @"match constructor has no nominal layout")))))
+
+(defn append-pattern-bindings! [constructors
+                                buffer
+                                pattern
+                                subject-type
+                                expression
+                                depth
+                                by-ref]
+  (match-ref pattern
+    (CorePattern.Ignore)
+    (Result.Success ())
+    (CorePattern.Bind binding)
+    ;; a unit-typed field has no C storage (elided from the struct); the
+    ;; binding binds nothing and its uses render as unit.
+    (if (unit-type? subject-type)
+      (Result.Success ())
+      (match (render-type subject-type)
+        (Result.Success field-type)
+          (do
+            (append-indent! buffer depth)
+            (StringBuf.append-str buffer &field-type)
+            (when by-ref (StringBuf.append-char buffer \*))
+            (StringBuf.append-char buffer \space)
+            (StringBuf.append-str buffer &(local-symbol binding))
+            (StringBuf.append-str buffer " = ")
+            (when by-ref (StringBuf.append-char buffer \&))
+            (StringBuf.append-str buffer expression)
+            (StringBuf.append-str buffer ";
+")
+            (Result.Success ()))
+        (Result.Error error) (Result.Error error)))
+    (CorePattern.Constructor reference children)
+    (match (constructor-for-pattern constructors reference subject-type)
+      (Maybe.Just constructor)
+        (match (collect-template-bindings
+            (Box.peek (CoreConstructorDeclaration.result &constructor))
+            subject-type
+            &[])
+          (Result.Success layout-bindings)
+            (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+                     fields (CoreConstructorDeclaration.arguments &constructor)
+                     n (Array.length children)]
+              (if (/= n (Array.length fields))
+                (set! result
+                      (Result.Error
+                        (BackendError.init
+                          @"match constructor pattern arity mismatch")))
+                (for [i 0 n]
+                  (match-ref &result
+                    (Result.Success _)
+                      (match (concretize-core-type &layout-bindings
+                                                   (Box.peek (Array.unsafe-nth fields
+                                                                               i)))
+                        (Result.Success field-type)
+                          (let [child-expression (String.concat
+                                  &[(String.copy expression)
+                                    @".data.variant_"
+                                    (Int.str
+                                      @(CoreConstructorDeclaration.tag &constructor))
+                                    @".member_"
+                                    (Int.str i)])]
+                            (set! result
+                                  (append-pattern-bindings! constructors
+                                                            buffer
+                                                            (Box.peek (Array.unsafe-nth children
+                                                                                        i))
+                                                            &field-type
+                                                            &child-expression
+                                                            depth
+                                                            by-ref)))
+                        (Result.Error error) (set! result (Result.Error error)))
+                    (Result.Error _) ())))
+              result)
+          (Result.Error error) (Result.Error error))
+      (Maybe.Nothing)
+        (Result.Error
+          (BackendError.init @"match constructor has no nominal layout")))))
+
+(defn append-match-pattern-body! [constructors
+                                  buffer
+                                  temporary
+                                  scrutinee-type
+                                  branch
+                                  depth
+                                  tail?
+                                  destination
+                                  by-ref]
+  (match (append-pattern-bindings! constructors
+                                   buffer
+                                   (SpecializedMatchBranch.pattern branch)
+                                   scrutinee-type
+                                   temporary
+                                   (Int.inc depth)
+                                   by-ref)
+    (Result.Success _)
+      (let [body-result (if tail?
+              (append-result! constructors
+                              buffer
+                              (Box.peek (SpecializedMatchBranch.body branch))
+                              destination
+                              (Int.inc depth))
+              (append-statement! constructors
+                                 buffer
+                                 (Box.peek (SpecializedMatchBranch.body branch))
+                                 (Int.inc depth)))]
+        (match body-result
+          (Result.Success _)
+            (do (append-indent! buffer depth) (StringBuf.append-str buffer "}
+") (Result.Success ()))
+          (Result.Error error) (Result.Error error)))
+    (Result.Error error) (Result.Error error)))
+
+(defn deref-type [type]
+  (match-ref type
+    (MonoType.Reference inner _) (MonoType.copy (Box.peek inner))
+    _ (MonoType.copy type)))
+
+(defn append-match! [constructors
+                     buffer
+                     id
+                     by-reference
+                     scrutinee
+                     branches
+                     depth
+                     tail?
+                     destination]
+  (match (render-value-expression constructors scrutinee)
+    (Result.Success rendered-scrutinee)
+      (let [scrutinee-type (specialized-type scrutinee)
+            subject-type (deref-type &scrutinee-type)]
+        (match (render-type &scrutinee-type)
+          (Result.Success rendered-type)
+            (let-do [temporary (String.concat &[@"match_" (Int.str id)])
+                     base-expr (if (match-ref &scrutinee-type
+                         (MonoType.Reference _ _) true
+                         _ false)
+                       (String.concat &[@"(*" (String.copy &temporary) @")"])
+                       (String.copy &temporary))
+                     result (the (Result Unit BackendError) (Result.Success ()))
+                     emitted-condition false
+                     emitted-wildcard false
+                     n (Array.length branches)]
+              (append-indent! buffer depth)
+              (StringBuf.append-str buffer &rendered-type)
+              (StringBuf.append-char buffer \space)
+              (StringBuf.append-str buffer &temporary)
+              (StringBuf.append-str buffer " = ")
+              (StringBuf.append-str buffer &rendered-scrutinee)
+              (StringBuf.append-str buffer ";
+")
+              (for [i 0 n]
+                (match-ref &result
+                  (Result.Success _)
+                    (let [branch (Array.unsafe-nth branches i)]
+                      (match (pattern-condition constructors
+                                                (SpecializedMatchBranch.pattern branch)
+                                                &subject-type
+                                                &base-expr)
+                        (Result.Success condition)
+                          (cond
+                            (and (String.empty? &condition) emitted-wildcard)
+                              (set! result
+                                    (Result.Error
+                                      (BackendError.init @"match has multiple wildcard branches")))
+                            (String.empty? &condition)
+                              (do
+                                (append-indent! buffer depth)
+                                (StringBuf.append-str buffer
+                                                      (if emitted-condition
+                                                        "else {
+"
+                                                        "{
+"))
+                                (set! emitted-wildcard true)
+                                (set! result
+                                      (append-match-pattern-body! constructors
+                                                                  buffer
+                                                                  &base-expr
+                                                                  &subject-type
+                                                                  branch
+                                                                  depth
+                                                                  tail?
+                                                                  destination
+                                                                  by-reference)))
+                            emitted-wildcard
+                              (set! result
+                                    (Result.Error
+                                      (BackendError.init @"conditional branch follows wildcard")))
+                            (do
+                              (append-indent! buffer depth)
+                              (StringBuf.append-str buffer
+                                                    (if emitted-condition
+                                                      "else if ("
+                                                      "if ("))
+                              (StringBuf.append-str buffer &condition)
+                              (StringBuf.append-str buffer ") {
+")
+                              (set! emitted-condition true)
+                              (set! result
+                                    (append-match-pattern-body! constructors
+                                                                buffer
+                                                                &base-expr
+                                                                &subject-type
+                                                                branch
+                                                                depth
+                                                                tail?
+                                                                destination
+                                                                by-reference))))
+                        (Result.Error error) (set! result (Result.Error error))))
+                  (Result.Error _) ()))
+              (match result
+                (Result.Success _)
+                  (if (and emitted-condition (not emitted-wildcard))
+                    (do
+                      (append-indent! buffer depth)
+                      (StringBuf.append-str buffer "else {
+")
+                      (append-indent! buffer (Int.inc depth))
+                      (StringBuf.append-str buffer "abort();
+")
+                      (append-indent! buffer depth)
+                      (StringBuf.append-str buffer "}
+")
+                      (Result.Success ()))
+                    (Result.Success ()))
+                (Result.Error error) (Result.Error error)))
+          (Result.Error error) (Result.Error error)))
+    (Result.Error error) (Result.Error error)))

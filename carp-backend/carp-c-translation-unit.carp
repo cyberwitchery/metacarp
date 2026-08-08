@@ -1,0 +1,185 @@
+;; Whole-translation-unit assembly and executable entry-point rendering.
+;; This is intentionally last: it composes all lower-level renderer sections.
+
+(doc prototypes "renders valid C declarations for every concrete backend
+declaration.")
+(defn prototypes [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           declarations (BackendModule.declarations module)
+           n (Array.length declarations)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (match (prototype (Array.unsafe-nth declarations i))
+            (Result.Success rendered)
+              (do
+                (StringBuf.append-str &buffer &rendered)
+                (when (Int.< (Int.inc i) n)
+                  (StringBuf.append-char &buffer \newline))
+                ())
+            (Result.Error error) (set! result (Result.Error error)))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _)
+        (match (closure-prototypes-of module)
+          (Result.Success rendered-closures)
+            (do
+              (StringBuf.append-str &buffer &rendered-closures)
+              (Result.Success (StringBuf.to-string &buffer)))
+          (Result.Error error) (Result.Error error))
+      (Result.Error error) (Result.Error error))))
+
+(doc translation-unit "assembles runtime includes, declarations, primitive
+definitions, and supported user-function definitions into one C source
+artifact without an entry point.")
+(defn translation-unit [module]
+  (match (prototypes module)
+    (Result.Success declarations)
+      (match (template-definitions module)
+        (Result.Success templates)
+          (match (function-definitions module)
+            (Result.Success functions)
+              (match (global-definitions module)
+                (Result.Success globals)
+                  (match (global-initializers module)
+                    (Result.Success initializers)
+                      (match (nominal-definitions module)
+                        (Result.Success nominals)
+                          (match (constructor-definitions module)
+                            (Result.Success nominal-constructors)
+                              (match (system-includes module)
+                                (Result.Success includes)
+                                  (let-do [buffer (StringBuf.create)
+                                           ignored-includes (StringBuf.append-str &buffer
+                                                                                  &includes)]
+                                    (unless-do (String.empty? &nominals)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer &nominals)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (unless-do (String.empty? &declarations)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer
+                                                            &declarations)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (unless-do (String.empty? &templates)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer &templates)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (unless-do (String.empty? &nominal-constructors)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer
+                                                            &nominal-constructors)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (unless-do (String.empty? &globals)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer &globals)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (unless-do (String.empty? &initializers)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer
+                                                            &initializers)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (unless-do (String.empty? &functions)
+                                      (StringBuf.append-char &buffer \newline)
+                                      (StringBuf.append-str &buffer &functions)
+                                      (StringBuf.append-char &buffer \newline))
+                                    (Result.Success (StringBuf.to-string &buffer)))
+                                (Result.Error error) (Result.Error error))
+                            (Result.Error error) (Result.Error error))
+                        (Result.Error error) (Result.Error error))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))
+    (Result.Error error) (Result.Error error)))
+
+(doc find-entry "locates a specialized `main` function to call from the C entry
+point, returning its C symbol paired with whether it returns an `Int` (an exit
+code) or `Unit`. `main` is nullary, so only those two mangled symbols can match.")
+(defn find-entry [module]
+  (let-do [result (the (Maybe (Pair String Bool)) (Maybe.Nothing))
+           declarations (BackendModule.declarations module)
+           int-symbol (CAbi.mangle "main"
+                                   &(MonoType.Function []
+                                                       (Box.init (MonoType.Integer))))
+           unit-symbol (CAbi.mangle "main"
+                                    &(MonoType.Function []
+                                                        (Box.init (MonoType.Unit))))
+           n (Array.length declarations)]
+    (for [i 0 n]
+      (match-ref (Array.unsafe-nth declarations i)
+        (BackendDeclaration.Function symbol _ _ _)
+          (cond
+            (String.= symbol &int-symbol)
+              (set! result (Maybe.Just (Pair.init (String.copy symbol) true)))
+            (String.= symbol &unit-symbol)
+              (set! result (Maybe.Just (Pair.init (String.copy symbol) false)))
+            ())
+        _ ()))
+    result))
+
+(doc entry-definition "renders ownerless specialized root expressions as a
+C entry point. This policy is requested explicitly by a compiler driver.")
+(defn entry-definition [module]
+  (let-do [buffer (StringBuf.create)
+           ignored-open (StringBuf.append-str &buffer
+                                              "int main(int argc, char** argv) {
+")
+           ignored-globals (StringBuf.append-str &buffer
+                                                 "  carp_init_globals(argc, argv);
+")
+           result (the (Result Unit BackendError) (Result.Success ()))
+           roots (BackendModule.roots module)
+           seen (the (Array String) [])
+           winners (the (Array Int) [])
+           n (Array.length roots)]
+    (for [i 0 n]
+      (collect-plain-locals! (Box.peek (Array.unsafe-nth roots i))
+                             &seen
+                             &winners))
+    (set! *plain-local-ids* winners)
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (set! result
+                (append-statement! (BackendModule.constructors module)
+                                   &buffer
+                                   (Box.peek (Array.unsafe-nth roots i))
+                                   1))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _)
+        (do
+          (match (find-entry module)
+            (Maybe.Just entry)
+              (if @(Pair.b &entry)
+                (do
+                  (StringBuf.append-str &buffer "  return ")
+                  (StringBuf.append-str &buffer (Pair.a &entry))
+                  (StringBuf.append-str &buffer "();
+}
+"))
+                (do
+                  (StringBuf.append-str &buffer "  ")
+                  (StringBuf.append-str &buffer (Pair.a &entry))
+                  (StringBuf.append-str &buffer "();
+  return 0;
+}
+")))
+            (Maybe.Nothing) (StringBuf.append-str &buffer "  return 0;
+}
+"))
+          (Result.Success (StringBuf.to-string &buffer)))
+      (Result.Error error) (Result.Error error))))
+
+(doc executable-translation-unit "adds an explicit C entry wrapper to a
+backend translation unit.")
+(defn executable-translation-unit [module]
+  (match (translation-unit module)
+    (Result.Success c)
+      (match (entry-definition module)
+        (Result.Success entry) (Result.Success (String.concat &[c @"
+" entry]))
+        (Result.Error error) (Result.Error error))
+    (Result.Error error) (Result.Error error)))

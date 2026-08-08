@@ -1,0 +1,2035 @@
+;; Template instantiation plus nominal, closure, function, and global
+;; declaration rendering. Loaded after expression rendering.
+
+(defn replace-template-token [text token replacement]
+  (let-do [buffer (StringBuf.create)
+           cursor 0
+           length (String.length text)
+           searching true]
+    (while searching
+      (let [remaining (String.byte-slice text cursor length)
+            relative (String.index-of-string &remaining token)]
+        (if (Int.< relative 0)
+          (let-do [suffix (String.byte-slice text cursor length)]
+            (StringBuf.append-str &buffer &suffix)
+            (set! searching false))
+          (let [found (Int.+ cursor relative)
+                token-end (Int.+ found (String.length token))
+                followed-by-identifier? (and (Int.< token-end length)
+                                             (let [next (String.char-at text
+                                                                        token-end)]
+                                               (or (Char.alphanum? next)
+                                                   (Char.= next \_))))]
+            (if followed-by-identifier?
+              (let-do [unchanged (String.byte-slice text cursor token-end)]
+                (StringBuf.append-str &buffer &unchanged)
+                (set! cursor token-end))
+              (let-do [prefix (String.byte-slice text cursor found)]
+                (StringBuf.append-str &buffer &prefix)
+                (StringBuf.append-str &buffer replacement)
+                (set! cursor token-end)))))))
+    (StringBuf.to-string &buffer)))
+
+(defn instantiate-template-text [text bindings]
+  (let-do [result (the (Result String BackendError)
+                       (Result.Success (String.copy text)))
+           n (Array.length bindings)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success current)
+          (let [binding (Array.unsafe-nth bindings i)]
+            (match (render-type (Box.peek (TemplateTypeBinding.type binding)))
+              (Result.Success rendered)
+                (let [token (String.append "$"
+                                           (TemplateTypeBinding.name binding))]
+                  (set! result
+                        (Result.Success
+                          (replace-template-token current &token &rendered))))
+              (Result.Error error) (set! result (Result.Error error))))
+        (Result.Error _) ()))
+    result))
+
+(defn source-template-declaration [declaration]
+  (match-ref declaration
+    (BackendDeclaration.SourceTemplate symbol
+                                       concrete-signature
+                                       source-signature
+                                       source-declaration
+                                       _)
+      (match (collect-template-bindings (Box.peek source-signature)
+                                        (Box.peek concrete-signature)
+                                        &[])
+        (Result.Success bindings)
+          (match (instantiate-template-text source-declaration &bindings)
+            (Result.Success typed-declaration)
+              (Result.Success
+                (replace-template-token &typed-declaration
+                                        "$NAME"
+                                        &(sanitize symbol)))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))
+    _ (Result.Error (BackendError.init @"declaration is not a source template"))))
+
+(defn source-template-definition [declaration]
+  (match-ref declaration
+    (BackendDeclaration.SourceTemplate symbol
+                                       concrete-signature
+                                       source-signature
+                                       _
+                                       source-body)
+      (match (collect-template-bindings (Box.peek source-signature)
+                                        (Box.peek concrete-signature)
+                                        &[])
+        (Result.Success bindings)
+          (match (instantiate-template-text source-body &bindings)
+            (Result.Success typed-body)
+              (match (source-template-declaration declaration)
+                (Result.Success rendered-declaration)
+                  (let [named-body (replace-template-token &typed-body
+                                                           "$NAME"
+                                                           &(sanitize symbol))]
+                    (Result.Success
+                      (replace-template-token &named-body
+                                              "$DECL"
+                                              &rendered-declaration)))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))
+    _ (Result.Error (BackendError.init @"declaration is not a source template"))))
+
+(defn template-declaration? [declaration]
+  (match-ref declaration
+    (BackendDeclaration.Template _ _ _ _) true
+    (BackendDeclaration.SourceTemplate _ _ _ _ _) true
+    _ false))
+
+;; unit-typed parameters are elided entirely, matching the reference
+;; (`bool Unit__EQ_()`); references to them render as `((void)0)`.
+(defn append-parameters! [buffer arguments parameters]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           emitted 0
+           n (Array.length arguments)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (unless (unit-type? (Box.peek (Array.unsafe-nth arguments i)))
+            (match (render-type (Box.peek (Array.unsafe-nth arguments i)))
+              (Result.Success rendered)
+                (do
+                  (when (Int.> emitted 0) (StringBuf.append-str buffer ", "))
+                  (StringBuf.append-str buffer &rendered)
+                  (StringBuf.append-char buffer \space)
+                  (if (Int.< i (Array.length parameters))
+                    (StringBuf.append-str buffer
+                                          &(local-symbol (Array.unsafe-nth parameters
+                                                                           i)))
+                    (StringBuf.append-str buffer
+                                          &(String.concat &[@"arg" (Int.str i)])))
+                  (set! emitted (Int.inc emitted)))
+              (Result.Error error) (set! result (Result.Error error))))
+        (Result.Error _) ()))
+    (when (Int.= emitted 0) (StringBuf.append-str buffer "void"))
+    result))
+
+(defn contains-string? [items key]
+  (let-do [found false
+           n (Array.length items)]
+    (for [i 0 n]
+      (when (String.= (Array.unsafe-nth items i) key) (set! found true)))
+    found))
+
+(defn c-reserved-word? [name]
+  (let-do [found false
+           keywords [@"auto"
+                     @"break"
+                     @"case"
+                     @"char"
+                     @"const"
+                     @"continue"
+                     @"default"
+                     @"do"
+                     @"double"
+                     @"else"
+                     @"enum"
+                     @"extern"
+                     @"float"
+                     @"for"
+                     @"goto"
+                     @"if"
+                     @"inline"
+                     @"int"
+                     @"long"
+                     @"register"
+                     @"restrict"
+                     @"return"
+                     @"short"
+                     @"signed"
+                     @"sizeof"
+                     @"static"
+                     @"struct"
+                     @"switch"
+                     @"typedef"
+                     @"union"
+                     @"unsigned"
+                     @"void"
+                     @"volatile"
+                     @"while"
+                     ;; identifiers the rendered C already claims in scope
+                     @"argc"
+                     @"argv"
+                     @"main"
+                     @"_env"]
+           n (Array.length &keywords)]
+    (for [i 0 n]
+      (when (String.= (Array.unsafe-nth &keywords i) name) (set! found true)))
+    found))
+
+(doc plain-name-eligible? "whether a binder's Carp name can be its C
+identifier: lowercase-or-underscore start keeps clear of the (capitalized)
+runtime typedefs, and C keywords are excluded.")
+(defn plain-name-eligible? [name]
+  (and (Int.> (String.length name) 0)
+       (and (not (c-reserved-word? name))
+            (let [first-char (Char.to-int (String.char-at name 0))]
+              (or
+                (and (Int.>= first-char 97) (Int.<= first-char 122))
+                (Int.= first-char 95))))))
+
+(defn note-plain-binder! [reference seen winners]
+  (let [name (CAbi.component (CoreRef.name reference))]
+    (when-do (and (plain-name-eligible? &name)
+                  (not (contains-string? seen &name)))
+      (Array.push-back! seen name)
+      (Array.push-back! winners @(CoreRef.id reference)))))
+
+(sig collect-plain-locals!
+     (Fn [(Ref SpecializedExpr) (Ref (Array String)) (Ref (Array Int))] ()))
+(defn collect-plain-locals! [expression seen winners]
+  (match-ref expression
+    (SpecializedExpr.Let _ _ reference value body)
+      (do
+        (note-plain-binder! reference seen winners)
+        (collect-plain-locals! (Box.peek value) seen winners)
+        (collect-plain-locals! (Box.peek body) seen winners))
+    (SpecializedExpr.Match _ _ _ scrutinee branches)
+      (do
+        (collect-plain-locals! (Box.peek scrutinee) seen winners)
+        (for [i 0 (Array.length branches)]
+          (let-do [branch (Array.unsafe-nth branches i)
+                   bindings (SpecializedMatchBranch.bindings branch)]
+            (for [j 0 (Array.length bindings)]
+              (note-plain-binder! (Array.unsafe-nth bindings j) seen winners))
+            (collect-plain-locals!
+              (Box.peek (SpecializedMatchBranch.body branch))
+              seen
+              winners))))
+    (SpecializedExpr.Do _ _ expressions)
+      (for [i 0 (Array.length expressions)]
+        (collect-plain-locals!
+          (Box.peek (Array.unsafe-nth expressions i))
+          seen
+          winners))
+    (SpecializedExpr.ArrayLit _ _ expressions)
+      (for [i 0 (Array.length expressions)]
+        (collect-plain-locals!
+          (Box.peek (Array.unsafe-nth expressions i))
+          seen
+          winners))
+    (SpecializedExpr.StaticArrayLit _ _ expressions)
+      (for [i 0 (Array.length expressions)]
+        (collect-plain-locals!
+          (Box.peek (Array.unsafe-nth expressions i))
+          seen
+          winners))
+    (SpecializedExpr.Call _ _ callee arguments)
+      (do
+        (collect-plain-locals! (Box.peek callee) seen winners)
+        (for [i 0 (Array.length arguments)]
+          (collect-plain-locals!
+            (Box.peek (Array.unsafe-nth arguments i))
+            seen
+            winners)))
+    (SpecializedExpr.GlobalCall _ _ _ _ _ arguments)
+      (for [i 0 (Array.length arguments)]
+        (collect-plain-locals!
+          (Box.peek (Array.unsafe-nth arguments i))
+          seen
+          winners))
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+      (do
+        (collect-plain-locals! (Box.peek condition) seen winners)
+        (collect-plain-locals! (Box.peek then-branch) seen winners)
+        (collect-plain-locals! (Box.peek else-branch) seen winners))
+    (SpecializedExpr.While _ _ condition body)
+      (do
+        (collect-plain-locals! (Box.peek condition) seen winners)
+        (collect-plain-locals! (Box.peek body) seen winners))
+    (SpecializedExpr.Set _ _ _ value)
+      (collect-plain-locals! (Box.peek value) seen winners)
+    (SpecializedExpr.Lambda _ _ parameters body)
+      (do
+        (for [i 0 (Array.length parameters)]
+          (note-plain-binder! (Array.unsafe-nth parameters i) seen winners))
+        (collect-plain-locals! (Box.peek body) seen winners))
+    (SpecializedExpr.Annotation _ _ inner _)
+      (collect-plain-locals! (Box.peek inner) seen winners)
+    _ ()))
+
+(doc set-plain-locals! "computes and installs the plain-name grants for one
+rendered C function: its parameters and prelude binders first, then every
+binder in the body, first-of-a-name wins.")
+(defn set-plain-locals! [prelude-binders body]
+  (let-do [seen (the (Array String) [])
+           winners (the (Array Int) [])]
+    (for [i 0 (Array.length prelude-binders)]
+      (note-plain-binder! (Array.unsafe-nth prelude-binders i) &seen &winners))
+    (collect-plain-locals! body &seen &winners)
+    (set! *plain-local-ids* winners)))
+
+(defn clear-plain-locals! [] (set! *plain-local-ids* []))
+
+(defn callable-prototype [symbol signature parameters]
+  (match-ref signature
+    (MonoType.Function arguments return-type)
+      (match (render-type (Box.peek return-type))
+        (Result.Success rendered-return)
+          (let-do [buffer (StringBuf.create)
+                   ignored-a (StringBuf.append-str &buffer &rendered-return)
+                   ignored-b (StringBuf.append-char &buffer \space)
+                   ignored-c (StringBuf.append-str &buffer &(sanitize symbol))
+                   ignored-d (StringBuf.append-char &buffer \()
+                   parameter-result (append-parameters! &buffer
+                                                        arguments
+                                                        parameters)]
+            (match parameter-result
+              (Result.Success _)
+                (do
+                  (StringBuf.append-str &buffer ");")
+                  (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error))
+    _
+      (Result.Error
+        (BackendError.init @"callable declaration has a non-function signature"))))
+
+(defn prototype [declaration]
+  (match-ref declaration
+    (BackendDeclaration.Function symbol signature parameters _)
+      (callable-prototype symbol (Box.peek signature) parameters)
+    (BackendDeclaration.Global symbol signature _)
+      (match (render-type (Box.peek signature))
+        (Result.Success rendered)
+          (Result.Success
+            (String.concat &[@"extern " rendered @" " (sanitize symbol) @";"]))
+        (Result.Error error) (Result.Error error))
+    (BackendDeclaration.Intrinsic symbol signature external)
+      (match-ref external
+        ;; a `register`ed external C function is declared by an included header;
+        ;; emitting our own prototype would conflict (e.g. `const` qualifiers).
+        (Maybe.Just _)
+        (Result.Success (String.copy ""))
+        (Maybe.Nothing)
+        (match-ref (Box.peek signature)
+          (MonoType.Function _ _)
+            (callable-prototype symbol (Box.peek signature) &[])
+          _
+            (match (render-type (Box.peek signature))
+              (Result.Success rendered)
+                (Result.Success
+                  (String.concat
+                    &[@"extern " rendered @" " (sanitize symbol) @";"]))
+              (Result.Error error) (Result.Error error))))
+    (BackendDeclaration.Constructor symbol signature _)
+      (callable-prototype symbol (Box.peek signature) &[])
+    (BackendDeclaration.Template symbol signature _ _)
+      (callable-prototype symbol (Box.peek signature) &[])
+    (BackendDeclaration.SourceTemplate _ _ _ _ _)
+      (match (source-template-declaration declaration)
+        (Result.Success rendered) (Result.Success (String.append &rendered ";"))
+        (Result.Error error) (Result.Error error))))
+
+(defn template-element-type [signature]
+  (match-ref signature
+    (MonoType.Function arguments _)
+      (if (Int.= 1 (Array.length arguments))
+        (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+          (MonoType.Reference container _)
+            (match-ref (Box.peek container)
+              (MonoType.Named _ type-arguments)
+                (if (Int.= 1 (Array.length type-arguments))
+                  (Result.Success
+                    (MonoType.copy
+                      (Box.peek (Array.unsafe-nth type-arguments 0))))
+                  (Result.Error
+                    (BackendError.init
+                      @"template container must have one type argument")))
+              _
+                (Result.Error
+                  (BackendError.init
+                    @"template argument must reference a named container")))
+          _
+            (Result.Error
+              (BackendError.init @"template argument must be a reference")))
+        (Result.Error (BackendError.init @"template must have one argument")))
+    _
+      (Result.Error
+        (BackendError.init @"template must have a function signature"))))
+
+(defn prototype-head [declaration]
+  (match (prototype declaration)
+    (Result.Success rendered)
+      (Result.Success
+        (String.byte-slice &rendered 0 (Int.dec (String.length &rendered))))
+    (Result.Error error) (Result.Error error)))
+
+(defn concrete-type-listed? [types type]
+  (let-do [found false
+           n (Array.length types)]
+    (for [i 0 n]
+      (when (Type.same-representation? (Box.peek (Array.unsafe-nth types i))
+                                       type)
+        (set! found true)))
+    found))
+
+(defn source-nominal? [constructors name]
+  (let-do [found false
+           n (Array.length constructors)]
+    (for [i 0 n]
+      (match-ref (Box.peek
+          (CoreConstructorDeclaration.result (Array.unsafe-nth constructors i)))
+        (CoreType.Named candidate _) (when (= candidate name) (set! found true))
+        _ ()))
+    found))
+
+(defn collect-nominal-application! [constructors type visiting ordered]
+  (if (concrete-type-listed? ordered type)
+    (Result.Success ())
+    (match-ref type
+      (MonoType.Named name arguments)
+      (if (source-nominal? constructors name)
+        (if (concrete-type-listed? visiting type)
+          (Result.Error
+            (BackendError.init
+              @"recursive by-value nominal layouts are not supported"))
+          (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+                   ignored-visiting (Array.push-back! visiting
+                                                      (Box.init (MonoType.copy type)))
+                   n (Array.length constructors)]
+            (for [i 0 n]
+              (match-ref &result
+                (Result.Success _)
+                  (let [constructor (Array.unsafe-nth constructors i)]
+                    (match-ref (Box.peek
+                        (CoreConstructorDeclaration.result constructor))
+                      (CoreType.Named candidate _)
+                        (when (= candidate name)
+                          (match (collect-template-bindings
+                              (Box.peek
+                                (CoreConstructorDeclaration.result constructor))
+                              type
+                              &[])
+                            (Result.Success bindings)
+                              (let [fields (CoreConstructorDeclaration.arguments constructor)
+                                    field-count (Array.length fields)]
+                                (for [j 0 field-count]
+                                  (match-ref &result
+                                    (Result.Success _)
+                                      (match (concretize-core-type &bindings
+                                                                   (Box.peek (Array.unsafe-nth fields
+                                                                                               j)))
+                                        (Result.Success field-type)
+                                          (set! result
+                                                (collect-nominal-application! constructors
+                                                                              &field-type
+                                                                              visiting
+                                                                              ordered))
+                                        (Result.Error error)
+                                          (set! result (Result.Error error)))
+                                    (Result.Error _) ())))
+                            (Result.Error error)
+                              (set! result (Result.Error error))))
+                      _ ()))
+                (Result.Error _) ()))
+            (match result
+              (Result.Success _)
+                (do
+                  (Array.push-back! ordered (Box.init (MonoType.copy type)))
+                  (Result.Success ()))
+              (Result.Error error) (Result.Error error))))
+        ;; a builtin container (Array, Box, Ptr, ...) stores its payload
+        ;; behind a heap pointer, never inline, so a recursive occurrence
+        ;; through one is legal: skip any type already being visited (that
+        ;; skip also terminates the walk), and descend into the rest only
+        ;; for typedef ordering.
+        (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+                 n (Array.length arguments)]
+          (for [i 0 n]
+            (match-ref &result
+              (Result.Success _)
+                (let [argument (Box.peek (Array.unsafe-nth arguments i))]
+                  (unless (concrete-type-listed? visiting argument)
+                    (set! result
+                          (collect-nominal-application! constructors
+                                                        argument
+                                                        visiting
+                                                        ordered))))
+              (Result.Error _) ()))
+          result))
+      (MonoType.Reference inner _)
+      (collect-nominal-application! constructors
+                                    (Box.peek inner)
+                                    visiting
+                                    ordered)
+      ;; A function value is a fixed-size `Lambda` struct: a callback plus an
+      ;; environment pointer, never its argument or result inline. So a member
+      ;; typed `(Fn [T] T)` does NOT make T contain itself by value — descend to
+      ;; collect the types for typedef ORDERING, but skip any type already being
+      ;; visited instead of reporting unsupported recursion. Skipping is also
+      ;; what terminates the walk: in produces-output/function_members,
+      ;; `(deftype SelfReferencer [hp Int f (λ [SelfReferencer] SelfReferencer)])`
+      ;; has a Lambda over SelfReferencer forever.
+      (MonoType.Function arguments result-type)
+      (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+               n (Array.length arguments)]
+        (for [i 0 n]
+          (match-ref &result
+            (Result.Success _)
+              (let [argument (Box.peek (Array.unsafe-nth arguments i))]
+                (unless (concrete-type-listed? visiting argument)
+                  (set! result
+                        (collect-nominal-application! constructors
+                                                      argument
+                                                      visiting
+                                                      ordered))))
+            (Result.Error _) ()))
+        (match result
+          (Result.Success _)
+            (let [inner (Box.peek result-type)]
+              (if (concrete-type-listed? visiting inner)
+                (Result.Success ())
+                (collect-nominal-application! constructors
+                                              inner
+                                              visiting
+                                              ordered)))
+          (Result.Error error) (Result.Error error)))
+      _
+      (Result.Success ()))))
+
+(defn nominal-applications [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           visiting (the (Array (Box MonoType)) [])
+           ordered (the (Array (Box MonoType)) [])
+           declarations (BackendModule.declarations module)
+           constructors (BackendModule.constructors module)
+           declaration-count (Array.length declarations)]
+    (for [i 0 declaration-count]
+      (match-ref &result
+        (Result.Success _)
+          (match-ref (Array.unsafe-nth declarations i)
+            (BackendDeclaration.Function _ signature _ _)
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  (Box.peek signature)
+                                                  &visiting
+                                                  &ordered))
+            (BackendDeclaration.Global _ signature _)
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  (Box.peek signature)
+                                                  &visiting
+                                                  &ordered))
+            (BackendDeclaration.Intrinsic _ signature _)
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  (Box.peek signature)
+                                                  &visiting
+                                                  &ordered))
+            (BackendDeclaration.Constructor _ signature _)
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  (Box.peek signature)
+                                                  &visiting
+                                                  &ordered))
+            (BackendDeclaration.Template _ signature _ _)
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  (Box.peek signature)
+                                                  &visiting
+                                                  &ordered))
+            (BackendDeclaration.SourceTemplate _ signature _ _ _)
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  (Box.peek signature)
+                                                  &visiting
+                                                  &ordered)))
+        (Result.Error _) ()))
+    (let [roots (BackendModule.roots module)
+          root-count (Array.length roots)]
+      (for [i 0 root-count]
+        (match-ref &result
+          (Result.Success _)
+            (let [root-type (specialized-type (Box.peek (Array.unsafe-nth roots
+                                                                          i)))]
+              (set! result
+                    (collect-nominal-application! constructors
+                                                  &root-type
+                                                  &visiting
+                                                  &ordered)))
+          (Result.Error _) ())))
+    (match result
+      (Result.Success _) (Result.Success ordered)
+      (Result.Error error) (Result.Error error))))
+
+(defn append-nominal-variant! [buffer variant concrete-result]
+  (match (collect-template-bindings
+      (Box.peek (CoreConstructorDeclaration.result variant))
+      concrete-result
+      &[])
+    (Result.Success bindings)
+      (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+               fields (CoreConstructorDeclaration.arguments variant)
+               field-count (Array.length fields)]
+        (StringBuf.append-str buffer "    struct {
+")
+        (let-do [emitted 0]
+          (for [i 0 field-count]
+            (match-ref &result
+              (Result.Success _)
+                (match (render-core-type &bindings
+                                         (Box.peek (Array.unsafe-nth fields i)))
+                  (Result.Success field-type)
+                  ;; a unit member has no C storage; eliding it keeps the
+                  ;; remaining member_i names aligned with their field index.
+                  (unless-do (String.= &field-type "void")
+                    (StringBuf.append-str buffer "      ")
+                    (StringBuf.append-str buffer &field-type)
+                    (StringBuf.append-str buffer
+                                          &(String.concat &[@" member_"
+                                                            (Int.str i)
+                                                            @";
+"]))
+                    (set! emitted (Int.inc emitted)))
+                  (Result.Error error)
+                  (set! result (Result.Error error)))
+              (Result.Error _) ()))
+          ;; C forbids empty structs: a field-less (or all-unit) variant keeps
+          ;; a placeholder byte.
+          (when (Int.= emitted 0)
+            (StringBuf.append-str buffer "      unsigned char unused;
+")))
+        (match result
+          (Result.Success _)
+            (do
+              (StringBuf.append-str buffer
+                                    &(String.concat
+                                      &[@"    } variant_"
+                                        (Int.str
+                                          @(CoreConstructorDeclaration.tag variant))
+                                        @";
+"]))
+              (Result.Success ()))
+          (Result.Error error) (Result.Error error)))
+    (Result.Error error) (Result.Error error)))
+
+(doc last-declaration-start "the index at which the LAST declaration of a
+type name begins in the constructor array. A user deftype may shadow an
+earlier (e.g. Core) type of the same name; tags restart at the boundary, and
+the later declaration is the one later code means.")
+(defn last-declaration-start [constructors name]
+  (let-do [start -1
+           previous-tag -1
+           n (Array.length constructors)]
+    (for [i 0 n]
+      (let [c (Array.unsafe-nth constructors i)]
+        (match-ref (Box.peek (CoreConstructorDeclaration.result c))
+          (CoreType.Named rname _)
+            (when-do (= rname name)
+              (if (Int.< start 0)
+                (set! start i)
+                (when (Int.<= @(CoreConstructorDeclaration.tag c) previous-tag)
+                  (set! start i)))
+              (set! previous-tag @(CoreConstructorDeclaration.tag c)))
+          _ ())))
+    start))
+
+(defn render-nominal-definition [constructors concrete-result]
+  (match-ref concrete-result
+    (MonoType.Named source-name _)
+      (match (render-type concrete-result)
+        (Result.Success c-name)
+          (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+                   buffer (StringBuf.create)
+                   group-start (last-declaration-start constructors source-name)
+                   single-constructor (single-constructor-name? constructors
+                                                                source-name)
+                   constructor-count (Array.length constructors)]
+            ;; the payload union comes FIRST and the tag LAST, matching the
+            ;; reference layout: `Unsafe.coerce` of a sum reference to a payload
+            ;; pointer (e.g. `Maybe.unsafe-ptr`) relies on the payload sitting
+            ;; at offset zero.
+            (StringBuf.append-str &buffer "typedef struct ")
+            (StringBuf.append-str &buffer &c-name)
+            (StringBuf.append-str &buffer " {
+  union {
+")
+            (for [i 0 constructor-count]
+              (match-ref &result
+                (Result.Success _)
+                  (let [variant (Array.unsafe-nth constructors i)]
+                    (match-ref (Box.peek
+                        (CoreConstructorDeclaration.result variant))
+                      (CoreType.Named variant-name _)
+                        (when (and (= variant-name source-name)
+                                   (Int.>= i group-start))
+                          (set! result
+                                (append-nominal-variant! &buffer
+                                                         variant
+                                                         concrete-result)))
+                      _ ()))
+                (Result.Error _) ()))
+            (match result
+              (Result.Success _) (do (StringBuf.append-str &buffer "  } data;
+") (unless single-constructor (StringBuf.append-str &buffer "  int tag;
+")) (StringBuf.append-str &buffer "} ") (StringBuf.append-str &buffer &c-name) (StringBuf.append-str &buffer
+                                                                                                     ";
+") (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error error) (Result.Error error)))
+        (Result.Error error) (Result.Error error))
+    _
+      (Result.Error
+        (BackendError.init @"nominal application is not a named type"))))
+
+(doc nominal-definitions "renders one unmanaged nominal layout per reachable
+concrete application. Each constructor receives its stable source-order tag.")
+(defn nominal-definitions [module]
+  (match (nominal-applications module)
+    (Result.Success applications)
+      (let-do [result (the (Result String BackendError)
+                           (Result.Success (String.copy "")))
+               constructors (BackendModule.constructors module)
+               n (Array.length &applications)]
+        ;; forward-declare every nominal struct first: a recursive type
+        ;; reaches itself through a heap indirection (`Box`, `Ptr`), whose
+        ;; pointer member must name the struct before its full definition.
+        (for [i 0 n]
+          (match-ref &result
+            (Result.Success output)
+              (match (render-type (Box.peek (Array.unsafe-nth &applications i)))
+                (Result.Success c-name)
+                  (set! result
+                        (Result.Success
+                          (String.concat
+                            &[(String.copy output)
+                              @"typedef struct "
+                              (String.copy &c-name)
+                              @" "
+                              (String.copy &c-name)
+                              @";
+"])))
+                (Result.Error error) (set! result (Result.Error error)))
+            (Result.Error _) ()))
+        (for [i 0 n]
+          (match-ref &result
+            (Result.Success output)
+              (match (render-nominal-definition constructors
+                                                (Box.peek (Array.unsafe-nth &applications
+                                                                            i)))
+                (Result.Success rendered)
+                  (set! result
+                        (Result.Success
+                          (if (String.empty? output)
+                            rendered
+                            (String.concat &[(String.copy output) @"
+" rendered]))))
+                (Result.Error error) (set! result (Result.Error error)))
+            (Result.Error _) ()))
+        result)
+    (Result.Error error) (Result.Error error)))
+
+(doc constructor-definition "renders one reachable nominal constructor.")
+(defn constructor-definition [constructors declaration]
+  (match-ref declaration
+    (BackendDeclaration.Constructor _ signature constructor)
+      (match (prototype-head declaration)
+        (Result.Success head)
+          (match-ref (Box.peek signature)
+            (MonoType.Function arguments result-type)
+              (match (render-type (Box.peek result-type))
+                (Result.Success c-name)
+                  (let-do [buffer (StringBuf.create)
+                           ignored-head (StringBuf.append-str &buffer &head)]
+                    (StringBuf.append-str &buffer " {
+  ")
+                    (StringBuf.append-str &buffer &c-name)
+                    (StringBuf.append-str &buffer " value;
+")
+                    (match-ref (Box.peek
+                        (CoreConstructorDeclaration.result constructor))
+                      (CoreType.Named source-name _)
+                        (unless-do (single-constructor-name? constructors
+                                                             source-name)
+                          (StringBuf.append-str &buffer "  value.tag = ")
+                          (StringBuf.append-str &buffer
+                                                &(Int.str
+                                                  @(CoreConstructorDeclaration.tag constructor)))
+                          (StringBuf.append-str &buffer ";
+"))
+                      _ ())
+                    (let [n (Array.length arguments)]
+                      (for [i 0 n]
+                        ;; unit members have no C storage and no C parameter
+                        ;; (append-parameters! skips them, keeping the
+                        ;; original argI numbering for the rest).
+                        (unless-do (unit-type?
+                            (Box.peek (Array.unsafe-nth arguments i)))
+                          (StringBuf.append-str &buffer "  value.data.variant_")
+                          (StringBuf.append-str &buffer
+                                                &(Int.str
+                                                  @(CoreConstructorDeclaration.tag constructor)))
+                          (StringBuf.append-str &buffer
+                                                &(String.concat
+                                                  &[@".member_"
+                                                    (Int.str i)
+                                                    @" = arg"
+                                                    (Int.str i)
+                                                    @";
+"])))))
+                    (StringBuf.append-str &buffer "  return value;
+}")
+                    (Result.Success (StringBuf.to-string &buffer)))
+                (Result.Error error) (Result.Error error))
+            _
+              (Result.Error
+                (BackendError.init @"constructor has a non-function signature")))
+        (Result.Error error) (Result.Error error))
+    _
+      (Result.Error
+        (BackendError.init @"declaration is not a nominal constructor"))))
+
+(defn constructor-definitions [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           rendered-any false
+           declarations (BackendModule.declarations module)
+           n (Array.length declarations)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (match-ref declaration
+              (BackendDeclaration.Constructor _ _ _)
+                (match (constructor-definition (BackendModule.constructors module)
+                                               declaration)
+                  (Result.Success rendered)
+                    (do (when rendered-any (StringBuf.append-str &buffer "
+
+")) (StringBuf.append-str &buffer &rendered) (set! rendered-any true))
+                  (Result.Error error) (set! result (Result.Error error)))
+              _ ()))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+      (Result.Error error) (Result.Error error))))
+
+(doc function-definition "renders one typed user-function body when its
+signature and every emitted expression are in the unmanaged scalar subset.")
+(defn closure-env-typedef [captures env-type]
+  (let-do [buffer (StringBuf.create)
+           failure (the (Maybe BackendError) (Maybe.Nothing))
+           ignored-open (StringBuf.append-str &buffer "typedef struct { ")]
+    (for [i 0 (Array.length captures)]
+      (match-ref &failure
+        (Maybe.Nothing)
+          (match (render-type (Box.peek (Pair.b (Array.unsafe-nth captures i))))
+            (Result.Success rendered)
+              (do
+                (StringBuf.append-str &buffer &rendered)
+                (StringBuf.append-str &buffer " f")
+                (StringBuf.append-str &buffer &(Int.str i))
+                (StringBuf.append-str &buffer "; "))
+            (Result.Error error) (set! failure (Maybe.Just error)))
+        (Maybe.Just _) ()))
+    (StringBuf.append-str &buffer "} ")
+    (StringBuf.append-str &buffer env-type)
+    (StringBuf.append-char &buffer \;)
+    (match-ref &failure
+      (Maybe.Just error) (Result.Error @error)
+      (Maybe.Nothing) (Result.Success (StringBuf.to-string &buffer)))))
+
+(defn closure-head [symbol signature parameters env-type]
+  (match-ref signature
+    (MonoType.Function arguments return-type)
+      (match (render-type (Box.peek return-type))
+        (Result.Success rendered-return)
+          (let-do [buffer (StringBuf.create)
+                   ignored-a (StringBuf.append-str &buffer &rendered-return)
+                   ignored-b (StringBuf.append-char &buffer \space)
+                   ignored-c (StringBuf.append-str &buffer &(sanitize symbol))
+                   ignored-d (StringBuf.append-char &buffer \()
+                   ignored-e (StringBuf.append-str &buffer env-type)
+                   ignored-f (StringBuf.append-str &buffer "* _env")]
+            ;; the env is always a parameter, so never let `append-parameters!`
+            ;; emit its zero-argument "void" marker (which would fuse into
+            ;; "_envvoid"); only append the regular parameters when present.
+            (if (Int.> (Array.length arguments) 0)
+              (do
+                (StringBuf.append-str &buffer ", ")
+                (match (append-parameters! &buffer arguments parameters)
+                  (Result.Success _)
+                    (do
+                      (StringBuf.append-char &buffer \))
+                      (Result.Success (StringBuf.to-string &buffer)))
+                  (Result.Error error) (Result.Error error)))
+              (do
+                (StringBuf.append-char &buffer \))
+                (Result.Success (StringBuf.to-string &buffer)))))
+        (Result.Error error) (Result.Error error))
+    _ (Result.Error (BackendError.init @"closure has a non-function signature"))))
+
+(defn closure-delete-symbol [delete-symbols value-type]
+  (let-do [result (the (Maybe String) (Maybe.Nothing))
+           key (CAbi.type-key value-type)
+           n (Array.length delete-symbols)]
+    (for [i 0 n]
+      (let [entry (Array.unsafe-nth delete-symbols i)]
+        (when (String.= (Pair.a entry) &key)
+          (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
+    result))
+
+(defn closure-copy-symbol [copy-symbols value-type]
+  (let-do [result (the (Maybe String) (Maybe.Nothing))
+           key (CAbi.type-key value-type)
+           n (Array.length copy-symbols)]
+    (for [i 0 n]
+      (let [entry (Array.unsafe-nth copy-symbols i)]
+        (when (String.= (Pair.a entry) &key)
+          (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
+    result))
+
+(doc closure-env-copy-definition "renders the callback stored in `Lambda.copy`:
+it allocates a fresh environment and deep-copies managed captures. A recursive
+self edge is rebuilt as a non-owning view of the fresh environment.")
+(defn closure-env-copy-definition [closure-fn delete-symbols copy-symbols]
+  (let-do [lambda-symbol (sanitize (ClosureFunction.symbol closure-fn))
+           env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])
+           captures (ClosureFunction.captures closure-fn)
+           buffer (StringBuf.create)]
+    (StringBuf.append-str &buffer "void* ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "_copy(void* _raw) {
+  ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "* _env = _raw;
+  ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "* _copy = CARP_MALLOC(sizeof(")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "));
+")
+    (for [i 0 (Array.length captures)]
+      (let [capture (Array.unsafe-nth captures i)
+            capture-type (Box.peek (Pair.b capture))
+            field (String.concat &[@"f" (Int.str i)])]
+        (if (match-ref capture-type (MonoType.Function _ _) true _ false)
+          (do
+            (StringBuf.append-str &buffer "  if (_env->")
+            (StringBuf.append-str &buffer &field)
+            (StringBuf.append-str &buffer ".env == _env && _env->")
+            (StringBuf.append-str &buffer &field)
+            (StringBuf.append-str &buffer ".callback == (void*)")
+            (StringBuf.append-str &buffer &lambda-symbol)
+            (StringBuf.append-str &buffer ") {
+    _copy->")
+            (StringBuf.append-str &buffer &field)
+            (StringBuf.append-str &buffer " = (Lambda){ .callback = (void*)")
+            (StringBuf.append-str &buffer &lambda-symbol)
+            (StringBuf.append-str &buffer
+                                  ", .env = _copy, .delete = NULL, .copy = NULL };
+  } else ")
+            (match (closure-copy-symbol copy-symbols capture-type)
+              (Maybe.Just symbol)
+                (do
+                  (StringBuf.append-str &buffer "if (_env->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer ".env) {
+    _copy->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer " = ")
+                  (StringBuf.append-str &buffer &symbol)
+                  (StringBuf.append-str &buffer "(&_env->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer ");
+  } else {
+    _copy->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer " = _env->")
+                  (StringBuf.append-str &buffer &field)
+                  (StringBuf.append-str &buffer ";
+  }
+"))
+              (Maybe.Nothing) (do (StringBuf.append-str &buffer "{
+    _copy->") (StringBuf.append-str &buffer &field) (StringBuf.append-str &buffer
+                                                                          " = _env->") (StringBuf.append-str &buffer
+                                                                                                             &field) (StringBuf.append-str &buffer
+                                                                                                                                           ";
+  }
+"))))
+          (match (closure-delete-symbol delete-symbols capture-type)
+            (Maybe.Just _)
+              (match (closure-copy-symbol copy-symbols capture-type)
+                (Maybe.Just symbol)
+                  (do
+                    (StringBuf.append-str &buffer "  _copy->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer " = ")
+                    (StringBuf.append-str &buffer &symbol)
+                    (StringBuf.append-str &buffer "(&_env->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer ");
+"))
+                (Maybe.Nothing)
+                  (do
+                    (StringBuf.append-str &buffer "  _copy->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer " = _env->")
+                    (StringBuf.append-str &buffer &field)
+                    (StringBuf.append-str &buffer ";
+")))
+            (Maybe.Nothing)
+              (do
+                (StringBuf.append-str &buffer "  _copy->")
+                (StringBuf.append-str &buffer &field)
+                (StringBuf.append-str &buffer " = _env->")
+                (StringBuf.append-str &buffer &field)
+                (StringBuf.append-str &buffer ";
+"))))))
+    (StringBuf.append-str &buffer "  return _copy;
+}")
+    (StringBuf.to-string &buffer)))
+
+(doc closure-env-delete-definition "renders the callback stored in
+`Lambda.delete`: it releases every managed capture. `Function.delete` invokes
+this callback and then frees the environment cell itself.")
+(defn closure-env-delete-definition [closure-fn delete-symbols]
+  (let-do [env-type (String.concat
+             &[(sanitize (ClosureFunction.symbol closure-fn)) @"_env"])
+           captures (ClosureFunction.captures closure-fn)
+           buffer (StringBuf.create)]
+    (StringBuf.append-str &buffer "void ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "_delete(void* _raw) {
+  ")
+    (StringBuf.append-str &buffer &env-type)
+    (StringBuf.append-str &buffer "* _env = _raw;
+")
+    (for [i 0 (Array.length captures)]
+      (let [capture (Array.unsafe-nth captures i)]
+        (match (closure-delete-symbol delete-symbols (Box.peek (Pair.b capture)))
+          (Maybe.Just symbol)
+            (do
+              (StringBuf.append-str &buffer "  ")
+              (StringBuf.append-str &buffer &symbol)
+              (StringBuf.append-str &buffer "(_env->f")
+              (StringBuf.append-str &buffer &(Int.str i))
+              (StringBuf.append-str &buffer ");
+"))
+          (Maybe.Nothing) ())))
+    (StringBuf.append-char &buffer \})
+    (StringBuf.to-string &buffer)))
+
+(defn closure-function-definition [constructors closure-fn]
+  (let-do [signature (Box.peek (ClosureFunction.signature closure-fn))
+           captures (ClosureFunction.captures closure-fn)
+           env-type (String.concat
+             &[(sanitize (ClosureFunction.symbol closure-fn)) @"_env"])
+           prelude (Array.copy (ClosureFunction.parameters closure-fn))]
+    (for [i 0 (Array.length captures)]
+      (Array.push-back! &prelude @(Pair.a (Array.unsafe-nth captures i))))
+    (set-plain-locals! &prelude (Box.peek (ClosureFunction.body closure-fn)))
+    (match-ref signature
+      (MonoType.Function _ return-type)
+        (match (closure-head (ClosureFunction.symbol closure-fn)
+                             signature
+                             (ClosureFunction.parameters closure-fn)
+                             &env-type)
+          (Result.Success head)
+            (let-do [buffer (StringBuf.create)
+                     ignored-head (StringBuf.append-str &buffer &head)
+                     ignored-open (StringBuf.append-str &buffer " {")
+                     ignored-nl (StringBuf.append-char &buffer \newline)
+                     failure (the (Maybe BackendError) (Maybe.Nothing))]
+              (for [i 0 (Array.length captures)]
+                (match-ref &failure
+                  (Maybe.Nothing)
+                    (let [capture (Array.unsafe-nth captures i)]
+                      (match (render-type (Box.peek (Pair.b capture)))
+                        (Result.Success rendered)
+                          (do
+                            (StringBuf.append-str &buffer "  ")
+                            (StringBuf.append-str &buffer &rendered)
+                            (StringBuf.append-char &buffer \space)
+                            (StringBuf.append-str &buffer
+                                                  &(local-symbol (Pair.a capture)))
+                            (StringBuf.append-str &buffer " = _env->f")
+                            (StringBuf.append-str &buffer &(Int.str i))
+                            (StringBuf.append-char &buffer \;)
+                            (StringBuf.append-char &buffer \newline))
+                        (Result.Error error) (set! failure (Maybe.Just error))))
+                  (Maybe.Just _) ()))
+              (match-ref &failure
+                (Maybe.Just error) (Result.Error @error)
+                (Maybe.Nothing)
+                  (let [destination (ResultDestination.Return
+                          (Box.init (MonoType.copy (Box.peek return-type))))]
+                    (match (append-result! constructors
+                                           &buffer
+                                           (Box.peek (ClosureFunction.body closure-fn))
+                                           &destination
+                                           1)
+                      (Result.Success _)
+                        (do
+                          (StringBuf.append-char &buffer \})
+                          (Result.Success (StringBuf.to-string &buffer)))
+                      (Result.Error error) (Result.Error error)))))
+          (Result.Error error) (Result.Error error))
+      _
+        (Result.Error
+          (BackendError.init @"closure has a non-function signature")))))
+
+(doc closure-prototypes-of "renders environment typedefs and callback prototypes
+for every capturing closure, emitted in the declarations section so both closure
+sites and callback definitions can refer to them.")
+(defn closure-prototypes-of [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           closures (BackendModule.closure-functions module)
+           n (Array.length closures)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (let [closure-fn (Array.unsafe-nth closures i)
+                env-type (String.concat
+                  &[(sanitize (ClosureFunction.symbol closure-fn)) @"_env"])]
+            (match (closure-env-typedef (ClosureFunction.captures closure-fn)
+                                        &env-type)
+              (Result.Success typedef)
+                (match (closure-head (ClosureFunction.symbol closure-fn)
+                                     (Box.peek (ClosureFunction.signature closure-fn))
+                                     (ClosureFunction.parameters closure-fn)
+                                     &env-type)
+                  (Result.Success head)
+                    (do
+                      (StringBuf.append-str &buffer &typedef)
+                      (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer "void ")
+                      (StringBuf.append-str &buffer &env-type)
+                      (StringBuf.append-str &buffer "_delete(void* _raw);")
+                      (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer "void* ")
+                      (StringBuf.append-str &buffer &env-type)
+                      (StringBuf.append-str &buffer "_copy(void* _raw);")
+                      (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer &head)
+                      (StringBuf.append-char &buffer \;)
+                      (StringBuf.append-char &buffer \newline))
+                  (Result.Error error) (set! result (Result.Error error)))
+              (Result.Error error) (set! result (Result.Error error))))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+      (Result.Error error) (Result.Error error))))
+
+(doc closure-definitions-of "renders every capturing closure callback definition
+with a leading environment pointer and captured-value unpacking.")
+(defn closure-definitions-of [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           closures (BackendModule.closure-functions module)
+           n (Array.length closures)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (let-do [closure-fn (Array.unsafe-nth closures i)]
+            (StringBuf.append-char &buffer \newline)
+            (StringBuf.append-char &buffer \newline)
+            (StringBuf.append-str &buffer
+                                  &(closure-env-delete-definition closure-fn
+                                                                  (BackendModule.delete-symbols module)))
+            (StringBuf.append-char &buffer \newline)
+            (StringBuf.append-char &buffer \newline)
+            (StringBuf.append-str &buffer
+                                  &(closure-env-copy-definition closure-fn
+                                                                (BackendModule.delete-symbols module)
+                                                                (BackendModule.copy-symbols module)))
+            (match (closure-function-definition (BackendModule.constructors module)
+                                                closure-fn)
+              (Result.Success rendered)
+                (do
+                  (StringBuf.append-char &buffer \newline)
+                  (StringBuf.append-char &buffer \newline)
+                  (StringBuf.append-str &buffer &rendered))
+              (Result.Error error) (set! result (Result.Error error))))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+      (Result.Error error) (Result.Error error))))
+
+(defn function-definition [constructors declaration]
+  (match-ref declaration
+    (BackendDeclaration.Function fn-symbol signature parameters body)
+      (let-do [ignored-context (set! *render-context* [(String.copy fn-symbol)])]
+        (if (renderable-signature? constructors (Box.peek signature))
+          (match-ref (Box.peek signature)
+            (MonoType.Function _ return-type)
+              (match (do
+                  (set-plain-locals! parameters (Box.peek body))
+                  (prototype-head declaration))
+                (Result.Success head)
+                  (let-do [buffer (StringBuf.create)
+                           ignored-head (StringBuf.append-str &buffer &head)
+                           ignored-open (StringBuf.append-str &buffer " {
+")
+                           destination (ResultDestination.Return
+                             (Box.init (MonoType.copy (Box.peek return-type))))
+                           body-result (append-result! constructors
+                                                       &buffer
+                                                       (Box.peek body)
+                                                       &destination
+                                                       1)]
+                    (match body-result
+                      (Result.Success _)
+                        (do
+                          (StringBuf.append-char &buffer \})
+                          (Result.Success (StringBuf.to-string &buffer)))
+                      (Result.Error error) (Result.Error error)))
+                (Result.Error error) (Result.Error error))
+            _
+              (Result.Error
+                (BackendError.init @"user function has a non-function signature")))
+          (Result.Error
+            (BackendError.init
+              @"user function signature requires ownership or lifetime lowering"))))
+    _ (Result.Error (BackendError.init @"declaration is not a user function"))))
+
+(doc function-definitions "renders every reachable typed user-function body
+supported by the unmanaged scalar subset.")
+(defn function-definitions [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           rendered-any false
+           declarations (BackendModule.declarations module)
+           n (Array.length declarations)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (match-ref declaration
+              (BackendDeclaration.Function _ _ _ _)
+                (match (function-definition (BackendModule.constructors module)
+                                            declaration)
+                  (Result.Success rendered)
+                    (do (when rendered-any (StringBuf.append-str &buffer "
+
+")) (StringBuf.append-str &buffer &rendered) (set! rendered-any true))
+                  (Result.Error error) (set! result (Result.Error error)))
+              _ ()))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _)
+        (match (closure-definitions-of module)
+          (Result.Success closures)
+            (do
+              (StringBuf.append-str &buffer &closures)
+              (Result.Success (StringBuf.to-string &buffer)))
+          (Result.Error error) (Result.Error error))
+      (Result.Error error) (Result.Error error))))
+
+(defn constant-global-initializer? [expression]
+  (match-ref expression
+    (SpecializedExpr.IntLit _ _ _) true
+    (SpecializedExpr.ByteLit _ _ _) true
+    (SpecializedExpr.LongLit _ _ _) true
+    (SpecializedExpr.FloatLit _ _ _) true
+    (SpecializedExpr.DoubleLit _ _ _) true
+    (SpecializedExpr.CharLit _ _ _) true
+    (SpecializedExpr.BoolLit _ _ _) true
+    (SpecializedExpr.Annotation _ _ inner _)
+      (constant-global-initializer? (Box.peek inner))
+    _ false))
+
+(doc global-definition "renders one ownership-free scalar global with a
+compile-time C initializer.")
+(defn global-definition [constructors declaration]
+  (match-ref declaration
+    (BackendDeclaration.Global symbol signature body)
+      (match-ref (Box.peek signature)
+        ;; the reference elides unit definitions (issue #1296): no C storage.
+        (MonoType.Unit)
+        (Result.Success (String.copy ""))
+        _
+        (if (unmanaged-type? constructors (Box.peek signature))
+          (match (render-type (Box.peek signature))
+            (Result.Success rendered-type)
+              (if (constant-global-initializer? (Box.peek body))
+                (match (render-value-expression constructors (Box.peek body))
+                  (Result.Success initializer)
+                    (Result.Success
+                      (String.concat
+                        &[rendered-type
+                          @" "
+                          (sanitize symbol)
+                          @" = "
+                          initializer
+                          @";"]))
+                  (Result.Error error) (Result.Error error))
+                (Result.Success
+                  (String.concat &[rendered-type @" " (sanitize symbol) @";"])))
+            (Result.Error error) (Result.Error error))
+          ;; a managed global is declared bare here; `global-initializers` emits
+          ;; its startup assignment through the ownership-aware `append-result!`.
+          (match (render-type (Box.peek signature))
+            (Result.Success rendered-type)
+              (Result.Success
+                (String.concat &[rendered-type @" " (sanitize symbol) @";"]))
+            (Result.Error error) (Result.Error error))))
+    _ (Result.Error (BackendError.init @"declaration is not a global value"))))
+
+(doc global-definitions "renders every reachable ownership-free scalar
+global definition.")
+(defn global-definitions [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           rendered-any false
+           declarations (BackendModule.declarations module)
+           n (Array.length declarations)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (match-ref declaration
+              (BackendDeclaration.Global _ _ _)
+                (match (global-definition (BackendModule.constructors module)
+                                          declaration)
+                  (Result.Success rendered)
+                    (do (when rendered-any (StringBuf.append-str &buffer "
+
+")) (StringBuf.append-str &buffer &rendered) (set! rendered-any true))
+                  (Result.Error error) (set! result (Result.Error error)))
+              _ ()))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+      (Result.Error error) (Result.Error error))))
+
+(defn greater-score [left right] (if (Int.> left right) left right))
+
+(sig expressions-global-score
+     (Fn
+       [(Ref BackendModule)
+        (Ref (Array (Box SpecializedExpr)))
+        (Ref (Array String))]
+       Int))
+(defn expressions-global-score [module expressions visited]
+  (let-do [score 0
+           n (Array.length expressions)]
+    (for [i 0 n]
+      (set! score
+            (greater-score score
+                           (expression-global-score module
+                                                    (Box.peek (Array.unsafe-nth expressions
+                                                                                i))
+                                                    visited))))
+    score))
+
+(sig branches-global-score
+     (Fn
+       [(Ref BackendModule)
+        (Ref (Array SpecializedMatchBranch))
+        (Ref (Array String))]
+       Int))
+(defn branches-global-score [module branches visited]
+  (let-do [score 0
+           n (Array.length branches)]
+    (for [i 0 n]
+      (set! score
+            (greater-score score
+                           (expression-global-score module
+                                                    (Box.peek
+                                                      (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                                                     i)))
+                                                    visited))))
+    score))
+
+(sig global-symbol-score
+     (Fn [(Ref BackendModule) (Ref String) (Ref (Array String))] Int))
+(defn global-symbol-score [module symbol visited]
+  (if (string-listed? visited symbol)
+    0
+    (let-do [score 0
+             next (Array.copy visited)
+             ignored-next (Array.push-back! &next (String.copy symbol))
+             declarations (BackendModule.declarations module)
+             n (Array.length declarations)]
+      (for [i 0 n]
+        (match-ref (Array.unsafe-nth declarations i)
+          (BackendDeclaration.Global candidate _ body)
+            (when (= candidate symbol)
+              (set! score (expression-global-score module (Box.peek body) &next)))
+          (BackendDeclaration.Function candidate _ _ body)
+            (when (= candidate symbol)
+              (set! score (expression-global-score module (Box.peek body) &next)))
+          _ ()))
+      score)))
+
+(sig expression-global-score
+     (Fn [(Ref BackendModule) (Ref SpecializedExpr) (Ref (Array String))] Int))
+(defn expression-global-score [module expression visited]
+  (match-ref expression
+    (SpecializedExpr.ArrayLit _ _ expressions)
+      (expressions-global-score module expressions visited)
+    (SpecializedExpr.StaticArrayLit _ _ expressions)
+      (expressions-global-score module expressions visited)
+    (SpecializedExpr.GlobalValue _ _ _ _ symbol _)
+      (Int.inc (global-symbol-score module symbol visited))
+    (SpecializedExpr.Call _ _ callee arguments)
+      (greater-score
+        (expression-global-score module (Box.peek callee) visited)
+        (expressions-global-score module arguments visited))
+    (SpecializedExpr.GlobalCall _ _ _ _ symbol arguments)
+      (greater-score
+        (Int.inc (global-symbol-score module symbol visited))
+        (expressions-global-score module arguments visited))
+    (SpecializedExpr.Do _ _ expressions)
+      (expressions-global-score module expressions visited)
+    (SpecializedExpr.If _ _ condition then-branch else-branch)
+      (greater-score
+        (expression-global-score module (Box.peek condition) visited)
+        (greater-score
+          (expression-global-score module (Box.peek then-branch) visited)
+          (expression-global-score module (Box.peek else-branch) visited)))
+    (SpecializedExpr.Let _ _ _ value body)
+      (greater-score
+        (expression-global-score module (Box.peek value) visited)
+        (expression-global-score module (Box.peek body) visited))
+    (SpecializedExpr.Set _ _ _ value)
+      (expression-global-score module (Box.peek value) visited)
+    (SpecializedExpr.While _ _ condition body)
+      (greater-score
+        (expression-global-score module (Box.peek condition) visited)
+        (expression-global-score module (Box.peek body) visited))
+    (SpecializedExpr.Lambda _ _ _ body)
+      (expression-global-score module (Box.peek body) visited)
+    (SpecializedExpr.Match _ _ _ scrutinee branches)
+      (greater-score
+        (expression-global-score module (Box.peek scrutinee) visited)
+        (branches-global-score module branches visited))
+    (SpecializedExpr.Annotation _ _ inner _)
+      (expression-global-score module (Box.peek inner) visited)
+    _ 0))
+
+(doc global-initializers "renders ordered startup assignments for reachable
+ownership-free globals whose initializers are not C constant expressions.
+Ordering follows transitive global dependencies through called functions;
+cycles retain declaration order.")
+(defn global-initializers [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           global-indices (the (Array Int) [])
+           scores (the (Array Int) [])
+           maximum-score 0
+           declarations (BackendModule.declarations module)
+           declaration-count (Array.length declarations)]
+    (for [i 0 declaration-count]
+      (match-ref (Array.unsafe-nth declarations i)
+        (BackendDeclaration.Global symbol global-type body)
+          (unless (or
+              (constant-global-initializer? (Box.peek body))
+              ;; elided unit globals have no storage to initialize
+              (match-ref (Box.peek global-type) (MonoType.Unit) true _ false))
+            (let-do [visited (the (Array String) [])
+                     score (global-symbol-score module symbol &visited)]
+              (Array.push-back! &global-indices i)
+              (Array.push-back! &scores score)
+              (set! maximum-score (greater-score maximum-score score))))
+        _ ()))
+    (let-do [buffer (StringBuf.create)
+             ignored-plain (clear-plain-locals!)
+             ;; the reference signature: argc/argv feed `System.args` before
+             ;; any other global initializes. The tentative definition merges
+             ;; with the extern declaration programs that read it emit.
+             ignored-open (StringBuf.append-str &buffer "Array System_args;
+void carp_init_globals(int argc, char** argv) {
+  System_args.len = argc;
+  System_args.data = argv;
+")
+             global-count (Array.length &global-indices)]
+      (for [score 0 (Int.inc maximum-score)]
+        (for [offset 0 global-count]
+          (when (Int.= score @(Array.unsafe-nth &scores offset))
+            (let [declaration-index @(Array.unsafe-nth &global-indices offset)]
+              (match-ref (Array.unsafe-nth declarations declaration-index)
+                (BackendDeclaration.Global symbol signature body)
+                  (match-ref &result
+                    (Result.Success _)
+                      (let-do [destination (ResultDestination.Assign (sanitize symbol)
+                                                                     (Box.init (MonoType.copy (Box.peek signature))))]
+                        (set! *render-context* [(String.copy symbol)])
+                        (set! result
+                              (append-result! (BackendModule.constructors module)
+                                              &buffer
+                                              (Box.peek body)
+                                              &destination
+                                              1)))
+                    (Result.Error _) ())
+                _ ())))))
+      (StringBuf.append-str &buffer "}
+")
+      (match result
+        (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+        (Result.Error error) (Result.Error error)))))
+
+(doc template-definition "renders the body of a registry-declared
+parameterized primitive. All interface dependencies must already have been
+selected by specialization.")
+(defn template-definition [declaration]
+  (match-ref declaration
+    (BackendDeclaration.Template _ signature template dependencies)
+      (match (prototype-head declaration)
+        (Result.Success head)
+          (match-ref template
+            (PrimitiveTemplate.IntComparison comparison)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       operator (match-ref comparison
+                         (PrimitiveIntComparison.LessEqual) (String.copy "<=")
+                         (PrimitiveIntComparison.GreaterEqual)
+                           (String.copy ">=")
+                         (PrimitiveIntComparison.NotEqual) (String.copy "!="))
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  return arg0 ")
+                (StringBuf.append-str &buffer &operator)
+                (StringBuf.append-str &buffer " arg1;
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"Int comparison template must not have dependencies")))
+            (PrimitiveTemplate.PointerCopy)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  return *arg0;
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"pointer copy template must not have dependencies")))
+            ;; only reached when a length is referenced as a value (call sites
+            ;; inline `.len`/`strlen`); the body mirrors that call lowering.
+            (PrimitiveTemplate.CollectionLength)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)
+                       behind-ref (match-ref (Box.peek signature)
+                         (MonoType.Function length-arguments _)
+                           (if (Int.= 1 (Array.length length-arguments))
+                             (match-ref (Box.peek (Array.unsafe-nth length-arguments
+                                                                    0))
+                               (MonoType.Reference _ _) true
+                               _ false)
+                             false)
+                         _ false)
+                       strlen-backed (match-ref (Box.peek signature)
+                         (MonoType.Function length-arguments _)
+                           (if (Int.= 1 (Array.length length-arguments))
+                             (match-ref &(deref-type
+                                 (Box.peek (Array.unsafe-nth length-arguments 0)))
+                               (MonoType.String) true
+                               (MonoType.Named length-type-name _)
+                                 (String.= length-type-name "Pattern")
+                               _ false)
+                             false)
+                         _ false)]
+                (StringBuf.append-str &buffer
+                                      (cond (and strlen-backed behind-ref) " {
+  return (int)strlen(*arg0);
+}" strlen-backed " {
+  return (int)strlen(arg0);
+}" behind-ref " {
+  return arg0->len;
+}" " {
+  return arg0.len;
+}"))
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init @"length template must not have dependencies")))
+            ;; the reference renders any function value as the fixed string
+            ;; "λ" (StartingEnv.generateTemplateFuncStrOrPrn).
+            (PrimitiveTemplate.FunctionStr)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  static String lambda = \"\\u03bb\";
+  return String_copy(&lambda);
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"function str template must not have dependencies")))
+            (PrimitiveTemplate.FunctionCopy _)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  if(arg0->env) {
+    Lambda copy;
+    copy.callback = arg0->callback;
+    copy.delete = arg0->delete;
+    copy.copy = arg0->copy;
+    copy.env = ((void*(*)(void*))arg0->copy)(arg0->env);
+    return copy;
+  }
+  return *arg0;
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"function copy template must not have dependencies")))
+            (PrimitiveTemplate.FunctionDelete _)
+            (if (Int.= 0 (Array.length dependencies))
+              (let-do [buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  if(arg0.delete) {
+    ((void(*)(void*))arg0.delete)(arg0.env);
+    CARP_FREE(arg0.env);
+  }
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"function delete template must not have dependencies")))
+            (PrimitiveTemplate.BoxCopy _)
+            (if (Int.= 1 (Array.length dependencies))
+              (match (template-element-type (Box.peek signature))
+                (Result.Success element)
+                  (match (CBackend.render-type &element)
+                    (Result.Success rendered-element)
+                      (let [dependency (Array.unsafe-nth dependencies 0)
+                            dependency-symbol (sanitize (BackendDependency.symbol dependency))]
+                        (let-do [buffer (StringBuf.create)
+                                 ignored-head (StringBuf.append-str &buffer
+                                                                    &head)]
+                          (StringBuf.append-str &buffer " {
+  ")
+                          (StringBuf.append-str &buffer &rendered-element)
+                          (StringBuf.append-str &buffer
+                                                "* copy = CARP_MALLOC(sizeof(")
+                          (StringBuf.append-str &buffer &rendered-element)
+                          (StringBuf.append-str &buffer "));
+  *copy = ")
+                          (StringBuf.append-str &buffer &dependency-symbol)
+                          (StringBuf.append-str &buffer "(*arg0);
+  return copy;
+}")
+                          (Result.Success (StringBuf.to-string &buffer))))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+              (Result.Error
+                (BackendError.init
+                  @"box copy template requires one copy dependency")))
+            (PrimitiveTemplate.PairCopy _)
+            (if (Int.= 2 (Array.length dependencies))
+              (match-ref (Box.peek signature)
+                (MonoType.Function _ result-type)
+                  (match (CBackend.render-type (Box.peek result-type))
+                    (Result.Success rendered-pair)
+                      (let [first-dependency (Array.unsafe-nth dependencies 0)
+                            second-dependency (Array.unsafe-nth dependencies 1)
+                            first-symbol (sanitize
+                              (BackendDependency.symbol first-dependency))
+                            second-symbol (sanitize
+                              (BackendDependency.symbol second-dependency))]
+                        (let-do [buffer (StringBuf.create)
+                                 ignored-head (StringBuf.append-str &buffer
+                                                                    &head)]
+                          (StringBuf.append-str &buffer " {
+  ")
+                          (StringBuf.append-str &buffer &rendered-pair)
+                          (StringBuf.append-str &buffer " copy;
+  copy.a = ")
+                          (StringBuf.append-str &buffer &first-symbol)
+                          (StringBuf.append-str &buffer "(&arg0->a);
+  copy.b = ")
+                          (StringBuf.append-str &buffer &second-symbol)
+                          (StringBuf.append-str &buffer "(&arg0->b);
+  return copy;
+}")
+                          (Result.Success (StringBuf.to-string &buffer))))
+                    (Result.Error error) (Result.Error error))
+                _
+                  (Result.Error
+                    (BackendError.init
+                      @"pair copy template needs a function signature")))
+              (Result.Error
+                (BackendError.init
+                  @"pair copy template requires two copy dependencies")))
+            (PrimitiveTemplate.BoxStr _)
+            (if (Int.= 1 (Array.length dependencies))
+              (let-do [dependency (Array.unsafe-nth dependencies 0)
+                       dependency-symbol (sanitize (BackendDependency.symbol dependency))
+                       by-ref (match-ref (Box.peek (BackendDependency.signature dependency))
+                         (MonoType.Function str-arguments _)
+                           (if (Int.= 1 (Array.length str-arguments))
+                             (match-ref (Box.peek (Array.unsafe-nth str-arguments
+                                                                    0))
+                               (MonoType.Reference _ _) true
+                               _ false)
+                             false)
+                         _ false)
+                       ;; `arg0` is elt**: the boxed element pointer is *arg0.
+                       str-call (if by-ref
+                         (fmt "String temp = %s(*arg0);" &dependency-symbol)
+                         (fmt "String temp = %s(**arg0);" &dependency-symbol))
+                       buffer (StringBuf.create)
+                       ignored-head (StringBuf.append-str &buffer &head)]
+                (StringBuf.append-str &buffer " {
+  ")
+                (StringBuf.append-str &buffer &str-call)
+                (StringBuf.append-str &buffer "
+  int size = snprintf(NULL, 0, \"(Box %s)\", temp) + 1;
+  String buffer = CARP_MALLOC(size);
+  snprintf(buffer, size, \"(Box %s)\", temp);
+  if(temp) { CARP_FREE(temp); temp = NULL; }
+  return buffer;
+}")
+                (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Error
+                (BackendError.init
+                  @"box str template requires one str dependency")))
+            ;; a Box is a bare element pointer: delete the boxed element when
+            ;; it is managed (one delete dependency), then free the cell.
+            (PrimitiveTemplate.BoxDelete _)
+            (match-ref (Box.peek signature)
+              (MonoType.Function box-delete-arguments _)
+                (if (Int.= 1 (Array.length box-delete-arguments))
+                  (let-do [buffer (StringBuf.create)
+                           ignored-head (StringBuf.append-str &buffer &head)]
+                    (StringBuf.append-str &buffer " {
+  if (arg0) {
+")
+                    (when (Int.= 1 (Array.length dependencies))
+                      (let-do [dependency (Array.unsafe-nth dependencies 0)
+                               dependency-symbol (sanitize (BackendDependency.symbol dependency))]
+                        (StringBuf.append-str &buffer "    ")
+                        (StringBuf.append-str &buffer &dependency-symbol)
+                        (StringBuf.append-str &buffer "(*arg0);
+")))
+                    (StringBuf.append-str &buffer "    CARP_FREE(arg0);
+  }
+}")
+                    (Result.Success (StringBuf.to-string &buffer)))
+                  (Result.Error
+                    (BackendError.init
+                      @"box delete template must have one argument")))
+              _
+                (Result.Error
+                  (BackendError.init
+                    @"box delete template needs a function signature")))
+            (PrimitiveTemplate.ArrayDelete _)
+            (match-ref (Box.peek signature)
+              (MonoType.Function delete-arguments _)
+                (if (Int.= 1 (Array.length delete-arguments))
+                  (match-ref (Box.peek (Array.unsafe-nth delete-arguments 0))
+                    (MonoType.Named _ element-arguments)
+                      (if (Int.= 1 (Array.length element-arguments))
+                        (match (render-type
+                            (Box.peek (Array.unsafe-nth element-arguments 0)))
+                          (Result.Success rendered-element)
+                            (let-do [buffer (StringBuf.create)
+                                     ignored-head (StringBuf.append-str &buffer
+                                                                        &head)]
+                              (StringBuf.append-str &buffer " {
+")
+                              (StringBuf.append-str &buffer "  if (arg0.data) {
+")
+                              (when (Int.= 1 (Array.length dependencies))
+                                (let-do [dependency (Array.unsafe-nth dependencies
+                                                                      0)
+                                         dependency-symbol (sanitize (BackendDependency.symbol dependency))]
+                                  (StringBuf.append-str &buffer
+                                                        "  for(int i = 0; i < arg0.len; i++) {
+    ")
+                                  (StringBuf.append-str &buffer
+                                                        &dependency-symbol)
+                                  (StringBuf.append-str &buffer "(((")
+                                  (StringBuf.append-str &buffer
+                                                        &rendered-element)
+                                  (StringBuf.append-str &buffer
+                                                        "*)arg0.data)[i]);
+  }
+")))
+                              (StringBuf.append-str &buffer
+                                                    "    CARP_FREE(arg0.data);
+  }
+}")
+                              (Result.Success (StringBuf.to-string &buffer)))
+                          (Result.Error error) (Result.Error error))
+                        (Result.Error
+                          (BackendError.init
+                            @"array delete template container must have one type argument")))
+                    _
+                      (Result.Error
+                        (BackendError.init
+                          @"array delete template argument must be a named container")))
+                  (Result.Error
+                    (BackendError.init
+                      @"array delete template must have one argument")))
+              _
+                (Result.Error
+                  (BackendError.init
+                    @"array delete template needs a function signature")))
+            (PrimitiveTemplate.ArraySet _)
+            (match-ref (Box.peek signature)
+              (MonoType.Function arguments return-type)
+                (if (Int.= 3 (Array.length arguments))
+                  (match (render-type (Box.peek (Array.unsafe-nth arguments 2)))
+                    (Result.Success rendered-element)
+                      (let-do [buffer (StringBuf.create)
+                               by-reference (match-ref (Box.peek (Array.unsafe-nth arguments
+                                                                                   0))
+                                 (MonoType.Reference _ _) true
+                                 _ false)
+                               data (if by-reference @"arg0->data" @"arg0.data")
+                               ignored-head (StringBuf.append-str &buffer &head)]
+                        (StringBuf.append-str &buffer " {
+")
+                        (when (Int.> (Array.length dependencies) 0)
+                          (let-do [dependency (Array.unsafe-nth dependencies 0)]
+                            (StringBuf.append-str &buffer "  ")
+                            (StringBuf.append-str &buffer
+                                                  &(sanitize (BackendDependency.symbol dependency)))
+                            (StringBuf.append-str &buffer "(((")
+                            (StringBuf.append-str &buffer &rendered-element)
+                            (StringBuf.append-str &buffer "*)")
+                            (StringBuf.append-str &buffer &data)
+                            (StringBuf.append-str &buffer ")[arg1]);
+")))
+                        (StringBuf.append-str &buffer "  ((")
+                        (StringBuf.append-str &buffer &rendered-element)
+                        (StringBuf.append-str &buffer "*)")
+                        (StringBuf.append-str &buffer &data)
+                        (StringBuf.append-str &buffer ")[arg1] = arg2;
+")
+                        (unless by-reference
+                          (StringBuf.append-str &buffer "  return arg0;
+"))
+                        (StringBuf.append-char &buffer \})
+                        (Result.Success (StringBuf.to-string &buffer)))
+                    (Result.Error error) (Result.Error error))
+                  (Result.Error
+                    (BackendError.init
+                      @"array set template must have three arguments")))
+              _
+                (Result.Error
+                  (BackendError.init
+                    @"array set template needs a function signature")))
+            (PrimitiveTemplate.ArrayFilter _)
+            (match-ref (Box.peek signature)
+              (MonoType.Function arguments _)
+                (if (Int.= 2 (Array.length arguments))
+                  (match-ref (Box.peek (Array.unsafe-nth arguments 1))
+                    (MonoType.Named _ element-arguments)
+                      (if (Int.= 1 (Array.length element-arguments))
+                        (match (render-type
+                            (Box.peek (Array.unsafe-nth element-arguments 0)))
+                          (Result.Success rendered-element)
+                            (let-do [buffer (StringBuf.create)
+                                     ignored-head (StringBuf.append-str &buffer
+                                                                        &head)]
+                              (StringBuf.append-str &buffer " {
+  int insertIndex = 0;
+  for(int i = 0; i < arg1.len; ++i) {
+    if((*arg0).env
+       ? ((bool (*)(void*, ")
+                              (StringBuf.append-str &buffer &rendered-element)
+                              (StringBuf.append-str &buffer
+                                                    "*))(*arg0).callback)((*arg0).env, &((")
+                              (StringBuf.append-str &buffer &rendered-element)
+                              (StringBuf.append-str &buffer "*)arg1.data)[i])
+       : ((bool (*) (")
+                              (StringBuf.append-str &buffer &rendered-element)
+                              (StringBuf.append-str &buffer
+                                                    "*))(*arg0).callback)(&((")
+                              (StringBuf.append-str &buffer &rendered-element)
+                              (StringBuf.append-str &buffer "*)arg1.data)[i])) {
+      ((")
+                              (StringBuf.append-str &buffer &rendered-element)
+                              (StringBuf.append-str &buffer
+                                                    "*)arg1.data)[insertIndex++] = ((")
+                              (StringBuf.append-str &buffer &rendered-element)
+                              (StringBuf.append-str &buffer "*)arg1.data)[i];
+    }")
+                              (when (Int.> (Array.length dependencies) 0)
+                                (let-do [dependency (Array.unsafe-nth dependencies
+                                                                      0)]
+                                  (StringBuf.append-str &buffer " else {
+      ")
+                                  (StringBuf.append-str &buffer
+                                                        &(sanitize (BackendDependency.symbol dependency)))
+                                  (StringBuf.append-str &buffer "(((")
+                                  (StringBuf.append-str &buffer
+                                                        &rendered-element)
+                                  (StringBuf.append-str &buffer
+                                                        "*)arg1.data)[i]);
+    }")))
+                              (StringBuf.append-str &buffer "
+  }
+  arg1.len = insertIndex;
+  return arg1;
+}")
+                              (Result.Success (StringBuf.to-string &buffer)))
+                          (Result.Error error) (Result.Error error))
+                        (Result.Error
+                          (BackendError.init
+                            @"array filter container must have one type argument")))
+                    _
+                      (Result.Error
+                        (BackendError.init
+                          @"array filter template needs an array argument")))
+                  (Result.Error
+                    (BackendError.init
+                      @"array filter template must have two arguments")))
+              _
+                (Result.Error
+                  (BackendError.init
+                    @"array filter template needs a function signature")))
+            (PrimitiveTemplate.ArrayStr _)
+            (if (Int.= 1 (Array.length dependencies))
+              (match (template-element-type (Box.peek signature))
+                (Result.Success element)
+                  (match (CBackend.render-type &element)
+                    (Result.Success rendered-element)
+                      (let-do [dependency (Array.unsafe-nth dependencies 0)
+                               dependency-symbol (sanitize (BackendDependency.symbol dependency))
+                               ;; the dependency's own signature says whether the
+                               ;; element `str` takes its argument by reference.
+                               by-ref (match-ref (Box.peek (BackendDependency.signature dependency))
+                                 (MonoType.Function str-arguments _)
+                                   (if (Int.= 1 (Array.length str-arguments))
+                                     (match-ref (Box.peek (Array.unsafe-nth str-arguments
+                                                                            0))
+                                       (MonoType.Reference _ _) true
+                                       _ false)
+                                     false)
+                                 _ false)
+                               element-access (fmt "((%s*)arg0->data)[i]"
+                                                   &rendered-element)
+                               call-arg (if by-ref
+                                 (fmt "&(%s)" &element-access)
+                                 (String.copy &element-access))
+                               str-call (fmt "temp = %s(%s);"
+                                             &dependency-symbol
+                                             &call-arg)
+                               buffer (StringBuf.create)
+                               ignored-head (StringBuf.append-str &buffer &head)]
+                        (StringBuf.append-str &buffer " {
+  String temp = NULL;
+  int tempsize = 0;
+  (void)tempsize;
+  int size = 3;
+  for(int i = 0; i < arg0->len; i++) {
+    ")
+                        (StringBuf.append-str &buffer &str-call)
+                        (StringBuf.append-str &buffer "
+    size += snprintf(NULL, 0, \"%s \", temp);
+    if(temp) { CARP_FREE(temp); temp = NULL; }
+  }
+  String buffer = CARP_MALLOC(size);
+  String bufferPtr = buffer;
+  snprintf(buffer, size, \"[\");
+  bufferPtr += 1;
+  for(int i = 0; i < arg0->len; i++) {
+    ")
+                        (StringBuf.append-str &buffer &str-call)
+                        (StringBuf.append-str &buffer "
+    tempsize = snprintf(bufferPtr, size - (bufferPtr - buffer), \"%s \", temp);
+    bufferPtr += tempsize;
+    if(temp) { CARP_FREE(temp); temp = NULL; }
+  }
+  if(arg0->len > 0) { bufferPtr -= 1; }
+  snprintf(bufferPtr, size - (bufferPtr - buffer), \"]\");
+  return buffer;
+}")
+                        (Result.Success (StringBuf.to-string &buffer)))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+              (Result.Error
+                (BackendError.init
+                  @"array str template requires one str dependency")))
+            (PrimitiveTemplate.ArrayCopy _)
+            (if (Int.= 1 (Array.length dependencies))
+              (match (template-element-type (Box.peek signature))
+                (Result.Success element)
+                  (match (CBackend.render-type &element)
+                    (Result.Success rendered-element)
+                      (let [dependency (Array.unsafe-nth dependencies 0)
+                            dependency-symbol (sanitize (BackendDependency.symbol dependency))]
+                        (let-do [buffer (StringBuf.create)
+                                 ignored-head (StringBuf.append-str &buffer
+                                                                    &head)]
+                          (StringBuf.append-str &buffer " {
+  Array copy;
+  copy.len = arg0->len;
+  copy.capacity = arg0->capacity;
+  copy.data = arg0->capacity == 0 ? NULL : CARP_MALLOC(sizeof(")
+                          (StringBuf.append-str &buffer &rendered-element)
+                          (StringBuf.append-str &buffer ") * arg0->capacity);
+  for(size_t i = 0; i < arg0->len; i++) {
+    ((")
+                          (StringBuf.append-str &buffer &rendered-element)
+                          (StringBuf.append-str &buffer "*)copy.data)[i] = ")
+                          (StringBuf.append-str &buffer &dependency-symbol)
+                          (StringBuf.append-str &buffer "(&(((")
+                          (StringBuf.append-str &buffer &rendered-element)
+                          (StringBuf.append-str &buffer "*)arg0->data)[i]));
+  }
+  return copy;
+}")
+                          (Result.Success (StringBuf.to-string &buffer))))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+              (Result.Error
+                (BackendError.init
+                  @"array copy template requires one copy dependency"))))
+        (Result.Error error) (Result.Error error))
+    (BackendDeclaration.SourceTemplate _ _ _ _ _)
+      (source-template-definition declaration)
+    _ (Result.Error (BackendError.init @"declaration is not a template"))))
+
+(doc template-definitions "renders every reachable registry-declared
+primitive template. User function bodies and source-defined intrinsic payloads
+are separate backend inputs.")
+(defn template-definitions [module]
+  (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+           buffer (StringBuf.create)
+           rendered-any false
+           declarations (BackendModule.declarations module)
+           n (Array.length declarations)]
+    (for [i 0 n]
+      (match-ref &result
+        (Result.Success _)
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (when (template-declaration? declaration)
+              (match (template-definition declaration)
+                (Result.Success rendered)
+                  (do (when rendered-any (StringBuf.append-str &buffer "
+
+")) (StringBuf.append-str &buffer &rendered) (set! rendered-any true))
+                (Result.Error error) (set! result (Result.Error error)))))
+        (Result.Error _) ()))
+    (match result
+      (Result.Success _) (Result.Success (StringBuf.to-string &buffer))
+      (Result.Error error) (Result.Error error))))
