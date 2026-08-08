@@ -18,10 +18,6 @@ to a load form; parse and missing-source errors have no source span yet.")
                       path String
                       span (Maybe SurfaceSpan)])
 
-(deftype ModuleLoadState
-  [forms (Array (Box SurfaceNode))
-   visited (Array String)])
-
 (defmodule ModuleLoader
   (private symbol-name)
   (hidden symbol-name)
@@ -57,19 +53,6 @@ to a load form; parse and missing-source errors have no source span yet.")
         (let [source (Array.unsafe-nth sources i)]
           (when (= (ModuleSource.path source) path)
             (set! result (Maybe.Just @source)))))
-      result))
-
-  (private append-forms)
-  (hidden append-forms)
-  (defn append-forms [left right]
-    (let-do [result left
-             n (Array.length right)]
-      (for [i 0 n]
-        (set! result
-              (Array.push-back result
-                               (Box.init
-                                 (SurfaceNode.copy (Box.peek (Array.unsafe-nth right
-                                                                               i)))))))
       result))
 
   (private load-target)
@@ -146,12 +129,21 @@ to a load form; parse and missing-source errors have no source span yet.")
         (Maybe.Nothing) ())
       (SurfaceNode.init span (SurfaceForm.List items))))
 
-  (private load-path)
-  (hidden load-path)
+  (private load-path!)
+  (hidden load-path!)
+  (sig load-path!
+       (Fn
+         [(Ref (Array ModuleSource))
+          (Ref String)
+          (Ref (Array String))
+          (Ref (Array String))
+          (Ref (Array (Box SurfaceNode)))]
+         (Result Unit ModuleError)))
   ;; a file's identity is its canonical `file`, not the load spelling: the same
   ;; source reached through different spellings (repo-relative vs ../-relative)
-  ;; is loaded once.
-  (defn load-path [sources path active visited]
+  ;; is loaded once. `visited` and `output` are shared accumulators: recursion
+  ;; appends directly instead of repeatedly copying a partially loaded module.
+  (defn load-path! [sources path active visited output]
     (match (source-by-path sources path)
       (Maybe.Nothing)
         (Result.Error
@@ -162,8 +154,7 @@ to a load form; parse and missing-source errors have no source span yet.")
             (contains? active file)
               (Result.Error
                 (ModuleError.init @"recursive module load" @path (Maybe.Nothing)))
-            (contains? visited file)
-              (Result.Success (ModuleLoadState.init [] @visited))
+            (contains? visited file) (Result.Success ())
             (match (Surface.parse (ModuleSource.text &source))
               (Result.Error _)
                 (Result.Error
@@ -173,72 +164,58 @@ to a load form; parse and missing-source errors have no source span yet.")
               (Result.Success module)
                 (let-do [push-marker (load-stack-marker "load-stack-push!"
                                                         &(Maybe.Just @(ModuleSource.file &source)))
-                         result (the (Result ModuleLoadState ModuleError)
-                                     (Result.Success
-                                       (ModuleLoadState.init [(Box.init push-marker)]
-                                                             @visited)))
+                         result (the (Result Unit ModuleError)
+                                     (Result.Success ()))
                          next-active (Array.push-back @active (String.copy file))
                          forms (SurfaceModule.forms &module)
                          n (Array.length forms)]
+                  (Array.push-back! output (Box.init push-marker))
                   (for [i 0 n]
                     (match-ref &result
-                      (Result.Success state)
+                      (Result.Success _)
                         (let [form (Box.peek (Array.unsafe-nth forms i))]
                           (match (load-and-use-target form)
                             (Maybe.Just module-name)
                               (let [child-path (String.concat &[@&module-name
                                                                 @".carp"])]
-                                (match (load-path sources
-                                                  &child-path
-                                                  &next-active
-                                                  (ModuleLoadState.visited state))
-                                  (Result.Success child-state)
-                                    (set! result
-                                          (Result.Success
-                                            (ModuleLoadState.init
-                                              (Array.push-back
-                                                (append-forms @(ModuleLoadState.forms state)
-                                                              (ModuleLoadState.forms &child-state))
-                                                (Box.init (use-node form
-                                                                    &module-name)))
-                                              @(ModuleLoadState.visited &child-state))))
+                                (match (the (Result Unit ModuleError)
+                                            (load-path! sources
+                                                        &child-path
+                                                        &next-active
+                                                        visited
+                                                        output))
+                                  (Result.Success _)
+                                    (Array.push-back! output
+                                                      (Box.init (use-node form
+                                                                          &module-name)))
                                   (Result.Error error)
                                     (set! result (Result.Error error))))
                             (Maybe.Nothing)
                               (match (load-target form)
                                 (Maybe.Just child-path)
-                                  (match (load-path sources
-                                                    &child-path
-                                                    &next-active
-                                                    (ModuleLoadState.visited state))
-                                    (Result.Success child-state)
-                                      (set! result
-                                            (Result.Success
-                                              (ModuleLoadState.init
-                                                (append-forms @(ModuleLoadState.forms state)
-                                                              (ModuleLoadState.forms &child-state))
-                                                @(ModuleLoadState.visited &child-state))))
+                                  (match (the (Result Unit ModuleError)
+                                              (load-path! sources
+                                                          &child-path
+                                                          &next-active
+                                                          visited
+                                                          output))
+                                    (Result.Success _) ()
                                     (Result.Error error)
                                       (set! result (Result.Error error)))
                                 (Maybe.Nothing)
-                                  (set! result
-                                        (Result.Success
-                                          (ModuleLoadState.init
-                                            (Array.push-back @(ModuleLoadState.forms state)
-                                                             (Box.init (SurfaceNode.copy form)))
-                                            @(ModuleLoadState.visited state)))))))
+                                  (Array.push-back! output
+                                                    (Box.init (SurfaceNode.copy form))))))
                       (Result.Error error) (set! result (Result.Error @error))))
                   (match result
-                    (Result.Success state)
-                      (Result.Success
-                        (ModuleLoadState.init
-                          (Array.push-back @(ModuleLoadState.forms &state)
-                                           (Box.init
-                                             (load-stack-marker "load-stack-pop!"
-                                                                &(the (Maybe String)
-                                                                      (Maybe.Nothing)))))
-                          (Array.push-back @(ModuleLoadState.visited &state)
-                                           (String.copy file))))
+                    (Result.Success _)
+                      (do
+                        (Array.push-back! output
+                                          (Box.init
+                                            (load-stack-marker "load-stack-pop!"
+                                                               &(the (Maybe String)
+                                                                     (Maybe.Nothing)))))
+                        (Array.push-back! visited (String.copy file))
+                        (Result.Success ()))
                     (Result.Error error) (Result.Error error))))))))
 
   (doc load "loads `root` from an in-memory source registry. Load directives
@@ -257,11 +234,12 @@ and `length`, which any Core-rooted load already provides.")
         (the (Array (Box SurfaceNode)) [])))
 
   (defn load [sources root]
-    (let [active (the (Array String) [])
-          visited (the (Array String) [])]
-      (match (load-path sources root &active &visited)
-        (Result.Success state)
-          (Result.Success (SurfaceModule.init @(ModuleLoadState.forms &state)))
+    (let-do [active (the (Array String) [])
+             visited (the (Array String) [])
+             forms (the (Array (Box SurfaceNode)) [])]
+      (match (the (Result Unit ModuleError)
+                  (load-path! sources root &active &visited &forms))
+        (Result.Success _) (Result.Success (SurfaceModule.init forms))
         (Result.Error error) (Result.Error error))))
 
   (doc with-compiler-prelude

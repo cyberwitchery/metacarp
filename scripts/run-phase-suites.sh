@@ -22,8 +22,8 @@ run_phase_test() {
 cd "$repo_root"
 
 for directory in \
-  carp-graph carp-c-abi carp-primitives carp-surface carp-ct-env carp-ct-eval \
-  carp-ir carp-resolve carp-types carp-infer carp-specialize carp-backend \
+  carp-graph carp-c-abi carp-primitives carp-surface carp-module carp-ct-env \
+  carp-ct-eval carp-ir carp-resolve carp-types carp-infer carp-specialize carp-backend \
   carp-expand
 do
   (
