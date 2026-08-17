@@ -1,0 +1,1076 @@
+(load "../carp-surface/carp-surface.carp")
+(load "../carp-ct-types/carp-ct-types.carp")
+
+(doc CtShapeError "one rejection, in the shape the other phase libraries use:
+a message and the span it belongs to. `definition` names the compile-time
+definition it was found in, and `kind` says which check produced it — `shape`
+for a provable tag contradiction, `callee` for applying something that can
+never be applied, `arity` for a call to a compile-time definition with the
+wrong number of arguments.")
+(deftype CtShapeError [definition String
+                       kind String
+                       message String
+                       span SurfaceSpan])
+
+(doc CtShapeBinding "one name in scope during checking, and the shape it may
+carry there. Narrowing replaces the shape, so the same name appears once per
+branch rather than once per definition.")
+(deftype CtShapeBinding [name String
+                         shape Int])
+
+(doc CtDefinition "a compile-time definition the checker knows about: its
+name, how many fixed parameters it takes, and whether it has a rest
+parameter. `macro?` matters because a macro's parameters bind unevaluated
+syntax while a dynamic function's bind evaluated values.")
+(deftype CtDefinition [name String
+                       arity Int
+                       rest? Bool
+                       macro? Bool])
+
+(doc CtObservation "one place the pass had something to say: an argument
+position with a domain, or a binding a predicate refined. Recording these is
+what lets a clean run be inspected rather than merely believed.")
+(deftype CtObservation [definition String
+                        line Int
+                        operation String
+                        detail String
+                        actual Int
+                        required Int])
+
+(def *ct-observations* (the (Array CtObservation) []))
+(def *ct-explain* false)
+
+(def *ct-findings* (the (Array CtShapeError) []))
+(def *ct-definitions* (the (Array CtDefinition) []))
+(def *ct-current-definition* @"")
+(def *ct-current-file* @"")
+(def *ct-current-module* @"")
+
+;; whether a macro's parameters start at Syntax rather than at ⊤. Precision
+;; against false positives is exactly the tradeoff being measured, so it is a
+;; switch rather than a decision baked into the walker.
+(def *ct-precise-macro-parameters* false)
+
+;; coverage counters. A checker that reports nothing because it looked at
+;; nothing is indistinguishable from a clean result unless it says how much it
+;; examined, so the pass counts its own opportunities.
+(def *ct-constrained-positions* 0)   ;; argument positions with a domain
+(def *ct-decided-positions* 0)       ;; of those, ones whose actual shape was not ⊤
+(def *ct-narrowings* 0)              ;; times a predicate actually refined a binding
+(def *ct-argument-positions* 0)      ;; every argument position walked, constrained or not
+(def *ct-definitions-constrained* 0) ;; definitions with at least one constrained position
+(def *ct-definitions-decided* 0)     ;; definitions where a contradiction was possible at all
+
+(defmodule CtInfer
+
+  (doc reset! "clears findings and known definitions for a fresh run.")
+  (defn reset! []
+    (do (set! *ct-findings* [])
+        (set! *ct-definitions* [])
+        (set! *ct-current-definition* @"")
+        (set! *ct-current-file* @"")
+        (set! *ct-current-module* @"")
+        (set! *ct-constrained-positions* 0)
+        (set! *ct-decided-positions* 0)
+        (set! *ct-narrowings* 0)
+        (set! *ct-argument-positions* 0)
+        (set! *ct-definitions-constrained* 0)
+        (set! *ct-definitions-decided* 0)
+        (set! *ct-observations* [])))
+
+  (defn observations [] &*ct-observations*)
+
+  (defn constrained-positions [] *ct-constrained-positions*)
+  (defn decided-positions [] *ct-decided-positions*)
+  (defn narrowings [] *ct-narrowings*)
+  (defn argument-positions [] *ct-argument-positions*)
+  (defn definitions-constrained [] *ct-definitions-constrained*)
+  (defn definitions-decided [] *ct-definitions-decided*)
+
+  (defn findings [] &*ct-findings*)
+  (defn definitions [] &*ct-definitions*)
+
+  (private record!)
+  (hidden record!)
+  (defn record! [node kind message]
+    (Array.push-back! &*ct-findings*
+                      (CtShapeError.init @&*ct-current-definition*
+                                         kind
+                                         message
+                                         @(SurfaceNode.span node))))
+
+  ;; ---------------------------------------------------------------- syntax
+
+  (private node-line)
+  (hidden node-line)
+  (defn node-line [node]
+    @(Info.line (SurfaceSpan.start (SurfaceNode.span node))))
+
+  (doc symbol-key "the dotted spelling of a symbol node, if it is one.")
+  (defn symbol-key [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (if (Int.> (Array.length segments) 0)
+          (Maybe.Just (String.join "." segments))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private last-segment)
+  (hidden last-segment)
+  (defn last-segment [name]
+    (let [parts (String.split-by name &[\.])
+          n (Array.length &parts)]
+      (if (Int.> n 0) @(Array.unsafe-nth &parts (Int.dec n)) @name)))
+
+  (private raw-items-of)
+  (hidden raw-items-of)
+  (defn raw-items-of [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.List items) @items
+      (SurfaceForm.Array items) @items
+      (SurfaceForm.StaticArray items) @items
+      (SurfaceForm.Dictionary items) @items
+      _ (the (Array (Box SurfaceNode)) [])))
+
+  (doc items-of "the children of a container node that carry meaning, copied
+out. Empty for a node that has none.
+
+Comments are dropped here rather than at each use. `carp-surface` is a
+lossless boundary, so a comment is a node like any other, and every walker
+that reads a form by position has to agree about that. `(if c t ; note
+e)` has five children, and a walker that does not skip the comment reads the
+comment as the default branch and never looks at `e`.")
+  (defn items-of [node]
+    (let-do [kept (the (Array (Box SurfaceNode)) [])
+             raw (raw-items-of node)]
+      (for [i 0 (Array.length &raw)]
+        (let [child (Array.unsafe-nth &raw i)]
+          (match-ref (SurfaceNode.form (Box.peek child))
+            (SurfaceForm.Comment _) ()
+            _ (set! kept (Array.push-back kept @child)))))
+      kept))
+
+  (doc head-key "the spelling of a form's head, when the head is a symbol.")
+  (defn head-key [items]
+    (if (Int.= 0 (Array.length items))
+      (Maybe.Nothing)
+      (symbol-key (Box.peek (Array.unsafe-nth items 0)))))
+
+  (doc data-shape "the shape of a node taken as data rather than as code.
+This is where quotation gets its precision: a quoted form's tag is decided by
+the reader, not by evaluation.")
+  (defn data-shape [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.IntLit _) (CtShape.leaf (CtShape.i-int-lit))
+      (SurfaceForm.ByteLit _) (CtShape.leaf (CtShape.i-byte-lit))
+      (SurfaceForm.LongLit _) (CtShape.leaf (CtShape.i-long-lit))
+      (SurfaceForm.FloatLit _) (CtShape.leaf (CtShape.i-float-lit))
+      (SurfaceForm.DoubleLit _) (CtShape.leaf (CtShape.i-double-lit))
+      (SurfaceForm.BoolLit _) (CtShape.leaf (CtShape.i-bool-lit))
+      (SurfaceForm.CharLit _) (CtShape.leaf (CtShape.i-char-lit))
+      (SurfaceForm.StringLit _) (CtShape.leaf (CtShape.i-string-lit))
+      (SurfaceForm.PatternLit _) (CtShape.leaf (CtShape.i-pattern-lit))
+      (SurfaceForm.Symbol _) (CtShape.leaf (CtShape.i-symbol))
+      (SurfaceForm.List _) (CtShape.leaf (CtShape.i-list))
+      (SurfaceForm.Array _) (CtShape.leaf (CtShape.i-array))
+      (SurfaceForm.StaticArray _) (CtShape.leaf (CtShape.i-static-array))
+      (SurfaceForm.Dictionary _) (CtShape.leaf (CtShape.i-dictionary))
+      (SurfaceForm.Comment _) (CtShape.leaf (CtShape.i-comment))))
+
+  ;; ----------------------------------------------------------- environment
+
+  (private lookup)
+  (hidden lookup)
+  (defn lookup [env name]
+    (let-do [found (Maybe.Nothing)
+             n (Array.length env)]
+      ;; innermost binding wins, so scan from the end
+      (for [i 0 n]
+        (let [entry (Array.unsafe-nth env (Int.dec (Int.- n i)))]
+          (when (and (Maybe.nothing? &found)
+                     (= (CtShapeBinding.name entry) name))
+            (set! found (Maybe.Just @(CtShapeBinding.shape entry))))))
+      found))
+
+  (private bind)
+  (hidden bind)
+  (defn bind [env name shape]
+    (Array.push-back @env (CtShapeBinding.init @name shape)))
+
+  (doc dynamic-key "the builtin a name refers to, if any. The compile-time
+evaluator answers to `car` and to `Dynamic.car` and to nothing else, so a
+`Map.length` defined in a module is not the builtin `length` and must not be
+constrained as though it were.")
+  (defn dynamic-key [name]
+    (let [parts (String.split-by name &[\.])
+          n (Array.length &parts)]
+      (cond
+        (Int.= 1 n) (Maybe.Just @(Array.unsafe-nth &parts 0))
+        (and (Int.= 2 n) (= (Array.unsafe-nth &parts 0) "Dynamic"))
+          (Maybe.Just @(Array.unsafe-nth &parts 1))
+        (Maybe.Nothing))))
+
+  (private one-of?)
+  (hidden one-of?)
+  (defn one-of? [name names]
+    (Array.any? &(fn [candidate] (= candidate name)) names))
+
+  ;; ------------------------------------------------------------- builtins
+
+  (doc builtin-range "the shape a builtin returns. ⊤ where the answer depends
+on values the checker does not track.")
+  (defn builtin-range [name]
+    (cond
+      ;; qualified builtins are matched on their full spelling: `String.append`
+      ;; is not `append`, and reducing it to its last segment would give it the
+      ;; sequence operations' result shape
+      (one-of? name &[@"String.append" @"String.concat" @"String.slice"
+                      @"String.head" @"String.tail" @"String.prefix"
+                      @"String.suffix"])
+        (CtShape.leaf (CtShape.i-string-lit))
+      (one-of? name &[@"String.length" @"String.index-of"])
+        (CtShape.leaf (CtShape.i-int-lit))
+      (= name "String.char-at") (CtShape.leaf (CtShape.i-char-lit))
+      (= name "String.empty?") (CtShape.leaf (CtShape.i-bool-lit))
+      (= name "String.to-array") (CtShape.leaf (CtShape.i-array))
+      (= name "String.to-list") (CtShape.leaf (CtShape.i-list))
+      (one-of? name &[@"Symbol.from" @"Symbol.concat" @"Symbol.prefix"])
+        (CtShape.leaf (CtShape.i-symbol))
+      (match (dynamic-key name)
+        (Maybe.Nothing) (CtShape.top)
+        (Maybe.Just n)
+          (cond
+            (one-of? &n &[@"cdr" @"cddr" @"cdadr" @"all-but-last"
+                          @"cons" @"cons-last" @"append"]) (CtShape.listy)
+            (= &n "list") (CtShape.leaf (CtShape.i-list))
+            (= &n "array") (CtShape.leaf (CtShape.i-array))
+            (one-of? &n &[@"length" @"index-of" @"inc"])
+              (CtShape.leaf (CtShape.i-int-lit))
+            (one-of? &n &[@"list?" @"array?" @"empty?" @"not"
+                          @"=" @"<" @">" @"managed?"])
+              (CtShape.leaf (CtShape.i-bool-lit))
+            (one-of? &n &[@"+" @"-" @"*" @"/" @"mod" @"dec" @"neg" @"round"])
+              (CtShape.leaf (CtShape.i-int-lit))
+            (= &n "str") (CtShape.leaf (CtShape.i-string-lit))
+            (= &n "dynamic-type") (CtShape.leaf (CtShape.i-symbol))
+            (= &n "macro-error") (CtShape.bottom)
+            (CtShape.top)))))
+
+  ;; String.* keeps its module prefix: `length` and `String.length` are
+  ;; different operations on different shapes, and collapsing them to the last
+  ;; segment would silently accept a list where a string belongs.
+  (private string-builtin?)
+  (hidden string-builtin?)
+  (defn string-builtin? [name] (String.starts-with? name "String."))
+
+  (doc builtin-domain "the shape a builtin requires of its argument at
+`index`, or ⊤ when it constrains nothing. This table is the whole soundness
+surface of the pass: everything it does not mention is accepted.")
+  (defn builtin-domain [name index]
+    (cond
+      ;; every String operation wants a String and not a Symbol: the evaluator
+      ;; rejects `(String.length (quote s))`, though the compile-time language
+      ;; otherwise treats symbols and their spellings interchangeably
+      (one-of? name &[@"String.length" @"String.head" @"String.tail"
+                      @"String.empty?" @"String.to-array" @"String.to-list"])
+        (if (Int.= index 0) (CtShape.leaf (CtShape.i-string-lit)) (CtShape.top))
+      (= name "String.append")
+        (if (Int.< index 2) (CtShape.leaf (CtShape.i-string-lit)) (CtShape.top))
+      ;; concat takes one argument, an array of strings, not a pair of them
+      (= name "String.concat")
+        (if (Int.= index 0) (CtShape.listy) (CtShape.top))
+      (one-of? name &[@"String.slice" @"String.char-at" @"String.prefix"
+                      @"String.suffix"])
+        (if (Int.= index 0)
+          (CtShape.leaf (CtShape.i-string-lit))
+          (CtShape.leaf (CtShape.i-int-lit)))
+      (= name "String.index-of")
+        (if (Int.= index 0) (CtShape.leaf (CtShape.i-string-lit)) (CtShape.top))
+      ;; `Symbol.from` builds a symbol out of a spelling, and the evaluator
+      ;; will take that spelling from a string or an integer and nothing else
+      (= name "Symbol.from")
+        (if (Int.= index 0)
+          (CtShape.union (CtShape.leaf (CtShape.i-string-lit))
+                         (CtShape.leaf (CtShape.i-int-lit)))
+          (CtShape.top))
+      (= name "Symbol.concat")
+        (if (Int.= index 0) (CtShape.listy) (CtShape.top))
+      (string-builtin? name) (CtShape.top)
+      (match (dynamic-key name)
+        (Maybe.Nothing) (CtShape.top)
+        (Maybe.Just n)
+          (cond
+            (one-of? &n &[@"car" @"cdr" @"cadr" @"caddr" @"cadddr" @"cddr"
+                          @"caadr" @"cdadr" @"last" @"all-but-last"
+                          @"length" @"empty?"])
+              (if (Int.= index 0) (CtShape.listy) (CtShape.top))
+            (one-of? &n &[@"cons" @"cons-last"])
+              (if (Int.= index 1) (CtShape.listy) (CtShape.top))
+            (= &n "append")
+              (if (Int.< index 2) (CtShape.listy) (CtShape.top))
+            ;; compile-time arithmetic is Int arithmetic. The evaluator
+            ;; rejects Byte, Long, Float and Double outright, so the domain is
+            ;; the Int leaf and not the Num node above it
+            (one-of? &n &[@"+" @"-" @"*" @"/" @"mod"])
+              (CtShape.leaf (CtShape.i-int-lit))
+            (one-of? &n &[@"inc" @"dec" @"neg" @"round"])
+              (if (Int.= index 0)
+                (CtShape.leaf (CtShape.i-int-lit))
+                (CtShape.top))
+            ;; ordering compares numbers; `=` and the predicates compare
+            ;; syntax. Neither accepts a closure or a builtin, because neither
+            ;; can be turned back into syntax to look at
+            (one-of? &n &[@"<" @">"]) (CtShape.num)
+            (= &n "not")
+              (if (Int.= index 0) (CtShape.leaf (CtShape.i-bool-lit)) (CtShape.top))
+            ;; `list` may hold a closure because it can build a collection;
+            ;; `array` may not, because it builds syntax and a closure has no
+            ;; syntax to build from. The two differ, so the table says so
+            (= &n "list") (CtShape.top)
+            (one-of? &n &[@"list?" @"array?" @"str" @"array" @"="])
+              (CtShape.syntax)
+            (CtShape.top)))))
+
+  (doc constrained? "whether the checker has anything to say about this name.
+Unknown names constrain nothing, which is what keeps the pass from inventing
+findings about the parts of the dynamic language it does not model.")
+  (defn constrained? [name]
+    (not (Int.= (CtShape.top)
+                (CtShape.intersection (builtin-domain name 0)
+                                      (builtin-domain name 1)))))
+
+  ;; --------------------------------------------------------------- special
+
+  (private special-form?)
+  (hidden special-form?)
+  (defn special-form? [name]
+    (one-of? name &[@"if" @"let" @"let-do" @"do" @"fn" @"quote" @"quasiquote"
+                    @"when" @"unless" @"cond" @"case" @"and" @"or" @"while"
+                    @"set!" @"for" @"macro-error"]))
+
+  (private definition-form?)
+  (hidden definition-form?)
+  (defn definition-form? [name]
+    (one-of? name &[@"defn" @"defn-" @"def" @"def-" @"defmodule" @"deftype"
+                    @"definterface" @"defmacro" @"defndynamic" @"defdynamic"
+                    @"deftemplate" @"register" @"doc" @"sig" @"hidden"
+                    @"private" @"implements" @"use" @"load"]))
+
+  ;; --------------------------------------------------------------- narrowing
+
+  (doc narrowing-shape "the shape a predicate confirms about its subject.")
+  (defn narrowing-shape [predicate]
+    (match (dynamic-key predicate)
+      (Maybe.Nothing) (CtShape.top)
+      (Maybe.Just n)
+        (cond
+          (= &n "list?") (CtShape.listy)
+          (= &n "array?") (CtShape.array-like)
+          (= &n "string?") (CtShape.leaf (CtShape.i-string-lit))
+          (= &n "number?") (CtShape.num)
+          (CtShape.top))))
+
+  (private narrowing-predicate?)
+  (hidden narrowing-predicate?)
+  (defn narrowing-predicate? [name]
+    (match (dynamic-key name)
+      (Maybe.Nothing) false
+      (Maybe.Just n) (one-of? &n &[@"list?" @"array?" @"string?" @"number?"])))
+
+  (doc narrow "refines an environment by what a condition tells us, as
+`T-If` does: the matched branch intersects the subject with the tag, the
+default branch intersects it with the tag's complement. A condition the
+checker does not understand refines nothing.")
+  (defn narrow [env condition positive?]
+    (let [items (items-of condition)]
+      (if (Int.= 0 (Array.length &items))
+        @env
+        (match (head-key &items)
+          (Maybe.Nothing) @env
+          (Maybe.Just name)
+            (cond
+              ;; (not e) flips the polarity of whatever e says
+              (and (= &name "not") (Int.= 2 (Array.length &items)))
+                (narrow env (Box.peek (Array.unsafe-nth &items 1)) (not positive?))
+              ;; (and a b ...) refines on the true branch only: on the false
+              ;; branch we cannot tell which conjunct failed
+              (and (= &name "and") positive?)
+                (let-do [acc @env]
+                  (for [i 1 (Array.length &items)]
+                    (set! acc (narrow &acc (Box.peek (Array.unsafe-nth &items i)) true)))
+                  acc)
+              ;; (or a b ...) refines on the false branch only, dually
+              (and (= &name "or") (not positive?))
+                (let-do [acc @env]
+                  (for [i 1 (Array.length &items)]
+                    (set! acc (narrow &acc (Box.peek (Array.unsafe-nth &items i)) false)))
+                  acc)
+              (and (narrowing-predicate? &name) (Int.= 2 (Array.length &items)))
+                (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
+                  (Maybe.Nothing) @env
+                  (Maybe.Just subject)
+                    (match (lookup env &subject)
+                      (Maybe.Nothing) @env
+                      (Maybe.Just current)
+                        (let [tag (narrowing-shape &name)
+                              refined (if positive?
+                                        (CtShape.intersection current tag)
+                                        (CtShape.difference current tag))]
+                          (do (when (Int./= refined current)
+                                (do (set! *ct-narrowings* (Int.inc *ct-narrowings*))
+                                    (when *ct-explain*
+                                      (Array.push-back!
+                                        &*ct-observations*
+                                        (CtObservation.init
+                                          @&*ct-current-definition*
+                                          (node-line condition)
+                                          (if positive? @"narrow" @"narrow-else")
+                                          (fmt "%s by %s" &subject &name)
+                                          current
+                                          refined)))))
+                              (bind env &subject refined)))))
+              @env)))))
+
+  ;; ---------------------------------------------------------------- walking
+
+  ;; the walker is one mutually recursive group: a node's shape depends on the
+  ;; shapes of its subforms, and every special form re-enters the top. Declared
+  ;; ahead of the group so each member can name the others.
+  (private check-each)
+  (hidden check-each)
+  (private check-quoted)
+  (hidden check-quoted)
+  (private quote-each)
+  (hidden quote-each)
+  (private check-list)
+  (hidden check-list)
+  (private check-call)
+  (hidden check-call)
+  (private check-do)
+  (hidden check-do)
+  (private check-short-circuit)
+  (hidden check-short-circuit)
+  (private check-if)
+  (hidden check-if)
+  (private check-cond)
+  (hidden check-cond)
+  (private check-let)
+  (hidden check-let)
+  (private check-arguments)
+  (hidden check-arguments)
+  (private check-arity)
+  (hidden check-arity)
+
+  (sig known-definition (Fn [(Ref String)] (Maybe CtDefinition)))
+  (sig builtin? (Fn [(Ref String)] Bool))
+  (sig check (Fn [(Ref SurfaceNode) (Ref (Array CtShapeBinding)) Int] Int))
+  (sig check-each
+       (Fn [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding)) Int] ()))
+  (sig check-quoted
+       (Fn [(Ref SurfaceNode) (Ref (Array CtShapeBinding)) Int] Int))
+  (sig quote-each
+       (Fn [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding)) Int Int] ()))
+  (sig check-list
+       (Fn [(Ref SurfaceNode)
+            (Ref (Array (Box SurfaceNode)))
+            (Ref (Array CtShapeBinding))]
+           Int))
+  (sig check-call
+       (Fn [(Ref SurfaceNode)
+            (Ref (Array (Box SurfaceNode)))
+            (Ref (Array CtShapeBinding))
+            (Ref String)]
+           Int))
+  (sig check-do
+       (Fn [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding)) Int] Int))
+  (sig check-short-circuit
+       (Fn [(Ref (Array (Box SurfaceNode)))
+            (Ref (Array CtShapeBinding))
+            (Ref String)]
+           Int))
+  (sig check-if
+       (Fn [(Ref SurfaceNode)
+            (Ref (Array (Box SurfaceNode)))
+            (Ref (Array CtShapeBinding))]
+           Int))
+  (sig check-cond
+       (Fn [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding))] Int))
+  (sig check-let
+       (Fn [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding))] Int))
+  (sig check-arguments
+       (Fn [(Ref (Array (Box SurfaceNode)))
+            (Ref (Array CtShapeBinding))
+            (Ref String)]
+           ()))
+  (sig check-arity
+       (Fn [(Ref SurfaceNode)
+            (Ref (Array (Box SurfaceNode)))
+            (Ref String)]
+           ()))
+
+  (private parameter-names)
+  (hidden parameter-names)
+  (defn parameter-names [node]
+    (let-do [names (the (Array String) [])
+             items (items-of node)]
+      (for [i 0 (Array.length &items)]
+        (match (symbol-key (Box.peek (Array.unsafe-nth &items i)))
+          (Maybe.Just name) (set! names (Array.push-back names name))
+          (Maybe.Nothing) ()))
+      names))
+
+  (doc check "walks a node and returns its shape, recording a finding for
+every provable contradiction it meets. `quasi` is the quasiquotation depth:
+at depth zero a form is code, above zero it is data and only `unquote` and
+`unquote-splicing` return to code.")
+  (defn check [node env quasi]
+    (if (Int.> quasi 0)
+      (check-quoted node env quasi)
+      ;; `data-shape` already classifies every variant, so the walk dispatches
+      ;; on the shape rather than re-matching the form. Container children are
+      ;; copied out before recursing: branches of one `match-ref` share a
+      ;; lifetime, and passing a borrow from one branch into a call does not
+      ;; survive that.
+      (let [kind (data-shape node)]
+        (cond
+          (Int.= kind (CtShape.leaf (CtShape.i-symbol)))
+            (match (symbol-key node)
+              (Maybe.Just name)
+                (match (lookup env &name)
+                  (Maybe.Just shape) shape
+                  (Maybe.Nothing) (CtShape.top))
+              (Maybe.Nothing) (CtShape.top))
+          (Int.= kind (CtShape.leaf (CtShape.i-list)))
+            (let [items (items-of node)] (check-list node &items env))
+          (or (Int.= kind (CtShape.leaf (CtShape.i-array)))
+              (or (Int.= kind (CtShape.leaf (CtShape.i-static-array)))
+                  (Int.= kind (CtShape.leaf (CtShape.i-dictionary)))))
+            (let [items (items-of node)] (do (check-each &items env 0) kind))
+          kind))))
+
+  (defn check-each [items env from]
+    (for [i from (Array.length items)]
+      (ignore (check (Box.peek (Array.unsafe-nth items i)) env 0))))
+
+  (defn check-quoted [node env quasi]
+    (let [kind (data-shape node)]
+      (cond
+        (Int.= kind (CtShape.leaf (CtShape.i-list)))
+          (let [items (items-of node)
+                n (Array.length &items)]
+            (if (Int.= 0 n)
+              kind
+              (match (head-key &items)
+                (Maybe.Just name)
+                  (cond
+                    ;; back to code, one level out
+                    (and (or (= &name "unquote") (= &name "unquote-splicing"))
+                         (Int.= 2 n))
+                      (check (Box.peek (Array.unsafe-nth &items 1)) env (Int.dec quasi))
+                    ;; a nested quasiquote needs one more unquote to escape
+                    (= &name "quasiquote")
+                      (do (quote-each &items env (Int.inc quasi) 1) kind)
+                    (do (quote-each &items env quasi 0) kind))
+                (Maybe.Nothing) (do (quote-each &items env quasi 0) kind))))
+        (or (Int.= kind (CtShape.leaf (CtShape.i-array)))
+            (or (Int.= kind (CtShape.leaf (CtShape.i-static-array)))
+                (Int.= kind (CtShape.leaf (CtShape.i-dictionary)))))
+          (let [items (items-of node)] (do (quote-each &items env quasi 0) kind))
+        kind)))
+
+  (defn quote-each [items env quasi from]
+    (for [i from (Array.length items)]
+      (ignore (check-quoted (Box.peek (Array.unsafe-nth items i)) env quasi))))
+
+  (defn check-list [node items env]
+    (let [n (Array.length items)]
+      (if (Int.= 0 n)
+        (CtShape.leaf (CtShape.i-list))
+        (match (head-key items)
+          (Maybe.Nothing)
+            ;; a computed callee: it still has to be able to be called
+            (let [callee (check (Box.peek (Array.unsafe-nth items 0)) env 0)]
+              (do (when (and (not (CtShape.bottom? callee))
+                             (CtShape.bottom? (CtShape.intersection callee
+                                                                    (CtShape.callable))))
+                    (record! node @"callee"
+                             (fmt "applied a value of shape %s, which can never be callable"
+                                  &(CtShape.render callee))))
+                  (check-each items env 1)
+                  (CtShape.top)))
+          (Maybe.Just name) (check-call node items env &name)))))
+
+  (defn check-call [node items env name]
+    (let [n (Array.length items)]
+      (cond
+        (= name "quote") (if (Int.> n 1)
+                           (data-shape (Box.peek (Array.unsafe-nth items 1)))
+                           (CtShape.top))
+        (= name "quasiquote")
+          (if (Int.> n 1)
+            (check-quoted (Box.peek (Array.unsafe-nth items 1)) env 1)
+            (CtShape.top))
+        (= name "if") (check-if node items env)
+        (or (= name "when") (= name "unless"))
+          (let [condition (if (Int.> n 1)
+                            (Box.peek (Array.unsafe-nth items 1))
+                            (Box.peek (Array.unsafe-nth items 0)))]
+            (do (when (Int.> n 1) (ignore (check condition env 0)))
+                (let [inner (if (Int.> n 1)
+                              (narrow env condition (= name "when"))
+                              @env)]
+                  (do (check-each items &inner 2) (CtShape.top)))))
+        (= name "do") (check-do items env 1)
+        (or (= name "let") (= name "let-do")) (check-let items env)
+        (or (= name "fn") (= name "λ"))
+          (let-do [inner @env]
+            (when (Int.> n 1)
+              (let [names (parameter-names (Box.peek (Array.unsafe-nth items 1)))]
+                (for [i 0 (Array.length &names)]
+                  (set! inner (bind &inner (Array.unsafe-nth &names i) (CtShape.top))))))
+            (check-each items &inner 2)
+            (CtShape.leaf (CtShape.i-closure)))
+        (= name "cond") (check-cond items env)
+        (= name "case")
+          (do (check-each items env 1) (CtShape.top))
+        ;; `and` and `or` short-circuit and answer with an operand rather than
+        ;; with a Bool: `(or false 7)` is 7. So the result is the union of the
+        ;; operands, and every operand but the last is tested and must be a
+        ;; Bool. `not` is an ordinary call and falls through to the argument
+        ;; check below, which is where its own Bool domain applies.
+        (or (= name "and") (= name "or")) (check-short-circuit items env name)
+        (or (= name "while") (= name "set!"))
+          (do (check-each items env 1) (CtShape.top))
+        (= name "for")
+          (let-do [inner @env]
+            (when (Int.> n 1)
+              (let [names (parameter-names (Box.peek (Array.unsafe-nth items 1)))]
+                (when (Int.> (Array.length &names) 0)
+                  (set! inner (bind &inner
+                                    (Array.unsafe-nth &names 0)
+                                    (CtShape.leaf (CtShape.i-int-lit)))))))
+            (check-each items &inner 2)
+            (CtShape.top))
+        (= name "macro-error")
+          (do (check-each items env 1) (CtShape.bottom))
+        (definition-form? name)
+          ;; a definition nested inside a body is not an expression the shape
+          ;; pass models; its subforms are still walked so findings inside are
+          ;; not lost
+          (do (check-each items env 1) (CtShape.top))
+        ;; an ordinary call
+        (do (check-arguments items env name)
+            (check-arity node items name)
+            (builtin-range name)))))
+
+  (defn check-short-circuit [items env name]
+    (let-do [result (CtShape.bottom)
+             n (Array.length items)
+             boolean (CtShape.leaf (CtShape.i-bool-lit))]
+      (for [i 1 n]
+        (let [operand (Box.peek (Array.unsafe-nth items i))
+              shape (check operand env 0)]
+          (do (when (and (Int.< i (Int.dec n))
+                         (and (not (CtShape.bottom? shape))
+                              (CtShape.bottom? (CtShape.intersection shape boolean))))
+                (record! operand @"shape"
+                         (fmt "%s tests argument %d, which is %s and so can never be Bool"
+                              name (Int.dec i) &(CtShape.render shape))))
+              (set! result (CtShape.union result shape)))))
+      (if (CtShape.bottom? result) (CtShape.top) result)))
+
+  (doc shape-of-source "the shape the walker gives the first form of a source
+string, in an empty environment. Exposed so that a harness can compare the
+walker's answer for an arbitrary expression against what the evaluator
+actually returns, which is the only way to check the result shapes of forms
+the walker handles itself rather than through the builtin table.")
+  (defn shape-of-source [source]
+    (match (Surface.parse source)
+      (Result.Error _) (CtShape.top)
+      (Result.Success module)
+        (let [forms (SurfaceModule.forms &module)]
+          (if (Int.= 0 (Array.length forms))
+            (CtShape.top)
+            (let [empty (the (Array CtShapeBinding) [])]
+              (check (Box.peek (Array.unsafe-nth forms 0)) &empty 0))))))
+
+  (defn check-do [items env from]
+    (let-do [result (CtShape.top)
+             n (Array.length items)]
+      (for [i from n]
+        (set! result (check (Box.peek (Array.unsafe-nth items i)) env 0)))
+      result))
+
+  (defn check-if [node items env]
+    (let [n (Array.length items)]
+      (if (Int.< n 3)
+        (do (check-each items env 1) (CtShape.top))
+        (let [condition (Box.peek (Array.unsafe-nth items 1))
+              _ (check condition env 0)
+              then-env (narrow env condition true)
+              else-env (narrow env condition false)
+              then-shape (check (Box.peek (Array.unsafe-nth items 2)) &then-env 0)]
+          (if (Int.> n 3)
+            (CtShape.union then-shape
+                           (check (Box.peek (Array.unsafe-nth items 3)) &else-env 0))
+            (CtShape.union then-shape (CtShape.top)))))))
+
+  (defn check-cond [items env]
+    (let-do [n (Array.length items)
+             result (CtShape.bottom)
+             running @env
+             i 1]
+      (while (Int.< i n)
+        (if (Int.= i (Int.dec n))
+          ;; a trailing form with no test is the default branch
+          (do (set! result (CtShape.union result
+                                          (check (Box.peek (Array.unsafe-nth items i))
+                                                 &running 0)))
+              (set! i (Int.inc i)))
+          (let [condition (Box.peek (Array.unsafe-nth items i))
+                _ (check condition &running 0)
+                taken (narrow &running condition true)]
+            (do (set! result (CtShape.union result
+                                            (check (Box.peek (Array.unsafe-nth items (Int.inc i)))
+                                                   &taken 0)))
+                ;; later clauses only run when this test failed
+                (set! running (narrow &running condition false))
+                (set! i (Int.+ i 2))))))
+      (if (CtShape.bottom? result) (CtShape.top) result)))
+
+  (defn check-let [items env]
+    (let-do [n (Array.length items)
+             inner @env]
+      (when (Int.> n 1)
+        (let-do [bindings (items-of (Box.peek (Array.unsafe-nth items 1)))
+                 b 0
+                 bn (Array.length &bindings)]
+          (while (Int.< (Int.inc b) bn)
+            (let [value (check (Box.peek (Array.unsafe-nth &bindings (Int.inc b))) &inner 0)]
+              (do (match (symbol-key (Box.peek (Array.unsafe-nth &bindings b)))
+                    (Maybe.Just name) (set! inner (bind &inner &name value))
+                    (Maybe.Nothing) ())
+                  (set! b (Int.+ b 2)))))))
+      (check-do items &inner 2)))
+
+  (defn check-arguments [items env name]
+    ;; a compile-time definition the program wrote wins over a builtin of the
+    ;; same spelling, because that is what the name resolves to when the body
+    ;; runs. Constraining `(length m)` as the builtin inside a module that
+    ;; defines its own `length` is how a checker rejects correct code.
+    (let [n (Array.length items)]
+      (for [i 1 n]
+        (let [argument (Box.peek (Array.unsafe-nth items i))
+              actual (check argument env 0)
+              index (Int.dec i)
+              required (builtin-domain name index)]
+          (do
+            (set! *ct-argument-positions* (Int.inc *ct-argument-positions*))
+            (when (Int./= required (CtShape.top))
+              (do (set! *ct-constrained-positions* (Int.inc *ct-constrained-positions*))
+                  (when (Int./= actual (CtShape.top))
+                    (set! *ct-decided-positions* (Int.inc *ct-decided-positions*)))
+                  (when *ct-explain*
+                    (Array.push-back! &*ct-observations*
+                                      (CtObservation.init @&*ct-current-definition*
+                                                          (node-line argument)
+                                                          @name
+                                                          (fmt "argument %d" index)
+                                                          actual
+                                                          required)))))
+          ;; ⊥ on the left is Lemma 4.12 case (a): unreachable code relates to
+          ;; anything, so it is never a contradiction
+          (when (and (not (CtShape.bottom? actual))
+                     (CtShape.bottom? (CtShape.intersection actual required)))
+            (record! argument @"shape"
+                     (fmt "%s argument %d is %s, which can never be %s"
+                          name
+                          index
+                          &(CtShape.render actual)
+                          &(CtShape.render required)))))))))
+
+  (private exact-definition)
+  (hidden exact-definition)
+  (defn exact-definition [name]
+    (let-do [found (Maybe.Nothing)
+             n (Array.length &*ct-definitions*)]
+      (for [i 0 n]
+        (let [entry (Array.unsafe-nth &*ct-definitions* i)]
+          (when (and (Maybe.nothing? &found) (= (CtDefinition.name entry) name))
+            (set! found (Maybe.Just @entry)))))
+      found))
+
+  (doc known-definition "resolves a name the way the expander would: a short
+name written inside a module means that module's definition when it has one,
+and only otherwise the top-level one. Registering module-scoped definitions
+under their short name as well would let `Map.str` shadow the builtin `str`
+for the whole program.")
+  (defn known-definition [name]
+    (if (String.empty? &*ct-current-module*)
+      (exact-definition name)
+      (let [qualified (String.concat &[@&*ct-current-module* @"." @name])]
+        (match (exact-definition &qualified)
+          (Maybe.Just found) (Maybe.Just found)
+          (Maybe.Nothing) (exact-definition name)))))
+
+  (doc builtin? "whether the compile-time evaluator answers to this name
+itself.
+
+This decides two things, and gets them from the evaluator rather than from
+taste. `carp-ct-eval` tries `apply-builtin` on a call's head *before* it looks
+the head up in the environment, so a builtin wins over a compile-time
+definition that shares its spelling: inside `(defmodule Map ...)`, `(length m)`
+is the builtin `length`, not a `Map.length` the module defined. So a name in
+this list keeps its domain no matter what the program defines, and is never
+arity-checked against a definition that cannot receive the call.")
+  (defn builtin? [name]
+    (match (dynamic-key name)
+      (Maybe.Just n) (one-of? &n &[
+  @"*" @"+" @"-" @"/" @"<" @"=" @">" @"String.append" @"String.char-at"
+  @"String.concat" @"String.empty?" @"String.head" @"String.index-of"
+  @"String.length" @"String.prefix" @"String.slice" @"String.suffix"
+  @"String.tail" @"String.to-array" @"String.to-list" @"Symbol.concat"
+  @"Symbol.from" @"Symbol.prefix" @"Unsafe.load-stack" @"all-but-last"
+  @"and" @"append" @"apply" @"array" @"array?" @"caadr" @"cadddr"
+  @"caddr" @"cadr" @"car" @"case" @"cdadr" @"cddr" @"cdr" @"column"
+  @"concat" @"cond" @"cons" @"cons-last" @"dec" @"def" @"def-"
+  @"definterface" @"defmodule" @"defn" @"defn-" @"deftemplate" @"deftype"
+  @"do" @"dynamic-type" @"empty?" @"eval" @"expand" @"file" @"fn" @"for"
+  @"hash" @"if" @"inc" @"last" @"length" @"let" @"let-do" @"line" @"list"
+  @"list?" @"macro-error" @"macro-log" @"managed?" @"members" @"mod"
+  @"neg" @"not" @"or" @"parse" @"quote" @"read-file" @"register" @"round"
+  @"s-expr" @"set!" @"str" @"use" @"when" @"while" @"with-test-internal"])
+      (Maybe.Nothing) (one-of? name &[
+  @"*" @"+" @"-" @"/" @"<" @"=" @">" @"String.append" @"String.char-at"
+  @"String.concat" @"String.empty?" @"String.head" @"String.index-of"
+  @"String.length" @"String.prefix" @"String.slice" @"String.suffix"
+  @"String.tail" @"String.to-array" @"String.to-list" @"Symbol.concat"
+  @"Symbol.from" @"Symbol.prefix" @"Unsafe.load-stack" @"all-but-last"
+  @"and" @"append" @"apply" @"array" @"array?" @"caadr" @"cadddr"
+  @"caddr" @"cadr" @"car" @"case" @"cdadr" @"cddr" @"cdr" @"column"
+  @"concat" @"cond" @"cons" @"cons-last" @"dec" @"def" @"def-"
+  @"definterface" @"defmodule" @"defn" @"defn-" @"deftemplate" @"deftype"
+  @"do" @"dynamic-type" @"empty?" @"eval" @"expand" @"file" @"fn" @"for"
+  @"hash" @"if" @"inc" @"last" @"length" @"let" @"let-do" @"line" @"list"
+  @"list?" @"macro-error" @"macro-log" @"managed?" @"members" @"mod"
+  @"neg" @"not" @"or" @"parse" @"quote" @"read-file" @"register" @"round"
+  @"s-expr" @"set!" @"str" @"use" @"when" @"while" @"with-test-internal"])))
+
+  (defn check-arity [node items name]
+    (let [supplied (Int.dec (Array.length items))]
+      ;; a call whose head the evaluator handles itself never reaches a
+      ;; compile-time definition, so it cannot be checked against one
+      (if (builtin? name)
+        ()
+        (match (known-definition name)
+          (Maybe.Nothing) ()
+          (Maybe.Just definition)
+            (let [expected @(CtDefinition.arity &definition)]
+              (when (if @(CtDefinition.rest? &definition)
+                      (Int.< supplied expected)
+                      (Int./= supplied expected))
+                (record! node @"arity"
+                         (fmt "%s takes %d argument(s) but is given %d"
+                              name expected supplied))))))))
+
+  ;; ------------------------------------------------------------ definitions
+
+  (private rest-marker?)
+  (hidden rest-marker?)
+  (defn rest-marker? [name] (String.starts-with? name ":"))
+
+  (doc check-definition "checks one `defmacro` or `defndynamic` body under an
+environment holding its parameters.")
+  (defn check-definition [items macro?]
+    (let-do [n (Array.length items)
+             env (the (Array CtShapeBinding) [])
+             seen-rest false]
+      (when (Int.> n 2)
+        (let-do [names (parameter-names (Box.peek (Array.unsafe-nth items 2)))
+                 parameter-shape (if (and macro? *ct-precise-macro-parameters*)
+                                   (CtShape.syntax)
+                                   (CtShape.top))]
+          (for [i 0 (Array.length &names)]
+            (let [name (Array.unsafe-nth &names i)]
+              (if (rest-marker? name)
+                (set! seen-rest true)
+                (set! env (bind &env
+                                name
+                                (if seen-rest (CtShape.listy) parameter-shape))))))))
+      (let-do [constrained-before *ct-constrained-positions*
+               decided-before *ct-decided-positions*]
+        (check-each items &env 3)
+        (when (Int.> *ct-constrained-positions* constrained-before)
+          (set! *ct-definitions-constrained* (Int.inc *ct-definitions-constrained*)))
+        (when (Int.> *ct-decided-positions* decided-before)
+          (set! *ct-definitions-decided* (Int.inc *ct-definitions-decided*))))))
+
+  (private definition-of)
+  (hidden definition-of)
+  (defn definition-of [items macro?]
+    (let-do [names (if (Int.> (Array.length items) 2)
+                     (parameter-names (Box.peek (Array.unsafe-nth items 2)))
+                     (the (Array String) []))
+             fixed 0
+             rest? false]
+      (for [i 0 (Array.length &names)]
+        (let [name (Array.unsafe-nth &names i)]
+          (if (rest-marker? name)
+            (set! rest? true)
+            (when (not rest?) (set! fixed (Int.inc fixed))))))
+      (CtDefinition.init @"" fixed rest? macro?)))
+
+  (doc collect "records every compile-time definition in a module, descending
+into `defmodule`. A definition is registered under its full path; only a
+top-level one is also reachable unqualified.")
+  (defn collect [node prefix]
+    (let [items (items-of node)]
+      (when (Int.> (Array.length &items) 0)
+        (match (head-key &items)
+          (Maybe.Nothing) ()
+          (Maybe.Just head)
+            (cond
+              (= &head "defmodule")
+                (when (Int.> (Array.length &items) 1)
+                  (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
+                    (Maybe.Just module)
+                      (let [inner (if (String.empty? prefix)
+                                    module
+                                    (String.concat &[@prefix @"." @&module]))]
+                        (for [i 2 (Array.length &items)]
+                          (collect (Box.peek (Array.unsafe-nth &items i)) &inner)))
+                    (Maybe.Nothing) ()))
+              (or (= &head "defmacro") (or (= &head "defndynamic") (= &head "defdynamic")))
+                (when (Int.> (Array.length &items) 1)
+                  (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
+                    (Maybe.Just short)
+                      (let [template (definition-of &items (= &head "defmacro"))
+                            path (if (String.empty? prefix)
+                                   @&short
+                                   (String.concat &[@prefix @"." @&short]))]
+                        (Array.push-back! &*ct-definitions*
+                                          (CtDefinition.init path
+                                                             @(CtDefinition.arity &template)
+                                                             @(CtDefinition.rest? &template)
+                                                             @(CtDefinition.macro? &template))))
+                    (Maybe.Nothing) ()))
+              ())))))
+
+  (doc check-module "checks every compile-time definition in one parsed
+module. `collect` must have run over every module first, so that calls
+between files can be checked for arity.")
+  (defn check-module [node prefix]
+    (let [items (items-of node)]
+      (when (Int.> (Array.length &items) 0)
+        (match (head-key &items)
+          (Maybe.Nothing) ()
+          (Maybe.Just head)
+            (cond
+              (= &head "defmodule")
+                (when (Int.> (Array.length &items) 1)
+                  (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
+                    (Maybe.Just module)
+                      (let [inner (if (String.empty? prefix)
+                                    module
+                                    (String.concat &[@prefix @"." @&module]))]
+                        (for [i 2 (Array.length &items)]
+                          (check-module (Box.peek (Array.unsafe-nth &items i)) &inner)))
+                    (Maybe.Nothing) ()))
+              (or (= &head "defmacro") (= &head "defndynamic"))
+                (when (Int.> (Array.length &items) 1)
+                  (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
+                    (Maybe.Just short)
+                      (do (set! *ct-current-module* @prefix)
+                          (set! *ct-current-definition*
+                                (if (String.empty? prefix)
+                                  @&short
+                                  (String.concat &[@prefix @"." @&short])))
+                          (check-definition &items (= &head "defmacro")))
+                    (Maybe.Nothing) ()))
+              ())))))
+
+  (doc check-parsed "collects and then checks one parsed module. Callers with
+several modules should run `collect` over all of them first, so that calls
+between files resolve.")
+  (defn check-parsed [module]
+    (let [forms (SurfaceModule.forms module)]
+      (do (for [i 0 (Array.length forms)]
+            (collect (Box.peek (Array.unsafe-nth forms i)) ""))
+          (for [i 0 (Array.length forms)]
+            (check-module (Box.peek (Array.unsafe-nth forms i)) "")))))
+
+  (doc check-source "checks every compile-time definition in one source
+string, returning whether it parsed. Findings accumulate in `findings`.")
+  (defn check-source [source]
+    (match (Surface.parse source)
+      (Result.Success module) (do (check-parsed &module) true)
+      (Result.Error _) false))
+
+  (doc check-parsed-all "collects every definition across a set of parsed
+modules and then checks them all, so that a call from one file into another
+resolves. Modules are checked in the order given.")
+  (defn check-parsed-all [modules]
+    (do (for [i 0 (Array.length modules)]
+          (let [forms (SurfaceModule.forms (Array.unsafe-nth modules i))]
+            (for [f 0 (Array.length forms)]
+              (collect (Box.peek (Array.unsafe-nth forms f)) ""))))
+        (for [i 0 (Array.length modules)]
+          (let [forms (SurfaceModule.forms (Array.unsafe-nth modules i))]
+            (for [f 0 (Array.length forms)]
+              (check-module (Box.peek (Array.unsafe-nth forms f)) ""))))))
+)
+
+(doc CtCheck "the experimental compile-time shape phase.
+
+It is opt-in: nothing in the compiler calls it. A caller hands it parsed
+surface modules and gets back either nothing to say or the rejections, in the
+same shape the other phases report — a message and the span it belongs to.
+
+The phase is a *checking* phase, like the borrow check rather than like
+inference: it produces no type and changes no representation, so a caller that
+ignores it loses only the diagnostics. That is what makes it safe to leave
+unwired while it is still experimental.")
+(defmodule CtCheck
+  (doc name "the phase name, for a driver that tags diagnostics by phase.")
+  (defn name [] @"ct-shape")
+
+  (doc module "checks one parsed module on its own. Calls between files will
+not resolve; use `modules` for a whole program.")
+  (defn module [surface]
+    (do (CtInfer.reset!)
+        (CtInfer.check-parsed surface)
+        (if (Int.= 0 (Array.length (CtInfer.findings)))
+          (Result.Success ())
+          (Result.Error @(CtInfer.findings)))))
+
+  (doc modules "checks a whole program: every definition is registered before
+anything is checked, so a call into another file resolves.")
+  (defn modules [surfaces]
+    (do (CtInfer.reset!)
+        (CtInfer.check-parsed-all surfaces)
+        (if (Int.= 0 (Array.length (CtInfer.findings)))
+          (Result.Success ())
+          (Result.Error @(CtInfer.findings)))))
+
+  (doc render "renders one rejection the way a phase-tagged diagnostic reads:
+`ct-shape:<file>:<line>: <definition>: <message>`. The file is empty for a
+module parsed without an identity; use `Surface.parse-in` to give it one.")
+  (defn render [error]
+    (let [span (CtShapeError.span error)]
+      (String.concat
+        &[@"ct-shape:"
+          (String.copy (SurfaceSpan.source span))
+          @":"
+          (Int.str @(Info.line (SurfaceSpan.start span)))
+          @": "
+          (String.copy (CtShapeError.definition error))
+          @": "
+          (String.copy (CtShapeError.message error))])))
+
+  (doc render-all "renders every rejection, one per line.")
+  (defn render-all [errors]
+    (let-do [lines (the (Array String) [])]
+      (for [i 0 (Array.length errors)]
+        (set! lines (Array.push-back lines (render (Array.unsafe-nth errors i)))))
+      (String.join "\n" &lines)))
+)

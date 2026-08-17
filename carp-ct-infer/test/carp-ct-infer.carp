@@ -1,0 +1,230 @@
+(load "../carp-ct-infer.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn findings-for [source]
+  (do (CtInfer.reset!)
+      (ignore (CtInfer.check-source source))
+      (Array.length (CtInfer.findings))))
+
+(defn kinds-for [source]
+  (do (CtInfer.reset!)
+      (ignore (CtInfer.check-source source))
+      (let-do [out (the (Array String) [])
+               fs (CtInfer.findings)]
+        (for [i 0 (Array.length fs)]
+          (set! out (Array.push-back out @(CtShapeError.kind (Array.unsafe-nth fs i)))))
+        out)))
+
+(defn rejected? [source] (Int.> (findings-for source) 0))
+
+(defn phase-result [source]
+  (match (Surface.parse-in "cell:one" source)
+    (Result.Error _) (Result.Error (the (Array CtShapeError) []))
+    (Result.Success module) (CtCheck.module &module)))
+
+(defn phase-rendered [source]
+  (match (phase-result source)
+    (Result.Success _) @"<accepted>"
+    (Result.Error errors) (CtCheck.render-all &errors)))
+
+;; ------------------------------------------------------------------ lattice
+
+(deftest t
+  (assert-true t
+    (CtShape.subshape? (CtShape.leaf (CtShape.i-list)) (CtShape.listy))
+    "a list is a sequence")
+  (assert-true t
+    (CtShape.subshape? (CtShape.leaf (CtShape.i-int-lit)) (CtShape.num))
+    "an integer literal is numeric")
+  (assert-true t
+    (CtShape.bottom?
+      (CtShape.intersection (CtShape.leaf (CtShape.i-symbol)) (CtShape.listy)))
+    "S-TagBot: a symbol and a sequence are unrelated, so their meet is bottom")
+  (assert-false t
+    (CtShape.subshape? (CtShape.leaf (CtShape.i-collection)) (CtShape.seq))
+    "a collection is not a syntax sequence, only listy alongside one")
+  (assert-equal t
+    (CtShape.top)
+    (CtShape.negation (CtShape.negation (CtShape.top)))
+    "double negation is the identity in the lattice")
+  (assert-equal t
+    (CtShape.bottom)
+    (CtShape.intersection (CtShape.listy) (CtShape.negation (CtShape.listy)))
+    "S-Compl: a shape and its complement do not overlap")
+
+  ;; --------------------------------------------------------------- rejected
+
+  (assert-true t
+    (rejected? "(defndynamic f [x] (car (quote foo)))")
+    "a quoted symbol can never be taken apart by car")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (length \"hello\"))")
+    "length is a sequence operation, not a string one")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (if (list? x) (car x) (car x)))")
+    "narrowing rejects car in the branch where x is known not to be a list")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (car (String.append \"a\" \"b\")))")
+    "a string result flows into car")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (String.length (list 1 2)))")
+    "a constructed list flows into a string operation")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (+ 1 \"two\"))")
+    "arithmetic on a string literal")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (cons 1 (quote sym)))")
+    "cons needs a sequence as its tail")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (let [y (quote a)] (cdr y)))")
+    "a let-bound quoted symbol keeps its shape into cdr")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (car (quasiquote (unquote (length x)))))")
+    "an unquoted length is an integer, and integers are not sequences")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (cadr (if (list? x) 5 4)))")
+    "a union of two numeric branches can never be a sequence")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (car (dynamic-type x)))")
+    "dynamic-type answers with a symbol")
+  (assert-equal t
+    &[@"callee"]
+    &(kinds-for "(defndynamic f [x] ((quote foo) 1))")
+    "applying a quoted symbol is a callee finding, not a shape one")
+  (assert-equal t
+    &[@"arity"]
+    &(kinds-for "(defndynamic g [a b] a) (defndynamic f [x] (g x))")
+    "a known compile-time definition called with too few arguments")
+
+  (assert-false t
+    (rejected? "(defndynamic f [x] (cadr (if (list? x) x 4)))")
+    "a union that still allows a sequence is not a provable contradiction")
+
+  (assert-true t
+    (rejected? "(defndynamic f [x] (String.concat \"a\" \"b\"))")
+    "String.concat takes one array of strings, not a pair of strings")
+
+  (assert-true t
+    (rejected? "(defndynamic f [x] (if x 1 ; a note between the branches
+                                        (car \"s\")))")
+    "a comment between branches must not hide the branch behind it")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (let [y ; naming the thing
+                                          (quote a)] (cdr y)))")
+    "a comment inside let bindings must not shift the pairing")
+
+  ;; ----------------------------------------------------------- the phase
+
+  (assert-true t
+    (match (phase-result "(defndynamic f [x] (car x))")
+      (Result.Success _) true
+      (Result.Error _) false)
+    "a clean module is a Success, so a caller can compose the phase")
+  (assert-true t
+    (match (phase-result "(defndynamic f [x] (car (quote s)))")
+      (Result.Success _) false
+      (Result.Error errors) (Int.= 1 (Array.length &errors)))
+    "a rejection is an Error carrying every finding")
+  (assert-equal t
+    "ct-shape:cell:one:1: f: car argument 0 is Symbol, which can never be Seq ⊔ Collection"
+    &(phase-rendered "(defndynamic f [x] (car (quote s)))")
+    "a rendered rejection names the phase, the source, the line and the definition")
+  (assert-true t
+    (match (CtCheck.modules
+             &[(Result.unsafe-from-success
+                 (Surface.parse-in "a.carp" "(defndynamic g [a b] a)"))
+               (Result.unsafe-from-success
+                 (Surface.parse-in "b.carp" "(defndynamic f [x] (g x))"))])
+      (Result.Success _) false
+      (Result.Error errors) (Int.= 1 (Array.length &errors)))
+    "checking a whole program resolves a call from one file into another")
+
+  ;; ------------------------------------- corrected against the evaluator
+
+  (assert-true t
+    (rejected? "(defndynamic f [x] (+ 1 1l))")
+    "compile-time arithmetic is Int arithmetic: the evaluator refuses a Long")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (String.length (quote s)))")
+    "a String operation wants a String and not a Symbol")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (String.slice \"abc\" \"x\" 2))")
+    "a slice index is an Int")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (not 1))")
+    "not takes a Bool, and is an ordinary call rather than a special form")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (< 1 \"a\"))")
+    "ordering compares numbers")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (Symbol.from true))")
+    "a symbol is built from a spelling, so from a String or an Int")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (array (fn [y] y)))")
+    "array builds syntax, and a closure has no syntax to build from")
+  (assert-true t
+    (rejected? "(defmodule M (defndynamic length [m] 1)
+                             (defndynamic f [x] (length \"s\")))")
+    "a builtin beats a definition of the same name: the evaluator tries
+apply-builtin before it looks the head up, so the domain still applies")
+
+  (assert-true t
+    (rejected? "(defndynamic f [x] (and (car (quote sym)) true))")
+    "operands of a short-circuit are ordinary code and are checked")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (or 1 true))")
+    "every operand of a short-circuit but the last is tested, so must be Bool")
+  (assert-true t
+    (rejected? "(defndynamic f [x] (car (or false (quote sym))))")
+    "a short-circuit answers with an operand, not with a Bool")
+
+  ;; --------------------------------------------------------------- accepted
+
+  (assert-false t
+    (rejected? "(defndynamic f [x] (if (list? x) (car x) x))")
+    "car guarded by list? is fine")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (String.concat (array \"a\" \"b\")))")
+    "an array of strings is what concat wants")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (car (or false (quote (1 2)))))")
+    "the union of a short-circuit's operands is what flows on")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (list (fn [y] y)))")
+    "list may hold a closure, because it can build a collection")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (car (list 1 2)))")
+    "car of a constructed list is fine")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (if (list? x) (car x) (macro-error \"nope\")))")
+    "macro-error is bottom, so the default branch contradicts nothing")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (cond (list? x) (car x) (array? x) (car x) x))")
+    "cond narrows each clause independently")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (String.length (str x)))")
+    "str produces a string")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (quote (car sym)))")
+    "quoted code is data and is not walked as code")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (quasiquote (car (quote sym))))")
+    "a quasiquote without unquotes is data too")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (car x))")
+    "an unconstrained parameter is top and contradicts nothing")
+  (assert-false t
+    (rejected? "(defndynamic f [x :rest xs] (car xs))")
+    "a rest parameter is a sequence")
+  (assert-false t
+    (rejected? "(defmodule M (defndynamic str [m] m) (defndynamic f [x] (str x 1 2)))")
+    "a module-scoped definition does not shadow a variadic builtin elsewhere")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (if (array? x) (car x) (car x)))")
+    "array? does not exclude lists, so neither branch contradicts car")
+  (assert-false t
+    (rejected? "(defndynamic f [x] (let [y (if (list? x) x (list x))] (car y)))")
+    "a union of two sequence shapes is still a sequence"))

@@ -1,0 +1,342 @@
+;; Mutation-tests the shape pass against a whole Carp standard library.
+;;
+;;   CARP_CORE=$CARP_DIR/core carp -x corpus/mutate.carp
+;;
+;; A clean run over correct code says nothing on its own: a pass that examines
+;; nothing produces the same result as a pass that examines everything and
+;; approves. So this injects a shape error into each compile-time definition,
+;; one site at a time, and requires the pass to catch it.
+;;
+;; Mutations are structural rather than textual. Each one edits the parsed
+;; tree and renders it back, so a site is always a real argument position of a
+;; real call, never a coincidence of spelling inside a string or a comment.
+;; Only `defmacro` and `defndynamic` bodies are mutated: a mutation in runtime
+;; code is out of the pass's scope and would only depress the score.
+
+(load "../carp-ct-infer.carp")
+(Project.no-echo)
+
+(def *core-dir* @"")
+
+;; walk state. The walker visits every site of the operator under test,
+;; counting as it goes, and edits only the one whose index matches.
+(def *site-counter* 0)
+(def *target-site* -1)
+(def *operator* 0)
+(def *quasi-depth* 0)
+(def *current-definition* @"")
+(def *mutated-definition* @"")
+
+(def *op-seq-string* 0)     ;; sequence operation's subject becomes a String
+(def *op-seq-symbol* 1)     ;; sequence operation's subject becomes a Symbol
+(def *op-arith-string* 2)   ;; arithmetic operand becomes a String
+(def *op-string-list* 3)    ;; String operation's subject becomes a List
+(def *op-index-string* 4)   ;; a slice or char-at index becomes a String
+(def *op-not-int* 5)        ;; `not` receives an Int instead of a Bool
+(def *op-swap-branches* 6)  ;; the branches of `(if (list? v) a b)` are swapped
+(def *operator-count* 7)
+
+(defn operator-name [op]
+  (cond
+    (Int.= op *op-seq-string*) @"seq-subject->String"
+    (Int.= op *op-seq-symbol*) @"seq-subject->Symbol"
+    (Int.= op *op-arith-string*) @"arith-operand->String"
+    (Int.= op *op-string-list*) @"string-subject->List"
+    (Int.= op *op-index-string*) @"index->String"
+    (Int.= op *op-not-int*) @"not-operand->Int"
+    @"swap-narrowed-branches"))
+
+;; ------------------------------------------------------------ node building
+
+(defn sym-node [span name]
+  (SurfaceNode.init @span (SurfaceForm.Symbol [@name])))
+
+(defn string-node [span] (SurfaceNode.init @span (SurfaceForm.StringLit @"s")))
+(defn int-node [span] (SurfaceNode.init @span (SurfaceForm.IntLit 1)))
+
+(defn quoted-symbol-node [span]
+  (SurfaceNode.init @span
+                    (SurfaceForm.List [(Box.init (sym-node span "quote"))
+                                       (Box.init (sym-node span "s"))])))
+
+(defn quoted-list-node [span]
+  (SurfaceNode.init
+    @span
+    (SurfaceForm.List
+      [(Box.init (sym-node span "quote"))
+       (Box.init (SurfaceNode.init @span
+                                   (SurfaceForm.List
+                                     [(Box.init (int-node span))
+                                      (Box.init (int-node span))])))])))
+
+;; --------------------------------------------------------------- the walker
+
+(defn sequence-op? [name]
+  (Array.any? &(fn [c] (= c name))
+              &[@"car" @"cdr" @"cadr" @"caddr" @"cadddr" @"cddr" @"last"
+                @"all-but-last" @"length" @"empty?"]))
+
+(defn arith-op? [name]
+  (Array.any? &(fn [c] (= c name)) &[@"+" @"-" @"*" @"/" @"mod" @"inc" @"dec"]))
+
+(defn string-op? [name]
+  (Array.any? &(fn [c] (= c name))
+              &[@"String.length" @"String.head" @"String.tail"
+                @"String.append" @"String.slice" @"String.char-at"]))
+
+(defn index-op? [name]
+  (Array.any? &(fn [c] (= c name))
+              &[@"String.slice" @"String.char-at" @"String.prefix"
+                @"String.suffix"]))
+
+(doc narrowed-if? "whether a form is `(if (list? v) a b)` with a plain
+variable as the subject, which is the shape the branch-swap operator needs.")
+(defn narrowed-if? [items]
+  (and (Int.= 4 (Array.length items))
+       (match (CtInfer.head-key items)
+         (Maybe.Nothing) false
+         (Maybe.Just head)
+           (and (= &head "if")
+                (let [condition (CtInfer.items-of (Box.peek (Array.unsafe-nth items 1)))]
+                  (and (Int.= 2 (Array.length &condition))
+                       (match (CtInfer.head-key &condition)
+                         (Maybe.Nothing) false
+                         (Maybe.Just predicate)
+                           (and (= &predicate "list?")
+                                (match (CtInfer.symbol-key
+                                         (Box.peek (Array.unsafe-nth &condition 1)))
+                                  (Maybe.Just _) true
+                                  (Maybe.Nothing) false)))))))))
+
+(sig mutate (Fn [(Ref SurfaceNode)] SurfaceNode))
+(sig mutate-children (Fn [(Ref SurfaceNode)] SurfaceNode))
+
+(doc replacement "the node an operator substitutes in.")
+(defn replacement [span]
+  (cond
+    (Int.= *operator* *op-seq-string*) (string-node span)
+    (Int.= *operator* *op-seq-symbol*) (quoted-symbol-node span)
+    (Int.= *operator* *op-arith-string*) (string-node span)
+    (Int.= *operator* *op-string-list*) (quoted-list-node span)
+    (Int.= *operator* *op-index-string*) (string-node span)
+    (int-node span)))
+
+(doc target-index "the argument position this operator attacks in a call to
+`name`, or -1 when the operator does not apply to it.")
+(defn target-index [name]
+  (cond
+    (and (Int.= *operator* *op-seq-string*) (sequence-op? name)) 0
+    (and (Int.= *operator* *op-seq-symbol*) (sequence-op? name)) 0
+    (and (Int.= *operator* *op-arith-string*) (arith-op? name)) 0
+    (and (Int.= *operator* *op-string-list*) (string-op? name)) 0
+    (and (Int.= *operator* *op-index-string*) (index-op? name)) 1
+    (and (Int.= *operator* *op-not-int*) (= name "not")) 0
+    -1))
+
+(defn mutate [node]
+  (let [items (CtInfer.items-of node)
+        n (Array.length &items)]
+    (if (Int.= 0 n)
+      @node
+      (let [head (CtInfer.head-key &items)
+            ;; a form inside a quotation is the syntax a macro emits, not
+            ;; the code it runs. Corrupting it is not an error the pass is
+            ;; supposed to catch, so it is not a mutation site.
+            quoting (match-ref &head
+                      (Maybe.Just name)
+                        (cond (= name "quasiquote") 1
+                              (= name "quote") 1
+                              (or (= name "unquote") (= name "unquote-splicing")) -1
+                              0)
+                      (Maybe.Nothing) 0)
+            swap? (and (Int.= *quasi-depth* 0)
+                       (and (Int.= *operator* *op-swap-branches*) (narrowed-if? &items)))
+            at (if (Int./= *quasi-depth* 0)
+                 -1
+                 (match-ref &head
+                   (Maybe.Nothing) -1
+                   (Maybe.Just name)
+                     (if (Int.= *operator* *op-swap-branches*) -1 (target-index name))))
+            applies? (or swap? (and (Int.>= at 0) (Int.> n (Int.inc at))))]
+        (if (not applies?)
+          (let-do [saved *quasi-depth*
+                   result (the (Maybe SurfaceNode) (Maybe.Nothing))]
+            (set! *quasi-depth* (Int.max 0 (Int.+ *quasi-depth* quoting)))
+            (set! result (Maybe.Just (mutate-children node)))
+            (set! *quasi-depth* saved)
+            (Maybe.unsafe-from result))
+          (let-do [index *site-counter*]
+            (set! *site-counter* (Int.inc *site-counter*))
+            (if (Int./= index *target-site*)
+              (mutate-children node)
+              ;; this is the site under test: edit it and stop descending, so
+              ;; one mutant carries exactly one error
+              (let-do [edited (the (Array (Box SurfaceNode)) [])]
+                (set! *mutated-definition* @&*current-definition*)
+                (for [i 0 n]
+                  (let [child (Box.peek (Array.unsafe-nth &items i))]
+                    (set! edited
+                          (Array.push-back
+                            edited
+                            (Box.init
+                              (cond
+                                (and swap? (Int.= i 2))
+                                  (SurfaceNode.copy
+                                    (Box.peek (Array.unsafe-nth &items 3)))
+                                (and swap? (Int.= i 3))
+                                  (SurfaceNode.copy
+                                    (Box.peek (Array.unsafe-nth &items 2)))
+                                (Int.= i (Int.inc at))
+                                  (replacement (SurfaceNode.span child))
+                                (SurfaceNode.copy child)))))))
+                (SurfaceNode.init @(SurfaceNode.span node)
+                                  (SurfaceForm.List edited))))))))))
+
+(defn mutate-children [node]
+  (let [items (CtInfer.items-of node)
+        n (Array.length &items)]
+    (if (Int.= 0 n)
+      @node
+      (let-do [edited (the (Array (Box SurfaceNode)) [])]
+        (for [i 0 n]
+          (set! edited
+                (Array.push-back edited
+                                 (Box.init (mutate (Box.peek (Array.unsafe-nth &items i)))))))
+        (SurfaceNode.init @(SurfaceNode.span node)
+                          (match-ref (SurfaceNode.form node)
+                            (SurfaceForm.Array _) (SurfaceForm.Array edited)
+                            (SurfaceForm.StaticArray _) (SurfaceForm.StaticArray edited)
+                            (SurfaceForm.Dictionary _) (SurfaceForm.Dictionary edited)
+                            _ (SurfaceForm.List edited)))))))
+
+;; ------------------------------------------------ compile-time bodies only
+
+(sig mutate-definitions (Fn [(Ref SurfaceNode)] SurfaceNode))
+
+(defn mutate-definitions [node]
+  (let [items (CtInfer.items-of node)]
+    (if (Int.= 0 (Array.length &items))
+      @node
+      (match (CtInfer.head-key &items)
+        (Maybe.Nothing) @node
+        (Maybe.Just head)
+          (cond
+            (= &head "defmodule")
+              (let-do [edited (the (Array (Box SurfaceNode)) [])]
+                (for [i 0 (Array.length &items)]
+                  (let [child (Box.peek (Array.unsafe-nth &items i))]
+                    (set! edited
+                          (Array.push-back edited
+                                           (Box.init (if (Int.< i 2)
+                                                       (SurfaceNode.copy child)
+                                                       (mutate-definitions child)))))))
+                (SurfaceNode.init @(SurfaceNode.span node) (SurfaceForm.List edited)))
+            (or (= &head "defmacro") (= &head "defndynamic"))
+              (let-do [edited (the (Array (Box SurfaceNode)) [])]
+                (match (CtInfer.symbol-key (Box.peek (Array.unsafe-nth &items 1)))
+                  (Maybe.Just name) (set! *current-definition* name)
+                  (Maybe.Nothing) (set! *current-definition* @"?"))
+                (for [i 0 (Array.length &items)]
+                  (let [child (Box.peek (Array.unsafe-nth &items i))]
+                    (set! edited
+                          (Array.push-back edited
+                                           (Box.init (if (Int.< i 3)
+                                                       (SurfaceNode.copy child)
+                                                       (mutate child)))))))
+                (SurfaceNode.init @(SurfaceNode.span node) (SurfaceForm.List edited)))
+            @node)))))
+
+(defn render-mutated [module target op]
+  (let-do [out @""]
+    (set! *site-counter* 0)
+    (set! *target-site* target)
+    (set! *operator* op)
+    (let [forms (SurfaceModule.forms module)]
+      (for [i 0 (Array.length forms)]
+        (set! out (String.concat
+                    &[@&out
+                      @&(Surface.render &(mutate-definitions
+                                           (Box.peek (Array.unsafe-nth forms i))))
+                      @"\n"]))))
+    out))
+
+(defn findings-in [source]
+  (do (CtInfer.reset!)
+      (ignore (CtInfer.check-source source))
+      (Array.length (CtInfer.findings))))
+
+(defn read-source [path]
+  (match (IO.read-file path)
+    (Result.Success source) (Maybe.Just source)
+    (Result.Error _) (Maybe.Nothing)))
+
+(defn load-order [source]
+  (let-do [files (the (Array String) [])]
+    (match (Surface.parse source)
+      (Result.Error _) ()
+      (Result.Success module)
+        (let [forms (SurfaceModule.forms &module)]
+          (for [i 0 (Array.length forms)]
+            (let [items (CtInfer.items-of (Box.peek (Array.unsafe-nth forms i)))]
+              (when (Int.= 2 (Array.length &items))
+                (match (CtInfer.head-key &items)
+                  (Maybe.Nothing) ()
+                  (Maybe.Just head)
+                    (when (or (= &head "load-once") (= &head "load"))
+                      (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth &items 1)))
+                        (SurfaceForm.StringLit name)
+                          (when (String.ends-with? name ".carp")
+                            (set! files (Array.push-back files @name)))
+                        _ ()))))))))
+    files))
+
+(def *caught* 0)
+(def *missed* 0)
+(def *sites* 0)
+(def *control-dirty* 0)
+
+(defn run-file [file module]
+  (for [op 0 *operator-count*]
+    (let-do [total (do (ignore (render-mutated module -1 op)) *site-counter*)]
+      (for [site 0 total]
+        (let [source (render-mutated module site op)
+              found (findings-in &source)]
+          (do (set! *sites* (Int.inc *sites*))
+              (if (Int.> found 0)
+                (set! *caught* (Int.inc *caught*))
+                (do (set! *missed* (Int.inc *missed*))
+                    (IO.println &(fmt "MISSED %s in %s: %s"
+                                      &(operator-name op) file &*mutated-definition*))))))))))
+
+(defn main []
+  (match (IO.getenv "CARP_CORE")
+    (Maybe.Nothing)
+      (IO.println "set CARP_CORE to a Carp standard-library directory")
+    (Maybe.Just dir)
+      (do (set! *core-dir* dir)
+          (match (read-source &(String.concat &[@&*core-dir* @"/Core.carp"]))
+            (Maybe.Nothing) (IO.println "could not read Core.carp there")
+            (Maybe.Just core)
+              (let-do [files (load-order &core)]
+                (for [i 0 (Array.length &files)]
+                  (let [file (Array.unsafe-nth &files i)]
+                    (match (read-source &(String.concat &[@&*core-dir* @"/" @file]))
+                      (Maybe.Nothing) ()
+                      (Maybe.Just source)
+                        (match (Surface.parse &source)
+                          (Result.Error _) ()
+                          (Result.Success module)
+                            (do
+                              ;; the control: rendering without mutating must
+                              ;; still be clean, or a finding on a mutant might
+                              ;; only be an artifact of re-rendering
+                              (let [rendered (render-mutated &module -1 0)]
+                                (when (Int.> (findings-in &rendered) 0)
+                                  (do (set! *control-dirty* (Int.inc *control-dirty*))
+                                      (IO.println &(fmt "CONTROL DIRTY %s" file)))))
+                              (run-file file &module))))))
+                (IO.println "")
+                (IO.println &(fmt "files with a dirty control: %d" *control-dirty*))
+                (IO.println &(fmt "mutation sites            : %d" *sites*))
+                (IO.println &(fmt "caught                    : %d" *caught*))
+                (IO.println &(fmt "missed                    : %d" *missed*)))))))

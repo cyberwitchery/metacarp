@@ -1,0 +1,247 @@
+;; Derives the compile-time builtins' argument domains and result shapes by
+;; running `carp-ct-eval`, and compares them against the hand-written table in
+;; `carp-ct-infer`.
+;;
+;;   carp -x corpus/oracle.carp
+;;
+;; The table in the checker was first written by reading the evaluator. That is
+;; the wrong direction of evidence: running the checker over correct code can
+;; only expose a domain that is too strict, never one that is too permissive,
+;; and a domain that is too permissive is exactly what lets a checker miss bugs
+;; while reporting a clean result. This runs the evaluator and asks it instead.
+;;
+;; Four outcomes are distinguished:
+;;
+;;   TOO PERMISSIVE  the table admits a shape the evaluator rejects. The
+;;                   checker is missing bugs. Always a defect in the table.
+;;   TOO STRICT      the evaluator accepts a shape the table does not. The
+;;                   checker will reject working code, unless the divergence is
+;;                   listed below with a reason.
+;;   DIVERGENCE      too strict, on purpose, and written down.
+;;   RANGE WRONG     the shape the table says a builtin returns does not
+;;                   contain what it actually returned. Wrong result shapes
+;;                   propagate, so these matter more than their count suggests.
+
+(load "../../carp-ct-eval/carp-ct-eval.carp")
+(load "../carp-ct-infer.carp")
+(Project.no-echo)
+
+(doc Probe "one builtin and a baseline call that succeeds. Each argument
+position is varied in turn while the others keep their baseline value, so a
+failure is attributable to the position under test.")
+(deftype Probe [name String args (Array String)])
+
+(def *shape-names* [@"Int" @"Byte" @"Long" @"Float" @"Double" @"Bool" @"Char"
+                    @"String" @"Pattern" @"Symbol" @"List" @"Array"
+                    @"StaticArray" @"Dictionary" @"Closure" @"Builtin"])
+(def *shape-source* [@"1" @"1b" @"1l" @"1.0f" @"1.0" @"true" @"\\a"
+                     @"\"abc\"" @"#\"a\"" @"(quote s)" @"(quote (1 (2 3) 4 5))"
+                     @"(array 1 (array 2 3) 4 5)" @"$[1 2 3 4]" @"{1 2}"
+                     @"(fn [x] x)" @"car"])
+
+;; Divergences the checker keeps on purpose: a shape the evaluator accepts and
+;; the table refuses, with the reason it refuses.
+;;
+;; Char: `collection-values` in carp-ct-eval returns a one-element collection
+;; for a CharLit, while the Symbol, Int, String and Bool cases sitting beside
+;; it all raise. So `(car \a)` answers `\a` and `(length \a)` answers 1. That
+;; reads as an oversight rather than a decision, no Core macro relies on it,
+;; and matching it here would cost the pass every genuine `(car <char>)`.
+(def *divergent-shapes* [@"Char"])
+
+(defn shape-leaf [index]
+  (let [n (Array.unsafe-nth &*shape-names* index)]
+    (cond
+      (= n "Int") (CtShape.i-int-lit)
+      (= n "Byte") (CtShape.i-byte-lit)
+      (= n "Long") (CtShape.i-long-lit)
+      (= n "Float") (CtShape.i-float-lit)
+      (= n "Double") (CtShape.i-double-lit)
+      (= n "Bool") (CtShape.i-bool-lit)
+      (= n "Char") (CtShape.i-char-lit)
+      (= n "String") (CtShape.i-string-lit)
+      (= n "Pattern") (CtShape.i-pattern-lit)
+      (= n "Symbol") (CtShape.i-symbol)
+      (= n "List") (CtShape.i-list)
+      (= n "Array") (CtShape.i-array)
+      (= n "StaticArray") (CtShape.i-static-array)
+      (= n "Dictionary") (CtShape.i-dictionary)
+      (= n "Closure") (CtShape.i-closure)
+      (CtShape.i-builtin))))
+
+(doc evaluate "runs one source form through the compile-time evaluator.
+`Maybe.Just` of the resulting leaf when it succeeded, `Maybe.Nothing` when the
+evaluator rejected it.")
+(defn evaluate [source]
+  (match (Surface.parse source)
+    (Result.Error _) (Maybe.Nothing)
+    (Result.Success m)
+      (let [forms (SurfaceModule.forms &m)]
+        (if (Int.= 0 (Array.length forms))
+          (Maybe.Nothing)
+          (let-do [state (CtEval.state)
+                   root (CtEval.root &state)]
+            (match (CtEval.eval-value (Box.peek (Array.unsafe-nth forms 0))
+                                      &state
+                                      &root)
+              (Result.Error _) (Maybe.Nothing)
+              (Result.Success value)
+                (Maybe.Just
+                  (match value
+                    (CtValue.Syntax node) (CtInfer.data-shape (Box.peek &node))
+                    (CtValue.Closure _) (CtShape.leaf (CtShape.i-closure))
+                    (CtValue.Macro _) (CtShape.leaf (CtShape.i-macro))
+                    (CtValue.Builtin _) (CtShape.leaf (CtShape.i-builtin))
+                    (CtValue.Collection _)
+                      (CtShape.leaf (CtShape.i-collection))))))))))
+
+(defn call-source [name args at replacement]
+  (let-do [out (String.concat &[@"(" @name])]
+    (for [i 0 (Array.length args)]
+      (set! out (String.concat &[@&out @" "
+                                 (if (Int.= i at)
+                                   @replacement
+                                   @(Array.unsafe-nth args i))])))
+    (String.concat &[@&out @")"])))
+
+(doc constructible "the leaves the probe set can actually build. A shape whose
+literal the evaluator will not accept at all is evidence for nothing, so the
+comparison happens inside this window.")
+(defn constructible []
+  (let-do [mask (CtShape.bottom)]
+    (for [s 0 (Array.length &*shape-names*)]
+      (match (evaluate (Array.unsafe-nth &*shape-source* s))
+        (Maybe.Nothing) ()
+        (Maybe.Just leaf)
+          (when (Int.= leaf (CtShape.leaf (shape-leaf s)))
+            (set! mask (CtShape.union mask leaf)))))
+    mask))
+
+(defn divergent-mask []
+  (let-do [mask (CtShape.bottom)]
+    (for [s 0 (Array.length &*shape-names*)]
+      (when (Array.any? &(fn [d] (= d (Array.unsafe-nth &*shape-names* s)))
+                        &*divergent-shapes*)
+        (set! mask (CtShape.union mask (CtShape.leaf (shape-leaf s))))))
+    mask))
+
+(defn observed-domain [probe at window]
+  (let-do [accepted (CtShape.bottom)]
+    (for [s 0 (Array.length &*shape-names*)]
+      (let [leaf (CtShape.leaf (shape-leaf s))]
+        (when (not (CtShape.bottom? (CtShape.intersection leaf window)))
+          (match (evaluate &(call-source (Probe.name probe)
+                                         (Probe.args probe)
+                                         at
+                                         (Array.unsafe-nth &*shape-source* s)))
+            (Maybe.Just _) (set! accepted (CtShape.union accepted leaf))
+            (Maybe.Nothing) ()))))
+    accepted))
+
+(def *strict* 0)
+(def *permissive* 0)
+(def *diverged* 0)
+(def *range-wrong* 0)
+
+(defn check-domains [probe window]
+  (for [at 0 (Array.length (Probe.args probe))]
+    (let [observed (observed-domain probe at window)
+          declared (CtShape.intersection (CtInfer.builtin-domain (Probe.name probe) at)
+                                         window)
+          strict-gap (CtShape.difference observed declared)
+          documented (CtShape.intersection strict-gap (divergent-mask))
+          undocumented (CtShape.difference strict-gap (divergent-mask))
+          permissive-gap (CtShape.difference declared observed)]
+      (do
+        (when (not (CtShape.bottom? documented))
+          (do (set! *diverged* (Int.inc *diverged*))
+              (IO.println &(fmt "DIVERGENCE     %s arg %d: evaluator accepts %s, table refuses on purpose"
+                                (Probe.name probe) at &(CtShape.render documented)))))
+        (when (not (CtShape.bottom? undocumented))
+          (do (set! *strict* (Int.inc *strict*))
+              (IO.println &(fmt "TOO STRICT     %s arg %d: evaluator accepts %s, table does not"
+                                (Probe.name probe) at &(CtShape.render undocumented)))))
+        (when (not (CtShape.bottom? permissive-gap))
+          (do (set! *permissive* (Int.inc *permissive*))
+              (IO.println &(fmt "TOO PERMISSIVE %s arg %d: table admits %s, evaluator rejects it"
+                                (Probe.name probe) at &(CtShape.render permissive-gap)))))))))
+
+(defn check-range [probe]
+  (match (evaluate &(call-source (Probe.name probe) (Probe.args probe) -1 ""))
+    (Maybe.Nothing)
+      (IO.println &(fmt "BASELINE FAILS %s" (Probe.name probe)))
+    (Maybe.Just observed)
+      (let [declared (CtInfer.builtin-range (Probe.name probe))]
+        (when (not (CtShape.subshape? observed declared))
+          (do (set! *range-wrong* (Int.inc *range-wrong*))
+              (IO.println &(fmt "RANGE WRONG    %s: returns %s, table says %s"
+                                (Probe.name probe)
+                                &(CtShape.render observed)
+                                &(CtShape.render declared))))))))
+
+;; Symbol.concat, caadr and cdadr are deliberately absent. Their real
+;; constraint is on the elements of the argument rather than on the argument's
+;; own tag -- caadr needs its second element to be a collection, Symbol.concat
+;; needs every element to be a symbol -- and an element constraint is beyond
+;; the shape homomorphism. Expressing it needs the component homomorphisms this
+;; library does not implement, so probing them here would only measure the
+;; probe values.
+(def *probes*
+  [(Probe.init @"car" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"cdr" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"cadr" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"caddr" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"cadddr" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"cddr" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"last" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"all-but-last" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"length" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"empty?" [@"(quote (1 (2 3) 4 5))"])
+   (Probe.init @"list?" [@"(quote (1 2))"])
+   (Probe.init @"array?" [@"(array 1 2)"])
+   (Probe.init @"not" [@"true"])
+   (Probe.init @"cons" [@"1" @"(quote (2 3))"])
+   (Probe.init @"cons-last" [@"1" @"(quote (2 3))"])
+   (Probe.init @"append" [@"(quote (1))" @"(quote (2))"])
+   (Probe.init @"list" [@"1" @"2"])
+   (Probe.init @"array" [@"1" @"2"])
+   (Probe.init @"+" [@"1" @"2"])
+   (Probe.init @"-" [@"1" @"2"])
+   (Probe.init @"*" [@"1" @"2"])
+   (Probe.init @"/" [@"4" @"2"])
+   (Probe.init @"mod" [@"4" @"2"])
+   (Probe.init @"inc" [@"1"])
+   (Probe.init @"dec" [@"1"])
+   (Probe.init @"=" [@"1" @"1"])
+   (Probe.init @"<" [@"1" @"2"])
+   (Probe.init @">" [@"2" @"1"])
+   (Probe.init @"str" [@"1"])
+   (Probe.init @"dynamic-type" [@"1"])
+   (Probe.init @"Symbol.from" [@"\"abc\""])
+   (Probe.init @"String.length" [@"\"abc\""])
+   (Probe.init @"String.head" [@"\"abc\""])
+   (Probe.init @"String.tail" [@"\"abc\""])
+   (Probe.init @"String.append" [@"\"a\"" @"\"b\""])
+   (Probe.init @"String.slice" [@"\"abcdef\"" @"1" @"3"])
+   (Probe.init @"String.char-at" [@"\"abc\"" @"1"])
+   (Probe.init @"String.prefix" [@"\"abc\"" @"2"])
+   (Probe.init @"String.suffix" [@"\"abc\"" @"2"])])
+
+(defn main []
+  (let-do [window (constructible)]
+    (IO.println &(fmt "probe shapes constructible: %s" &(CtShape.render window)))
+    (IO.println "")
+    (IO.println "=== result shapes ===")
+    (for [p 0 (Array.length &*probes*)]
+      (check-range (Array.unsafe-nth &*probes* p)))
+    (IO.println "")
+    (IO.println "=== argument domains ===")
+    (for [p 0 (Array.length &*probes*)]
+      (check-domains (Array.unsafe-nth &*probes* p) window))
+    (IO.println "")
+    (IO.println &(fmt "probes                  : %d" (Array.length &*probes*)))
+    (IO.println &(fmt "positions too permissive: %d" *permissive*))
+    (IO.println &(fmt "positions too strict    : %d" *strict*))
+    (IO.println &(fmt "documented divergences  : %d" *diverged*))
+    (IO.println &(fmt "wrong result shapes     : %d" *range-wrong*))
+))

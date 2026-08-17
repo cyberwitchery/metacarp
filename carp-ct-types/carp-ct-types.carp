@@ -1,0 +1,202 @@
+(doc CtShape "the tag lattice of the compile-time language, and the shape
+homomorphism over it.
+
+Boolean-algebraic subtyping is characterised by five families of monotonic
+Boolean homomorphisms. This library implements the first of them, the shape
+homomorphism `H`, which maps a compile-time type to the set of runtime tags a
+value of that type may carry. `H` is the one that rules out impossible
+constructor pairings by contradiction, so it is exactly what a checker needs
+in order to report only provable impossibilities.
+
+A shape is that set of tags, held as a bitmask over the leaves of the tag
+lattice. The Boolean operations are the set operations:
+
+    ⊤        the full mask            ⊥        zero
+    τ ⊔ π    bitwise or               τ ⊓ π    bitwise and
+    ¬τ       complement               τ ≤ π    inclusion
+
+The lattice itself is not invented here. It is `CtValue` crossed with
+`SurfaceForm`, which is a tree under a single root, so unrelated tags have
+disjoint leaf sets and `S-TagBot` holds by construction:
+
+    Obj
+    ├─ Syntax
+    │  ├─ Lit
+    │  │  ├─ Num ── IntLit ByteLit LongLit FloatLit DoubleLit
+    │  │  └─ BoolLit CharLit StringLit PatternLit
+    │  ├─ Symbol
+    │  ├─ Seq ── List Array StaticArray Dictionary
+    │  └─ Comment
+    ├─ Closure
+    ├─ Macro
+    ├─ Builtin
+    └─ Collection
+
+Type variables and unbound names map to ⊤. The paper licenses this: under a
+guarded assumption context a variable can only be introduced and eliminated by
+the pure Boolean-algebraic rules, so any element of the target algebra
+preserves monotonicity, and ⊤ is the imprecise-but-sound choice.
+
+`Collection` and `Seq` are siblings rather than one being under the other.
+They are distinct runtime representations that the evaluator converts between
+at a boundary, and a conversion is not a subtyping relation. Operations that
+accept either say so with a union, which is what unions are for.")
+(defmodule CtShape
+
+  ;; leaf indices. Order is arbitrary but fixed: masks are cached in the
+  ;; checker's environments, so renumbering invalidates nothing but is
+  ;; pointless churn.
+  (defn i-int-lit [] 0)
+  (defn i-byte-lit [] 1)
+  (defn i-long-lit [] 2)
+  (defn i-float-lit [] 3)
+  (defn i-double-lit [] 4)
+  (defn i-bool-lit [] 5)
+  (defn i-char-lit [] 6)
+  (defn i-string-lit [] 7)
+  (defn i-pattern-lit [] 8)
+  (defn i-symbol [] 9)
+  (defn i-list [] 10)
+  (defn i-array [] 11)
+  (defn i-static-array [] 12)
+  (defn i-dictionary [] 13)
+  (defn i-comment [] 14)
+  (defn i-closure [] 15)
+  (defn i-macro [] 16)
+  (defn i-builtin [] 17)
+  (defn i-collection [] 18)
+
+  (doc leaf-count "the number of leaves in the tag lattice.")
+  (defn leaf-count [] 19)
+
+  (doc leaf "the shape containing exactly the leaf tag at `index`.")
+  (defn leaf [index] (Int.bit-shift-left 1 index))
+
+  (doc bottom "⊥, the empty shape. No value has it, so a binding at ⊥ is
+unreachable.")
+  (defn bottom [] 0)
+
+  (doc top "⊤, every tag in the lattice.")
+  (defn top [] (Int.dec (Int.bit-shift-left 1 (leaf-count))))
+
+  (doc union "τ ⊔ π.")
+  (defn union [a b] (Int.bit-or a b))
+
+  (doc intersection "τ ⊓ π.")
+  (defn intersection [a b] (Int.bit-and a b))
+
+  (doc negation "¬τ, complemented within the lattice rather than within Int.")
+  (defn negation [a] (Int.bit-and (top) (Int.bit-not a)))
+
+  (doc difference "τ ⊓ ¬π.")
+  (defn difference [a b] (intersection a (negation b)))
+
+  (doc bottom? "whether a shape is ⊥. This is the whole soundness test the
+checker performs: an operation is rejected when the intersection of what it
+requires and what it may receive is empty, which is a contradiction under `H`
+and therefore a contradiction in the subtyping relation.")
+  (defn bottom? [a] (Int.= 0 a))
+
+  (doc subshape? "τ ≤ π, inclusion in the target Boolean algebra.")
+  (defn subshape? [a b] (bottom? (difference a b)))
+
+  (doc range-mask "the shape holding every leaf from `from` up to and
+including `to`.")
+  (defn range-mask [from to]
+    (Int.bit-and (top)
+                 (Int.- (Int.bit-shift-left 1 (Int.inc to))
+                        (Int.bit-shift-left 1 from))))
+
+  ;; interior nodes of the lattice. Each is the union of the leaves beneath
+  ;; it, so `S-TagSub` (subtags of T are included in T) holds definitionally.
+
+  ;; `num` describes the lattice, not the arithmetic domain: compile-time
+  ;; arithmetic turns out to accept the Int leaf only. See `corpus/oracle.carp`.
+  (doc num "the numeric literals.")
+  (defn num [] (range-mask (i-int-lit) (i-double-lit)))
+
+  (doc lit "every literal, numeric or not.")
+  (defn lit [] (range-mask (i-int-lit) (i-pattern-lit)))
+
+  (doc seq "the syntax containers: a list, array, static array or
+dictionary read from source.")
+  (defn seq [] (range-mask (i-list) (i-dictionary)))
+
+  (doc syntax "every syntax node, which is `CtValue.Syntax`.")
+  (defn syntax [] (range-mask (i-int-lit) (i-comment)))
+
+  (doc callable "the values that can appear in head position: a compile-time
+closure, a macro, or a builtin.")
+  (defn callable [] (range-mask (i-closure) (i-builtin)))
+
+  (doc listy "everything the list operations accept: syntax containers and
+computed collections alike. This is the union that exists because `Collection`
+is not a subtag of `Seq`.")
+  (defn listy [] (union (seq) (leaf (i-collection))))
+
+  (doc array-like "everything `array?` answers true for.")
+  (defn array-like [] (union (union (leaf (i-array)) (leaf (i-static-array)))
+                             (leaf (i-collection))))
+
+  (private leaf-name)
+  (hidden leaf-name)
+  (defn leaf-name [index]
+    (cond
+      (Int.= index (i-int-lit)) @"Int"
+      (Int.= index (i-byte-lit)) @"Byte"
+      (Int.= index (i-long-lit)) @"Long"
+      (Int.= index (i-float-lit)) @"Float"
+      (Int.= index (i-double-lit)) @"Double"
+      (Int.= index (i-bool-lit)) @"Bool"
+      (Int.= index (i-char-lit)) @"Char"
+      (Int.= index (i-string-lit)) @"String"
+      (Int.= index (i-pattern-lit)) @"Pattern"
+      (Int.= index (i-symbol)) @"Symbol"
+      (Int.= index (i-list)) @"List"
+      (Int.= index (i-array)) @"Array"
+      (Int.= index (i-static-array)) @"StaticArray"
+      (Int.= index (i-dictionary)) @"Dictionary"
+      (Int.= index (i-comment)) @"Comment"
+      (Int.= index (i-closure)) @"Closure"
+      (Int.= index (i-macro)) @"Macro"
+      (Int.= index (i-builtin)) @"Builtin"
+      @"Collection"))
+
+  (private node-name)
+  (hidden node-name)
+  (defn node-name [shape]
+    (cond
+      (bottom? shape) (Maybe.Just @"⊥")
+      (Int.= shape (top)) (Maybe.Just @"Obj")
+      (Int.= shape (syntax)) (Maybe.Just @"Syntax")
+      (Int.= shape (listy)) (Maybe.Just @"Seq ⊔ Collection")
+      (Int.= shape (seq)) (Maybe.Just @"Seq")
+      (Int.= shape (lit)) (Maybe.Just @"Lit")
+      (Int.= shape (num)) (Maybe.Just @"Num")
+      (Int.= shape (callable)) (Maybe.Just @"Callable")
+      (Int.= shape (array-like)) (Maybe.Just @"Array ⊔ StaticArray ⊔ Collection")
+      (let-do [single (Maybe.Nothing)]
+        (for [i 0 (leaf-count)]
+          (when (Int.= shape (leaf i))
+            (set! single (Maybe.Just (leaf-name i)))))
+        single)))
+
+  (doc render "renders a shape the way the checker reports it.
+
+A shape that is exactly one node of the lattice prints as that node. One that
+is exactly the complement of a node prints as its negation: narrowing produces
+complements constantly, and `¬(Seq ⊔ Collection)` says what fourteen leaves
+joined by `⊔` does not. Anything else prints as the union of its leaves.")
+  (defn render [shape]
+    (match (node-name shape)
+      (Maybe.Just name) name
+      (Maybe.Nothing)
+        (match (node-name (negation shape))
+          (Maybe.Just name) (String.concat &[@"¬(" @&name @")"])
+          (Maybe.Nothing)
+            (let-do [parts (the (Array String) [])]
+              (for [i 0 (leaf-count)]
+                (when (Int./= 0 (Int.bit-and shape (leaf i)))
+                  (set! parts (Array.push-back parts (leaf-name i)))))
+              (String.join " ⊔ " &parts)))))
+)

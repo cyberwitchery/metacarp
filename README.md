@@ -160,6 +160,15 @@ source registry
   -> one C translation unit
 ```
 
+Two further libraries are **experimental and opt-in**, and are not part of
+that pipeline: `carp-ct-types` (a tag lattice for the compile-time language)
+and `carp-ct-infer` (a shape check over `defmacro` and `defndynamic` bodies,
+invoked through `CtCheck.modules`). Nothing calls them. They are a checking
+phase rather than a transforming one, so a build that ignores them loses only
+their diagnostics. See
+[`carp-ct-infer/README.md`](carp-ct-infer/README.md) for what they do and do
+not cover yet.
+
 Supporting libraries: `carp-primitives` (the declarative primitive registry) and
 `carp-graph` (strongly-connected-component ordering), plus `carp-source`
 (caller-owned source identities and byte spans) and `carp-session` (warm,
