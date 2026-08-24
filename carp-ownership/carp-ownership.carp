@@ -953,6 +953,26 @@ binder, but it must not outlive the frame.")
         (Array.push-back @(BorrowState.moved state) (CoreRef.copy local))
         @(BorrowState.origins state))))
 
+  (private state-mark-moved-checked)
+  (hidden state-mark-moved-checked)
+  ;; a genuine consuming move: moving a value that was already moved is a
+  ;; use-after-move. The loop pass re-runs a `while` body against the first
+  ;; pass's moved set, so a loop-carried second move lands here too. The
+  ;; `Let` scope-death mark stays on the unchecked variant -- dying after
+  ;; being consumed is the normal case, not an error.
+  (defn state-mark-moved-checked [state local flags]
+    (do
+      (when-do (contains-ref? (BorrowState.moved state) local)
+        (match (IO.getenv "CARP_DEBUG_OWNERSHIP")
+          (Maybe.Just _)
+            (IO.errorln
+              &(fmt "  move-after-move: owner %s (id %d)"
+                    (CoreRef.name local)
+                    @(CoreRef.id local)))
+          (Maybe.Nothing) ())
+        (Array.aset! flags 3 true))
+      (state-mark-moved state local)))
+
   (private join-origins)
   (hidden join-origins)
   (defn join-origins [left right]
@@ -1268,7 +1288,9 @@ values only — the syntactic borrow sources of the value expression.")
           ;; the move mid-loop would poison borrows used by later arguments.
           (for [i 0 (Array.length &pending)]
             (set! current
-                  (state-mark-moved &current (Array.unsafe-nth &pending i))))
+                  (state-mark-moved-checked &current
+                                            (Array.unsafe-nth &pending i)
+                                            flags)))
           current)
       _ @state))
 
@@ -1331,7 +1353,7 @@ values only — the syntactic borrow sources of the value expression.")
             (SpecializedExpr.Reference _ node-type sbinder)
               (when-do (and (owned-type? (Box.peek node-type) facts)
                             (not @(CoreRef.global sbinder)))
-                (set! after-s (state-mark-moved &after-s sbinder))
+                (set! after-s (state-mark-moved-checked &after-s sbinder flags))
                 (set! joined @&after-s))
             _ ())
           (for [i 0 n]
@@ -1476,11 +1498,13 @@ values only — the syntactic borrow sources of the value expression.")
             (Array.aset! flags 2 true))))))
 
   (doc check-borrows "runs the sound flow-sensitive borrow check over one
-definition body. Returns a three-element flag array: index 0 is set if a borrow
+definition body. Returns a four-element flag array: index 0 is set if a borrow
 into a local escapes the body, index 1 if a borrow is used after its owner is
-moved, index 2 if a lambda moves a captured value out of its environment.")
+moved, index 2 if a lambda moves a captured value out of its environment, and
+index 3 if an owned value is moved after it was already moved (sequentially,
+across joined branches, or carried around a loop).")
   (defn check-borrows [body parameters facts]
-    (let-do [flags [false false false]
+    (let-do [flags [false false false false]
              state (BorrowState.init [] [])]
       (ignore (analyze body &state parameters facts &flags true))
       flags))
@@ -1800,6 +1824,14 @@ that are not moved out of their scope. Types are classified from `facts`.")
                                 (OwnershipError.init
                                   (String.concat
                                     &[@"a captured value is moved out of a lambda in "
+                                      (String.copy
+                                        (CoreRef.name (Specialization.reference instance)))]))))
+                      @(Array.unsafe-nth &flags 3)
+                        (set! result
+                              (Result.Error
+                                (OwnershipError.init
+                                  (String.concat
+                                    &[@"an owned value is used after it was moved in "
                                       (String.copy
                                         (CoreRef.name (Specialization.reference instance)))]))))
                       (do
