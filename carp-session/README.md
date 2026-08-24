@@ -17,6 +17,16 @@ The immutable base expansion snapshot is shared with the current overlay via
 `Rc`; it is copied only when expansion actually commits a user definition.
 This keeps cheap reset support without duplicating the resident Core state.
 
+The committed input is the unit of text ownership: `upsert-input` and
+`remove-input` act on a whole input in place, and a definition that arrived
+in a multi-definition input cannot be edited or removed by name — the
+name-keyed calls refuse with a diagnostic pointing at the owning input.
+Binding follows the latest committed definition of a name: replacing an
+overlay definition or shadowing a base one rebinds that name's committed
+dependents to the new definition (their inputs replay after it), and the
+report lists them as invalidated. `remove` drops whole inputs, dependents'
+inputs included, and reports every definition that disappeared.
+
 Replacement is atomic: the candidate overlay is rebuilt before it is committed,
 and resolved global-reference edges identify its transitive dependents. Failed
 replacement leaves the previous overlay untouched. Removal drops only the

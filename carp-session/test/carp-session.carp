@@ -37,14 +37,24 @@
     found))
 
 (defn session-reference-id [session name]
+  ;; references run parallel to INPUTS (one slot per input), so a
+  ;; definition's retained identity lives at its owning input's slot
   (let-do [result (the (Maybe Int) (Maybe.Nothing))
            overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)
            definitions (SessionOverlay.definitions overlay)
-           references (SessionOverlay.references overlay)]
+           inputs (SessionOverlay.inputs overlay)
+           references (SessionOverlay.references overlay)
+           owner (String.copy "")]
     (for [i 0 (Array.length definitions)]
       (when (String.=
           (SessionDefInfo.name (Array.unsafe-nth definitions i))
           name)
+        (set! owner
+              (String.copy
+                (SourceInput.id
+                  (SessionDefInfo.source (Array.unsafe-nth definitions i)))))))
+    (for [i 0 (Array.length inputs)]
+      (when (String.= (SourceInput.id (Array.unsafe-nth inputs i)) &owner)
         (match-ref (Array.unsafe-nth references i)
           (Maybe.Just reference)
             (set! result (Maybe.Just @(CoreRef.id reference)))
@@ -912,6 +922,83 @@
         ok)
     (Result.Error diagnostic) (diagnostic-false &diagnostic)))
 
+(defn session-commit [session id text]
+  (let [input (SourceInput.init (String.copy id) (String.copy text))]
+    (match (Session.upsert session &input)
+      (Result.Success _) ()
+      (Result.Error _) ())))
+
+(sig session-cell-type (Fn [(Ref CompilerSession) (Ref String)] String))
+(defn session-cell-type [session text]
+  (let [input (SourceInput.init (String.copy "cell:contract") (String.copy text))]
+    (match (Session.infer-cell session &input)
+      (Result.Success report)
+        (let [entities (CellReport.expressions &report)]
+          (if (Int.> (Array.length entities) 0)
+            (String.copy (SessionTypedEntity.type (Array.unsafe-nth entities 0)))
+            (String.copy "<no expression>")))
+      (Result.Error d)
+        (fmt "<%s: %s>" (Diagnostic.phase &d) (Diagnostic.message &d)))))
+
+(defn session-definition-count [session name]
+  (let-do [defs (Session.definitions session)
+           n 0]
+    (for [i 0 (Array.length &defs)]
+      (when (String.= (SessionDefInfo.name (Array.unsafe-nth &defs i)) name)
+        (set! n (Int.inc n))))
+    n))
+
+(defn multi-definition-input-upsert-is-atomic? []
+  ;; a definition that arrived in a multi-definition input is owned by that
+  ;; input: name-keyed upsert either refuses with a diagnostic (the current
+  ;; contract) or genuinely replaces -- it must never report success while
+  ;; the stale definition survives (the 2026-08-24 parallel-array corruption)
+  (match (make-session)
+    (Result.Success session)
+      (let-do [s session
+               multi (SourceInput.init (String.copy "file:multi")
+                                       (String.copy "(defn alpha [] 1)
+(defn beta [] 2)
+(defn gamma [] (alpha))"))
+               edit (SourceInput.init (String.copy "edit:beta")
+                                      (String.copy "(defn beta [] true)"))
+               committed (match (Session.upsert-input &s &multi)
+                 (Result.Success _) true
+                 (Result.Error _) false)]
+        (and committed
+             (match (Session.upsert &s &edit)
+               (Result.Error _)
+               ;; refusal must leave the session intact
+               (and
+                 (Int.= 1 (session-definition-count &s "beta"))
+                 (String.= &(session-cell-type &s "(gamma)") "(Fn [] Int)"))
+               (Result.Success _)
+               (and
+                 (Int.= 1 (session-definition-count &s "beta"))
+                 (String.= &(session-cell-type &s "(beta)") "(Fn [] Bool)")))))
+    (Result.Error _) false))
+
+(defn base-shadow-is-commit-order-independent? []
+  ;; the latest committed definition of a name is the one every committed
+  ;; dependent resolves to, whether the earlier definition lived in the base
+  ;; or the overlay: both commit orders converge on the shadow's type
+  (let [use-id-first (match (make-session)
+          (Result.Success session)
+            (let-do [s session]
+              (session-commit &s "def:user" "(defn use-id [] (warm-id 5))")
+              (session-commit &s "def:shadow" "(defn warm-id [x] true)")
+              (session-cell-type &s "(use-id)"))
+          (Result.Error _) (String.copy "<create failed>"))
+        shadow-first (match (make-session)
+          (Result.Success session)
+            (let-do [s session]
+              (session-commit &s "def:shadow" "(defn warm-id [x] true)")
+              (session-commit &s "def:user" "(defn use-id [] (warm-id 5))")
+              (session-cell-type &s "(use-id)"))
+          (Result.Error _) (String.copy "<create failed>"))]
+    (and (String.= &use-id-first &shadow-first)
+         (String.= &use-id-first "(Fn [] Bool)"))))
+
 (defn dispatch-session-emit []
   ;; a session whose overlay resolves definitions with local binders whose
   ;; ids reach C symbol names; used to pin that emission depends only on the
@@ -961,6 +1048,12 @@
   (assert-true t
     (cross-session-emits-are-deterministic?)
     "identically-driven sessions in one process emit identical bytes")
+  (assert-true t
+    (multi-definition-input-upsert-is-atomic?)
+    "a successful upsert into a multi-definition input replaces, or it refuses")
+  (assert-true t
+    (base-shadow-is-commit-order-independent?)
+    "shadowing a base binding yields the same session regardless of commit order")
   (assert-true t
     (definition-cell-has-structured-report?)
     "definition cells report their name, scheme, kind, and caller span")
