@@ -637,52 +637,6 @@ happens to render identically.")
                 (Maybe.Nothing) (Result.Success (Maybe.Nothing))))))
       _ (Result.Success (Maybe.Nothing))))
 
-  (doc expand-module-1-against "performs one outermost macro-expansion step
-for each transient top-level form against a private copy of a warm snapshot.
-Returns `Nothing` when no top-level form is a macro call.")
-  (sig expand-module-1-against
-       (Fn
-         [(Ref SurfaceModule) (Ref ExpandSnapshot)]
-         (Result (Maybe SurfaceModule) CtError)))
-  (defn expand-module-1-against [module snapshot]
-    (let-do [_ignored-stack (CtEval.reset-load-stack!)
-             scope (ExpandScope.copy (ExpandSnapshot.scope snapshot))
-             macros (Array.copy (ExpandSnapshot.macros snapshot))
-             state (CtState.copy (ExpandSnapshot.state snapshot))
-             modules (Array.copy (ExpandSnapshot.modules snapshot))
-             preludes (Array.copy (ExpandSnapshot.preludes snapshot))
-             forms (SurfaceModule.forms module)
-             expanded (the (Array (Box SurfaceNode)) [])
-             changed false
-             failure (the (Maybe CtError) (Maybe.Nothing))]
-      (for [i 0 (Array.length forms)]
-        (match-ref &failure
-          (Maybe.Just _) ()
-          (Maybe.Nothing)
-            (let [form (Box.peek (Array.unsafe-nth forms i))]
-              (match (expand-node-1 form
-                                    &macros
-                                    &state
-                                    &modules
-                                    &preludes
-                                    &scope)
-                (Result.Success maybe-expanded)
-                  (match maybe-expanded
-                    (Maybe.Just next)
-                      (do
-                        (set! changed true)
-                        (Array.push-back! &expanded (Box.init next)))
-                    (Maybe.Nothing)
-                      (Array.push-back! &expanded
-                                        (Box.init (SurfaceNode.copy form))))
-                (Result.Error error) (set! failure (Maybe.Just error))))))
-      (match failure
-        (Maybe.Just error) (Result.Error error)
-        (Maybe.Nothing)
-          (if changed
-            (Result.Success (Maybe.Just (SurfaceModule.init expanded)))
-            (Result.Success (Maybe.Nothing))))))
-
   (private expand-top-level)
   (hidden expand-top-level)
   (private literal-arguments?)
@@ -1140,6 +1094,8 @@ Returns `Nothing` when no top-level form is a macro call.")
 
   (private register-deftype-members!)
   (hidden register-deftype-members!)
+
+
   (private delete-implementation-type-name)
   (hidden delete-implementation-type-name)
   (private register-managed-implementation!)
@@ -1258,6 +1214,103 @@ Returns `Nothing` when no top-level form is a macro call.")
                 (Maybe.Nothing) ()))
             (register-source-expression! state form scope)))
       _ ()))
+
+  (private seed-transient-definition!)
+  (hidden seed-transient-definition!)
+  (doc seed-transient-definition! "registers one transient compile-time
+definition — a defmacro, defndynamic or defdynamic — into a one-step
+expansion's private environment, exactly the way full expansion registers
+it while walking a module in source order. Seeding is not a step: the form
+itself stays as written, and only the forms after it see the definition.")
+  (defn seed-transient-definition! [form scope macros state]
+    (cond
+      (defmacro? form)
+        (do
+          (register-source-expressions! state form scope)
+          (match (parse-definition form (ExpandScope.frame scope))
+            (Result.Success macro)
+              (do
+                (CtEval.register-macro! state
+                                        (ExpandScope.frame scope)
+                                        (ExpandMacro.name &macro)
+                                        @(MacroParameters.fixed (ExpandMacro.parameters &macro))
+                                        @(MacroParameters.rest (ExpandMacro.parameters &macro))
+                                        @(ExpandMacro.body &macro)
+                                        @(ExpandMacro.defining-frame &macro))
+                (Array.push-back! macros macro)
+                (Result.Success ()))
+            (Result.Error error) (Result.Error error)))
+      (defndynamic? form)
+        (do
+          (register-source-expressions! state form scope)
+          (match (parse-dynamic-definition form &(CtEval.root state))
+            (Result.Success dynamic)
+              (do
+                (register-dynamic! state scope &dynamic)
+                (Result.Success ()))
+            (Result.Error error) (Result.Error error)))
+      (defdynamic? form)
+        (do
+          (register-source-expressions! state form scope)
+          (match (parse-dynamic-value form state (ExpandScope.frame scope))
+            (Result.Success dynamic)
+              (do
+                (register-dynamic! state scope &dynamic)
+                (Result.Success ()))
+            (Result.Error error) (Result.Error error)))
+      (Result.Success ())))
+
+  (doc expand-module-1-against "performs one outermost macro-expansion step
+for each transient top-level form against a private copy of a warm snapshot.
+Transient compile-time definitions seed the private environment in source
+order, the way full expansion sees them, so a macro defined earlier in the
+same module expands the forms after it. Returns `Nothing` when no top-level
+form is a macro call.")
+  (sig expand-module-1-against
+       (Fn
+         [(Ref SurfaceModule) (Ref ExpandSnapshot)]
+         (Result (Maybe SurfaceModule) CtError)))
+  (defn expand-module-1-against [module snapshot]
+    (let-do [_ignored-stack (CtEval.reset-load-stack!)
+             scope (ExpandScope.copy (ExpandSnapshot.scope snapshot))
+             macros (Array.copy (ExpandSnapshot.macros snapshot))
+             state (CtState.copy (ExpandSnapshot.state snapshot))
+             modules (Array.copy (ExpandSnapshot.modules snapshot))
+             preludes (Array.copy (ExpandSnapshot.preludes snapshot))
+             forms (SurfaceModule.forms module)
+             expanded (the (Array (Box SurfaceNode)) [])
+             changed false
+             failure (the (Maybe CtError) (Maybe.Nothing))]
+      (for [i 0 (Array.length forms)]
+        (match-ref &failure
+          (Maybe.Just _) ()
+          (Maybe.Nothing)
+            (let [form (Box.peek (Array.unsafe-nth forms i))]
+              (match (seed-transient-definition! form &scope &macros &state)
+                (Result.Error error) (set! failure (Maybe.Just error))
+                (Result.Success _)
+                  (match (expand-node-1 form
+                                        &macros
+                                        &state
+                                        &modules
+                                        &preludes
+                                        &scope)
+                    (Result.Success maybe-expanded)
+                      (match maybe-expanded
+                        (Maybe.Just next)
+                          (do
+                            (set! changed true)
+                            (Array.push-back! &expanded (Box.init next)))
+                        (Maybe.Nothing)
+                          (Array.push-back! &expanded
+                                            (Box.init (SurfaceNode.copy form))))
+                    (Result.Error error) (set! failure (Maybe.Just error)))))))
+      (match failure
+        (Maybe.Just error) (Result.Error error)
+        (Maybe.Nothing)
+          (if changed
+            (Result.Success (Maybe.Just (SurfaceModule.init expanded)))
+            (Result.Success (Maybe.Nothing))))))
 
   (defn delete-implementation-type-name [node]
     (match (symbol-key node)
