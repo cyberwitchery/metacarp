@@ -54,7 +54,9 @@ hash_file() {
 
 "$compiler" -c "$core_dir" -o "$gen2_c" "$repo_root/main.carp"
 
-link_flags=(-O3 -D NDEBUG -I "$repo_root" -I "$core_dir")
+link_flags=(-O3 -D NDEBUG -D_DEFAULT_SOURCE -std=c99 -Wall
+  -Werror=typedef-redefinition
+  -I "$repo_root" -I "$core_dir")
 if [[ "$(uname -s)" == "Darwin" ]]; then
   link_flags+=(-Wl,-stack_size,0x20000000)
 fi
