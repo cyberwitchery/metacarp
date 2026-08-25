@@ -100,15 +100,15 @@ native linking, the persistent ORC session JIT, and its test commands.
 
 ## Self-hosting
 
-The bootstrap chain, from the repository root:
+The bootstrap chain, from the repository root, is automated by the assurance
+harness:
 
 ```sh
-carp -b --optimize main.carp                                    # gen 1
-./out/carp-compiler -c "$CARP_DIR/core" -o self.c main.carp     # gen 1 emits itself
-clang -O3 -D NDEBUG -o self-cc self.c -I "$CARP_DIR/core"      # link gen 2
-./self-cc -c "$CARP_DIR/core" -o self2.c main.carp              # gen 2 emits itself
-cmp self.c self2.c                                              # fixed point
+./scripts/run-assurance.sh self
 ```
+
+It freshly builds generation 1 with reference Carp before running the
+reference suite, fixed-point/provenance/smoke checks, and expansion parity.
 
 The canonical generation benchmark compares reference Carp, gen 1, and gen 2
 on the same workload (generating C for `main.carp`):
