@@ -67,6 +67,9 @@ cache (`~/.cache/carp/libs/...`) on first use:
 The examples below assume `CARP_DIR` points at a checkout of the reference
 Carp repository (its `core/` is the standard library and runtime headers).
 
+That checkout must include Carp's recursive value-type `Box`
+(carp-lang/Carp#1571); CI pins `d718653fb82a62f667bf2117f30222267c5fbb27`.
+
 Compile a standalone program (no standard library) to C:
 
 ```sh
@@ -134,6 +137,12 @@ The assurance harness keeps the self-host honest:
   unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run independent test groups
   concurrently; CI runs this architecture-neutral group once on two Linux
   workers.
+- `scripts/run-assurance.sh phase-self` runs the same compiler-phase and
+  session suites through the freshly built self-hosted compiler. CI runs this
+  lane once on Linux, catching generation-specific miscompilations that the
+  reference-compiler phase lane cannot expose. The reference-only memory-log
+  test remains in `phase`, because the self-hosted CLI does not implement
+  Carp's `--log-memory` instrumentation.
 - `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
   checks the self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated

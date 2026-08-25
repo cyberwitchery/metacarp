@@ -2,6 +2,7 @@
 # The canonical local and CI assurance entry point.
 #
 #   run-assurance.sh phase  phase suites plus lint and formatting
+#   run-assurance.sh phase-self  phase suites through the self-hosted compiler
 #   run-assurance.sh self   bootstrap, reference suite, fixed point, leaks,
 #                           expansion
 #   run-assurance.sh sanitize  the reference suite again, every generated
@@ -59,6 +60,23 @@ run_phase() {
   "$script_dir/run-phase-suites.sh"
 }
 
+run_phase_self() {
+  core_dir=${CARP_CORE_DIR:-${CARP_DIR:-${CARP_ROOT:-}}/core}
+  if [[ ! -x "$repo_root/out/carp-compiler" ]]; then
+    printf 'self-hosted compiler not found: %s\n' "$repo_root/out/carp-compiler" >&2
+    exit 2
+  fi
+  if [[ ! -f "$core_dir/Core.carp" ]]; then
+    printf 'Carp Core.carp not found under: %s\n' "$core_dir" >&2
+    exit 2
+  fi
+  CARP_REFERENCE="$repo_root/out/carp-compiler" \
+    CARP_PHASE_CORE="$core_dir" \
+    CARP_PHASE_LOG_MEMORY=0 \
+    CARP_PHASE_MEMORY_TESTS=0 \
+    "$script_dir/run-phase-suites.sh"
+}
+
 run_self() {
   cd "$repo_root"
   "$reference" -b --optimize main.carp
@@ -82,6 +100,7 @@ run_sanitize() {
 
 case "$group" in
   phase) run_phase ;;
+  phase-self) run_phase_self ;;
   self) run_self ;;
   sanitize) run_sanitize ;;
   all)
@@ -89,7 +108,7 @@ case "$group" in
     run_self
     ;;
   *)
-    printf 'usage: %s [phase|self|sanitize|all]\n' "$0" >&2
+    printf 'usage: %s [phase|phase-self|self|sanitize|all]\n' "$0" >&2
     exit 2
     ;;
 esac
