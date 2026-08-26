@@ -68,6 +68,7 @@ run_phase_self() {
     exit 2
   fi
   CARP_REFERENCE="$phase_compiler" \
+    CARP_DIR="${CARP_DIR:-$(dirname -- "$core_dir")}" \
     CARP_PHASE_CORE="$core_dir" \
     CARP_PHASE_LOG_MEMORY=0 \
     CARP_PHASE_MEMORY_TESTS=0 \
