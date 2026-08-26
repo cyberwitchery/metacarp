@@ -62,15 +62,16 @@ run_phase() {
 
 run_phase_self() {
   core_dir=${CARP_CORE_DIR:-${CARP_DIR:-${CARP_ROOT:-}}/core}
-  if [[ ! -x "$repo_root/out/carp-compiler" ]]; then
-    printf 'self-hosted compiler not found: %s\n' "$repo_root/out/carp-compiler" >&2
+  phase_compiler=${CARP_PHASE_COMPILER:-"$repo_root/out/carp-compiler"}
+  if [[ ! -x "$phase_compiler" ]]; then
+    printf 'self-hosted compiler not found: %s\n' "$phase_compiler" >&2
     exit 2
   fi
   if [[ ! -f "$core_dir/Core.carp" ]]; then
     printf 'Carp Core.carp not found under: %s\n' "$core_dir" >&2
     exit 2
   fi
-  CARP_REFERENCE="$repo_root/out/carp-compiler" \
+  CARP_REFERENCE="$phase_compiler" \
     CARP_PHASE_CORE="$core_dir" \
     CARP_PHASE_LOG_MEMORY=0 \
     CARP_PHASE_MEMORY_TESTS=0 \

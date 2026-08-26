@@ -138,11 +138,8 @@ The assurance harness keeps the self-host honest:
   concurrently; CI runs this architecture-neutral group once on two Linux
   workers.
 - `scripts/run-assurance.sh phase-self` runs the same compiler-phase and
-  session suites through the freshly built self-hosted compiler. CI runs this
-  lane once on Linux, catching generation-specific miscompilations that the
-  reference-compiler phase lane cannot expose. The reference-only memory-log
-  test remains in `phase`, because the self-hosted CLI does not implement
-  Carp's `--log-memory` instrumentation.
+  session suites through `CARP_PHASE_COMPILER` (default
+  `out/carp-compiler`); CI points it at the fixed-point generation-2 compiler.
 - `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
   checks the self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated
