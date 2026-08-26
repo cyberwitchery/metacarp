@@ -31,6 +31,19 @@ CARP_FIXED_POINT_OUT=/tmp/metacarp-fixed \
   ./scripts/check-fixed-point.sh
 ```
 
+After fixed-point validation, produce the source-only end-user bootstrap asset:
+
+```sh
+CARP_FIXED_POINT_OUT=out/fixed-point scripts/build-bootstrap-bundle.sh
+```
+
+The deterministic `.tar.gz` contains generation-2 compiler C, generated CBOR
+session-host C, the exact Carp Core source/runtime headers, and a hash manifest.
+It contains no platform-native executable. Carpaccio can therefore verify one
+GitHub release asset, compile both programs with the user's Clang, and cache
+them without requiring Haskell Stack; Stack remains part of the independent
+from-source assurance chain.
+
 The harness emits generation 2 and generation 3, links with `-O3 -D NDEBUG`,
 requires byte-identical C, compiles and runs `examples/hello.carp`, and records
 source/compiler hashes in `bootstrap-provenance.txt`. Only promote a compiler
