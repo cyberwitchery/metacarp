@@ -39,7 +39,8 @@ CARP_FIXED_POINT_OUT=out/fixed-point scripts/build-bootstrap-bundle.sh
 
 The deterministic `.tar.gz` contains generation-2 compiler C, generated CBOR
 session-host C, the exact Carp Core source/runtime headers, and a hash manifest.
-It contains no platform-native executable. Carpaccio can therefore verify one
+It also carries Meta-Carp's MIT license and Carp/Core's Apache-2.0 and Lua
+license notices. It contains no platform-native executable. Carpaccio can therefore verify one
 GitHub release asset, compile both programs with the user's Clang, and cache
 them without requiring Haskell Stack; Stack remains part of the independent
 from-source assurance chain.

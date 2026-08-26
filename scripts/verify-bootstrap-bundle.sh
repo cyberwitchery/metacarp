@@ -24,6 +24,12 @@ if [[ ${#roots[@]} -ne 1 || ! -f "${roots[0]}/manifest.properties" ]]; then
   exit 1
 fi
 root=${roots[0]}
+for legal in LICENSE-METACARP LICENSE-CARP LICENSE-LUA; do
+  [[ -s "$root/$legal" ]] || {
+    printf 'bootstrap archive is missing %s\n' "$legal" >&2
+    exit 1
+  }
+done
 
 property() {
   awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2) }' \

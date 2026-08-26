@@ -12,6 +12,7 @@ compiler_c=${CARP_FIXED_POINT_C:-"$fixed_root/gen2.c"}
 carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../Carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 release_dir=${METACARP_RELEASE_DIR:-"$repo_root/out/release"}
+session_host_c=${CARP_SESSION_HOST_C:-}
 
 if [[ ! -x "$compiler" || ! -f "$compiler_c" ]]; then
   printf 'verified generation-2 compiler/C not found under %s\n' "$fixed_root" >&2
@@ -49,10 +50,19 @@ trap cleanup EXIT
 mkdir -p "$bundle/carp" "$release_dir"
 cp "$compiler_c" "$bundle/carp-compiler.c"
 cp -R "$core_dir" "$bundle/carp/core"
+cp "$repo_root/LICENSE" "$bundle/LICENSE-METACARP"
+cp "$carp_root/LICENSE" "$bundle/LICENSE-CARP"
+if [[ -f "$carp_root/LUA_LICENSE" ]]; then
+  cp "$carp_root/LUA_LICENSE" "$bundle/LICENSE-LUA"
+fi
 
-"$compiler" -c "$core_dir" \
-  -o "$bundle/carp-session-server-cbor.c" \
-  "$repo_root/hosts/cbor/SessionServer.carp"
+if [[ -n "$session_host_c" ]]; then
+  cp "$session_host_c" "$bundle/carp-session-server-cbor.c"
+else
+  "$compiler" -c "$core_dir" \
+    -o "$bundle/carp-session-server-cbor.c" \
+    "$repo_root/hosts/cbor/SessionServer.carp"
+fi
 
 compiler_hash=$(hash_file "$bundle/carp-compiler.c")
 host_hash=$(hash_file "$bundle/carp-session-server-cbor.c")
