@@ -2,7 +2,13 @@
 
 Warm, transport-independent compiler sessions for notebook and editor hosts.
 
-The revision-4 API provides `Session.api-version`, `Session.create`,
+Upstream introduced `Session.api-version` at revision 1. This branch uses
+revision 2 for its incompatible public report/artifact extensions. Internal
+storage refactors and moving a transport adapter do not consume API revision
+numbers. The CBOR wire protocol and encoded library-artifact format are
+independently versioned.
+
+The revision-2 API provides `Session.api-version`, `Session.create`,
 `Session.create-from-module`, `Session.fork`, `Session.reset`, and transactional
 `Session.infer-cell`. Runtime definitions, macros, nominal types, interfaces,
 and implementations can be committed and queried with `Session.upsert`,

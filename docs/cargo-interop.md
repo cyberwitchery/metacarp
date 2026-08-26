@@ -109,7 +109,7 @@ active generation.
 
 `unsafe-sendable` and `requires-send` are currently **unsafe host
 attestations**, not compiler-derived Rust `Send`/`Sync` proofs. Meta-Carp
-preserves them in the Core IR and ownership artifact. At API revision 4,
+preserves them in the Core IR and ownership artifact. At API revision 2,
 `requires-send` verifies that its target name resolves and both forms validate
 their syntax, but nominal existence/admissibility, callable arity, duplicate
 indices, structural `Send`, and closure captures are not yet enforced. Hosts

@@ -4,14 +4,18 @@ This is the native, deterministic-CBOR host for the transport-neutral
 `carp-session` library. It accepts four-byte big-endian length-prefixed messages
 on stdin/stdout and uses the source-only `carp-cbor` package pinned by commit.
 
-Requests are `[3, id, operation, payload]`; responses are
-`[3, id, success?, payload]`. Protocol 3 requires format-2 library artifacts,
+Requests are `[1, id, operation, payload]`; responses are
+`[1, id, success?, payload]`. Protocol 1 requires format-2 library artifacts,
 so a stale host is rejected during the ready handshake rather than after
 compilation. The host supports `ping`, `quit`, `reset`,
 single-definition and whole-input upsert/removal, ownership analysis, and
 rooted native-library emission. Library artifacts use format 2 and carry C,
 the exact ownership plan used by lowering, and host-resolved include/link
 inputs.
+
+Protocol 1 is the first published CBOR transport protocol. Its number is
+independent of `Session.api-version` and the artifact's `format` field; each is
+incremented only when that particular compatibility boundary changes.
 
 From a Meta-Carp checkout with `CARP_DIR` pointing at compatible Carp Core:
 
