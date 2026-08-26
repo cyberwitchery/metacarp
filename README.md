@@ -231,8 +231,8 @@ implementation history.
 
 ## Limitations
 
-- The host architecture and OS are stamped for the build machine
-  (`aarch64`/`darwin`) in the `--core` path.
+- Target configuration is detected from the build host; an explicit
+  cross-compilation target override is not implemented yet.
 - Delete placement is scope-based, not liveness-based: values die at scope or
   branch exit rather than after their last use, so peak memory can exceed the
   reference compiler's on the same program.
