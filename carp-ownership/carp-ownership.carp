@@ -79,11 +79,14 @@ someone else owns, and `Unmanaged` values are plain data with no cleanup.")
 
 (doc OwnershipTypeFacts "declares, by structural ABI type key, which concrete
 types own memory (have a declared `delete`) and which a valid `blit` forces back
-to unmanaged. Classification consults these facts; it never inspects a type's
-spelling.")
+to unmanaged. `deleters` records the exact implementation references: those
+functions discharge their owned argument by contract and must not recursively
+schedule themselves as implicit parameter cleanup. Classification consults
+these facts; it never inspects a type or function's spelling.")
 (deftype OwnershipTypeFacts
   [owned (Array String)
-   unmanaged-override (Array String)])
+   unmanaged-override (Array String)
+   deleters (Array CoreRef)])
 
 (defmodule OwnershipClassify
   (private has-key?)
@@ -220,12 +223,15 @@ skipped; functions are classified intrinsically because their registered
 deleters are polymorphic over each arity.")
   (defn facts-from-module [core]
     (let-do [owned (the (Array String) [])
+             deleters (the (Array CoreRef) [])
              delete-ref (PrimitiveRegistry.delete-reference)
              impls (CoreModule.implementations core)
              n (Array.length impls)]
       (for [i 0 n]
         (let [im (Array.unsafe-nth impls i)]
-          (when (CoreIR.same-ref? (CoreImplementation.interface im) &delete-ref)
+          (when-do (CoreIR.same-ref? (CoreImplementation.interface im) &delete-ref)
+            (Array.push-back! &deleters
+                              (CoreRef.copy (CoreImplementation.implementation im)))
             (match (signature-arg0 core (CoreImplementation.implementation im))
               (Maybe.Just arg0)
                 (match (deleted-type-key &arg0)
@@ -234,7 +240,7 @@ deleters are polymorphic over each arity.")
                       (set! owned (Array.push-back owned key)))
                   (Maybe.Nothing) ())
               (Maybe.Nothing) ()))))
-      (OwnershipTypeFacts.init owned []))))
+      (OwnershipTypeFacts.init owned [] deleters))))
 
 (defmodule Ownership
   (private invalid-id)
@@ -1679,8 +1685,10 @@ moved, index 2 if a lambda moves a captured value out of its environment.")
   (doc collect-param-deletes "schedules a delete for every owned parameter the
 body does not consume (move out or into a call). A function receives ownership
 of its owned arguments and must release any it neither returns nor passes on.")
-  (defn collect-param-deletes [parameters signature body facts context]
-    (match-ref signature
+  (defn collect-param-deletes [parameters signature body facts context discharges?]
+    (if discharges?
+      (the (Array OwnershipAction) [])
+      (match-ref signature
       (MonoType.Function arg-types _)
         (let-do [result (the (Array OwnershipAction) [])
                  n (Int.min (Array.length parameters) (Array.length arg-types))]
@@ -1696,7 +1704,17 @@ of its owned arguments and must release any it neither returns nor passes on.")
                                                            (CoreRef.copy param)
                                                            (MonoType.copy param-type)))))))
           result)
-      _ (the (Array OwnershipAction) [])))
+      _ (the (Array OwnershipAction) []))))
+
+  (private deleter-reference?)
+  (hidden deleter-reference?)
+  (defn deleter-reference? [facts reference]
+    (let-do [found false
+             deleters (OwnershipTypeFacts.deleters facts)]
+      (for [i 0 (Array.length deleters)]
+        (when (CoreIR.same-ref? (Array.unsafe-nth deleters i) reference)
+          (set! found true)))
+      found))
 
   (private collect-roots-deletes)
   (hidden collect-roots-deletes)
@@ -1823,7 +1841,10 @@ that are not moved out of their scope. Types are classified from `facts`.")
                                                        (Box.peek (Specialization.signature instance))
                                                        (Box.peek (SpecializedBody.body body))
                                                        facts
-                                                       i))))))
+                                                       i
+                                                       (deleter-reference?
+                                                         facts
+                                                         (Specialization.reference instance))))))))
                 (Result.Error error) (set! result (Result.Error error))))
           (Result.Error _) ()))
       (match-ref &result

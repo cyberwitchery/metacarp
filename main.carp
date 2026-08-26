@@ -7,6 +7,27 @@
 ;; so the reservation costs address space, not memory.
 (when (= (host-os) "darwin") (add-cflag "-Wl,-stack_size,0x20000000"))
 
+(deftemplate compiler-ensure-stack
+             (Fn [] Bool)
+             "#if defined(__linux__)\n#include <sys/resource.h>\n#endif\nbool $NAME(void)"
+             "$DECL {
+#if defined(__linux__)
+  const rlim_t wanted = (rlim_t)512 * 1024 * 1024;
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_STACK, &limit) != 0) return false;
+  if (limit.rlim_cur >= wanted || limit.rlim_cur == RLIM_INFINITY) return true;
+  rlim_t target = wanted;
+  if (limit.rlim_max != RLIM_INFINITY && target > limit.rlim_max) {
+    target = limit.rlim_max;
+  }
+  if (target <= limit.rlim_cur) return false;
+  limit.rlim_cur = target;
+  return setrlimit(RLIMIT_STACK, &limit) == 0;
+#else
+  return true;
+#endif
+}")
+
 ;; These are compiled into the compiler binary from the C implementation's
 ;; target macros. They describe the machine actually running this compiler,
 ;; unlike the old aarch64/darwin literals in the synthetic Core prelude.
@@ -549,13 +570,27 @@
           (IO.read-file &local))
         (Result.Success text) (Maybe.Just (Pair.init @&local text))
         (Result.Error _)
-          (match (read-core-file core-dir name)
-            (Maybe.Just found)
-              (Maybe.Just
-                (Pair.init
-                  (String.concat &[@core-dir @"/" (String.copy name)])
-                  found))
-            (Maybe.Nothing) (the (Maybe (Pair String String)) (Maybe.Nothing)))))))
+          ;; Reference Carp also accepts paths relative to the compiler process
+          ;; working directory. Keep requester-relative resolution first (it is
+          ;; stable for editors and nested packages), then retain that
+          ;; compatibility before falling back to Core.
+          (let [working (normalize-path name)]
+            (match (if (or (String.starts-with? name "/")
+                           (same-path-ignoring-case?
+                             &working
+                             &(normalize-path requester-file)))
+                (Result.Error @"self")
+                (IO.read-file &working))
+              (Result.Success text) (Maybe.Just (Pair.init working text))
+              (Result.Error _)
+                (match (read-core-file core-dir name)
+                  (Maybe.Just found)
+                    (Maybe.Just
+                      (Pair.init
+                        (String.concat &[@core-dir @"/" (String.copy name)])
+                        found))
+                  (Maybe.Nothing)
+                    (the (Maybe (Pair String String)) (Maybe.Nothing)))))))))
 
 (defn ensure-sources [registry core-dir seed]
   (let-do [result registry
@@ -718,8 +753,11 @@
                     (Result.Error e)
                       (do
                         (IO.errorln
-                          &(String.append "carp-compiler: cannot load: "
-                                          (ModuleError.message &e)))
+                          &(String.concat
+                            &[@"carp-compiler: cannot load "
+                              (String.copy (ModuleError.path &e))
+                              @": "
+                              (String.copy (ModuleError.message &e))]))
                         (the (Maybe (Pair SurfaceModule String)) (Maybe.Nothing)))
                     (Result.Success loaded)
                       (let-do [_ignored-phase (phase! "loaded")
@@ -1207,7 +1245,8 @@ substitution applied; node ids alone collide across definitions.")
           (emit-c &c output)))))
 
 (defn main []
-  (let-do [args &System.args
+  (let-do [stack-ready (compiler-ensure-stack)
+           args &System.args
            n (StaticArray.length args)
            input (the (Maybe String) (Maybe.Nothing))
            output (the (Maybe String) (Maybe.Nothing))
@@ -1221,6 +1260,9 @@ substitution applied; node ids alone collide across definitions.")
            ; 0 = compile, 1 = help, 2 = version, 3 = argument error
            mode 0
            i 1]
+    (unless stack-ready
+      (IO.errorln
+        "carp-compiler: warning: could not raise the stack limit; deep compile-time evaluation may overflow"))
     (while-do (and (Int.< i n) (Int.= mode 0))
       (let-do [arg @(StaticArray.unsafe-nth args i)]
         (cond

@@ -22,7 +22,22 @@ source through reference Carp:
 carp -b --optimize main.carp
 ```
 
-This produces `./out/carp-compiler`.
+This produces `./out/carp-compiler` and `./out/main.c`. The entire `out/`
+directory is generated and ignored; neither file is a trusted bootstrap seed.
+Always rebuild generation 1 after changing compiler source, then validate it:
+
+```sh
+CARP_FIXED_POINT_OUT=/tmp/metacarp-fixed \
+  ./scripts/check-fixed-point.sh
+```
+
+The harness emits generation 2 and generation 3, links with `-O3 -D NDEBUG`,
+requires byte-identical C, compiles and runs `examples/hello.carp`, and records
+source/compiler hashes in `bootstrap-provenance.txt`. Only promote a compiler
+after those checks succeed. At revision `7aee762`, reference Carp built
+generation 1 in 527.04 seconds at about 1.09 GiB; optimized Meta-Carp emitted
+the next generation in 99.49 seconds at about 0.91 GiB. This is a bootstrap
+operation, not the latency of resident incremental compilation.
 
 ## Usage
 
@@ -56,6 +71,12 @@ cache (`~/.cache/carp/libs/...`) on first use:
 The examples below assume `CARP_DIR` points at a checkout of the reference
 Carp repository (its `core/` is the standard library and runtime headers).
 
+The bootstrap baseline must include Carp's recursive value-type `Box`
+refactor (carp-lang/Carp#1571). Meta-Carp emits `Box a` as the aggregate
+`Box__a { a* data; }`, while `Ptr a` remains the raw `a*` ABI. CI pins Carp at
+`d718653fb82a62f667bf2117f30222267c5fbb27`; the Core revision is therefore
+part of the compiler ABI and should be recorded in binary/cache provenance.
+
 Compile a standalone program (no standard library) to C:
 
 ```sh
@@ -73,15 +94,18 @@ Compile and run a program that uses the standard library:
 
 ## Self-hosting
 
-The bootstrap chain, from the repository root:
+The bootstrap chain, from the repository root, is automated by the assurance
+harness:
 
 ```sh
-carp -b --optimize main.carp                                    # gen 1
-./out/carp-compiler -c "$CARP_DIR/core" -o self.c main.carp     # gen 1 emits itself
-clang -O3 -D NDEBUG -o self-cc self.c -I "$CARP_DIR/core"      # link gen 2
-./self-cc -c "$CARP_DIR/core" -o self2.c main.carp              # gen 2 emits itself
-cmp self.c self2.c                                              # fixed point
+./scripts/run-assurance.sh self
 ```
+
+It freshly builds generation 1 with reference Carp before running the
+reference suite, fixed-point/provenance/smoke checks, and expansion parity.
+`scripts/check-fixed-point.sh` alone deliberately consumes
+`CARP_COMPILER` (default `out/carp-compiler`); do not point it at an old local
+artifact.
 
 The canonical generation benchmark compares reference Carp, gen 1, and gen 2
 on the same workload (generating C for `main.carp`):
@@ -102,11 +126,26 @@ noise-sensitive CI timing threshold.
 
 The assurance harness keeps the self-host honest:
 
+CircleCI is the primary Linux topology in `.circleci/config.yml`: one cached
+bootstrap job supplies the pinned reference Carp checkout and style tools;
+the reference phase suite and self-host assurance then run in parallel; the
+fixed-point generation-2 compiler is passed through a workspace into the final
+phase-suite job. GitHub Actions retains the same Linux gates during the CI
+transition and the independent ARM64 macOS self-host lane.
+
 - `scripts/run-assurance.sh phase` runs lint and formatting before every
   phase/session suite. Set `CARP_SKIP_STYLE=1` when the two style tools are
   unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run independent test groups
   concurrently; CI runs this architecture-neutral group once on two Linux
   workers.
+- `scripts/run-assurance.sh phase-self` runs the same compiler-phase and
+  session suites through `CARP_PHASE_COMPILER` (default
+  `out/carp-compiler`). CI retains the fixed-point generation-2 executable and
+  points this lane at it, catching both compiler-source regressions and
+  generation-specific miscompilations that the reference-compiler phase lane
+  cannot expose. The reference-only memory-log test remains in `phase`,
+  because the self-hosted CLI does not implement Carp's `--log-memory`
+  instrumentation.
 - `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
   checks the self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated

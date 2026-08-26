@@ -1,0 +1,132 @@
+version: 2.1
+
+executors:
+  linux:
+    docker:
+      - image: cimg/base:stable
+    working_directory: ~/project
+    resource_class: large
+
+commands:
+  attach-bootstrap:
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Export Carp toolchain
+          command: |
+            echo 'export PATH="$HOME/.local/bin:$HOME/project/.ci-tools/bin:$PATH"' >> "$BASH_ENV"
+            echo 'export CARP_DIR="$HOME/.carp-src"' >> "$BASH_ENV"
+
+jobs:
+  bootstrap:
+    executor: linux
+    steps:
+      - checkout
+      - run:
+          name: Use HTTPS for public Carp packages
+          command: git config --global url."https://github.com/".insteadOf "git@github.com:"
+      - restore_cache:
+          keys:
+            - metacarp-bootstrap-v1-{{ arch }}-d718653fb82a62f667bf2117f30222267c5fbb27
+            - metacarp-bootstrap-v1-{{ arch }}-
+      - run:
+          name: Install Stack
+          command: |
+            if ! command -v stack >/dev/null; then
+              curl -sSL https://get.haskellstack.org/ | sh
+            fi
+            stack --version
+      - run:
+          name: Build pinned reference Carp
+          command: |
+            if [ ! -d "$HOME/.carp-src/.git" ]; then
+              git clone https://github.com/carp-lang/Carp "$HOME/.carp-src"
+            fi
+            git -C "$HOME/.carp-src" fetch origin d718653fb82a62f667bf2117f30222267c5fbb27
+            git -C "$HOME/.carp-src" checkout --detach d718653fb82a62f667bf2117f30222267c5fbb27
+            mkdir -p "$HOME/.local/bin"
+            if [ ! -x "$HOME/.local/bin/carp" ]; then
+              (cd "$HOME/.carp-src" && \
+                stack install --local-bin-path "$HOME/.local/bin")
+            fi
+            "$HOME/.local/bin/carp" --help >/dev/null
+      - run:
+          name: Build pinned style tools
+          command: |
+            mkdir -p .ci-tools/bin
+            if [ ! -x .ci-tools/bin/angler ]; then
+              git clone https://github.com/carpentry-org/angler /tmp/angler
+              git -C /tmp/angler checkout --detach fd6d6826d830263d9f66c7b55cfc7e33b90eb337
+              (cd /tmp/angler && CARP_DIR="$HOME/.carp-src" "$HOME/.local/bin/carp" -b main.carp)
+              install -m 755 /tmp/angler/out/angler .ci-tools/bin/
+            fi
+            if [ ! -x .ci-tools/bin/carp-fmt ]; then
+              git clone https://github.com/carpentry-org/carp-fmt /tmp/carp-fmt
+              git -C /tmp/carp-fmt checkout --detach 13d3c0246dbc6b9b4004ebc222afab85f4235af7
+              (cd /tmp/carp-fmt && CARP_DIR="$HOME/.carp-src" "$HOME/.local/bin/carp" -b main.carp)
+              install -m 755 /tmp/carp-fmt/out/carp-fmt .ci-tools/bin/
+            fi
+      - save_cache:
+          key: metacarp-bootstrap-v1-{{ arch }}-d718653fb82a62f667bf2117f30222267c5fbb27
+          paths:
+            - ~/.stack
+            - ~/.carp-src
+            - ~/.local/bin/carp
+            - ~/.cache/carp/libs
+            - .ci-tools/bin
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - project
+            - .carp-src
+            - .local/bin/carp
+            - .cache/carp/libs
+
+  phase:
+    executor: linux
+    steps:
+      - attach-bootstrap
+      - run:
+          name: Reference-compiler phase assurance
+          no_output_timeout: 30m
+          command: CARP_PHASE_JOBS=3 ./scripts/run-assurance.sh phase
+
+  self-host:
+    executor: linux
+    steps:
+      - attach-bootstrap
+      - run:
+          name: Self-host and fixed-point assurance
+          no_output_timeout: 45m
+          command: |
+            CARP_SELF_JOBS=3 \
+            CARP_FIXED_POINT_OUT="$PWD/out/fixed-point" \
+              ./scripts/run-assurance.sh self
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - out/fixed-point
+
+  phase-generation-2:
+    executor: linux
+    steps:
+      - attach-bootstrap
+      - run:
+          name: Generation-2 phase assurance
+          no_output_timeout: 45m
+          command: |
+            CARP_PHASE_JOBS=3 \
+            CARP_PHASE_COMPILER="$PWD/out/fixed-point/carp-compiler-gen2" \
+              ./scripts/run-assurance.sh phase-self
+
+workflows:
+  compiler-assurance:
+    jobs:
+      - bootstrap
+      - phase:
+          requires: [bootstrap]
+      - self-host:
+          requires: [bootstrap]
+      - phase-generation-2:
+          requires: [self-host]
