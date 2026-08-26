@@ -5,6 +5,9 @@ strict bencode, warms `carp-session` once, and exposes independent cheap
 session forks. Clojure is not in the server path: ordinary nREPL clients work
 because nREPL itself is language-neutral.
 
+The host pins `replikativ/carp-bencode` as a fetched source dependency, so a
+Meta-Carp source checkout and compatible Carp Core are sufficient to build it.
+
 Build and start it with:
 
 ```sh

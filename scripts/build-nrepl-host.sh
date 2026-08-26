@@ -14,11 +14,6 @@ if [ ! -f "$core/Core.carp" ]; then
   echo "missing Carp Core: $core (set CARP_CORE_DIR)" >&2
   exit 1
 fi
-if [ ! -f "$repo_root/../carp-bencode/main.carp" ]; then
-  echo "missing source dependency: $repo_root/../carp-bencode" >&2
-  exit 1
-fi
-
 mkdir -p "$(dirname -- "$output")"
 next="$output.next"
 "$compiler" -b --optimize -c "$core" -o "$next" \
