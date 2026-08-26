@@ -19,14 +19,93 @@ source ID space; specialization may leave holes in it.")
   (Temporary [Int])
   (Result []))
 
+(doc OwnershipBorrowMode "distinguishes an aliasing read-only borrow from an
+exclusive borrow which permits mutation. It is explicit in the ownership IR
+even while source-level syntax and inference continue to evolve.")
+(deftype OwnershipBorrowMode
+  (Shared [])
+  (Unique []))
+
+(doc OwnershipProjection "is one backend-neutral step from an ownership root
+to a sub-place. Unknown array indices and slice bounds are represented by
+`Nothing`, which conservatively overlaps every concrete value.")
+(deftype OwnershipProjection
+  (Deref [])
+  (Field [String])
+  (Index [(Maybe Int)])
+  (Slice [(Maybe Int) (Maybe Int)]))
+
+(doc OwnershipPlace "names memory as a root resource followed by zero or more
+projections. A root-only place preserves the meaning of the former bare
+resource representation while allowing later field-sensitive loan checking.")
+(deftype OwnershipPlace
+  [root OwnershipResource
+   projections (Array OwnershipProjection)])
+
 (doc OwnershipAction "is the backend-neutral output vocabulary for the future
 linear ownership planner. Copy is intentionally absent: Carp copies are
 explicit calls which create a new temporary. The planner inserts moves,
 borrows, and deletes.")
 (deftype OwnershipAction
   (Move [OwnershipSite OwnershipResource OwnershipResource (Box MonoType)])
-  (Borrow [OwnershipSite OwnershipResource])
+  (Borrow [OwnershipSite OwnershipBorrowMode OwnershipPlace])
   (Delete [OwnershipSite OwnershipResource (Box MonoType)]))
+
+(doc OwnershipAccessKind "normalizes planner actions into the memory effects
+consumed by loan checking and foreign-interface validation. Read and Write are
+reserved now so later expression analysis extends this vocabulary without an
+external protocol change.")
+(deftype OwnershipAccessKind
+  (Read [])
+  (Write [])
+  (Move [])
+  (Borrow [OwnershipBorrowMode])
+  (Drop []))
+
+(deftype OwnershipAccess
+  [site OwnershipSite
+   kind OwnershipAccessKind
+   place OwnershipPlace])
+
+(deftype OwnershipParameterMode
+  (Copy [])
+  (Take [])
+  (SharedBorrow [])
+  (UniqueBorrow []))
+
+(deftype OwnershipParameterEffect
+  [index Int
+   binding CoreRef
+   mode OwnershipParameterMode])
+
+(deftype OwnershipResultMode
+  (Unmanaged [])
+  (Owned [])
+  (Borrowed []))
+
+(doc OwnershipResultEffect "summarizes both the result's memory class and the
+parameter lifetimes it may retain. Keeping these axes separate covers owned
+containers which themselves carry borrowed fields.")
+(deftype OwnershipResultEffect
+  [ownership OwnershipResultMode
+   borrows-from (Array Int)])
+
+(deftype OwnershipFunctionSummary
+  [context Int
+   reference CoreRef
+   parameters (Array OwnershipParameterEffect)
+   result OwnershipResultEffect])
+
+(doc OwnershipForeignContract "describes the affine calling convention inferred
+for one specialized external symbol. Reference parameters default to shared;
+an explicit foreign-contract layer may safely refine them to unique once loan
+checking is enabled at the call site.")
+(deftype OwnershipForeignContract
+  [reference CoreRef
+   symbol String
+   declared Bool
+   parameters (Array OwnershipParameterMode)
+   result OwnershipResultEffect])
 
 (doc OwnershipRequirement "records concrete interface work introduced by
 ownership planning. Delete requirements are returned to specialization before
@@ -38,12 +117,18 @@ rewrite the specialized expression tree.")
 (deftype OwnershipPlan
   [contexts (Array OwnershipContext)
    actions (Array OwnershipAction)
+   accesses (Array OwnershipAccess)
+   summaries (Array OwnershipFunctionSummary)
+   foreign-contracts (Array OwnershipForeignContract)
    requirements (Array OwnershipRequirement)])
 
 (doc SpannedOwnershipAction "is one ownership-plan action joined back to its
 caller source. Compiler-generated actions are retained with `Nothing` when no
 source node owns their site.")
 (deftype SpannedOwnershipAction [action OwnershipAction
+                                 span (Maybe SourceSpan)])
+
+(deftype SpannedOwnershipAccess [access OwnershipAccess
                                  span (Maybe SourceSpan)])
 
 (deftype OwnershipError [message String])
@@ -77,13 +162,22 @@ someone else owns, and `Unmanaged` values are plain data with no cleanup.")
   (Owned [])
   (Borrowed []))
 
+(deftype OwnershipForeignModeFact
+  [reference CoreRef
+   modes (Array CoreForeignParameterMode)
+   strict Bool])
+
 (doc OwnershipTypeFacts "declares, by structural ABI type key, which concrete
 types own memory (have a declared `delete`) and which a valid `blit` forces back
-to unmanaged. Classification consults these facts; it never inspects a type's
-spelling.")
+to unmanaged. `deleters` records the exact implementation references: those
+functions discharge their owned argument by contract and must not recursively
+schedule themselves as implicit parameter cleanup. Classification consults
+these facts; it never inspects a type or function's spelling.")
 (deftype OwnershipTypeFacts
   [owned (Array String)
-   unmanaged-override (Array String)])
+   unmanaged-override (Array String)
+   foreign-modes (Array OwnershipForeignModeFact)
+   deleters (Array CoreRef)])
 
 (defmodule OwnershipClassify
   (private has-key?)
@@ -202,16 +296,124 @@ generic-instance deleter's argument type can be keyed for ownership facts.")
                            (Box.init (resolved->mono (Box.peek ret))))
       (CoreType.Variable _) (MonoType.Variable 0)))
 
+  (private name-parent-scope)
+  (hidden name-parent-scope)
+  (defn name-parent-scope [name]
+    (let-do [last-dot -1]
+      (for [i 0 (String.length name)]
+        (when (Char.= (String.char-at name i) \.) (set! last-dot i)))
+      (if (Int.< last-dot 0)
+        (String.copy "")
+        (String.prefix name last-dot))))
+
+  (private declared-type-name?)
+  (hidden declared-type-name?)
+  (defn declared-type-name? [declarations name]
+    (let-do [found false]
+      (for [i 0 (Array.length declarations)]
+        (when (String.= (CoreTypeDeclaration.name
+                          (Array.unsafe-nth declarations i))
+                        name)
+          (set! found true)))
+      found))
+
+  (private canonical-deleted-name)
+  (hidden canonical-deleted-name)
+  (doc canonical-deleted-name "resolves a nominal name in the implementation's
+lexical module scopes against actual type declarations. This retains the
+canonical nested nominal identity without inferring it from a conventional
+deleter spelling such as `T.delete`.")
+  (defn canonical-deleted-name [name implementation declarations]
+    (if (declared-type-name? declarations name)
+      (String.copy name)
+      (let-do [scope (name-parent-scope (CoreRef.name implementation))
+               resolved (the (Maybe String) (Maybe.Nothing))]
+        (while (and (not (String.empty? &scope))
+                    (match-ref &resolved
+                      (Maybe.Just _) false
+                      (Maybe.Nothing) true))
+          (let [candidate (String.concat &[(String.copy &scope)
+                                            @"."
+                                            (String.copy name)])]
+            (if (declared-type-name? declarations &candidate)
+              (set! resolved (Maybe.Just candidate))
+              (set! scope (name-parent-scope &scope)))))
+        (match resolved
+          (Maybe.Just canonical) canonical
+          (Maybe.Nothing) (String.copy name)))))
+
   (private deleted-type-key)
   (hidden deleted-type-key)
-  (defn deleted-type-key [core-type]
+  (defn deleted-type-key [core-type implementation declarations]
     (match-ref core-type
       (CoreType.String) (Maybe.Just (CAbi.type-key &(MonoType.String)))
       (CoreType.Named name arguments)
         (if (Int.= 0 (Array.length arguments))
-          (Maybe.Just (CAbi.type-key &(MonoType.Named (String.copy name) [])))
+          (Maybe.Just
+            (CAbi.type-key
+              &(MonoType.Named
+                 (canonical-deleted-name name implementation declarations)
+                 [])))
           (Maybe.Just (CAbi.type-key &(resolved->mono core-type))))
       _ (Maybe.Nothing)))
+
+  (private direct-core-call-to?)
+  (hidden direct-core-call-to?)
+  (defn direct-core-call-to? [expression target]
+    (match-ref expression
+      (CoreExpr.Call _ callee _)
+        (match-ref (Box.peek callee)
+          (CoreExpr.Reference _ reference) (CoreIR.same-ref? reference target)
+          (CoreExpr.Annotation _ inner _)
+            (match-ref (Box.peek inner)
+              (CoreExpr.Reference _ reference)
+                (CoreIR.same-ref? reference target)
+              _ false)
+          _ false)
+      (CoreExpr.Annotation _ inner _)
+        (direct-core-call-to? (Box.peek inner) target)
+      _ false))
+
+  (private unique-first-modes)
+  (hidden unique-first-modes)
+  (defn unique-first-modes [arity]
+    (let-do [modes (the (Array CoreForeignParameterMode) [])]
+      (when (Int.> arity 0)
+        (Array.push-back! &modes (CoreForeignParameterMode.Unique)))
+      (for [i 1 arity]
+        (Array.push-back! &modes (CoreForeignParameterMode.Copy)))
+      modes))
+
+  (private modes-have-unique?)
+  (hidden modes-have-unique?)
+  (defn modes-have-unique? [modes]
+    (let-do [found false]
+      (for [i 0 (Array.length modes)]
+        (match-ref (Array.unsafe-nth modes i)
+          (CoreForeignParameterMode.Unique) (set! found true)
+          _ ()))
+      found))
+
+  (private registered-mutator?)
+  (hidden registered-mutator?)
+  (defn registered-mutator? [builtin type-name expected-name]
+    (and (String.= (CoreRef.name (CoreBuiltin.reference builtin)) expected-name)
+         (match-ref (Box.peek (CoreBuiltin.signature builtin))
+           (CoreType.Function arguments result)
+             (and (Int.= 2 (Array.length arguments))
+                  (and
+                    (match-ref (Box.peek result)
+                      (CoreType.Unit) true
+                      _ false)
+                    (match-ref (Box.peek (Array.unsafe-nth arguments 0))
+                      (CoreType.Reference inner _)
+                        (match-ref (Box.peek inner)
+                          (CoreType.Named name parameters)
+                            (and (String.= name type-name)
+                                 (Int.= 0 (Array.length parameters)))
+                          _ false)
+                      _ false)))
+           _ false)))
 
   (doc facts-from-module "derives the ownership fact table from a resolved core
 module by finding every implementation of the built-in `delete` interface and
@@ -220,23 +422,194 @@ skipped; functions are classified intrinsically because their registered
 deleters are polymorphic over each arity.")
   (defn facts-from-module [core]
     (let-do [owned (the (Array String) [])
+             deleters (the (Array CoreRef) [])
+             foreign-modes (the (Array OwnershipForeignModeFact) [])
              delete-ref (PrimitiveRegistry.delete-reference)
+             field-set-ref (PrimitiveRegistry.reference 49 "field-set!")
              impls (CoreModule.implementations core)
+             functions (CoreModule.functions core)
+             builtins (CoreModule.builtins core)
+             declarations (CoreModule.type-declarations core)
+             sources (CoreModule.builtin-sources core)
              n (Array.length impls)]
       (for [i 0 n]
         (let [im (Array.unsafe-nth impls i)]
-          (when (CoreIR.same-ref? (CoreImplementation.interface im) &delete-ref)
+          (when-do (CoreIR.same-ref? (CoreImplementation.interface im) &delete-ref)
+            (Array.push-back! &deleters
+                              (CoreRef.copy (CoreImplementation.implementation im)))
             (match (signature-arg0 core (CoreImplementation.implementation im))
               (Maybe.Just arg0)
-                (match (deleted-type-key &arg0)
+                (match (deleted-type-key
+                         &arg0
+                         (CoreImplementation.implementation im)
+                         declarations)
                   (Maybe.Just key)
                     (unless (has-key? &owned &key)
                       (set! owned (Array.push-back owned key)))
                   (Maybe.Nothing) ())
               (Maybe.Nothing) ()))))
-      (OwnershipTypeFacts.init owned []))))
+      (for [i 0 (Array.length sources)]
+        (let [source (Array.unsafe-nth sources i)]
+          (match-ref (CoreBuiltinSource.payload source)
+            (CoreBuiltinPayload.External _ contract)
+              (match-ref contract
+                (Maybe.Just modes)
+                  (Array.push-back! &foreign-modes
+                    (OwnershipForeignModeFact.init
+                      (CoreRef.copy (CoreBuiltinSource.reference source))
+                      (Array.copy modes)
+                      (modes-have-unique? modes)))
+                (Maybe.Nothing) ())
+            _ ())))
+      ;; Derived mutating record setters are real CoreFunctions whose body is
+      ;; the semantic field-set intrinsic. Preserve that fact before
+      ;; specialization so their first parameter is unique even when the
+      ;; intrinsic is lowered through a generic Call representation.
+      (for [i 0 (Array.length functions)]
+        (let [function (Array.unsafe-nth functions i)]
+          (when (direct-core-call-to? (Box.peek (CoreFunction.body function))
+                                      &field-set-ref)
+            (Array.push-back! &foreign-modes
+              (OwnershipForeignModeFact.init
+                (CoreRef.copy (CoreFunction.reference function))
+                (unique-first-modes
+                  (Array.length (CoreFunction.parameters function)))
+                false)))))
+      ;; `register-type` accessors remain CoreBuiltins because their bodies are
+      ;; supplied by the C ABI generator. Recover their mutation contract from
+      ;; the declaration/member table that generated them, not from a general
+      ;; spelling convention: the exact generated binding must also have the
+      ;; expected `(Ref RegisteredType, field) -> Unit` shape.
+      (for [i 0 (Array.length declarations)]
+        (let [declaration (Array.unsafe-nth declarations i)
+              type-name (CoreTypeDeclaration.name declaration)
+              members (CoreTypeDeclaration.members declaration)]
+          (for [j 0 (Array.length members)]
+            (let [member-name (Pair.a (Array.unsafe-nth members j))
+                  expected (String.concat
+                             &[(String.copy type-name)
+                               @".set-"
+                               (String.copy member-name)
+                               @"!"])]
+              (for [k 0 (Array.length builtins)]
+                (let [builtin (Array.unsafe-nth builtins k)]
+                  (when (registered-mutator? builtin type-name &expected)
+                    (Array.push-back! &foreign-modes
+                      (OwnershipForeignModeFact.init
+                        (CoreRef.copy (CoreBuiltin.reference builtin))
+                        (unique-first-modes 2)
+                        false)))))))))
+      (OwnershipTypeFacts.init owned [] foreign-modes deleters))))
 
 (defmodule Ownership
+  (private same-resource?)
+  (hidden same-resource?)
+  (defn same-resource? [left right]
+    (match-ref left
+      (OwnershipResource.Binding l)
+        (match-ref right
+          (OwnershipResource.Binding r) (CoreIR.same-ref? l r)
+          _ false)
+      (OwnershipResource.Temporary l)
+        (match-ref right
+          (OwnershipResource.Temporary r) (Int.= @l @r)
+          _ false)
+      (OwnershipResource.Result)
+        (match-ref right (OwnershipResource.Result) true _ false)))
+
+  (private index-outside-slice?)
+  (hidden index-outside-slice?)
+  (defn index-outside-slice? [index start end]
+    (match-ref index
+      (Maybe.Just i)
+        (match-ref start
+          (Maybe.Just s)
+            (if (Int.< @i @s)
+              true
+              (match-ref end
+                (Maybe.Just e) (Int.>= @i @e)
+                (Maybe.Nothing) false))
+          (Maybe.Nothing)
+            (match-ref end
+              (Maybe.Just e) (Int.>= @i @e)
+              (Maybe.Nothing) false))
+      (Maybe.Nothing) false))
+
+  (private projections-disjoint?)
+  (hidden projections-disjoint?)
+  (defn projections-disjoint? [left right]
+    (match-ref left
+      (OwnershipProjection.Field l)
+        (match-ref right
+          (OwnershipProjection.Field r) (not (String.= l r))
+          _ false)
+      (OwnershipProjection.Index l)
+        (match-ref right
+          (OwnershipProjection.Index r)
+            (match-ref l
+              (Maybe.Just li)
+                (match-ref r
+                  (Maybe.Just ri) (Int./= @li @ri)
+                  (Maybe.Nothing) false)
+              (Maybe.Nothing) false)
+          (OwnershipProjection.Slice start end)
+            (index-outside-slice? l start end)
+          _ false)
+      (OwnershipProjection.Slice lstart lend)
+        (match-ref right
+          (OwnershipProjection.Index index)
+            (index-outside-slice? index lstart lend)
+          (OwnershipProjection.Slice rstart rend)
+            (match-ref lend
+              (Maybe.Just le)
+                (match-ref rstart
+                  (Maybe.Just rs)
+                    (if (Int.<= @le @rs)
+                      true
+                      (match-ref rend
+                        (Maybe.Just re)
+                          (match-ref lstart
+                            (Maybe.Just ls) (Int.<= @re @ls)
+                            (Maybe.Nothing) false)
+                        (Maybe.Nothing) false))
+                  (Maybe.Nothing)
+                    (match-ref rend
+                      (Maybe.Just re)
+                        (match-ref lstart
+                          (Maybe.Just ls) (Int.<= @re @ls)
+                          (Maybe.Nothing) false)
+                      (Maybe.Nothing) false))
+              (Maybe.Nothing)
+                (match-ref rend
+                  (Maybe.Just re)
+                    (match-ref lstart
+                      (Maybe.Just ls) (Int.<= @re @ls)
+                      (Maybe.Nothing) false)
+                  (Maybe.Nothing) false))
+          _ false)
+      _ false))
+
+  (doc places-overlap? "conservatively decides whether two structured memory
+places can denote common bytes. Different known fields, indices, and disjoint
+half-open slices are proven separate; unknown indices/bounds and mismatched
+projection kinds remain overlapping. A whole-place prefix overlaps every one
+of its subplaces.")
+  (defn places-overlap? [left right]
+    (if (not (same-resource? (OwnershipPlace.root left)
+                             (OwnershipPlace.root right)))
+      false
+      (let-do [overlap true
+               left-projections (OwnershipPlace.projections left)
+               right-projections (OwnershipPlace.projections right)
+               n (Int.min (Array.length left-projections)
+                          (Array.length right-projections))]
+        (for [i 0 n]
+          (when (projections-disjoint?
+                  (Array.unsafe-nth left-projections i)
+                  (Array.unsafe-nth right-projections i))
+            (set! overlap false)))
+        overlap)))
+
   (private invalid-id)
   (hidden invalid-id)
   (private mark-id!)
@@ -278,13 +651,66 @@ expression site without dropping compiler-generated actions.")
               id (match-ref action
                 (OwnershipAction.Move site _ _ _)
                   @(OwnershipSite.expression site)
-                (OwnershipAction.Borrow site _) @(OwnershipSite.expression site)
+                (OwnershipAction.Borrow site _ _) @(OwnershipSite.expression site)
                 (OwnershipAction.Delete site _ _)
                   @(OwnershipSite.expression site))]
           (Array.push-back! &result
                             (SpannedOwnershipAction.init (OwnershipAction.copy action)
                                                          (CoreProvenance.node-span provenance
                                                                                    id)))))
+      result))
+
+  (doc spanned-accesses "joins normalized place accesses to caller source in
+the same way as `spanned-actions`.")
+  (defn spanned-accesses [plan provenance]
+    (let-do [result (the (Array SpannedOwnershipAccess) [])
+             accesses (OwnershipPlan.accesses plan)]
+      (for [i 0 (Array.length accesses)]
+        (let [access (Array.unsafe-nth accesses i)
+              id @(OwnershipSite.expression (OwnershipAccess.site access))]
+          (Array.push-back! &result
+                            (SpannedOwnershipAccess.init
+                              (OwnershipAccess.copy access)
+                              (CoreProvenance.node-span provenance id)))))
+      result))
+
+  (doc validate-strict-loans "checks the subset of function contracts which
+can be represented safely by Rust-like affine ABIs. It is intentionally
+opt-in: legacy Carp currently permits returning a reference into a parameter
+received by value, even though that parameter's storage does not outlive the
+call. Such take-and-return-borrow contracts are rejected here.")
+  (private taken-parameter?)
+  (hidden taken-parameter?)
+  (defn taken-parameter? [parameters index]
+    (and (Int.>= index 0)
+         (and (Int.< index (Array.length parameters))
+              (match-ref
+                (OwnershipParameterEffect.mode
+                  (Array.unsafe-nth parameters index))
+                (OwnershipParameterMode.Take) true
+                _ false))))
+
+  (defn validate-strict-loans [plan]
+    (let-do [result (the (Result () OwnershipError) (Result.Success ()))
+             summaries (OwnershipPlan.summaries plan)]
+      (for [i 0 (Array.length summaries)]
+        (when (Result.success? &result)
+          (let [summary (Array.unsafe-nth summaries i)
+                parameters (OwnershipFunctionSummary.parameters summary)
+                borrows (OwnershipResultEffect.borrows-from
+                          (OwnershipFunctionSummary.result summary))]
+            (for [j 0 (Array.length borrows)]
+              (let [index @(Array.unsafe-nth borrows j)]
+                (when (and (Result.success? &result)
+                           (taken-parameter? parameters index))
+                  (set! result
+                        (Result.Error
+                          (OwnershipError.init
+                            (fmt
+                              "strict loan contract rejects a result borrowing from taken parameter %d of %s"
+                              index
+                              (CoreRef.name
+                                (OwnershipFunctionSummary.reference summary))))))))))))
       result))
 
   (defn invalid-id [context id reason]
@@ -1036,7 +1462,7 @@ binder, but it must not outlive the frame.")
          BorrowState))
   (sig analyze-call-args
        (Fn
-         [(Ref (Box MonoType))
+         [(Ref MonoType)
           (Ref (Array (Box SpecializedExpr)))
           (Ref BorrowState)
           (Ref (Array CoreRef))
@@ -1125,7 +1551,10 @@ binder, but it must not outlive the frame.")
         (MonoType.Reference _ _)
         (cond
           @(CoreRef.global binder) (BorrowOrigin.Static)
-          (contains-ref? parameters binder) (BorrowOrigin.External)
+          ;; The pointee outlives this function, but aliases created inside the
+          ;; function must still be related to this parameter for uniqueness.
+          (contains-ref? parameters binder)
+            (BorrowOrigin.Param [(CoreRef.copy binder)])
           (state-origin state binder))
         ;; a closure value carries the origins of the borrows it captured;
         ;; ref-containing structs bound to a local do too.
@@ -1233,8 +1662,144 @@ values only — the syntactic borrow sources of the value expression.")
             (if (borrowish? &fallback) fallback precise))
         precise)))
 
+  (private foreign-modes-for)
+  (hidden foreign-modes-for)
+  (defn foreign-modes-for [facts callee]
+    (let-do [result (the (Maybe (Array CoreForeignParameterMode)) (Maybe.Nothing))
+             contracts (OwnershipTypeFacts.foreign-modes facts)]
+      (for [i 0 (Array.length contracts)]
+        (let [contract (Array.unsafe-nth contracts i)]
+          (when (CoreIR.same-ref? (OwnershipForeignModeFact.reference contract)
+                                  callee)
+            (set! result
+                  (Maybe.Just
+                    (Array.copy (OwnershipForeignModeFact.modes contract)))))))
+      result))
+
+  (private foreign-strict?)
+  (hidden foreign-strict?)
+  (defn foreign-strict? [facts callee]
+    (let-do [strict false
+             contracts (OwnershipTypeFacts.foreign-modes facts)]
+      (for [i 0 (Array.length contracts)]
+        (let [contract (Array.unsafe-nth contracts i)]
+          (when (CoreIR.same-ref? (OwnershipForeignModeFact.reference contract)
+                                  callee)
+            (set! strict @(OwnershipForeignModeFact.strict contract)))))
+      strict))
+
+  (private direct-borrow-owner)
+  (hidden direct-borrow-owner)
+  (defn direct-borrow-owner [expr]
+    (match-ref expr
+      (SpecializedExpr.GlobalCall _ _ callee _ _ args)
+        (if (is-ref-call? callee args)
+          (match-ref (Box.peek (Array.unsafe-nth args 0))
+            (SpecializedExpr.Reference _ _ owner)
+              (Maybe.Just (CoreRef.copy owner))
+            _ (the (Maybe CoreRef) (Maybe.Nothing)))
+          (the (Maybe CoreRef) (Maybe.Nothing)))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (direct-borrow-owner (Box.peek inner))
+      _ (the (Maybe CoreRef) (Maybe.Nothing))))
+
+  (private parameter-index)
+  (hidden parameter-index)
+  (defn parameter-index [parameters reference]
+    (let-do [result (the (Maybe Int) (Maybe.Nothing))]
+      (for [i 0 (Array.length parameters)]
+        (when (CoreIR.same-ref? (Array.unsafe-nth parameters i) reference)
+          (set! result (Maybe.Just i))))
+      result))
+
+  (private origin-contains-owner?)
+  (hidden origin-contains-owner?)
+  (defn origin-contains-owner? [origin owner]
+    (contains-ref? &(origin-owners origin) owner))
+
+  (private active-alias?)
+  (hidden active-alias?)
+  (defn active-alias? [state owner]
+    (let-do [found false
+             origins (BorrowState.origins state)]
+      (for [i 0 (Array.length origins)]
+        (let [binding (Pair.a (Array.unsafe-nth origins i))
+              origin (Pair.b (Array.unsafe-nth origins i))]
+          (when (and (not (contains-ref? (BorrowState.moved state) binding))
+                     (origin-contains-owner? origin owner))
+            (set! found true))))
+      found))
+
+  (private check-unique-owner!)
+  (hidden check-unique-owner!)
+  (private direct-parameter-reference)
+  (hidden direct-parameter-reference)
+  (defn check-unique-owner! [owner argument-index args state parameters flags strict?]
+    (when strict?
+      (do
+        (when (active-alias? state owner)
+          (Array.aset! flags 3 true))
+        (for [j 0 (Array.length args)]
+          (when (Int./= argument-index j)
+            (let [other (Box.peek (Array.unsafe-nth args j))]
+              (when
+                (or
+                  (match (direct-parameter-reference other)
+                    (Maybe.Just reference) (CoreIR.same-ref? &reference owner)
+                    (Maybe.Nothing) false)
+                  (origin-contains-owner?
+                    &(origin-of other state parameters)
+                    owner))
+                (Array.aset! flags 3 true))))))))
+
+  (private check-unique-call!)
+  (hidden check-unique-call!)
+  (defn direct-parameter-reference [argument]
+    (match-ref argument
+      (SpecializedExpr.Reference _ _ reference)
+        (Maybe.Just (CoreRef.copy reference))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (direct-parameter-reference (Box.peek inner))
+      _ (the (Maybe CoreRef) (Maybe.Nothing))))
+
+  (defn check-unique-call! [callee args state parameters facts flags]
+    (let [strict? (foreign-strict? facts callee)]
+      (match (foreign-modes-for facts callee)
+      (Maybe.Nothing) ()
+      (Maybe.Just modes)
+        (let [n (Int.min (Array.length &modes) (Array.length args))]
+          (for [i 0 n]
+            (match-ref (Array.unsafe-nth &modes i)
+              (CoreForeignParameterMode.Unique)
+                (let [argument (Box.peek (Array.unsafe-nth args i))]
+                  (do
+                    (when strict?
+                      (Array.aset! flags (Int.+ 4 (Array.length parameters)) true))
+                    (match (direct-borrow-owner argument)
+                    (Maybe.Just owner)
+                      (check-unique-owner! &owner i args state parameters flags strict?)
+                    (Maybe.Nothing)
+                      (match (direct-parameter-reference argument)
+                        (Maybe.Just reference)
+                          (match (parameter-index parameters &reference)
+                            (Maybe.Just index)
+                              (do
+                                (Array.aset! flags (Int.+ 4 index) true)
+                                (check-unique-owner! &reference
+                                                     i
+                                                     args
+                                                     state
+                                                     parameters
+                                                     flags
+                                                     strict?))
+                            (Maybe.Nothing)
+                              (when strict? (Array.aset! flags 3 true)))
+                        (Maybe.Nothing)
+                          (when strict? (Array.aset! flags 3 true))))))
+              _ ()))))))
+
   (defn analyze-call-args [signature args state parameters facts flags]
-    (match-ref (Box.peek signature)
+    (match-ref signature
       (MonoType.Function arg-types _)
         (let-do [current @state
                  pending (the (Array CoreRef) [])
@@ -1389,12 +1954,13 @@ values only — the syntactic borrow sources of the value expression.")
             (when tail?
               (check-escape! &(origin-of expr &current parameters) flags))
             current)
-          (let-do [current (analyze-call-args signature
+          (let-do [current (analyze-call-args (Box.peek signature)
                                               args
                                               state
                                               parameters
                                               facts
                                               flags)]
+            (check-unique-call! callee args &current parameters facts flags)
             (when tail?
               (check-escape! &(origin-of expr &current parameters) flags))
             current))
@@ -1404,22 +1970,42 @@ values only — the syntactic borrow sources of the value expression.")
                                   parameters
                                   facts
                                   flags
-                                  false)
-                 n (Array.length args)]
+                                  false)]
           ;; invoking a closure uses every borrow its environment captured;
           ;; if any captured borrow's owner has been moved, this call dangles.
           (check-use-after-move!
             &(origin-of (Box.peek callee) &current parameters)
             &current
             flags)
-          (for [i 0 n]
-            (set! current
-                  (analyze (Box.peek (Array.unsafe-nth args i))
-                           &current
-                           parameters
-                           facts
-                           flags
-                           false)))
+          (let [signature (Specialize.expression-type (Box.peek callee))]
+            (set! current (analyze-call-args &signature
+                                             args
+                                             &current
+                                             parameters
+                                             facts
+                                             flags)))
+          ;; Some derived/intrinsic calls retain the generic Call node even
+          ;; though their callee is a statically known global reference. They
+          ;; participate in the same propagated affine contract as GlobalCall.
+          (match-ref (Box.peek callee)
+            (SpecializedExpr.Reference _ _ reference)
+              (check-unique-call! reference
+                                  args
+                                  &current
+                                  parameters
+                                  facts
+                                  flags)
+            (SpecializedExpr.Annotation _ _ inner _)
+              (match-ref (Box.peek inner)
+                (SpecializedExpr.Reference _ _ reference)
+                  (check-unique-call! reference
+                                      args
+                                      &current
+                                      parameters
+                                      facts
+                                      flags)
+                _ ())
+            _ ())
           current)
       (SpecializedExpr.Reference _ _ _)
         (do
@@ -1476,12 +2062,19 @@ values only — the syntactic borrow sources of the value expression.")
             (Array.aset! flags 2 true))))))
 
   (doc check-borrows "runs the sound flow-sensitive borrow check over one
-definition body. Returns a three-element flag array: index 0 is set if a borrow
+definition body. Returns a flag array: index 0 is set if a borrow
 into a local escapes the body, index 1 if a borrow is used after its owner is
-moved, index 2 if a lambda moves a captured value out of its environment.")
+moved, index 2 if a lambda moves a captured value out of its environment, and
+index 3 if a unique foreign borrow overlaps another live access. Indices 4 and
+above identify reference parameters whose callers must supply a unique loan.")
   (defn check-borrows [body parameters facts]
-    (let-do [flags [false false false]
+    (let-do [flags [false false false false]
              state (BorrowState.init [] [])]
+      (for [i 0 (Array.length parameters)]
+        (Array.push-back! &flags false))
+      ;; Final flag: this body forwards a strict (`register ... [unique]`)
+      ;; obligation, as distinct from a relaxed Carp mutation intrinsic.
+      (Array.push-back! &flags false)
       (ignore (analyze body &state parameters facts &flags true))
       flags))
 
@@ -1679,8 +2272,10 @@ moved, index 2 if a lambda moves a captured value out of its environment.")
   (doc collect-param-deletes "schedules a delete for every owned parameter the
 body does not consume (move out or into a call). A function receives ownership
 of its owned arguments and must release any it neither returns nor passes on.")
-  (defn collect-param-deletes [parameters signature body facts context]
-    (match-ref signature
+  (defn collect-param-deletes [parameters signature body facts context discharges?]
+    (if discharges?
+      (the (Array OwnershipAction) [])
+      (match-ref signature
       (MonoType.Function arg-types _)
         (let-do [result (the (Array OwnershipAction) [])
                  n (Int.min (Array.length parameters) (Array.length arg-types))]
@@ -1696,7 +2291,17 @@ of its owned arguments and must release any it neither returns nor passes on.")
                                                            (CoreRef.copy param)
                                                            (MonoType.copy param-type)))))))
           result)
-      _ (the (Array OwnershipAction) [])))
+      _ (the (Array OwnershipAction) []))))
+
+  (private deleter-reference?)
+  (hidden deleter-reference?)
+  (defn deleter-reference? [facts reference]
+    (let-do [found false
+             deleters (OwnershipTypeFacts.deleters facts)]
+      (for [i 0 (Array.length deleters)]
+        (when (CoreIR.same-ref? (Array.unsafe-nth deleters i) reference)
+          (set! found true)))
+      found))
 
   (private collect-roots-deletes)
   (hidden collect-roots-deletes)
@@ -1722,6 +2327,252 @@ of its owned arguments and must release any it neither returns nor passes on.")
 
   (private delete-requirements)
   (hidden delete-requirements)
+  (private accesses-from-actions)
+  (hidden accesses-from-actions)
+  (defn accesses-from-actions [actions]
+    (let-do [result (the (Array OwnershipAccess) [])]
+      (for [i 0 (Array.length actions)]
+        (match-ref (Array.unsafe-nth actions i)
+          (OwnershipAction.Move site from _ _)
+            (Array.push-back! &result
+                              (OwnershipAccess.init
+                                (OwnershipSite.copy site)
+                                (OwnershipAccessKind.Move)
+                                (OwnershipPlace.init
+                                  (OwnershipResource.copy from)
+                                  [])))
+          (OwnershipAction.Borrow site mode place)
+            (Array.push-back! &result
+                              (OwnershipAccess.init
+                                (OwnershipSite.copy site)
+                                (OwnershipAccessKind.Borrow
+                                  (OwnershipBorrowMode.copy mode))
+                                (OwnershipPlace.copy place)))
+          (OwnershipAction.Delete site resource _)
+            (Array.push-back! &result
+                              (OwnershipAccess.init
+                                (OwnershipSite.copy site)
+                                (OwnershipAccessKind.Drop)
+                                (OwnershipPlace.init
+                                  (OwnershipResource.copy resource)
+                                  [])))))
+      result))
+
+  (private parameter-mode)
+  (hidden parameter-mode)
+  (defn parameter-mode [type facts]
+    (match (OwnershipClassify.classify type facts)
+      (OwnershipClass.Owned) (OwnershipParameterMode.Take)
+      (OwnershipClass.Borrowed) (OwnershipParameterMode.SharedBorrow)
+      (OwnershipClass.Unmanaged) (OwnershipParameterMode.Copy)))
+
+  (private result-mode)
+  (hidden result-mode)
+  (defn result-mode [type facts]
+    (match (OwnershipClassify.classify type facts)
+      (OwnershipClass.Owned) (OwnershipResultMode.Owned)
+      (OwnershipClass.Borrowed) (OwnershipResultMode.Borrowed)
+      (OwnershipClass.Unmanaged) (OwnershipResultMode.Unmanaged)))
+
+  (private signature-result-effect)
+  (hidden signature-result-effect)
+  (defn signature-result-effect [argument-types result-type facts]
+    (let-do [result-lifetimes (the (Array MonoLifetime) [])
+             borrows-from (the (Array Int) [])]
+      (collect-ref-lifetimes! result-type &result-lifetimes)
+      (for [i 0 (Array.length argument-types)]
+        (let-do [argument-lifetimes (the (Array MonoLifetime) [])]
+          (collect-ref-lifetimes!
+            (Box.peek (Array.unsafe-nth argument-types i))
+            &argument-lifetimes)
+          (when (any-lifetime-shared? &argument-lifetimes &result-lifetimes)
+            (Array.push-back! &borrows-from i))))
+      (OwnershipResultEffect.init (result-mode result-type facts) borrows-from)))
+
+  (private foreign-contracts)
+  (hidden foreign-contracts)
+  (private core-foreign-mode)
+  (hidden core-foreign-mode)
+  (private declared-mode-compatible?)
+  (hidden declared-mode-compatible?)
+  (private foreign-parameter-contract-error)
+  (hidden foreign-parameter-contract-error)
+  (private validate-foreign-parameter-contracts)
+  (hidden validate-foreign-parameter-contracts)
+  (defn core-foreign-mode [mode]
+    (match-ref mode
+      (CoreForeignParameterMode.Copy) (OwnershipParameterMode.Copy)
+      (CoreForeignParameterMode.Take) (OwnershipParameterMode.Take)
+      (CoreForeignParameterMode.Shared) (OwnershipParameterMode.SharedBorrow)
+      (CoreForeignParameterMode.Unique) (OwnershipParameterMode.UniqueBorrow)))
+
+  (defn declared-mode-compatible? [mode type facts]
+    (match (OwnershipClassify.classify type facts)
+      (OwnershipClass.Unmanaged)
+        (match-ref mode (CoreForeignParameterMode.Copy) true _ false)
+      (OwnershipClass.Owned)
+        (match-ref mode (CoreForeignParameterMode.Take) true _ false)
+      (OwnershipClass.Borrowed)
+        (match-ref mode
+          (CoreForeignParameterMode.Shared) true
+          (CoreForeignParameterMode.Unique) true
+          _ false)))
+
+  (defn foreign-parameter-contract-error [primitive facts]
+    (match-ref (SpecializedPrimitive.source primitive)
+      (Maybe.Just source)
+        (match-ref (SpecializedBuiltinSource.payload source)
+          (CoreBuiltinPayload.External _ declared-modes)
+            (match-ref declared-modes
+              (Maybe.Just modes)
+                (let [specialization
+                        (SpecializedPrimitive.specialization primitive)]
+                  (match-ref (Box.peek
+                      (Specialization.signature specialization))
+                    (MonoType.Function argument-types _)
+                      (let-do [error (the (Maybe OwnershipError)
+                                          (Maybe.Nothing))]
+                        (for [i 0 (Int.min (Array.length modes)
+                                            (Array.length argument-types))]
+                          (when (and (Maybe.nothing? &error)
+                                     (not (declared-mode-compatible?
+                                            (Array.unsafe-nth modes i)
+                                            (Box.peek
+                                              (Array.unsafe-nth argument-types i))
+                                            facts)))
+                            (set! error
+                              (Maybe.Just
+                                (OwnershipError.init
+                                  (fmt
+                                    "foreign parameter mode %d of %s disagrees with its concrete ownership class"
+                                    i
+                                    (CoreRef.name
+                                      (Specialization.reference
+                                        specialization))))))))
+                        error)
+                    _ (Maybe.Nothing)))
+              (Maybe.Nothing) (Maybe.Nothing))
+          _ (Maybe.Nothing))
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (doc validate-foreign-parameter-contracts "checks declared foreign modes
+against the concrete ownership classification used by call analysis. This
+prevents an ABI manifest from claiming `copy` for a value the compiler moves,
+or `take` for an unmanaged value it actually copies. Shared and unique remain
+the two valid refinements of a reference parameter.")
+  (defn validate-foreign-parameter-contracts [specialized facts]
+    (let-do [result (the (Result () OwnershipError) (Result.Success ()))
+             primitives (SpecializationModule.primitives specialized)]
+      (for [i 0 (Array.length primitives)]
+        (when (Result.success? &result)
+          (match (foreign-parameter-contract-error
+                   (Array.unsafe-nth primitives i)
+                   facts)
+            (Maybe.Just error) (set! result (Result.Error error))
+            (Maybe.Nothing) ())))
+      result))
+
+  (defn foreign-contracts [specialized facts]
+    (let-do [result (the (Array OwnershipForeignContract) [])
+             primitives (SpecializationModule.primitives specialized)]
+      (for [i 0 (Array.length primitives)]
+        (let [primitive (Array.unsafe-nth primitives i)]
+          (match-ref (SpecializedPrimitive.source primitive)
+            (Maybe.Just source)
+              (match-ref (SpecializedBuiltinSource.payload source)
+                (CoreBuiltinPayload.External _ declared-modes)
+                  (let [specialization (SpecializedPrimitive.specialization primitive)]
+                    (match-ref (Box.peek (Specialization.signature specialization))
+                      (MonoType.Function argument-types result-type)
+                        (let-do [parameters (the (Array OwnershipParameterMode) [])]
+                          (match-ref declared-modes
+                            (Maybe.Just modes)
+                              (for [j 0 (Array.length modes)]
+                                (Array.push-back! &parameters
+                                  (core-foreign-mode
+                                    (Array.unsafe-nth modes j))))
+                            (Maybe.Nothing)
+                              (for [j 0 (Array.length argument-types)]
+                                (Array.push-back! &parameters
+                                  (parameter-mode
+                                    (Box.peek (Array.unsafe-nth argument-types j))
+                                    facts))))
+                          (Array.push-back! &result
+                            (OwnershipForeignContract.init
+                              (CoreRef.copy (Specialization.reference specialization))
+                              (String.copy (Specialization.symbol specialization))
+                              (match-ref declared-modes
+                                (Maybe.Just _) true
+                                (Maybe.Nothing) false)
+                              parameters
+                              (signature-result-effect argument-types
+                                                       (Box.peek result-type)
+                                                       facts))))
+                      _ ()))
+                _ ())
+            (Maybe.Nothing) ())))
+      result))
+
+  (private function-summary)
+  (hidden function-summary)
+  (defn function-summary [body context facts flags]
+    (let [specialization (SpecializedBody.specialization body)
+          signature (Box.peek (Specialization.signature specialization))]
+      (match-ref signature
+        (MonoType.Function argument-types result-type)
+          (let-do [effects (the (Array OwnershipParameterEffect) [])
+                   result-lifetimes (the (Array MonoLifetime) [])
+                   borrows-from (the (Array Int) [])
+                   parameters (SpecializedBody.parameters body)
+                   n (Int.min (Array.length argument-types)
+                              (Array.length parameters))]
+            (collect-ref-lifetimes! (Box.peek result-type) &result-lifetimes)
+            (for [i 0 n]
+              (let [argument-type (Box.peek (Array.unsafe-nth argument-types i))]
+                (Array.push-back! &effects
+                                  (OwnershipParameterEffect.init
+                                    i
+                                    (CoreRef.copy (Array.unsafe-nth parameters i))
+                                    (if @(Array.unsafe-nth flags (Int.+ 4 i))
+                                      (OwnershipParameterMode.UniqueBorrow)
+                                      (parameter-mode argument-type facts))))
+                (let-do [argument-lifetimes (the (Array MonoLifetime) [])]
+                  (collect-ref-lifetimes! argument-type &argument-lifetimes)
+                  (when (any-lifetime-shared? &argument-lifetimes
+                                               &result-lifetimes)
+                    (Array.push-back! &borrows-from i)))))
+            ;; Direct source borrows such as `&parameter` cannot be recovered
+            ;; solely from a by-value argument type, so retain the proven tail
+            ;; origin as an additional result relationship.
+            (match (syntactic-borrow-origin
+                     (Box.peek (SpecializedBody.body body))
+                     &(BorrowState.init [] [])
+                     parameters)
+              (BorrowOrigin.Param owners)
+                (for [j 0 (Array.length &owners)]
+                  (for [i 0 n]
+                    (when (CoreIR.same-ref? (Array.unsafe-nth &owners j)
+                                            (Array.unsafe-nth parameters i))
+                      (let-do [seen false]
+                        (for [k 0 (Array.length &borrows-from)]
+                          (when (Int.= @(Array.unsafe-nth &borrows-from k) i)
+                            (set! seen true)))
+                        (unless seen (Array.push-back! &borrows-from i))))))
+              _ ())
+            (OwnershipFunctionSummary.init
+              context
+              (CoreRef.copy (Specialization.reference specialization))
+              effects
+              (OwnershipResultEffect.init
+                (result-mode (Box.peek result-type) facts)
+                borrows-from)))
+        _
+          (OwnershipFunctionSummary.init
+            context
+            (CoreRef.copy (Specialization.reference specialization))
+            []
+            (OwnershipResultEffect.init (OwnershipResultMode.Unmanaged) [])))))
+
   (doc delete-requirements "reports one `DeleteFunction` requirement per
 distinct concrete type deleted by the plan, so the driver can materialize the
 matching `delete` interface implementations before backend lowering.")
@@ -1747,14 +2598,154 @@ matching `delete` interface implementations before backend lowering.")
           _ ()))
       result))
 
+  (private mode-fact-index)
+  (hidden mode-fact-index)
+  (defn mode-fact-index [mode-facts reference]
+    (let-do [result -1]
+      (for [i 0 (Array.length mode-facts)]
+        (when (CoreIR.same-ref?
+                (OwnershipForeignModeFact.reference
+                  (Array.unsafe-nth mode-facts i))
+                reference)
+          (set! result i)))
+      result))
+
+  (private default-call-modes)
+  (hidden default-call-modes)
+  (defn default-call-modes [signature]
+    (match-ref signature
+      (MonoType.Function argument-types _)
+        (let-do [modes (the (Array CoreForeignParameterMode) [])]
+          (for [i 0 (Array.length argument-types)]
+            (Array.push-back! &modes
+              (match-ref (Box.peek (Array.unsafe-nth argument-types i))
+                (MonoType.Reference _ _)
+                  (CoreForeignParameterMode.Shared)
+                _ (CoreForeignParameterMode.Copy))))
+          modes)
+      _ (the (Array CoreForeignParameterMode) [])))
+
+  (private inferred-call-facts)
+  (hidden inferred-call-facts)
+  (private add-unique-intrinsic!)
+  (hidden add-unique-intrinsic!)
+  (defn add-unique-intrinsic! [mode-facts id name arity]
+    (let [reference (PrimitiveRegistry.reference id name)]
+      (when (Int.< (mode-fact-index mode-facts &reference) 0)
+        (let-do [modes [(CoreForeignParameterMode.Unique)]]
+          (for [i 1 arity]
+            (Array.push-back! &modes (CoreForeignParameterMode.Copy)))
+          (Array.push-back! mode-facts
+            (OwnershipForeignModeFact.init reference modes false))))))
+
+  (doc inferred-call-facts "propagates unique reference requirements from
+foreign contracts through ordinary specialized Carp calls to a fixed point.
+The resulting facts drive both final call-site validation and function
+summaries; a wrapper therefore cannot erase a callee's unique obligation.")
+  (defn inferred-call-facts [specialized base]
+    (let-do [mode-facts (Array.copy (OwnershipTypeFacts.foreign-modes base))
+             bodies (SpecializationModule.bodies specialized)
+             body-count (Array.length bodies)]
+      ;; Mutation intrinsics are semantic unique boundaries just like `&mut`
+      ;; foreign parameters. Their generated wrappers inherit the requirement
+      ;; through the same fixed-point propagation below.
+      (add-unique-intrinsic! &mode-facts 16 "aset-uninitialized!" 3)
+      (add-unique-intrinsic! &mode-facts 17 "Array.aset-uninitialized!" 3)
+      (add-unique-intrinsic! &mode-facts 18 "StaticArray.aset-uninitialized!" 3)
+      (add-unique-intrinsic! &mode-facts 19 "aset!" 3)
+      (add-unique-intrinsic! &mode-facts 20 "Array.aset!" 3)
+      (add-unique-intrinsic! &mode-facts 21 "StaticArray.aset!" 3)
+      (add-unique-intrinsic! &mode-facts 24 "push-back!" 2)
+      (add-unique-intrinsic! &mode-facts 25 "Array.push-back!" 2)
+      (add-unique-intrinsic! &mode-facts 49 "field-set!" 4)
+      (add-unique-intrinsic! &mode-facts 50 "pop-back!" 1)
+      (add-unique-intrinsic! &mode-facts 51 "Array.pop-back!" 1)
+      ;; Seed every ordinary callable with its representation-compatible
+      ;; defaults. Only Shared -> Unique is refined by this effect pass.
+      (for [i 0 body-count]
+        (let [instance (SpecializedBody.specialization
+                         (Array.unsafe-nth bodies i))]
+          (when (Int.< (mode-fact-index &mode-facts
+                                        (Specialization.reference instance))
+                       0)
+            (Array.push-back! &mode-facts
+              (OwnershipForeignModeFact.init
+                (CoreRef.copy (Specialization.reference instance))
+                (default-call-modes
+                  (Box.peek (Specialization.signature instance)))
+                false)))))
+      ;; At most one new per-parameter Unique fact can appear per body on a
+      ;; dependency path, so body-count + 1 deterministic rounds suffice even
+      ;; for recursive components.
+      (let-do [pass 0
+               changed true]
+        (while-do (and changed (Int.< pass (Int.+ body-count 1)))
+          (let [iteration-facts
+                  (OwnershipTypeFacts.init
+                    (Array.copy (OwnershipTypeFacts.owned base))
+                    (Array.copy (OwnershipTypeFacts.unmanaged-override base))
+                    (Array.copy &mode-facts)
+                    (Array.copy (OwnershipTypeFacts.deleters base)))]
+            (do
+              (set! changed false)
+              (for [i 0 body-count]
+                (let [body (Array.unsafe-nth bodies i)
+                      parameters (SpecializedBody.parameters body)
+                      flags (check-borrows (Box.peek (SpecializedBody.body body))
+                                           parameters
+                                           &iteration-facts)
+                      fact-index (mode-fact-index
+                                   &mode-facts
+                                   (Specialization.reference
+                                     (SpecializedBody.specialization body)))]
+                  (when (Int.>= fact-index 0)
+                    (for [j 0 (Array.length parameters)]
+                      (when @(Array.unsafe-nth &flags (Int.+ 4 j))
+                        (let-do [fact (OwnershipForeignModeFact.copy
+                                        (Array.unsafe-nth &mode-facts fact-index))
+                                 modes (Array.copy
+                                         (OwnershipForeignModeFact.modes &fact))
+                                 was-unique (match-ref (Array.unsafe-nth &modes j)
+                                              (CoreForeignParameterMode.Unique) true
+                                              _ false)
+                                 was-strict @(OwnershipForeignModeFact.strict &fact)
+                                 strict-required @(Array.unsafe-nth
+                                                    &flags
+                                                    (Int.+ 4
+                                                      (Array.length parameters)))
+                                 strict (or was-strict strict-required)]
+                          (when (or (not was-unique)
+                                    (and strict-required (not was-strict)))
+                            (do
+                              (set! changed true)
+                              (Array.aset! &modes j
+                                           (CoreForeignParameterMode.Unique))
+                              (Array.aset! &mode-facts fact-index
+                                (OwnershipForeignModeFact.init
+                                  (CoreRef.copy
+                                    (OwnershipForeignModeFact.reference &fact))
+                                  modes
+                                  strict))))))))))
+              (set! pass (Int.inc pass))))))
+      (OwnershipTypeFacts.init
+        (Array.copy (OwnershipTypeFacts.owned base))
+        (Array.copy (OwnershipTypeFacts.unmanaged-override base))
+        mode-facts
+        (Array.copy (OwnershipTypeFacts.deleters base)))))
+
   (doc prepare "validates the stable expression-ID contract, creates the
 specialization-aware namespaces, and plans ownership deletes for owned values
 that are not moved out of their scope. Types are classified from `facts`.")
   (defn prepare [specialized facts]
-    (let-do [contexts (the (Array OwnershipContext) [])
+    (match (validate-foreign-parameter-contracts specialized facts)
+      (Result.Error error) (Result.Error error)
+      (Result.Success _)
+        (let-do [effective-facts (inferred-call-facts specialized facts)
+             contexts (the (Array OwnershipContext) [])
              actions (the (Array OwnershipAction) [])
+             summaries (the (Array OwnershipFunctionSummary) [])
              result (the (Result OwnershipPlan OwnershipError)
-                         (Result.Success (OwnershipPlan.init [] [] [])))
+                         (Result.Success (OwnershipPlan.init [] [] [] [] [] [])))
              bodies (SpecializationModule.bodies specialized)
              body-count (Array.length bodies)]
       (for [i 0 body-count]
@@ -1776,7 +2767,7 @@ that are not moved out of their scope. Types are classified from `facts`.")
                 (Result.Success _)
                   (let [flags (check-borrows (Box.peek (SpecializedBody.body body))
                                              (SpecializedBody.parameters body)
-                                             facts)]
+                                             &effective-facts)]
                     (cond
                       @(Array.unsafe-nth &flags 0)
                         (set! result
@@ -1802,6 +2793,14 @@ that are not moved out of their scope. Types are classified from `facts`.")
                                     &[@"a captured value is moved out of a lambda in "
                                       (String.copy
                                         (CoreRef.name (Specialization.reference instance)))]))))
+                      @(Array.unsafe-nth &flags 3)
+                        (set! result
+                              (Result.Error
+                                (OwnershipError.init
+                                  (String.concat
+                                    &[@"a unique foreign borrow overlaps another live access in "
+                                      (String.copy
+                                        (CoreRef.name (Specialization.reference instance)))]))))
                       (do
                         (set! contexts
                               (Array.push-back contexts
@@ -1812,18 +2811,23 @@ that are not moved out of their scope. Types are classified from `facts`.")
                                                      (Box.peek (Specialization.signature instance))))
                                                  (String.copy (Specialization.symbol instance))
                                                  (Array.length &seen))))
+                        (Array.push-back! &summaries
+                                          (function-summary body i &effective-facts &flags))
                         (set! actions
                               (append-actions
                                 (append-actions actions
                                                 (collect-context-deletes (Box.peek (SpecializedBody.body body))
-                                                                         facts
+                                                                         &effective-facts
                                                                          i
                                                                          (SpecializationModule.constructors specialized)))
                                 (collect-param-deletes (SpecializedBody.parameters body)
                                                        (Box.peek (Specialization.signature instance))
                                                        (Box.peek (SpecializedBody.body body))
-                                                       facts
-                                                       i))))))
+                                                       &effective-facts
+                                                       i
+                                                       (deleter-reference?
+                                                         &effective-facts
+                                                         (Specialization.reference instance))))))))
                 (Result.Error error) (set! result (Result.Error error))))
           (Result.Error _) ()))
       (match-ref &result
@@ -1836,7 +2840,7 @@ that are not moved out of their scope. Types are classified from `facts`.")
               (Result.Success _)
                 (let [all-actions (append-actions actions
                                                   (collect-roots-deletes (SpecializationModule.roots specialized)
-                                                                         facts
+                                                                         &effective-facts
                                                                          body-count
                                                                          (SpecializationModule.constructors specialized)))
                       reqs (delete-requirements &all-actions)]
@@ -1846,7 +2850,10 @@ that are not moved out of their scope. Types are classified from `facts`.")
                             (Array.push-back contexts
                                              (OwnershipContext.Roots (Array.length &seen)))
                             all-actions
+                            (accesses-from-actions &all-actions)
+                            summaries
+                            (foreign-contracts specialized &effective-facts)
                             reqs))))
               (Result.Error error) (set! result (Result.Error error))))
         (Result.Error _) ())
-      result)))
+          result))))

@@ -68,6 +68,13 @@
    builtins (Array CoreBuiltin)
    declarations (Array CoreConstructorDeclaration)])
 
+(deftype TypeCapabilityShape [name String
+                              span SurfaceSpan])
+
+(deftype TransferRequirementShape [name String
+                                   arguments (Array Int)
+                                   span SurfaceSpan])
+
 (deftype CollectedForms
   [functions (Array FunctionShape)
    values (Array ValueShape)
@@ -77,6 +84,8 @@
    interfaces (Array TypedShape)
    implementations (Array ImplementationShape)
    imports (Array ScopedImport)
+   type-capabilities (Array TypeCapabilityShape)
+   transfer-requirements (Array TransferRequirementShape)
    system-includes (Array String)
    expressions (Array ScopedExpression)
    globals (Array CoreRef)])
@@ -539,17 +548,21 @@ same-named events.")
                                 (Maybe.Just (String.copy text))
                               _ (the (Maybe String) (Maybe.Nothing)))
                             (Maybe.Nothing))
-                          ;; an optional field array (`(register-type T [f Int ...])`)
+                          field-index (match-ref &representation
+                            (Maybe.Just _) 3
+                            (Maybe.Nothing) 2)
+                          ;; an optional field array (`(register-type T [f Int ...])`
+                          ;; or `(register-type T "c_name" [f Int ...])`)
                           ;; is carried raw; member types are resolved when the
                           ;; declarations are assembled (after `resolve-type`).
-                          fields (if (Int.>= (Array.length &items) 3)
+                          fields (if (Int.> (Array.length &items) field-index)
                             (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth &items
-                                                                                     2)))
+                                                                                     field-index)))
                               (SurfaceForm.Array _)
                                 (Maybe.Just
                                   (Box.init
-                                    (SurfaceNode.copy (Box.peek (Array.unsafe-nth &items
-                                                                                  2)))))
+                                    (SurfaceNode.copy
+                                      (Box.peek (Array.unsafe-nth &items field-index)))))
                               _ (the (Maybe (Box SurfaceNode)) (Maybe.Nothing)))
                             (Maybe.Nothing))]
                       (Result.Success
@@ -667,6 +680,8 @@ same-named events.")
   ;; inside the module that owns the name.
   (private register-qualified-name)
   (hidden register-qualified-name)
+  (private foreign-contract-modes)
+  (hidden foreign-contract-modes)
   (defn register-qualified-name [node]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.List raw-items)
@@ -680,6 +695,43 @@ same-named events.")
               (Maybe.Nothing) (the (Maybe String) (Maybe.Nothing)))
             (the (Maybe String) (Maybe.Nothing))))
       _ (the (Maybe String) (Maybe.Nothing))))
+
+  (defn foreign-contract-modes [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Array raw-modes)
+        (let-do [modes (the (Array CoreForeignParameterMode) [])
+                 items (semantic-items raw-modes)
+                 result (the (Result (Array CoreForeignParameterMode) ResolveError)
+                             (Result.Success []))]
+          (for [i 0 (Array.length &items)]
+            (match-ref &result
+              (Result.Success _)
+                (let [mode-node (Box.peek (Array.unsafe-nth &items i))]
+                  (match (symbol-key mode-node)
+                    (Maybe.Just mode)
+                      (cond
+                        (String.= &mode "copy")
+                          (Array.push-back! &modes (CoreForeignParameterMode.Copy))
+                        (String.= &mode "take")
+                          (Array.push-back! &modes (CoreForeignParameterMode.Take))
+                        (String.= &mode "shared")
+                          (Array.push-back! &modes (CoreForeignParameterMode.Shared))
+                        (String.= &mode "unique")
+                          (Array.push-back! &modes (CoreForeignParameterMode.Unique))
+                        (set! result
+                              (Result.Error
+                                (error-at mode-node
+                                          @"foreign parameter mode must be copy, take, shared, or unique"))))
+                    (Maybe.Nothing)
+                      (set! result
+                            (Result.Error
+                              (error-at mode-node
+                                        @"foreign parameter mode must be a symbol")))))
+              (Result.Error _) ()))
+          (match result
+            (Result.Success _) (Result.Success modes)
+            (Result.Error error) (Result.Error error)))
+      _ (Result.Error (error-at node @"foreign parameter contract must be an array"))))
 
   (defn register-shape [node scope]
     (match (register-qualified-name node)
@@ -696,18 +748,34 @@ same-named events.")
               (SurfaceForm.List raw-items)
                 (let [items (semantic-items raw-items)
                       n (Array.length &items)]
-                  (if (or (Int.= n 3) (Int.= n 4))
-                    (if (Int.= n 4)
+                  (if (or (Int.= n 3) (or (Int.= n 4) (Int.= n 5)))
+                    (if (Int.>= n 4)
                       (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth &items
                                                                                3)))
                         (SurfaceForm.StringLit external-name)
-                          (Result.Success
-                            (TypedShape.init @(TypedShape.name &shape)
-                                             @(TypedShape.signature &shape)
-                                             (Maybe.Just
-                                               (CoreBuiltinPayload.External (Maybe.Just (String.copy external-name))))
-                                             @(TypedShape.span &shape)
-                                             @(TypedShape.stamp &shape)))
+                          (if (Int.= n 5)
+                            (match (foreign-contract-modes
+                                     (Box.peek (Array.unsafe-nth &items 4)))
+                              (Result.Success modes)
+                                (Result.Success
+                                  (TypedShape.init @(TypedShape.name &shape)
+                                                   @(TypedShape.signature &shape)
+                                                   (Maybe.Just
+                                                     (CoreBuiltinPayload.External
+                                                       (Maybe.Just (String.copy external-name))
+                                                       (Maybe.Just modes)))
+                                                   @(TypedShape.span &shape)
+                                                   @(TypedShape.stamp &shape)))
+                              (Result.Error error) (Result.Error error))
+                            (Result.Success
+                              (TypedShape.init @(TypedShape.name &shape)
+                                               @(TypedShape.signature &shape)
+                                               (Maybe.Just
+                                                 (CoreBuiltinPayload.External
+                                                   (Maybe.Just (String.copy external-name))
+                                                   (Maybe.Nothing)))
+                                               @(TypedShape.span &shape)
+                                               @(TypedShape.stamp &shape))))
                         _
                           (Result.Error
                             (error-at (Box.peek (Array.unsafe-nth &items 3))
@@ -716,12 +784,14 @@ same-named events.")
                         (TypedShape.init @(TypedShape.name &shape)
                                          @(TypedShape.signature &shape)
                                          (Maybe.Just
-                                           (CoreBuiltinPayload.External (Maybe.Nothing)))
+                                           (CoreBuiltinPayload.External
+                                             (Maybe.Nothing)
+                                             (Maybe.Nothing)))
                                          @(TypedShape.span &shape)
                                          @(TypedShape.stamp &shape))))
                     (Result.Error
                       (error-at node
-                                @"register expects a name, signature, and optional external name"))))
+                                @"register expects a name, signature, optional external name, and optional parameter contract"))))
               _ (Result.Error (error-at node @"register must be a list")))
           (Result.Error error) (Result.Error error))))
 
@@ -1517,6 +1587,10 @@ submodules — may use its private bindings; everyone else may not.")
   (hidden add-import!)
   (private system-include-shape)
   (hidden system-include-shape)
+  (private type-capability-shape)
+  (hidden type-capability-shape)
+  (private transfer-requirement-shape)
+  (hidden transfer-requirement-shape)
   (private preproc-text)
   (hidden preproc-text)
   (private qualified-head?)
@@ -1724,6 +1798,64 @@ then reuse a reserved id.")
               (error-at form @"system-include expects one path string"))))
       _ (Result.Error (error-at form @"system-include must be a list"))))
 
+  (defn type-capability-shape [form scope]
+    (match-ref (SurfaceNode.form form)
+      (SurfaceForm.List raw-items)
+        (let [items (semantic-items raw-items)]
+          (if (Int.= 2 (Array.length &items))
+            (let [target (Box.peek (Array.unsafe-nth &items 1))]
+              (match (symbol-key target)
+                (Maybe.Just name)
+                  (Result.Success
+                    (TypeCapabilityShape.init (qualify-name scope &name)
+                                              @(SurfaceNode.span form)))
+                (Maybe.Nothing)
+                  (Result.Error
+                    (error-at target @"unsafe-sendable target must be a type symbol"))))
+            (Result.Error
+              (error-at form @"unsafe-sendable expects one type symbol"))))
+      _ (Result.Error (error-at form @"unsafe-sendable must be a list"))))
+
+  (defn transfer-requirement-shape [form scope]
+    (match-ref (SurfaceNode.form form)
+      (SurfaceForm.List raw-items)
+        (let [items (semantic-items raw-items)]
+          (if (Int.= 3 (Array.length &items))
+            (let [target (Box.peek (Array.unsafe-nth &items 1))
+                  indexes (Box.peek (Array.unsafe-nth &items 2))]
+              (match (symbol-key target)
+                (Maybe.Just name)
+                  (match-ref (SurfaceNode.form indexes)
+                    (SurfaceForm.Array raw-indexes)
+                      (let-do [arguments (the (Array Int) [])
+                               valid true
+                               parsed-indexes (semantic-items raw-indexes)]
+                        (for [i 0 (Array.length &parsed-indexes)]
+                          (match-ref (SurfaceNode.form
+                              (Box.peek (Array.unsafe-nth &parsed-indexes i)))
+                            (SurfaceForm.IntLit value)
+                              (if (Int.>= @value 0)
+                                (Array.push-back! &arguments @value)
+                                (set! valid false))
+                            _ (set! valid false)))
+                        (if valid
+                          (Result.Success
+                            (TransferRequirementShape.init
+                              (qualify-name scope &name)
+                              arguments
+                              @(SurfaceNode.span form)))
+                          (Result.Error
+                            (error-at indexes
+                              @"requires-send indexes must be non-negative integers"))))
+                    _ (Result.Error
+                        (error-at indexes @"requires-send indexes must be an array")))
+                (Maybe.Nothing)
+                  (Result.Error
+                    (error-at target @"requires-send target must be a function symbol"))))
+            (Result.Error
+              (error-at form @"requires-send expects a target and index array"))))
+      _ (Result.Error (error-at form @"requires-send must be a list"))))
+
   (defn collect-scoped! [forms scope collected]
     (let-do [result (the (Result Unit ResolveError) (Result.Success ()))
              n (Array.length forms)]
@@ -1803,6 +1935,20 @@ then reuse a reserved id.")
                     (Array.push-back!
                       (CollectedForms.system-includes collected)
                       path)
+                  (Result.Error error) (set! result (Result.Error error)))
+
+                (declaration? form @"unsafe-sendable")
+                (match (type-capability-shape form scope)
+                  (Result.Success shape)
+                    (Array.push-back! (CollectedForms.type-capabilities collected)
+                                      shape)
+                  (Result.Error error) (set! result (Result.Error error)))
+
+                (declaration? form @"requires-send")
+                (match (transfer-requirement-shape form scope)
+                  (Result.Success shape)
+                    (Array.push-back! (CollectedForms.transfer-requirements collected)
+                                      shape)
                   (Result.Error error) (set! result (Result.Error error)))
 
                 (qualified-head? form "Unsafe.preproc")
@@ -1928,6 +2074,8 @@ then reuse a reserved id.")
                                          (Array.copy &*resolve-seed-imports*)
                                          []
                                          []
+                                         []
+                                         []
                                          (Array.copy &*resolve-seed-globals*))]
       (match (collect-scoped! forms "" &collected)
         (Result.Success _) (Result.Success collected)
@@ -1935,6 +2083,45 @@ then reuse a reserved id.")
 
   (private collect-with-generations)
   (hidden collect-with-generations)
+  (private core-type-capabilities)
+  (hidden core-type-capabilities)
+  (private resolve-transfer-requirements)
+  (hidden resolve-transfer-requirements)
+
+  (defn core-type-capabilities [shapes]
+    (let-do [result (the (Array CoreTypeCapability) [])]
+      (for [i 0 (Array.length shapes)]
+        (Array.push-back! &result
+                          (CoreTypeCapability.init
+                            @(TypeCapabilityShape.name
+                              (Array.unsafe-nth shapes i)))))
+      result))
+
+  (defn resolve-transfer-requirements [shapes globals]
+    (let-do [result (the (Result (Array CoreTransferRequirement) ResolveError)
+                         (Result.Success []))]
+      (for [i 0 (Array.length shapes)]
+        (match-ref &result
+          (Result.Success requirements)
+            (let [shape (Array.unsafe-nth shapes i)]
+              (match (global-by-name globals (TransferRequirementShape.name shape))
+                (Maybe.Just reference)
+                  (set! result
+                        (Result.Success
+                          (Array.push-back @requirements
+                            (CoreTransferRequirement.init
+                              reference
+                              @(TransferRequirementShape.arguments shape)))))
+                (Maybe.Nothing)
+                  (set! result
+                        (Result.Error
+                          (ResolveError.init
+                            (fmt "requires-send can't find `%s`"
+                                 (TransferRequirementShape.name shape))
+                            @(TransferRequirementShape.span shape))))))
+          (Result.Error _) ()))
+      result))
+
   (doc collect-with-generations "collects, then derives the type-redefinition
 table; when a type name IS redefined, collects a second time so every
 qualified definition name is born under its generation (the table is empty
@@ -3607,6 +3794,35 @@ back to plain reference resolution.")
   (hidden resolve-builtins)
   (private resolve-builtin-sources)
   (hidden resolve-builtin-sources)
+  (private foreign-contract-compatible?)
+  (hidden foreign-contract-compatible?)
+  (defn foreign-contract-compatible? [payload signature]
+    (match-ref payload
+      (CoreBuiltinPayload.External _ declared)
+        (match-ref declared
+          (Maybe.Nothing) true
+          (Maybe.Just modes)
+            (match-ref signature
+              (CoreType.Function arguments _)
+                (let-do [ok (Int.= (Array.length modes) (Array.length arguments))
+                         n (Int.min (Array.length modes) (Array.length arguments))]
+                  (for [i 0 n]
+                    (let [reference? (match-ref
+                                       (Box.peek (Array.unsafe-nth arguments i))
+                                       (CoreType.Reference _ _) true
+                                       _ false)]
+                      (match-ref (Array.unsafe-nth modes i)
+                        (CoreForeignParameterMode.Shared)
+                          (unless reference? (set! ok false))
+                        (CoreForeignParameterMode.Unique)
+                          (unless reference? (set! ok false))
+                        (CoreForeignParameterMode.Copy)
+                          (when reference? (set! ok false))
+                        (CoreForeignParameterMode.Take)
+                          (when reference? (set! ok false)))))
+                  ok)
+              _ false))
+      _ true))
   (defn resolve-builtins [shapes globals]
     (let-do [result (the
                (Result (Array CoreBuiltin) ResolveError)
@@ -3652,12 +3868,18 @@ back to plain reference resolution.")
                     (Maybe.Just reference)
                       (match (resolve-type (Box.peek (TypedShape.signature shape)))
                         (Result.Success signature)
-                          (set! result
-                                (Result.Success
-                                  (Array.push-back @sources
-                                                   (CoreBuiltinSource.init reference
-                                                                           (Box.init signature)
-                                                                           @payload))))
+                          (if (foreign-contract-compatible? payload &signature)
+                            (set! result
+                                  (Result.Success
+                                    (Array.push-back @sources
+                                                     (CoreBuiltinSource.init reference
+                                                                             (Box.init signature)
+                                                                             @payload))))
+                            (set! result
+                                  (Result.Error
+                                    (ResolveError.init
+                                      @"foreign parameter contract must match function arity and use shared/unique only for Ref parameters"
+                                      @(TypedShape.span shape)))))
                         (Result.Error error) (set! result (Result.Error error)))
                     (Maybe.Nothing)
                       (set! result
@@ -4095,21 +4317,27 @@ back to plain reference resolution.")
       (SurfaceForm.List raw-items)
         (let [items (semantic-items raw-items)]
           (if (Int.>= (Array.length &items) 3)
-            (let [fields-node (Box.peek (Array.unsafe-nth &items 2))]
-              (match-ref (SurfaceNode.form fields-node)
-                (SurfaceForm.Array fields)
-                  (let [record-type (CoreType.Named (String.copy type-name) [])]
-                    (match (add-record-constructor state
-                                                   type-name
-                                                   &record-type
-                                                   fields)
-                      (Result.Success with-constructor)
-                        (add-accessors-from-fields &with-constructor
-                                                   type-name
-                                                   &record-type
-                                                   fields)
-                      (Result.Error error) (Result.Error error)))
-                _ (Result.Success @state)))
+            (let [field-index (match-ref (SurfaceNode.form
+                                           (Box.peek (Array.unsafe-nth &items 2)))
+                                (SurfaceForm.StringLit _) 3
+                                _ 2)]
+              (if (Int.> (Array.length &items) field-index)
+                (let [fields-node (Box.peek (Array.unsafe-nth &items field-index))]
+                  (match-ref (SurfaceNode.form fields-node)
+                    (SurfaceForm.Array fields)
+                      (let [record-type (CoreType.Named (String.copy type-name) [])]
+                        (match (add-record-constructor state
+                                                       type-name
+                                                       &record-type
+                                                       fields)
+                          (Result.Success with-constructor)
+                            (add-accessors-from-fields &with-constructor
+                                                       type-name
+                                                       &record-type
+                                                       fields)
+                          (Result.Error error) (Result.Error error)))
+                    _ (Result.Success @state)))
+                (Result.Success @state)))
             (Result.Success @state)))
       _ (Result.Success @state)))
 
@@ -4240,6 +4468,7 @@ distinct identities.")
                                  tag
                                  arguments
                                  field-names
+                                 record
                                  node]
     (let [name (append-scope type-name base-name)]
       (match (global-by-name globals &name)
@@ -4249,7 +4478,8 @@ distinct identities.")
                                              tag
                                              arguments
                                              field-names
-                                             (Box.init (CoreType.copy result-type))))
+                                             (Box.init (CoreType.copy result-type))
+                                             record))
         (Maybe.Nothing)
           (Result.Error (error-at node @"missing nominal constructor reference")))))
 
@@ -4284,6 +4514,7 @@ distinct identities.")
                                                               0
                                                               arguments
                                                               (field-names-of fields)
+                                                              true
                                                               third)
                                 (Result.Success declaration)
                                   (set! result (Result.Success [declaration]))
@@ -4309,6 +4540,7 @@ distinct identities.")
                                                                       arguments
                                                                       (the (Array String)
                                                                            [])
+                                                                      false
                                                                       constructor)
                                         (Result.Success declaration)
                                           (set! result
@@ -4837,24 +5069,33 @@ guessed at.")
                                                                                           &all-globals
                                                                                           (CollectedForms.imports &collected))
                                                       (Result.Success expressions)
-                                                        (let [final-interfaces (append-core-interfaces &all-interfaces
-                                                                                                       &*overload-interfaces*)
-                                                              final-implementations (append-core-implementations &all-implementations
-                                                                                                                 &*overload-implementations*)
-                                                              module (CoreModule.init functions
-                                                                                      values
-                                                                                      all-builtins
-                                                                                      all-builtin-sources
-                                                                                      signatures
-                                                                                      type-declarations
-                                                                                      constructor-declarations
-                                                                                      final-interfaces
-                                                                                      final-implementations
-                                                                                      @(CollectedForms.system-includes &collected)
-                                                                                      expressions)]
-                                                          (if *provenance-enabled*
-                                                            (Result.Success module)
-                                                            (Result.Success (CoreIR.index-call-sites &module))))
+                                                        (match (resolve-transfer-requirements
+                                                            (CollectedForms.transfer-requirements &collected)
+                                                            &all-globals)
+                                                          (Result.Success transfer-requirements)
+                                                            (let [final-interfaces (append-core-interfaces &all-interfaces
+                                                                                                           &*overload-interfaces*)
+                                                                  final-implementations (append-core-implementations &all-implementations
+                                                                                                                     &*overload-implementations*)
+                                                                  module (CoreModule.init functions
+                                                                                          values
+                                                                                          all-builtins
+                                                                                          all-builtin-sources
+                                                                                          signatures
+                                                                                          type-declarations
+                                                                                          constructor-declarations
+                                                                                          final-interfaces
+                                                                                          final-implementations
+                                                                                          @(CollectedForms.system-includes &collected)
+                                                                                          expressions
+                                                                                          (core-type-capabilities
+                                                                                            (CollectedForms.type-capabilities &collected))
+                                                                                          transfer-requirements)]
+                                                              (if *provenance-enabled*
+                                                                (Result.Success module)
+                                                                (Result.Success (CoreIR.index-call-sites &module))))
+                                                          (Result.Error error)
+                                                            (Result.Error error))
                                                       (Result.Error error)
                                                         (Result.Error error)))
                                                 (Result.Error error)

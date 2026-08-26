@@ -401,19 +401,46 @@ binder in the body, first-of-a-name wins.")
         _ ()))
     found))
 
-(defn collect-nominal-application! [constructors type visiting ordered]
+(defn collect-nominal-application! [constructors type pending by-value ordered]
   (if (concrete-type-listed? ordered type)
     (Result.Success ())
     (match-ref type
       (MonoType.Named name arguments)
-      (if (source-nominal? constructors name)
-        (if (concrete-type-listed? visiting type)
+      ;; Box is source-defined in Core.carp, but its ABI representation is a
+      ;; nominal struct containing a pointer. Ptr and the array containers are
+      ;; representation-level indirections and have no nominal layout to emit.
+      (if (= name "Box")
+        ;; Modern Carp defines Box as a recursive one-field value type.  An
+        ;; older bootstrap compiler still exposes it as a built-in pointer and
+        ;; therefore contributes no Core constructor declaration.  Record the
+        ;; concrete wrapper explicitly so generated C has the modern ABI in
+        ;; either bootstrap environment.  Its element is behind a pointer, so
+        ;; it is a reachability edge rather than a by-value ordering edge.
+        (let-do [n (Array.length arguments)]
+          (if (Int.= n 1)
+            (let [argument (Box.peek (Array.unsafe-nth arguments 0))]
+              (do
+                (unless (or (concrete-type-listed? pending argument)
+                            (concrete-type-listed? ordered argument))
+                  (Array.push-back! pending (Box.init (MonoType.copy argument))))
+                (Array.push-back! ordered (Box.init (MonoType.copy type)))
+                (Result.Success ())))
+            (Result.Error (BackendError.init @"Box expects one type argument"))))
+        (if (and (source-nominal? constructors name)
+               (not (or (= name "Ptr")
+                        (or (= name "Array") (= name "StaticArray")))))
+        (if (concrete-type-listed? by-value type)
           (Result.Error
             (BackendError.init
-              @"recursive by-value nominal layouts are not supported"))
+              (String.concat
+                &[@"recursive by-value nominal layout is not supported: "
+                  (CAbi.type-key type)])))
           (let-do [result (the (Result Unit BackendError) (Result.Success ()))
-                   _ignored-visiting (Array.push-back! visiting
-                                                       (Box.init (MonoType.copy type)))
+                   _ignored-pending (unless (concrete-type-listed? pending type)
+                                      (Array.push-back! pending
+                                                        (Box.init (MonoType.copy type))))
+                   _ignored-by-value (Array.push-back! by-value
+                                                      (Box.init (MonoType.copy type)))
                    n (Array.length constructors)]
             (for [i 0 n]
               (match-ref &result
@@ -441,7 +468,8 @@ binder in the body, first-of-a-name wins.")
                                           (set! result
                                                 (collect-nominal-application! constructors
                                                                               &field-type
-                                                                              visiting
+                                                                              pending
+                                                                              by-value
                                                                               ordered))
                                         (Result.Error error)
                                           (set! result (Result.Error error)))
@@ -450,74 +478,57 @@ binder in the body, first-of-a-name wins.")
                               (set! result (Result.Error error))))
                       _ ()))
                 (Result.Error _) ()))
+            (ignore (Array.pop-back! by-value))
             (match result
               (Result.Success _)
                 (do
                   (Array.push-back! ordered (Box.init (MonoType.copy type)))
                   (Result.Success ()))
               (Result.Error error) (Result.Error error))))
-        ;; a builtin container (Array, Box, Ptr, ...) stores its payload
-        ;; behind a heap pointer, never inline, so a recursive occurrence
-        ;; through one is legal: skip any type already being visited (that
-        ;; skip also terminates the walk), and descend into the rest only
-        ;; for typedef ordering.
+        ;; A representation-level container stores its payload behind an
+        ;; indirection. Discover its type arguments as independent work roots:
+        ;; they remain reachable, but impose no by-value definition ordering.
         (let-do [result (the (Result Unit BackendError) (Result.Success ()))
                  n (Array.length arguments)]
           (for [i 0 n]
-            (match-ref &result
-              (Result.Success _)
-                (let [argument (Box.peek (Array.unsafe-nth arguments i))]
-                  (unless (concrete-type-listed? visiting argument)
-                    (set! result
-                          (collect-nominal-application! constructors
-                                                        argument
-                                                        visiting
-                                                        ordered))))
-              (Result.Error _) ()))
-          result))
+            (let [argument (Box.peek (Array.unsafe-nth arguments i))]
+              (unless (or (concrete-type-listed? pending argument)
+                          (concrete-type-listed? ordered argument))
+                (Array.push-back! pending (Box.init (MonoType.copy argument))))))
+          result)))
       (MonoType.Reference inner _)
-      (collect-nominal-application! constructors
-                                    (Box.peek inner)
-                                    visiting
-                                    ordered)
+      (let-do [target (Box.peek inner)]
+        (unless (or (concrete-type-listed? pending target)
+                    (concrete-type-listed? ordered target))
+          (Array.push-back! pending (Box.init (MonoType.copy target))))
+        (Result.Success ()))
       ;; A function value is a fixed-size `Lambda` struct: a callback plus an
       ;; environment pointer, never its argument or result inline. So a member
-      ;; typed `(Fn [T] T)` does NOT make T contain itself by value — descend to
-      ;; collect the types for typedef ORDERING, but skip any type already being
-      ;; visited instead of reporting unsupported recursion. Skipping is also
-      ;; what terminates the walk: in produces-output/function_members,
+      ;; typed `(Fn [T] T)` does NOT make T contain itself by value. Enqueue its
+      ;; signature types as independent reachability roots. This also terminates
+      ;; the walk in produces-output/function_members, where
       ;; `(deftype SelfReferencer [hp Int f (λ [SelfReferencer] SelfReferencer)])`
       ;; has a Lambda over SelfReferencer forever.
       (MonoType.Function arguments result-type)
       (let-do [result (the (Result Unit BackendError) (Result.Success ()))
                n (Array.length arguments)]
         (for [i 0 n]
-          (match-ref &result
-            (Result.Success _)
-              (let [argument (Box.peek (Array.unsafe-nth arguments i))]
-                (unless (concrete-type-listed? visiting argument)
-                  (set! result
-                        (collect-nominal-application! constructors
-                                                      argument
-                                                      visiting
-                                                      ordered))))
-            (Result.Error _) ()))
-        (match result
-          (Result.Success _)
-            (let [inner (Box.peek result-type)]
-              (if (concrete-type-listed? visiting inner)
-                (Result.Success ())
-                (collect-nominal-application! constructors
-                                              inner
-                                              visiting
-                                              ordered)))
-          (Result.Error error) (Result.Error error)))
+          (let [argument (Box.peek (Array.unsafe-nth arguments i))]
+            (unless (or (concrete-type-listed? pending argument)
+                        (concrete-type-listed? ordered argument))
+              (Array.push-back! pending (Box.init (MonoType.copy argument))))))
+        (let [inner (Box.peek result-type)]
+          (unless (or (concrete-type-listed? pending inner)
+                      (concrete-type-listed? ordered inner))
+            (Array.push-back! pending (Box.init (MonoType.copy inner)))))
+        result)
       _
       (Result.Success ()))))
 
 (defn nominal-applications [module]
   (let-do [result (the (Result Unit BackendError) (Result.Success ()))
-           visiting (the (Array (Box MonoType)) [])
+           pending (the (Array (Box MonoType)) [])
+           by-value (the (Array (Box MonoType)) [])
            ordered (the (Array (Box MonoType)) [])
            declarations (BackendModule.declarations module)
            constructors (BackendModule.constructors module)
@@ -530,37 +541,43 @@ binder in the body, first-of-a-name wins.")
               (set! result
                     (collect-nominal-application! constructors
                                                   (Box.peek signature)
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered))
             (BackendDeclaration.Global _ signature _)
               (set! result
                     (collect-nominal-application! constructors
                                                   (Box.peek signature)
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered))
             (BackendDeclaration.Intrinsic _ signature _)
               (set! result
                     (collect-nominal-application! constructors
                                                   (Box.peek signature)
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered))
             (BackendDeclaration.Constructor _ signature _)
               (set! result
                     (collect-nominal-application! constructors
                                                   (Box.peek signature)
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered))
             (BackendDeclaration.Template _ signature _ _)
               (set! result
                     (collect-nominal-application! constructors
                                                   (Box.peek signature)
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered))
             (BackendDeclaration.SourceTemplate _ signature _ _ _)
               (set! result
                     (collect-nominal-application! constructors
                                                   (Box.peek signature)
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered)))
         (Result.Error _) ()))
     (let [roots (BackendModule.roots module)
@@ -573,9 +590,23 @@ binder in the body, first-of-a-name wins.")
               (set! result
                     (collect-nominal-application! constructors
                                                   &root-type
-                                                  &visiting
+                                                  &pending
+                                                  &by-value
                                                   &ordered)))
           (Result.Error _) ())))
+    ;; Indirect edges discover reachable applications without imposing a C
+    ;; definition-order dependency. Process them as fresh DFS roots; direct
+    ;; by-value fields above still recurse immediately and are emitted first.
+    (let-do [cursor 0]
+      (while-do (and (match-ref &result (Result.Success _) true _ false)
+                     (Int.< cursor (Array.length &pending)))
+        (set! result
+              (collect-nominal-application! constructors
+                                            (Box.peek (Array.unsafe-nth &pending cursor))
+                                            &pending
+                                            &by-value
+                                            &ordered))
+        (set! cursor (Int.inc cursor))))
     (match result
       (Result.Success _) (Result.Success ordered)
       (Result.Error error) (Result.Error error))))
@@ -631,6 +662,41 @@ binder in the body, first-of-a-name wins.")
           (Result.Error error) (Result.Error error)))
     (Result.Error error) (Result.Error error)))
 
+(defn append-record-fields! [buffer constructor concrete-result]
+  (match (collect-template-bindings
+      (Box.peek (CoreConstructorDeclaration.result constructor))
+      concrete-result
+      &[])
+    (Result.Success bindings)
+      (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+               fields (CoreConstructorDeclaration.arguments constructor)
+               names (CoreConstructorDeclaration.field-names constructor)
+               field-count (Array.length fields)
+               emitted 0]
+        (for [i 0 field-count]
+          (match-ref &result
+            (Result.Success _)
+              (match (render-core-type &bindings
+                                       (Box.peek (Array.unsafe-nth fields i)))
+                (Result.Success field-type)
+                  (unless-do (String.= &field-type "void")
+                    (StringBuf.append-str buffer "  ")
+                    (StringBuf.append-str buffer &field-type)
+                    (StringBuf.append-char buffer \space)
+                    (StringBuf.append-str
+                      buffer
+                      &(CAbi.runtime-symbol (Array.unsafe-nth names i)))
+                    (StringBuf.append-str buffer ";
+")
+                    (set! emitted (Int.inc emitted)))
+                (Result.Error error) (set! result (Result.Error error)))
+            (Result.Error _) ()))
+        (when (Int.= emitted 0)
+          (StringBuf.append-str buffer "  unsigned char unused;
+"))
+        result)
+    (Result.Error error) (Result.Error error)))
+
 (doc last-declaration-start "the index at which the LAST declaration of a
 type name begins in the constructor array. A user deftype may shadow an
 earlier (e.g. Core) type of the same name; tags restart at the boundary, and
@@ -654,47 +720,81 @@ the later declaration is the one later code means.")
 
 (defn render-nominal-definition [constructors concrete-result]
   (match-ref concrete-result
-    (MonoType.Named source-name _)
-      (match (render-type concrete-result)
+    (MonoType.Named source-name arguments)
+      (if (= source-name "Box")
+        (if (Int.= 1 (Array.length arguments))
+          (match (render-type concrete-result)
+            (Result.Success c-name)
+              (match (render-type (Box.peek (Array.unsafe-nth arguments 0)))
+                (Result.Success element-name)
+                  (Result.Success
+                    (String.concat
+                      &[@"struct "
+                        (String.copy &c-name)
+                        @" {\n  "
+                        (String.copy &element-name)
+                        @"* data;\n};\n"]))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+          (Result.Error (BackendError.init @"Box expects one type argument")))
+        (match (render-type concrete-result)
         (Result.Success c-name)
           (let-do [result (the (Result Unit BackendError) (Result.Success ()))
                    buffer (StringBuf.create)
                    group-start (last-declaration-start constructors source-name)
-                   single-constructor (single-constructor-name? constructors
-                                                                source-name)
+                   record (record-name? constructors source-name)
                    constructor-count (Array.length constructors)]
-            ;; the payload union comes FIRST and the tag LAST, matching the
-            ;; reference layout: `Unsafe.coerce` of a sum reference to a payload
-            ;; pointer (e.g. `Maybe.unsafe-ptr`) relies on the payload sitting
-            ;; at offset zero.
-            (StringBuf.append-str &buffer "typedef struct ")
+            (StringBuf.append-str &buffer "struct ")
             (StringBuf.append-str &buffer &c-name)
             (StringBuf.append-str &buffer " {
-  union {
 ")
-            (for [i 0 constructor-count]
-              (match-ref &result
-                (Result.Success _)
-                  (let [variant (Array.unsafe-nth constructors i)]
-                    (match-ref (Box.peek
-                        (CoreConstructorDeclaration.result variant))
-                      (CoreType.Named variant-name _)
-                        (when (and (= variant-name source-name)
-                                   (Int.>= i group-start))
-                          (set! result
-                                (append-nominal-variant! &buffer
-                                                         variant
+            (if record
+              (for [i group-start constructor-count]
+                (match-ref &result
+                  (Result.Success _)
+                    (let [constructor (Array.unsafe-nth constructors i)]
+                      (match-ref (Box.peek
+                          (CoreConstructorDeclaration.result constructor))
+                        (CoreType.Named constructor-name _)
+                          (when (and (= constructor-name source-name)
+                                     @(CoreConstructorDeclaration.record constructor))
+                            (set! result
+                                  (append-record-fields! &buffer
+                                                         constructor
                                                          concrete-result)))
-                      _ ()))
-                (Result.Error _) ()))
+                        _ ()))
+                  (Result.Error _) ()))
+              (do
+                ;; The payload union comes first and the tag last, matching the
+                ;; reference sum layout and its offset-zero payload guarantee.
+                (StringBuf.append-str &buffer "  union {
+")
+                (for [i 0 constructor-count]
+                  (match-ref &result
+                    (Result.Success _)
+                      (let [variant (Array.unsafe-nth constructors i)]
+                        (match-ref (Box.peek
+                            (CoreConstructorDeclaration.result variant))
+                          (CoreType.Named variant-name _)
+                            (when (and (= variant-name source-name)
+                                       (Int.>= i group-start))
+                              (set! result
+                                    (append-nominal-variant! &buffer
+                                                             variant
+                                                             concrete-result)))
+                          _ ()))
+                    (Result.Error _) ()))
+                (StringBuf.append-str &buffer "  } data;
+")
+                (StringBuf.append-str &buffer "  int tag;
+")))
             (match result
-              (Result.Success _) (do (StringBuf.append-str &buffer "  } data;
-") (unless single-constructor (StringBuf.append-str &buffer "  int tag;
-")) (StringBuf.append-str &buffer "} ") (StringBuf.append-str &buffer &c-name) (StringBuf.append-str &buffer
-                                                                                                     ";
-") (Result.Success (StringBuf.to-string &buffer)))
+              (Result.Success _)
+                (do (StringBuf.append-str &buffer "};
+")
+                    (Result.Success (StringBuf.to-string &buffer)))
               (Result.Error error) (Result.Error error)))
-        (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error)))
     _
       (Result.Error
         (BackendError.init @"nominal application is not a named type"))))
@@ -770,8 +870,7 @@ concrete application. Each constructor receives its stable source-order tag.")
                     (match-ref (Box.peek
                         (CoreConstructorDeclaration.result constructor))
                       (CoreType.Named source-name _)
-                        (unless-do (single-constructor-name? constructors
-                                                             source-name)
+                        (unless-do (record-name? constructors source-name)
                           (StringBuf.append-str &buffer "  value.tag = ")
                           (StringBuf.append-str &buffer
                                                 &(Int.str
@@ -786,17 +885,28 @@ concrete application. Each constructor receives its stable source-order tag.")
                         ;; original argI numbering for the rest).
                         (unless-do (unit-type?
                             (Box.peek (Array.unsafe-nth arguments i)))
-                          (StringBuf.append-str &buffer "  value.data.variant_")
-                          (StringBuf.append-str &buffer
-                                                &(Int.str
-                                                  @(CoreConstructorDeclaration.tag constructor)))
+                          (if @(CoreConstructorDeclaration.record constructor)
+                            (do
+                              (StringBuf.append-str &buffer "  value.")
+                              (StringBuf.append-str
+                                &buffer
+                                &(CAbi.runtime-symbol
+                                   (Array.unsafe-nth
+                                     (CoreConstructorDeclaration.field-names constructor)
+                                     i))))
+                            (do
+                              (StringBuf.append-str &buffer
+                                                    "  value.data.variant_")
+                              (StringBuf.append-str
+                                &buffer
+                                &(Int.str
+                                   @(CoreConstructorDeclaration.tag constructor)))
+                              (StringBuf.append-str
+                                &buffer
+                                &(String.concat &[@".member_" (Int.str i)]))))
                           (StringBuf.append-str &buffer
                                                 &(String.concat
-                                                  &[@".member_"
-                                                    (Int.str i)
-                                                    @" = arg"
-                                                    (Int.str i)
-                                                    @";
+                                                  &[@" = arg" (Int.str i) @";
 "])))))
                     (StringBuf.append-str &buffer "  return value;
 }")
@@ -1627,24 +1737,35 @@ selected by specialization.")
                 (Result.Success element)
                   (match (CBackend.render-type &element)
                     (Result.Success rendered-element)
-                      (let [dependency (Array.unsafe-nth dependencies 0)
-                            dependency-symbol (sanitize (BackendDependency.symbol dependency))]
-                        (let-do [buffer (StringBuf.create)
-                                 _ignored-head (StringBuf.append-str &buffer
-                                                                     &head)]
-                          (StringBuf.append-str &buffer " {
+                      (match-ref (Box.peek signature)
+                        (MonoType.Function _ result-type)
+                          (match (CBackend.render-type (Box.peek result-type))
+                            (Result.Success rendered-box)
+                              (let [dependency (Array.unsafe-nth dependencies 0)
+                                    dependency-symbol
+                                      (sanitize (BackendDependency.symbol dependency))]
+                                (let-do [buffer (StringBuf.create)
+                                         _ignored-head
+                                           (StringBuf.append-str &buffer &head)]
+                                  (StringBuf.append-str &buffer " {
   ")
-                          (StringBuf.append-str &buffer &rendered-element)
-                          (StringBuf.append-str &buffer
-                                                "* copy = CARP_MALLOC(sizeof(")
-                          (StringBuf.append-str &buffer &rendered-element)
-                          (StringBuf.append-str &buffer "));
-  *copy = ")
-                          (StringBuf.append-str &buffer &dependency-symbol)
-                          (StringBuf.append-str &buffer "(*arg0);
+                                  (StringBuf.append-str &buffer &rendered-box)
+                                  (StringBuf.append-str &buffer " copy;
+  copy.data = CARP_MALLOC(sizeof(")
+                                  (StringBuf.append-str &buffer &rendered-element)
+                                  (StringBuf.append-str &buffer "));
+  *copy.data = ")
+                                  (StringBuf.append-str &buffer &dependency-symbol)
+                                  (StringBuf.append-str &buffer "(arg0->data);
   return copy;
 }")
-                          (Result.Success (StringBuf.to-string &buffer))))
+                                  (Result.Success
+                                    (StringBuf.to-string &buffer))))
+                            (Result.Error error) (Result.Error error))
+                        _
+                          (Result.Error
+                            (BackendError.init
+                              @"box copy template needs a function signature")))
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
               (Result.Error
@@ -1699,10 +1820,9 @@ selected by specialization.")
                                _ false)
                              false)
                          _ false)
-                       ;; `arg0` is elt**: the boxed element pointer is *arg0.
                        str-call (if by-ref
-                         (fmt "String temp = %s(*arg0);" &dependency-symbol)
-                         (fmt "String temp = %s(**arg0);" &dependency-symbol))
+                         (fmt "String temp = %s(arg0->data);" &dependency-symbol)
+                         (fmt "String temp = %s(*arg0->data);" &dependency-symbol))
                        buffer (StringBuf.create)
                        _ignored-head (StringBuf.append-str &buffer &head)]
                 (StringBuf.append-str &buffer " {
@@ -1719,8 +1839,7 @@ selected by specialization.")
               (Result.Error
                 (BackendError.init
                   @"box str template requires one str dependency")))
-            ;; a Box is a bare element pointer: delete the boxed element when
-            ;; it is managed (one delete dependency), then free the cell.
+            ;; Box stores its owned element behind the record's data pointer.
             (PrimitiveTemplate.BoxDelete _)
             (match-ref (Box.peek signature)
               (MonoType.Function box-delete-arguments _)
@@ -1732,16 +1851,16 @@ selected by specialization.")
                            _ignored-reset (LineMap.mark-reset! &buffer)
                            _ignored-head (StringBuf.append-str &buffer &head)]
                     (StringBuf.append-str &buffer " {
-  if (arg0) {
+  if (arg0.data) {
 ")
                     (when (Int.= 1 (Array.length dependencies))
                       (let-do [dependency (Array.unsafe-nth dependencies 0)
                                dependency-symbol (sanitize (BackendDependency.symbol dependency))]
                         (StringBuf.append-str &buffer "    ")
                         (StringBuf.append-str &buffer &dependency-symbol)
-                        (StringBuf.append-str &buffer "(*arg0);
+                        (StringBuf.append-str &buffer "(*arg0.data);
 ")))
-                    (StringBuf.append-str &buffer "    CARP_FREE(arg0);
+                    (StringBuf.append-str &buffer "    CARP_FREE(arg0.data);
   }
 }")
                     (Result.Success (StringBuf.to-string &buffer)))

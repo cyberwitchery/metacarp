@@ -434,7 +434,7 @@ managed forms still require dedicated lowering.")
               (match-ref &(deref-type
                   &(specialized-type (Box.peek (Array.unsafe-nth arguments 0))))
                 (MonoType.Named name _)
-                  (if (single-constructor-name? constructors name)
+                  (if (record-name? constructors name)
                     (Result.Success (String.copy "0"))
                     (Result.Success (String.concat &[@"(*" operand @").tag"])))
                 _ (Result.Success (String.concat &[@"(*" operand @").tag"])))
@@ -451,19 +451,31 @@ managed forms still require dedicated lowering.")
                                               (Box.peek (Array.unsafe-nth arguments
                                                                           3)))
                 (Result.Success value-c)
-                  (Result.Success
-                    (String.concat
-                      &[@"((*"
-                        self-c
-                        @").data.variant_"
-                        (Int.str
-                          (literal-int (Box.peek (Array.unsafe-nth arguments 1))))
-                        @".member_"
-                        (Int.str
-                          (literal-int (Box.peek (Array.unsafe-nth arguments 2))))
-                        @" = "
-                        value-c
-                        @")"]))
+                  (let [member-index
+                          (literal-int (Box.peek (Array.unsafe-nth arguments 2)))
+                        self-type
+                          (deref-type
+                            &(specialized-type
+                               (Box.peek (Array.unsafe-nth arguments 0))))]
+                    (match (record-field-name constructors &self-type member-index)
+                      (Maybe.Just field)
+                        (Result.Success
+                          (String.concat
+                            &[@"((*" self-c @")." field @" = " value-c @")"]))
+                      (Maybe.Nothing)
+                        (Result.Success
+                          (String.concat
+                            &[@"((*"
+                              self-c
+                              @").data.variant_"
+                              (Int.str
+                                (literal-int
+                                  (Box.peek (Array.unsafe-nth arguments 1))))
+                              @".member_"
+                              (Int.str member-index)
+                              @" = "
+                              value-c
+                              @")"]))))
                 (Result.Error error) (Result.Error error))
             (Result.Error error) (Result.Error error))
           ;; `allocate`/`Array.allocate` (ids 14/15) build an uninitialized heap
@@ -1690,25 +1702,41 @@ choice the reference's multisym resolution makes.")
               result)
           _ (the (Maybe CoreConstructorDeclaration) (Maybe.Nothing))))))
 
-(defn single-constructor-name? [constructors name]
-  (let-do [count 0
-           previous-tag -1
+(defn record-name? [constructors name]
+  (let-do [record false
            n (Array.length constructors)]
-    ;; Tags restart when a later declaration shadows an earlier type. Keep
-    ;; only the size of the last declaration group, matching layout lookup.
+    ;; A later declaration shadows an earlier type, so the last matching
+    ;; constructor's declaration kind is authoritative.
     (for [i 0 n]
       (let [constructor (Array.unsafe-nth constructors i)]
         (match-ref (Box.peek (CoreConstructorDeclaration.result constructor))
           (CoreType.Named result-name _)
-            (when-do (String.= result-name name)
-              (if (Int.<=
-                  @(CoreConstructorDeclaration.tag constructor)
-                  previous-tag)
-                (set! count 1)
-                (set! count (Int.inc count)))
-              (set! previous-tag @(CoreConstructorDeclaration.tag constructor)))
+            (when (String.= result-name name)
+              (set! record @(CoreConstructorDeclaration.record constructor)))
           _ ())))
-    (Int.= count 1)))
+    record))
+
+(defn record-field-name [constructors type index]
+  (match-ref type
+    (MonoType.Named name _)
+      (let-do [result (the (Maybe String) (Maybe.Nothing))
+               n (Array.length constructors)]
+        (for [i 0 n]
+          (let [constructor (Array.unsafe-nth constructors i)]
+            (match-ref (Box.peek
+                (CoreConstructorDeclaration.result constructor))
+              (CoreType.Named result-name _)
+                (when (and (String.= result-name name)
+                           @(CoreConstructorDeclaration.record constructor))
+                  (let [names (CoreConstructorDeclaration.field-names constructor)]
+                    (when (Int.< index (Array.length names))
+                      (set! result
+                            (Maybe.Just
+                              (CAbi.runtime-symbol
+                                (Array.unsafe-nth names index)))))))
+              _ ())))
+        result)
+    _ (the (Maybe String) (Maybe.Nothing))))
 
 (defn pattern-condition [constructors pattern subject-type expression]
   (match-ref pattern
@@ -1735,7 +1763,7 @@ choice the reference's multisym resolution makes.")
                   (do
                     (match-ref subject-type
                       (MonoType.Named subject-name _)
-                        (if (single-constructor-name? constructors subject-name)
+                        (if (record-name? constructors subject-name)
                           (StringBuf.append-str &buffer "true")
                           (do
                             (StringBuf.append-str &buffer expression)
@@ -1757,13 +1785,23 @@ choice the reference's multisym resolution makes.")
                                                        (Box.peek (Array.unsafe-nth fields
                                                                                    i)))
                             (Result.Success field-type)
-                              (let [child-expression (String.concat
-                                      &[(String.copy expression)
-                                        @".data.variant_"
-                                        (Int.str
-                                          @(CoreConstructorDeclaration.tag &constructor))
-                                        @".member_"
-                                        (Int.str i)])]
+                              (let [child-expression
+                                      (if @(CoreConstructorDeclaration.record &constructor)
+                                        (String.concat
+                                          &[(String.copy expression)
+                                            @"."
+                                            (CAbi.runtime-symbol
+                                              (Array.unsafe-nth
+                                                (CoreConstructorDeclaration.field-names
+                                                  &constructor)
+                                                i))])
+                                        (String.concat
+                                          &[(String.copy expression)
+                                            @".data.variant_"
+                                            (Int.str
+                                              @(CoreConstructorDeclaration.tag &constructor))
+                                            @".member_"
+                                            (Int.str i)]))]
                                 (match (pattern-condition constructors
                                                           (Box.peek (Array.unsafe-nth children
                                                                                       i))
@@ -1842,13 +1880,23 @@ choice the reference's multisym resolution makes.")
                                                    (Box.peek (Array.unsafe-nth fields
                                                                                i)))
                         (Result.Success field-type)
-                          (let [child-expression (String.concat
-                                  &[(String.copy expression)
-                                    @".data.variant_"
-                                    (Int.str
-                                      @(CoreConstructorDeclaration.tag &constructor))
-                                    @".member_"
-                                    (Int.str i)])]
+                          (let [child-expression
+                                  (if @(CoreConstructorDeclaration.record &constructor)
+                                    (String.concat
+                                      &[(String.copy expression)
+                                        @"."
+                                        (CAbi.runtime-symbol
+                                          (Array.unsafe-nth
+                                            (CoreConstructorDeclaration.field-names
+                                              &constructor)
+                                            i))])
+                                    (String.concat
+                                      &[(String.copy expression)
+                                        @".data.variant_"
+                                        (Int.str
+                                          @(CoreConstructorDeclaration.tag &constructor))
+                                        @".member_"
+                                        (Int.str i)]))]
                             (set! result
                                   (append-pattern-bindings! constructors
                                                             buffer

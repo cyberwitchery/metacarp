@@ -1,0 +1,612 @@
+(load "../../carp-session/carp-session.carp")
+(load "https://github.com/replikativ/carp-cbor@c89885788e8e6599ad8faf7726aac5396b84d4df")
+(Project.no-echo)
+
+;; Protocol v1: a four-byte unsigned big-endian size followed by one strict,
+;; deterministic CBOR item. Requests are [version id operation payload] and
+;; responses are [version id success? payload].
+
+(deftemplate read-frame
+  (Fn [] (Array Byte))
+  "#include <stdio.h>\n#include <stdint.h>\nArray $NAME(void)"
+  "$DECL {
+  unsigned char header[4];
+  Array result = {0, 0, NULL};
+  if (fread(header, 1, 4, stdin) != 4) return result;
+  uint32_t length = ((uint32_t)header[0] << 24) |
+                    ((uint32_t)header[1] << 16) |
+                    ((uint32_t)header[2] << 8) |
+                    (uint32_t)header[3];
+  if (length == 0 || length > 67108864u) return result;
+  result.len = length;
+  result.capacity = length;
+  result.data = CARP_MALLOC(length);
+  if (result.data == NULL || fread(result.data, 1, length, stdin) != length) {
+    if (result.data != NULL) CARP_FREE(result.data);
+    result.len = 0;
+    result.capacity = 0;
+    result.data = NULL;
+  }
+  return result;
+}")
+
+(deftemplate write-frame
+  (Fn [(Ref (Array Byte))] Bool)
+  "#include <stdio.h>\n#include <stdint.h>\nbool $NAME(Array const *bytes)"
+  "$DECL {
+  if (bytes->len == 0 || bytes->len > 67108864u) return false;
+  uint32_t length = (uint32_t)bytes->len;
+  unsigned char header[4] = {
+    (unsigned char)(length >> 24), (unsigned char)(length >> 16),
+    (unsigned char)(length >> 8), (unsigned char)length
+  };
+  if (fwrite(header, 1, 4, stdout) != 4) return false;
+  if (fwrite(bytes->data, 1, bytes->len, stdout) != bytes->len) return false;
+  return fflush(stdout) == 0;
+}")
+
+(def protocol-version 1)
+
+(defn core-dir []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Just root)
+      (if (or (String.ends-with? &root "/core")
+              (String.ends-with? &root "/core/"))
+        root
+        (String.append &root (if (String.ends-with? &root "/") "core" "/core")))
+    (Maybe.Nothing) (String.copy "../Carp/core")))
+
+(defn box-null [] (Box.init (CborValue.Null)))
+(defn box-uint [value]
+  (Box.init (CborValue.Unsigned (Cbor.u64 (Long.from-int value)))))
+(defn box-text [value] (Box.init (CborValue.Text (String.copy value))))
+(defn box-bool [value]
+  (Box.init (if value (CborValue.True) (CborValue.False))))
+(defn box-values [values] (Box.init (CborValue.Values values)))
+(defn box-int [value]
+  (if (Int.>= value 0)
+    (box-uint value)
+    (Box.init
+      (CborValue.Negative
+        (Cbor.u64 (Long.from-int (Int.dec (Int.neg value))))))))
+(defn map-entry [key value] (Pair.init (box-text key) value))
+(defn box-map [entries] (Box.init (CborValue.Entries entries)))
+
+(defn span-value [span]
+  (match-ref span
+    (Maybe.Nothing) (box-null)
+    (Maybe.Just source-span)
+      (box-map
+        [(map-entry "source" (box-text (SourceSpan.source-id source-span)))
+         (map-entry "start" (box-int @(SourceSpan.start source-span)))
+         (map-entry "end" (box-int @(SourceSpan.end source-span)))])))
+
+(defn reference-value [reference]
+  (box-map
+    [(map-entry "kind" (box-text "binding"))
+     (map-entry "id" (box-int @(CoreRef.id reference)))
+     (map-entry "name" (box-text (CoreRef.name reference)))
+     (map-entry "global" (box-bool @(CoreRef.global reference)))]))
+
+(defn resource-value [resource]
+  (match-ref resource
+    (OwnershipResource.Binding reference) (reference-value reference)
+    (OwnershipResource.Temporary id)
+      (box-map
+        [(map-entry "kind" (box-text "temporary"))
+         (map-entry "id" (box-int @id))])
+    (OwnershipResource.Result)
+      (box-map [(map-entry "kind" (box-text "result"))])))
+
+(defn borrow-mode-value [mode]
+  (match-ref mode
+    (OwnershipBorrowMode.Shared) (box-text "shared")
+    (OwnershipBorrowMode.Unique) (box-text "unique")))
+
+(defn optional-int-value [value]
+  (match-ref value
+    (Maybe.Nothing) (box-null)
+    (Maybe.Just n) (box-int @n)))
+
+(defn projection-value [projection]
+  (match-ref projection
+    (OwnershipProjection.Deref)
+      (box-map [(map-entry "kind" (box-text "deref"))])
+    (OwnershipProjection.Field name)
+      (box-map
+        [(map-entry "kind" (box-text "field"))
+         (map-entry "name" (box-text name))])
+    (OwnershipProjection.Index index)
+      (box-map
+        [(map-entry "kind" (box-text "index"))
+         (map-entry "index" (optional-int-value index))])
+    (OwnershipProjection.Slice start end)
+      (box-map
+        [(map-entry "kind" (box-text "slice"))
+         (map-entry "start" (optional-int-value start))
+         (map-entry "end" (optional-int-value end))])))
+
+(defn place-value [place]
+  (let-do [projections (the (Array (Box CborValue)) [])
+           source-projections (OwnershipPlace.projections place)]
+    (for [i 0 (Array.length source-projections)]
+      (Array.push-back! &projections
+                        (projection-value
+                          (Array.unsafe-nth source-projections i))))
+    (box-map
+      [(map-entry "root" (resource-value (OwnershipPlace.root place)))
+       (map-entry "projections" (box-values projections))])))
+
+(defn access-kind-value [kind]
+  (match-ref kind
+    (OwnershipAccessKind.Read) (box-text "read")
+    (OwnershipAccessKind.Write) (box-text "write")
+    (OwnershipAccessKind.Move) (box-text "move")
+    (OwnershipAccessKind.Borrow _) (box-text "borrow")
+    (OwnershipAccessKind.Drop) (box-text "drop")))
+
+(defn access-mode-value [kind]
+  (match-ref kind
+    (OwnershipAccessKind.Borrow mode) (borrow-mode-value mode)
+    _ (box-null)))
+
+(defn ownership-access-value [spanned]
+  (let [access (SpannedOwnershipAccess.access spanned)
+        site (OwnershipAccess.site access)]
+    (box-map
+      [(map-entry "context" (box-int @(OwnershipSite.context site)))
+       (map-entry "expression" (box-int @(OwnershipSite.expression site)))
+       (map-entry "kind" (access-kind-value (OwnershipAccess.kind access)))
+       (map-entry "mode" (access-mode-value (OwnershipAccess.kind access)))
+       (map-entry "place" (place-value (OwnershipAccess.place access)))
+       (map-entry "span" (span-value (SpannedOwnershipAccess.span spanned)))])))
+
+(defn parameter-mode-value [mode]
+  (match-ref mode
+    (OwnershipParameterMode.Copy) (box-text "copy")
+    (OwnershipParameterMode.Take) (box-text "take")
+    (OwnershipParameterMode.SharedBorrow) (box-text "shared-borrow")
+    (OwnershipParameterMode.UniqueBorrow) (box-text "unique-borrow")))
+
+(defn result-mode-value [mode]
+  (match-ref mode
+    (OwnershipResultMode.Unmanaged) (box-text "unmanaged")
+    (OwnershipResultMode.Owned) (box-text "owned")
+    (OwnershipResultMode.Borrowed) (box-text "borrowed")))
+
+(defn ownership-summary-value [summary]
+  (let-do [parameters (the (Array (Box CborValue)) [])
+           source-parameters (OwnershipFunctionSummary.parameters summary)
+           borrows (the (Array (Box CborValue)) [])
+           result (OwnershipFunctionSummary.result summary)]
+    (for [i 0 (Array.length source-parameters)]
+      (let [parameter (Array.unsafe-nth source-parameters i)]
+        (Array.push-back! &parameters
+          (box-map
+            [(map-entry "index" (box-int @(OwnershipParameterEffect.index parameter)))
+             (map-entry "binding"
+                        (reference-value (OwnershipParameterEffect.binding parameter)))
+             (map-entry "mode"
+                        (parameter-mode-value
+                          (OwnershipParameterEffect.mode parameter)))]))))
+    (for [i 0 (Array.length (OwnershipResultEffect.borrows-from result))]
+      (Array.push-back! &borrows
+                        (box-int
+                          @(Array.unsafe-nth
+                             (OwnershipResultEffect.borrows-from result)
+                             i))))
+    (box-map
+      [(map-entry "context" (box-int @(OwnershipFunctionSummary.context summary)))
+       (map-entry "function"
+                  (reference-value (OwnershipFunctionSummary.reference summary)))
+       (map-entry "parameters" (box-values parameters))
+       (map-entry "result"
+         (box-map
+           [(map-entry "mode"
+                       (result-mode-value (OwnershipResultEffect.ownership result)))
+            (map-entry "borrows-from" (box-values borrows))]))])))
+
+(defn ownership-foreign-contract-value [contract]
+  (let-do [parameters (the (Array (Box CborValue)) [])
+           source-parameters (OwnershipForeignContract.parameters contract)
+           borrows (the (Array (Box CborValue)) [])
+           result (OwnershipForeignContract.result contract)]
+    (for [i 0 (Array.length source-parameters)]
+      (Array.push-back! &parameters
+                        (box-map
+                          [(map-entry "index" (box-int i))
+                           (map-entry "mode"
+                             (parameter-mode-value
+                               (Array.unsafe-nth source-parameters i)))])))
+    (for [i 0 (Array.length (OwnershipResultEffect.borrows-from result))]
+      (Array.push-back! &borrows
+                        (box-int
+                          @(Array.unsafe-nth
+                             (OwnershipResultEffect.borrows-from result)
+                             i))))
+    (box-map
+      [(map-entry "function"
+                  (reference-value (OwnershipForeignContract.reference contract)))
+       (map-entry "symbol" (box-text (OwnershipForeignContract.symbol contract)))
+       (map-entry "declared" (box-bool @(OwnershipForeignContract.declared contract)))
+       (map-entry "parameters" (box-values parameters))
+       (map-entry "result"
+         (box-map
+           [(map-entry "mode"
+                       (result-mode-value (OwnershipResultEffect.ownership result)))
+            (map-entry "borrows-from" (box-values borrows))]))])))
+
+(defn ownership-action-value [spanned]
+  (let [span (span-value (SpannedOwnershipAction.span spanned))]
+    (match-ref (SpannedOwnershipAction.action spanned)
+      (OwnershipAction.Move site from to type)
+        (box-map
+          [(map-entry "op" (box-text "move"))
+           (map-entry "context" (box-int @(OwnershipSite.context site)))
+           (map-entry "expression" (box-int @(OwnershipSite.expression site)))
+           (map-entry "from" (resource-value from))
+           (map-entry "to" (resource-value to))
+           (map-entry "type" (box-text &(Type.render (Box.peek type))))
+           (map-entry "span" span)])
+      (OwnershipAction.Borrow site mode place)
+        (box-map
+          [(map-entry "op" (box-text "borrow"))
+           (map-entry "context" (box-int @(OwnershipSite.context site)))
+           (map-entry "expression" (box-int @(OwnershipSite.expression site)))
+           ;; Keep resource for clients using the first ownership protocol.
+           (map-entry "resource" (resource-value (OwnershipPlace.root place)))
+           (map-entry "mode" (borrow-mode-value mode))
+           (map-entry "place" (place-value place))
+           (map-entry "span" span)])
+      (OwnershipAction.Delete site resource type)
+        (box-map
+          [(map-entry "op" (box-text "delete"))
+           (map-entry "context" (box-int @(OwnershipSite.context site)))
+           (map-entry "expression" (box-int @(OwnershipSite.expression site)))
+           (map-entry "resource" (resource-value resource))
+           (map-entry "type" (box-text &(Type.render (Box.peek type))))
+           (map-entry "span" span)]))))
+
+(defn ownership-report-value [report]
+  (let-do [actions (the (Array (Box CborValue)) [])
+           accesses (the (Array (Box CborValue)) [])
+           summaries (the (Array (Box CborValue)) [])
+           foreign-contracts (the (Array (Box CborValue)) [])
+           type-capabilities (the (Array (Box CborValue)) [])
+           transfer-requirements (the (Array (Box CborValue)) [])
+           source-actions (OwnershipReport.actions report)
+           source-accesses (OwnershipReport.accesses report)
+           source-summaries (OwnershipReport.summaries report)
+           source-foreign-contracts (OwnershipReport.foreign-contracts report)
+           source-type-capabilities (OwnershipReport.type-capabilities report)
+           source-transfer-requirements (OwnershipReport.transfer-requirements report)]
+    (for [i 0 (Array.length source-actions)]
+      (Array.push-back! &actions
+                        (ownership-action-value
+                          (Array.unsafe-nth source-actions i))))
+    (for [i 0 (Array.length source-accesses)]
+      (Array.push-back! &accesses
+                        (ownership-access-value
+                          (Array.unsafe-nth source-accesses i))))
+    (for [i 0 (Array.length source-summaries)]
+      (Array.push-back! &summaries
+                        (ownership-summary-value
+                          (Array.unsafe-nth source-summaries i))))
+    (for [i 0 (Array.length source-foreign-contracts)]
+      (Array.push-back! &foreign-contracts
+                        (ownership-foreign-contract-value
+                          (Array.unsafe-nth source-foreign-contracts i))))
+    (for [i 0 (Array.length source-type-capabilities)]
+      (Array.push-back! &type-capabilities
+        (box-map
+          [(map-entry "type"
+             (box-text
+               (CoreTypeCapability.name
+                 (Array.unsafe-nth source-type-capabilities i))))
+           (map-entry "unsafe" (box-bool true))])))
+    (for [i 0 (Array.length source-transfer-requirements)]
+      (let-do [requirement (Array.unsafe-nth source-transfer-requirements i)
+               arguments (the (Array (Box CborValue)) [])]
+        (for [j 0 (Array.length (CoreTransferRequirement.arguments requirement))]
+          (Array.push-back! &arguments
+            (box-int
+              @(Array.unsafe-nth
+                (CoreTransferRequirement.arguments requirement)
+                j))))
+        (Array.push-back! &transfer-requirements
+          (box-map
+            [(map-entry "function"
+               (reference-value
+                 (CoreTransferRequirement.reference requirement)))
+             (map-entry "arguments" (box-values arguments))]))))
+    (box-map
+      [(map-entry "name" (box-text (OwnershipReport.name report)))
+       (map-entry "scheme" (box-text (OwnershipReport.scheme report)))
+       (map-entry "actions" (box-values actions))
+       (map-entry "accesses" (box-values accesses))
+       (map-entry "summaries" (box-values summaries))
+       (map-entry "foreign-contracts" (box-values foreign-contracts))
+       (map-entry "type-capabilities" (box-values type-capabilities))
+       (map-entry "transfer-requirements" (box-values transfer-requirements))])))
+
+(defn library-artifact-value [artifact]
+  (let-do [reports (the (Array (Box CborValue)) [])
+           ownership (LibraryArtifact.ownership artifact)]
+    (for [i 0 (Array.length ownership)]
+      (Array.push-back! &reports
+                        (ownership-report-value
+                          (Array.unsafe-nth ownership i))))
+    (box-map
+      [(map-entry "format" (box-int 2))
+       (map-entry "c" (box-text (LibraryArtifact.c artifact)))
+       (map-entry "ownership" (box-values reports))
+       (map-entry "include-directories"
+                  (box-string-array (LibraryArtifact.include-directories artifact)))
+       (map-entry "link-libraries"
+                  (box-string-array (LibraryArtifact.link-libraries artifact)))])))
+
+(defn box-string-array [strings]
+  (let-do [values (the (Array (Box CborValue)) [])]
+    (for [i 0 (Array.length strings)]
+      (Array.push-back! &values
+                        (box-text (Array.unsafe-nth strings i))))
+    (box-values values)))
+
+(defn definition-kind-text [kind]
+  (match-ref kind
+    (SessionDefKind.Function) (String.copy "function")
+    (SessionDefKind.Value) (String.copy "value")
+    (SessionDefKind.External) (String.copy "external")
+    (SessionDefKind.Interface) (String.copy "interface")
+    (SessionDefKind.Other label) (String.copy label)))
+
+(defn definition-value [definition]
+  (let [span (SessionDefInfo.span definition)]
+    (box-map
+      [(map-entry "name" (box-text (SessionDefInfo.name definition)))
+       (map-entry "kind"
+                  (box-text &(definition-kind-text
+                               (SessionDefInfo.kind definition))))
+       (map-entry "scheme" (box-text (SessionDefInfo.scheme definition)))
+       (map-entry "span"
+                  (span-value &(the (Maybe SourceSpan)
+                                    (Maybe.Just (SourceSpan.copy span)))))])))
+
+(defn definitions-value [definitions]
+  (let-do [values (the (Array (Box CborValue)) [])]
+    (for [i 0 (Array.length definitions)]
+      (Array.push-back! &values
+                        (definition-value (Array.unsafe-nth definitions i))))
+    (box-values values)))
+
+(defn text-from [value]
+  (match-ref (Box.peek value)
+    (Text text) (Maybe.Just (String.copy text))
+    _ (the (Maybe String) (Maybe.Nothing))))
+
+(defn values-from [value]
+  (match-ref (Box.peek value)
+    (Values values) (Maybe.Just (Array.copy values))
+    _ (the (Maybe (Array (Box CborValue))) (Maybe.Nothing))))
+
+(defn valid-version? [value]
+  (match-ref (Box.peek value)
+    (Unsigned version) (Uint64.= @version (Cbor.u64 (Long.from-int protocol-version)))
+    _ false))
+
+(defn response-value [request-id success payload]
+  (CborValue.Values
+    [(box-uint protocol-version)
+     (box-text request-id)
+     (box-bool success)
+     payload]))
+
+(defn send-response [request-id success payload]
+  (let [response (response-value request-id success payload)]
+    (match (Cbor.encode &response)
+      (Result.Success bytes) (write-frame &bytes)
+      (Result.Error _) false)))
+
+(defn send-success [request-id payload]
+  (send-response request-id true payload))
+
+(defn send-error [request-id phase message]
+  (send-response
+    request-id
+    false
+    (box-values [(box-text phase) (box-text message)])))
+
+(defn send-diagnostic [request-id diagnostic]
+  (send-error request-id
+              (Diagnostic.phase diagnostic)
+              (Diagnostic.message diagnostic)))
+
+(defn malformed [request-id message]
+  (send-error request-id "protocol" message))
+
+(defn payload-text [payload index]
+  (match (values-from payload)
+    (Maybe.Just values)
+      (if (and (Int.>= index 0) (Int.< index (Array.length &values)))
+        (text-from (Array.unsafe-nth &values index))
+        (the (Maybe String) (Maybe.Nothing)))
+    (Maybe.Nothing) (the (Maybe String) (Maybe.Nothing))))
+
+(defn payload-roots [payload index]
+  (match (values-from payload)
+    (Maybe.Just values)
+      (if (and (Int.>= index 0) (Int.< index (Array.length &values)))
+        (match (values-from (Array.unsafe-nth &values index))
+          (Maybe.Just encoded-roots)
+            (let-do [roots (the (Array String) []) ok true]
+              (for [i 0 (Array.length &encoded-roots)]
+                (match (text-from (Array.unsafe-nth &encoded-roots i))
+                  (Maybe.Just root) (Array.push-back! &roots root)
+                  (Maybe.Nothing) (set! ok false)))
+              (if ok (Maybe.Just roots)
+                     (the (Maybe (Array String)) (Maybe.Nothing))))
+          (Maybe.Nothing) (the (Maybe (Array String)) (Maybe.Nothing)))
+        (the (Maybe (Array String)) (Maybe.Nothing)))
+    (Maybe.Nothing) (the (Maybe (Array String)) (Maybe.Nothing))))
+
+(defn payload-strings-or-empty [payload index]
+  (match (values-from payload)
+    (Maybe.Nothing) (the (Maybe (Array String)) (Maybe.Nothing))
+    (Maybe.Just values)
+      (if (>= index (Array.length &values))
+        (Maybe.Just [])
+        (payload-roots payload index))))
+
+(defn handle-upsert [session request-id payload]
+  (match (payload-text payload 0)
+    (Maybe.Just source)
+      (let [source-id (match (payload-text payload 1)
+                        (Maybe.Just explicit) explicit
+                        (Maybe.Nothing) (String.copy request-id))
+            input (SourceInput.init source-id source)]
+        (match (Session.upsert session &input)
+          (Result.Success report)
+            (send-success request-id
+                          (box-uint
+                            (Array.length (UpsertReport.invalidated &report))))
+          (Result.Error diagnostic)
+            (send-diagnostic request-id &diagnostic)))
+    (Maybe.Nothing) (malformed request-id "upsert payload must contain source text")))
+
+(defn handle-upsert-input [session request-id payload]
+  (match (payload-text payload 0)
+    (Maybe.Nothing)
+      (malformed request-id "upsert-input payload must contain source text")
+    (Maybe.Just source)
+      (match (payload-text payload 1)
+        (Maybe.Nothing)
+          (malformed request-id "upsert-input payload must contain a source id")
+        (Maybe.Just source-id)
+          (let [input (SourceInput.init source-id source)]
+            (match (Session.upsert-input session &input)
+              (Result.Success definitions)
+                (send-success request-id (definitions-value &definitions))
+              (Result.Error diagnostic)
+                (send-diagnostic request-id &diagnostic))))))
+
+(defn handle-remove [session request-id payload]
+  (match (payload-text payload 0)
+    (Maybe.Just name)
+      (match (Session.remove session &name)
+        (Result.Success report)
+          (send-success request-id
+                        (box-uint
+                          (Array.length (RemoveReport.invalidated &report))))
+        (Result.Error diagnostic)
+          (send-diagnostic request-id &diagnostic))
+    (Maybe.Nothing) (malformed request-id "remove payload must contain a name")))
+
+(defn handle-remove-input [session request-id payload]
+  (match (payload-text payload 0)
+    (Maybe.Just source-id)
+      (match (Session.remove-input session &source-id)
+        (Result.Success _)
+          (send-success request-id (box-null))
+        (Result.Error diagnostic)
+          (send-diagnostic request-id &diagnostic))
+    (Maybe.Nothing)
+      (malformed request-id "remove-input payload must contain a source id")))
+
+(defn handle-ownership [session request-id payload]
+  (match (payload-text payload 0)
+    (Maybe.Just name)
+      (match (Session.ownership session &name)
+        (Result.Success report)
+          (send-success request-id (ownership-report-value &report))
+        (Result.Error diagnostic)
+          (send-diagnostic request-id &diagnostic))
+    (Maybe.Nothing)
+      (malformed request-id "ownership payload must contain a definition name")))
+
+(defn handle-emit-library [session request-id payload]
+  (match (payload-text payload 0)
+    (Maybe.Nothing)
+      (malformed request-id "emit-library payload must contain source text")
+    (Maybe.Just source)
+      (match (payload-roots payload 1)
+        (Maybe.Nothing)
+          (malformed request-id "emit-library payload must contain text roots")
+        (Maybe.Just roots)
+          (match (payload-strings-or-empty payload 2)
+            (Maybe.Nothing)
+              (malformed request-id "include directories must be text")
+            (Maybe.Just include-directories)
+              (match (payload-strings-or-empty payload 3)
+                (Maybe.Nothing)
+                  (malformed request-id "link libraries must be text")
+                (Maybe.Just link-libraries)
+                  (let [input (SourceInput.init (String.copy request-id) source)]
+                    (match (Session.emit-library-with-build
+                             session
+                             &input
+                             &roots
+                             &include-directories
+                             &link-libraries)
+                      (Result.Success artifact)
+                        (send-success request-id
+                                      (library-artifact-value &artifact))
+                      (Result.Error diagnostic)
+                        (send-diagnostic request-id &diagnostic))))))))
+
+(defn dispatch [session request-id operation payload]
+  (cond
+    (String.= operation "ping")
+      (send-success request-id (box-null))
+    (String.= operation "quit")
+      (do (ignore (send-success request-id (box-null))) false)
+    (String.= operation "reset")
+      (do (Session.reset session)
+          (send-success request-id (box-null)))
+    (String.= operation "upsert") (handle-upsert session request-id payload)
+    (String.= operation "upsert-input")
+      (handle-upsert-input session request-id payload)
+    (String.= operation "remove") (handle-remove session request-id payload)
+    (String.= operation "remove-input")
+      (handle-remove-input session request-id payload)
+    (String.= operation "ownership") (handle-ownership session request-id payload)
+    (String.= operation "emit-library")
+      (handle-emit-library session request-id payload)
+    (malformed request-id "unknown operation")))
+
+(defn handle-request [session request]
+  (match (values-from request)
+    (Maybe.Just fields)
+      (if (Int./= (Array.length &fields) 4)
+        (malformed "" "request must have four fields")
+        (match (text-from (Array.unsafe-nth &fields 1))
+          (Maybe.Nothing) (malformed "" "request id must be text")
+          (Maybe.Just request-id)
+            (if (not (valid-version? (Array.unsafe-nth &fields 0)))
+              (malformed &request-id "unsupported protocol version")
+              (match (text-from (Array.unsafe-nth &fields 2))
+                (Maybe.Nothing) (malformed &request-id "operation must be text")
+                (Maybe.Just operation)
+                  (dispatch session &request-id &operation
+                            (Array.unsafe-nth &fields 3))))))
+    (Maybe.Nothing) (malformed "" "request must be an array")))
+
+(defn serve [session]
+  (let-do [running (send-success "ready" (box-uint protocol-version))]
+    (while running
+      (let [frame (read-frame)]
+        (if (Int.= (Array.length &frame) 0)
+          (set! running false)
+          (match (Cbor.decode &frame)
+            (Result.Success request) (set! running (handle-request session &request))
+            (Result.Error _)
+              (set! running
+                    (send-error "" "cbor" "invalid deterministic CBOR"))))))))
+
+(defn main []
+  (let [dir (core-dir)]
+    (match (Session.create &dir)
+      (Result.Success session) (serve &session)
+      (Result.Error diagnostic)
+        (do
+          (IO.errorln (Diagnostic.phase &diagnostic))
+          (IO.errorln (Diagnostic.message &diagnostic))))))

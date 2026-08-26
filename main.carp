@@ -7,6 +7,27 @@
 ;; so the reservation costs address space, not memory.
 (when (= (host-os) "darwin") (add-cflag "-Wl,-stack_size,0x20000000"))
 
+(deftemplate compiler-ensure-stack
+             (Fn [] Bool)
+             "#if defined(__linux__)\n#include <sys/resource.h>\n#endif\nbool $NAME(void)"
+             "$DECL {
+#if defined(__linux__)
+  const rlim_t wanted = (rlim_t)512 * 1024 * 1024;
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_STACK, &limit) != 0) return false;
+  if (limit.rlim_cur >= wanted || limit.rlim_cur == RLIM_INFINITY) return true;
+  rlim_t target = wanted;
+  if (limit.rlim_max != RLIM_INFINITY && target > limit.rlim_max) {
+    target = limit.rlim_max;
+  }
+  if (target <= limit.rlim_cur) return false;
+  limit.rlim_cur = target;
+  return setrlimit(RLIMIT_STACK, &limit) == 0;
+#else
+  return true;
+#endif
+}")
+
 ;; These are compiled into the compiler binary from the C implementation's
 ;; target macros. They describe the machine actually running this compiler,
 ;; unlike the old aarch64/darwin literals in the synthetic Core prelude.
@@ -81,6 +102,36 @@
 
 (def version "0.1.0")
 
+;; Native inputs are driver state, not part of the typed Carp module. Cargo
+;; adapters, package managers, and direct users normalize to these two arrays.
+(def *native-include-dirs* (the (Array String) []))
+(def *native-link-inputs* (the (Array String) []))
+
+(defn shell-quote [value]
+  (let-do [parts (the (Array String) [@"'"])]
+    (for [i 0 (String.length value)]
+      (let [c (String.char-at value i)]
+        (if (Int.= (Char.to-int c) 39)
+          (Array.push-back! &parts @"'\\''")
+          (Array.push-back! &parts (String.from-chars &[c])))))
+    (Array.push-back! &parts @"'")
+    (String.join "" &parts)))
+
+(defn native-include-flags []
+  (let-do [flags (the (Array String) [])]
+    (for [i 0 (Array.length &*native-include-dirs*)]
+      (Array.push-back! &flags
+        (String.append "-I "
+          &(shell-quote (Array.unsafe-nth &*native-include-dirs* i)))))
+    (String.join " " &flags)))
+
+(defn native-link-flags []
+  (let-do [flags (the (Array String) [])]
+    (for [i 0 (Array.length &*native-link-inputs*)]
+      (Array.push-back! &flags
+        (shell-quote (Array.unsafe-nth &*native-link-inputs* i))))
+    (String.join " " &flags)))
+
 (defn print-help []
   (do
     (IO.println "carp-compiler — a self-hosting Carp compiler (Carp → C)")
@@ -108,9 +159,15 @@
     (IO.println
       "  --ownership           emit the move/borrow/delete plan as JSON")
     (IO.println
+      "  --library             emit a C translation unit without main (needs --core)")
+    (IO.println
       "  --no-core             skip the implicit Core load; the source's own")
     (IO.println
       "                        (load \"X.carp\") directives still resolve in --core")
+    (IO.println
+      "  --include <dir>       add a native header directory (repeatable)")
+    (IO.println
+      "  --link <path|flag>    add a native library or linker input (repeatable)")
     (IO.println "  -h, --help            show this help and exit")
     (IO.println "  -v, --version         show version and exit")
     (IO.println "")
@@ -549,13 +606,27 @@
           (IO.read-file &local))
         (Result.Success text) (Maybe.Just (Pair.init @&local text))
         (Result.Error _)
-          (match (read-core-file core-dir name)
-            (Maybe.Just found)
-              (Maybe.Just
-                (Pair.init
-                  (String.concat &[@core-dir @"/" (String.copy name)])
-                  found))
-            (Maybe.Nothing) (the (Maybe (Pair String String)) (Maybe.Nothing)))))))
+          ;; Reference Carp also accepts paths relative to the compiler process
+          ;; working directory. Keep requester-relative resolution first (it is
+          ;; stable for editors and nested packages), then retain that
+          ;; compatibility before falling back to Core.
+          (let [working (normalize-path name)]
+            (match (if (or (String.starts-with? name "/")
+                           (same-path-ignoring-case?
+                             &working
+                             &(normalize-path requester-file)))
+                (Result.Error @"self")
+                (IO.read-file &working))
+              (Result.Success text) (Maybe.Just (Pair.init working text))
+              (Result.Error _)
+                (match (read-core-file core-dir name)
+                  (Maybe.Just found)
+                    (Maybe.Just
+                      (Pair.init
+                        (String.concat &[@core-dir @"/" (String.copy name)])
+                        found))
+                  (Maybe.Nothing)
+                    (the (Maybe (Pair String String)) (Maybe.Nothing)))))))))
 
 (defn ensure-sources [registry core-dir seed]
   (let-do [result registry
@@ -718,32 +789,46 @@
                     (Result.Error e)
                       (do
                         (IO.errorln
-                          &(String.append "carp-compiler: cannot load: "
-                                          (ModuleError.message &e)))
+                          &(String.concat
+                            &[@"carp-compiler: cannot load "
+                              (String.copy (ModuleError.path &e))
+                              @": "
+                              (String.copy (ModuleError.message &e))]))
                         (the (Maybe (Pair SurfaceModule String)) (Maybe.Nothing)))
                     (Result.Success loaded)
                       (let-do [_ignored-phase (phase! "loaded")
                                module (ModuleLoader.with-compiler-prelude &loaded)]
                         (Maybe.Just (Pair.init module source))))))))))
 
-(defn compile-with-core [input core-dir no-core]
+(defn compile-with-core [input core-dir no-core library]
   (match (load-with-core input core-dir no-core)
     (Maybe.Nothing) (the (Maybe String) (Maybe.Nothing))
     (Maybe.Just pair)
-      (match (CarpCompiler.compile-module-full (Pair.a &pair)
-                                               &(ExpandConfig.init [@"Dynamic"])
-                                               &(collect-check-names (Pair.b &pair))
-                                               (source-echo-enabled? (Pair.b &pair)))
+      (match (if library
+               (CarpCompiler.compile-module-library-full
+                 (Pair.a &pair)
+                 &(ExpandConfig.init [@"Dynamic"])
+                 &(collect-check-names (Pair.b &pair)))
+               (CarpCompiler.compile-module-full
+                 (Pair.a &pair)
+                 &(ExpandConfig.init [@"Dynamic"])
+                 &(collect-check-names (Pair.b &pair))
+                 (source-echo-enabled? (Pair.b &pair))))
         (Result.Success c) (Maybe.Just c)
         (Result.Error error)
           (do
             (IO.errorln &(CompileError.render &error))
             (the (Maybe String) (Maybe.Nothing))))))
 
-(defn produce-c [input core-dir no-core]
+(defn produce-c [input core-dir no-core library]
   (match-ref core-dir
-    (Maybe.Just dir) (compile-with-core input dir no-core)
-    (Maybe.Nothing) (compile-standalone input)))
+    (Maybe.Just dir) (compile-with-core input dir no-core library)
+    (Maybe.Nothing)
+      (if library
+        (do
+          (IO.errorln "carp-compiler: --library requires --core")
+          (the (Maybe String) (Maybe.Nothing)))
+        (compile-standalone input))))
 
 ; --- emitting / building ---
 
@@ -783,7 +868,11 @@
             @" -lm -o "
             @binary
             @" "
-            @temp-c])]
+            @temp-c
+            @" "
+            (native-include-flags)
+            @" "
+            (native-link-flags)])]
     (if (Int.= 0 (System.system &cmd))
       true
       (do (IO.errorln "carp-compiler: clang failed") false))))
@@ -1105,6 +1194,11 @@ substitution applied; node ids alone collide across definitions.")
         (Pair.init @(CoreRef.name reference) (type-string (Box.peek type)))
       (OwnershipContext.Roots _) (Pair.init @"«roots»" @""))))
 
+(defn ownership-borrow-mode-json [mode]
+  (match-ref mode
+    (OwnershipBorrowMode.Shared) @"shared"
+    (OwnershipBorrowMode.Unique) @"unique"))
+
 (defn ownership-json [planned]
   (let-do [plan (PlannedModule.plan planned)
            contexts (OwnershipPlan.contexts plan)
@@ -1125,14 +1219,16 @@ substitution applied; node ids alone collide across definitions.")
                        &(annotate-escape &(ownership-resource-json to))
                        &(annotate-escape &(type-string (Box.peek type)))
                        i))
-                 (OwnershipAction.Borrow site resource)
+                 (OwnershipAction.Borrow site mode place)
                    (let [names (ownership-context-strings contexts
                                                           @(OwnershipSite.context site))]
                      (fmt
-                       "{\"owner\": \"%s\", \"signature\": \"%s\", \"action\": \"borrow\", \"binding\": \"%s\", \"target\": \"\", \"type\": \"\", \"seq\": %d}"
+                       "{\"owner\": \"%s\", \"signature\": \"%s\", \"action\": \"borrow\", \"mode\": \"%s\", \"binding\": \"%s\", \"target\": \"\", \"type\": \"\", \"seq\": %d}"
                        &(annotate-escape (Pair.a &names))
                        &(annotate-escape (Pair.b &names))
-                       &(annotate-escape &(ownership-resource-json resource))
+                       &(ownership-borrow-mode-json mode)
+                       &(annotate-escape
+                          &(ownership-resource-json (OwnershipPlace.root place)))
                        i))
                  (OwnershipAction.Delete site resource type)
                    (let [names (ownership-context-strings contexts
@@ -1180,11 +1276,11 @@ substitution applied; node ids alone collide across definitions.")
     (Maybe.Nothing)
       (do (IO.errorln "carp-compiler: --ownership requires --core") 1)))
 
-(defn run [input core-dir output action log-memory optimize no-core debug]
+(defn run [input core-dir output action log-memory optimize no-core debug library]
   (cond
     (Int.= action 3) (annotate-input input core-dir no-core)
     (Int.= action 4) (ownership-input input core-dir no-core)
-    (run-produce input core-dir output action log-memory optimize no-core debug)))
+    (run-produce input core-dir output action log-memory optimize no-core debug library)))
 
 (defn run-produce [input
                    core-dir
@@ -1193,12 +1289,13 @@ substitution applied; node ids alone collide across definitions.")
                    log-memory
                    optimize
                    no-core
-                   debug]
+                   debug
+                   library]
   (do
     ;; a debug build asks the compiler to remember where its C came from, so the
     ;; C can point back at the Carp each line was written as
     (set! *want-source-map* debug)
-    (match (produce-c input core-dir no-core)
+    (match (produce-c input core-dir no-core library)
       (Maybe.Nothing) 1
       (Maybe.Just c)
         (cond
@@ -1207,7 +1304,8 @@ substitution applied; node ids alone collide across definitions.")
           (emit-c &c output)))))
 
 (defn main []
-  (let-do [args &System.args
+  (let-do [stack-ready (compiler-ensure-stack)
+           args &System.args
            n (StaticArray.length args)
            input (the (Maybe String) (Maybe.Nothing))
            output (the (Maybe String) (Maybe.Nothing))
@@ -1217,10 +1315,14 @@ substitution applied; node ids alone collide across definitions.")
            optimize false
            debug false
            no-core false
+           library false
            action 0
            ; 0 = compile, 1 = help, 2 = version, 3 = argument error
            mode 0
            i 1]
+    (unless stack-ready
+      (IO.errorln
+        "carp-compiler: warning: could not raise the stack limit; deep compile-time evaluation may overflow"))
     (while-do (and (Int.< i n) (Int.= mode 0))
       (let-do [arg @(StaticArray.unsafe-nth args i)]
         (cond
@@ -1230,10 +1332,31 @@ substitution applied; node ids alone collide across definitions.")
           (or (String.= &arg "-x") (String.= &arg "--execute")) (set! action 2)
           (String.= &arg "--annotate") (set! action 3)
           (String.= &arg "--ownership") (set! action 4)
+          (String.= &arg "--library") (set! library true)
           (String.= &arg "--log-memory") (set! log-memory true)
           (String.= &arg "--optimize") (set! optimize true)
           (or (String.= &arg "-g") (String.= &arg "--debug")) (set! debug true)
           (String.= &arg "--no-core") (set! no-core true)
+          (String.= &arg "--include")
+            (if (Int.< (Int.inc i) n)
+              (do
+                (Array.push-back! &*native-include-dirs*
+                  @(StaticArray.unsafe-nth args (Int.inc i)))
+                (set! i (Int.inc i)))
+              (do
+                (IO.errorln
+                  "carp-compiler: option '--include' requires a directory argument")
+                (set! mode 3)))
+          (String.= &arg "--link")
+            (if (Int.< (Int.inc i) n)
+              (do
+                (Array.push-back! &*native-link-inputs*
+                  @(StaticArray.unsafe-nth args (Int.inc i)))
+                (set! i (Int.inc i)))
+              (do
+                (IO.errorln
+                  "carp-compiler: option '--link' requires a linker input")
+                (set! mode 3)))
           (or (String.= &arg "-o") (String.= &arg "--output"))
             (if (Int.< (Int.inc i) n)
               (do
@@ -1278,6 +1401,7 @@ substitution applied; node ids alone collide across definitions.")
                  log-memory
                  optimize
                  no-core
-                 debug))
+                 debug
+                 library))
         (Maybe.Nothing)
           (do (IO.errorln "carp-compiler: no input file") (usage-hint))))))

@@ -34,7 +34,13 @@
         plan (OwnershipPlan.init []
                                  [(OwnershipAction.Borrow (OwnershipSite.init 0
                                                                               42)
-                                                          (OwnershipResource.Temporary 42))]
+                                                          (OwnershipBorrowMode.Shared)
+                                                          (OwnershipPlace.init
+                                                            (OwnershipResource.Temporary 42)
+                                                            []))]
+                                 []
+                                 []
+                                 []
                                  [])
         actions (Ownership.spanned-actions &plan &provenance)]
     (and (Int.= 1 (Array.length &actions))
@@ -54,7 +60,7 @@
              (CoreRef.init 1 (String.copy "derived") true)
              []
              (Box.init (CoreExpr.UnitLit -1)))
-           core (CoreModule.init [function] [] [] [] [] [] [] [] [] [] [])
+           core (CoreModule.init [function] [] [] [] [] [] [] [] [] [] [] [] [])
            provenance (CoreProvenance.init [] [] [])
            allocator (IdAllocator.init [100])
            identified (CoreIR.identify-generated &core
@@ -64,7 +70,13 @@
            plan (OwnershipPlan.init []
                                     [(OwnershipAction.Borrow (OwnershipSite.init 0
                                                                                  100)
-                                                             (OwnershipResource.Temporary 100))]
+                                                             (OwnershipBorrowMode.Shared)
+                                                             (OwnershipPlace.init
+                                                               (OwnershipResource.Temporary 100)
+                                                               []))]
+                                    []
+                                    []
+                                    []
                                     [])
            actions (Ownership.spanned-actions &plan
                                               (ProvenancedCoreModule.provenance &identified))]
@@ -72,6 +84,54 @@
       (Maybe.Just action-span)
         (String.= (SourceSpan.source-id action-span) "cell:derived-ownership")
       (Maybe.Nothing) false)))
+
+(defn structured-place-overlap-is-projection-sensitive? []
+  (let [root (CoreRef.init 70 (String.copy "buffer") false)
+        other-root (CoreRef.init 71 (String.copy "other") false)
+        whole (OwnershipPlace.init
+                (OwnershipResource.Binding (CoreRef.copy &root)) [])
+        x (OwnershipPlace.init
+            (OwnershipResource.Binding (CoreRef.copy &root))
+            [(OwnershipProjection.Field (String.copy "x"))])
+        x-again (OwnershipPlace.init
+                  (OwnershipResource.Binding (CoreRef.copy &root))
+                  [(OwnershipProjection.Field (String.copy "x"))])
+        y (OwnershipPlace.init
+            (OwnershipResource.Binding (CoreRef.copy &root))
+            [(OwnershipProjection.Field (String.copy "y"))])
+        i0 (OwnershipPlace.init
+             (OwnershipResource.Binding (CoreRef.copy &root))
+             [(OwnershipProjection.Index (Maybe.Just 0))])
+        i1 (OwnershipPlace.init
+             (OwnershipResource.Binding (CoreRef.copy &root))
+             [(OwnershipProjection.Index (Maybe.Just 1))])
+        unknown (OwnershipPlace.init
+                  (OwnershipResource.Binding (CoreRef.copy &root))
+                  [(OwnershipProjection.Index (Maybe.Nothing))])
+        low-slice (OwnershipPlace.init
+                    (OwnershipResource.Binding (CoreRef.copy &root))
+                    [(OwnershipProjection.Slice (Maybe.Just 0)
+                                                (Maybe.Just 4))])
+        high-slice (OwnershipPlace.init
+                     (OwnershipResource.Binding (CoreRef.copy &root))
+                     [(OwnershipProjection.Slice (Maybe.Just 4)
+                                                 (Maybe.Just 8))])
+        other (OwnershipPlace.init
+                (OwnershipResource.Binding other-root)
+                [(OwnershipProjection.Field (String.copy "x"))])]
+    (and (Ownership.places-overlap? &x &x-again)
+         (and (not (Ownership.places-overlap? &x &y))
+              (and (not (Ownership.places-overlap? &i0 &i1))
+                   (and (Ownership.places-overlap? &i0 &unknown)
+                        (and (not
+                               (Ownership.places-overlap?
+                                 &low-slice
+                                 &high-slice))
+                             (and (Ownership.places-overlap? &whole &x)
+                                  (not
+                                    (Ownership.places-overlap?
+                                      &x
+                                      &other))))))))))
 
 (defn creates-specialization-aware-contexts? []
   (match (prepare-source "(defn identity [x] x)
@@ -122,13 +182,13 @@
                                                []
                                                [])]
     (Result.error?
-      &(Ownership.prepare &specialized &(OwnershipTypeFacts.init [] [])))))
+      &(Ownership.prepare &specialized &(OwnershipTypeFacts.init [] [] [] [])))))
 
 (defn ownership-facts []
   (let [string-key (CAbi.type-key &(MonoType.String))
         widget-key (CAbi.type-key &(MonoType.Named @"Widget" []))
         handle-key (CAbi.type-key &(MonoType.Named @"Handle" []))]
-    (OwnershipTypeFacts.init [string-key widget-key @&handle-key] [handle-key])))
+    (OwnershipTypeFacts.init [string-key widget-key @&handle-key] [handle-key] [] [])))
 
 (defn classified [type facts]
   (match (OwnershipClassify.classify type facts)
@@ -168,6 +228,28 @@
             (and (Int.= 1 (classified &widget-t &facts))
                  (Int.= 0 (classified &gadget-t &facts))))
         (Result.Error _) false) (Result.Error _) false))
+
+(defn delete-implementation-discharges-its-parameter? []
+  (match (prepare-source "(register-type Widget \"void*\")
+(defmodule Widget
+  (sig delete (Fn [Widget] ()))
+  (defn delete [widget] ())
+  (implements delete Widget.delete))")
+    (Result.Success plan) (Int.= 0 (count-deletes &plan))
+    (Result.Error _) false))
+
+(defn nested-facts-derivation? []
+  (match (prepare-source "(defmodule Types
+  (register-type Widget \"void*\")
+  (register destroy-widget (Fn [Widget] ()) \"Widget_delete\" [take])
+  (implements delete Types.destroy-widget))
+(defmodule Bindings
+  (register make-widget (Fn [] Types.Widget) \"make_widget\" []))
+(defn owns-widget [] (let [widget (Bindings.make-widget)] ()))
+(owns-widget)")
+    (Result.Success plan)
+      (Int.= 1 (count-deletes &plan))
+    (Result.Error _) false))
 
 (defn accepts-calling-captured-function? []
   (match (prepare-source "(defn wrap [f] (fn [x] (f x)))
@@ -293,10 +375,78 @@
       (and (Int.= 1 (count-moves &plan)) (Int.= 0 (count-binding-deletes &plan)))
     (Result.Error _) false))
 
+(defn normalizes-actions-to-place-accesses? []
+  (match (prepare-source
+      &(String.append owned-widget-prelude "(defn alias [w] (let [a w] a))
+(alias (make-widget))"))
+    (Result.Success plan)
+      (let-do [found-move false
+               found-drop false
+               accesses (OwnershipPlan.accesses &plan)]
+        (for [i 0 (Array.length accesses)]
+          (let [access (Array.unsafe-nth accesses i)
+                place (OwnershipAccess.place access)]
+            (when (Int.= 0 (Array.length (OwnershipPlace.projections place)))
+              (match-ref (OwnershipAccess.kind access)
+                (OwnershipAccessKind.Move)
+                  (match-ref (OwnershipPlace.root place)
+                    (OwnershipResource.Binding _) (set! found-move true)
+                    _ ())
+                (OwnershipAccessKind.Drop) (set! found-drop true)
+                _ ()))))
+        (and found-move
+             (and found-drop
+                  (Int.= (Array.length (OwnershipPlan.actions &plan))
+                         (Array.length accesses)))))
+    (Result.Error _) false))
+
 (defn accepts-parameter-borrow? []
   (Result.success?
     &(prepare-source &(String.append owned-widget-prelude "(defn borrow [w] &w)
 (borrow (make-widget))"))))
+
+(defn summarizes-parameter-and-result-contract? []
+  (match (prepare-source &(String.append owned-widget-prelude
+                                        "(defn borrow [w] &w)
+(borrow (make-widget))"))
+    (Result.Success plan)
+      (let-do [ok false
+               summaries (OwnershipPlan.summaries &plan)]
+        (for [i 0 (Array.length summaries)]
+          (let [summary (Array.unsafe-nth summaries i)]
+            (when (String.= (CoreRef.name (OwnershipFunctionSummary.reference summary))
+                            "borrow")
+              (let [parameters (OwnershipFunctionSummary.parameters summary)
+                    effect (OwnershipFunctionSummary.result summary)]
+                (set! ok
+                      (and (Int.= 1 (Array.length parameters))
+                           (and
+                             (match-ref
+                               (OwnershipParameterEffect.mode
+                                 (Array.unsafe-nth parameters 0))
+                               (OwnershipParameterMode.Take) true
+                               _ false)
+                             (and
+                               (match-ref (OwnershipResultEffect.ownership effect)
+                                 (OwnershipResultMode.Borrowed) true
+                                 _ false)
+                               (and
+                                 (Int.= 1
+                                        (Array.length
+                                          (OwnershipResultEffect.borrows-from effect)))
+                                 (Int.= 0
+                                        @(Array.unsafe-nth
+                                           (OwnershipResultEffect.borrows-from effect)
+                                           0)))))))))))
+        ok)
+    (Result.Error _) false))
+
+(defn strict-loans-reject-taken-result-borrow? []
+  (match (prepare-source &(String.append owned-widget-prelude
+                                        "(defn borrow [w] &w)
+(borrow (make-widget))"))
+    (Result.Success plan) (Result.error? &(Ownership.validate-strict-loans &plan))
+    (Result.Error _) false))
 
 (defn rejects-escaped-borrow? []
   (Result.error?
@@ -342,6 +492,234 @@
 (register inspect (Fn [(Ref Widget)] ()) \"inspect\")
 ")
 
+(defn infers-default-foreign-contract? []
+  (match (prepare-source
+           &(String.append borrow-move-prelude
+                           "(defn observe [w] (inspect &w))
+(observe (make-widget))"))
+    (Result.Success plan)
+      (let-do [ok false
+               contracts (OwnershipPlan.foreign-contracts &plan)]
+        (for [i 0 (Array.length contracts)]
+          (let [contract (Array.unsafe-nth contracts i)]
+            (when (String.= (OwnershipForeignContract.symbol contract) "inspect")
+              (let [parameters (OwnershipForeignContract.parameters contract)]
+                (set! ok
+                      (and (not @(OwnershipForeignContract.declared contract))
+                           (and (Int.= 1 (Array.length parameters))
+                           (and
+                             (match-ref (Array.unsafe-nth parameters 0)
+                               (OwnershipParameterMode.SharedBorrow) true
+                               _ false)
+                             (match-ref
+                               (OwnershipResultEffect.ownership
+                                 (OwnershipForeignContract.result contract))
+                               (OwnershipResultMode.Unmanaged) true
+                               _ false)))))))))
+        ok)
+    (Result.Error _) false))
+
+(defn retains-explicit-unique-foreign-contract? []
+  (match (prepare-source
+           &(String.append owned-widget-prelude
+                           "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn invoke [w] (mutate &w))
+(invoke (make-widget))"))
+    (Result.Success plan)
+      (let-do [ok false
+               contracts (OwnershipPlan.foreign-contracts &plan)]
+        (for [i 0 (Array.length contracts)]
+          (let [contract (Array.unsafe-nth contracts i)]
+            (when (String.= (OwnershipForeignContract.symbol contract) "mutate")
+              (set! ok
+                    (and @(OwnershipForeignContract.declared contract)
+                         (match-ref
+                           (Array.unsafe-nth
+                             (OwnershipForeignContract.parameters contract)
+                             0)
+                           (OwnershipParameterMode.UniqueBorrow) true
+                           _ false))))))
+        ok)
+    (Result.Error _) false))
+
+(defn rejects-copy-contract-for-owned-parameter? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+        "(register false-copy (Fn [Widget] ()) \"false_copy\" [copy])
+(false-copy (make-widget))"))))
+
+(defn rejects-take-contract-for-unmanaged-parameter? []
+  (Result.error?
+    &(prepare-source
+      "(register false-take (Fn [Int] ()) \"false_take\" [take])
+(false-take 1)")))
+
+(defn infers-phantom-view-result-borrow? []
+  (match (prepare-source
+           &(String.append owned-widget-prelude
+             "(register-type View \"carp_view\")
+(register view (Fn [(Ref Widget owner)] (View (Ref Widget owner))) \"view\" [shared])
+(defn use-view [w] (view &w))
+(use-view (make-widget))"))
+    (Result.Success plan)
+      (let-do [ok false
+               contracts (OwnershipPlan.foreign-contracts &plan)]
+        (for [i 0 (Array.length contracts)]
+          (let [contract (Array.unsafe-nth contracts i)]
+            (when (String.= (OwnershipForeignContract.symbol contract) "view")
+              (let [effect (OwnershipForeignContract.result contract)]
+                (set! ok
+                  (and
+                    (match-ref (OwnershipResultEffect.ownership effect)
+                      (OwnershipResultMode.Unmanaged) true
+                      _ false)
+                    (and
+                      (Int.= 1 (Array.length
+                                  (OwnershipResultEffect.borrows-from effect)))
+                      (Int.= 0 @(Array.unsafe-nth
+                                  (OwnershipResultEffect.borrows-from effect)
+                                  0)))))))))
+        ok)
+    (Result.Error _) false))
+
+(defn rejects-unique-foreign-call-with-live-alias? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn bad [w] (let [alias &w] (mutate &w)))
+(bad (make-widget))"))))
+
+(defn rejects-unique-foreign-call-through-alias? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn bad [w] (let [alias &w] (mutate alias)))
+(bad (make-widget))"))))
+
+(defn rejects-unique-foreign-call-with-overlapping-argument? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register mutate-and-inspect (Fn [(Ref Widget) (Ref Widget)] ()) \"mutate_and_inspect\" [unique shared])
+(defn bad [w] (mutate-and-inspect &w &w))
+(bad (make-widget))"))))
+
+(defn rejects-take-before-unique-of-same-owner? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register consume-and-mutate (Fn [Widget (Ref Widget)] ()) \"consume_and_mutate\" [take unique])
+(defn bad [w] (consume-and-mutate w &w))
+(bad (make-widget))"))))
+
+(defn rejects-unique-before-take-of-same-owner? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register mutate-and-consume (Fn [(Ref Widget) Widget] ()) \"mutate_and_consume\" [unique take])
+(defn bad [w] (mutate-and-consume &w w))
+(bad (make-widget))"))))
+
+(defn accepts-unique-foreign-call-after-alias-scope? []
+  (Result.success?
+    &(prepare-source
+      &(String.append borrow-move-prelude
+                      "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn good [w] (do (let [alias &w] (inspect alias)) (mutate &w)))
+(good (make-widget))"))))
+
+(defn summarizes-forwarded-reference-as-unique? []
+  (match (prepare-source
+           &(String.append owned-widget-prelude
+                           "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn forward [point] (mutate point))
+(defn invoke [w] (forward &w))
+(invoke (make-widget))"))
+    (Result.Success plan)
+      (let-do [ok false
+               summaries (OwnershipPlan.summaries &plan)]
+        (for [i 0 (Array.length summaries)]
+          (let [summary (Array.unsafe-nth summaries i)]
+            (when (String.= (CoreRef.name
+                              (OwnershipFunctionSummary.reference summary))
+                            "forward")
+              (set! ok
+                    (match-ref
+                      (OwnershipParameterEffect.mode
+                        (Array.unsafe-nth
+                          (OwnershipFunctionSummary.parameters summary)
+                          0))
+                      (OwnershipParameterMode.UniqueBorrow) true
+                      _ false)))))
+        ok)
+    (Result.Error _) false))
+
+(defn transitive-unique-requirements-reach-wrappers? []
+  (match (prepare-source
+           &(String.append owned-widget-prelude
+                           "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn leaf [point] (mutate point))
+(defn middle [point] (leaf point))
+(defn invoke [w] (middle &w))
+(invoke (make-widget))"))
+    (Result.Success plan)
+      (let-do [leaf-unique false
+               middle-unique false
+               summaries (OwnershipPlan.summaries &plan)]
+        (for [i 0 (Array.length summaries)]
+          (let [summary (Array.unsafe-nth summaries i)
+                name (CoreRef.name
+                       (OwnershipFunctionSummary.reference summary))
+                unique (match-ref
+                         (OwnershipParameterEffect.mode
+                           (Array.unsafe-nth
+                             (OwnershipFunctionSummary.parameters summary)
+                             0))
+                         (OwnershipParameterMode.UniqueBorrow) true
+                         _ false)]
+            (do
+              (when (String.= name "leaf") (set! leaf-unique unique))
+              (when (String.= name "middle") (set! middle-unique unique)))))
+        (and leaf-unique middle-unique))
+    (Result.Error _) false))
+
+(defn rejects-alias-before-transitively-unique-call? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(register mutate (Fn [(Ref Widget)] ()) \"mutate\" [unique])
+(defn leaf [point] (mutate point))
+(defn bad [point] (let [alias point] (leaf point)))
+(defn invoke [w] (bad &w))
+(invoke (make-widget))"))))
+
+(defn mutation-intrinsics-require-unique-parameters? []
+  (match (prepare-source
+           "(defn mutate-first [values] (Array.aset! values 0 7))
+(defn invoke [] (let [values [1 2]] (mutate-first &values)))
+(invoke)")
+    (Result.Success plan)
+      (let-do [ok false
+               summaries (OwnershipPlan.summaries &plan)]
+        (for [i 0 (Array.length summaries)]
+          (let [summary (Array.unsafe-nth summaries i)]
+            (when (String.= (CoreRef.name
+                              (OwnershipFunctionSummary.reference summary))
+                            "mutate-first")
+              (set! ok
+                    (match-ref
+                      (OwnershipParameterEffect.mode
+                        (Array.unsafe-nth
+                          (OwnershipFunctionSummary.parameters summary)
+                          0))
+                      (OwnershipParameterMode.UniqueBorrow) true
+                      _ false)))))
+        ok)
+    (Result.Error _) false))
+
 (defn rejects-borrow-after-move? []
   (Result.error?
     &(prepare-source
@@ -363,6 +741,15 @@
 (register read-gauge (Fn [(Ref Gauge)] ()) \"rg\")
 (defn f [] (let [g (make-gauge) r &g] (do (take-gauge g) (read-gauge r))))
 (f)")))
+
+(defn rejects-owned-reuse-after-dynamic-closure-call? []
+  (Result.error?
+    &(prepare-source
+      &(String.append owned-widget-prelude
+                      "(defn bad []
+  (let [w (make-widget) consume-it (fn [x] ())]
+    (do (consume-it w) (inspect &w))))
+(bad)"))))
 
 (defn rejects-mutation-escape? []
   (Result.error?
@@ -393,6 +780,9 @@
     (generated-ownership-actions-use-derived-provenance?)
     "ownership actions on generated nodes inherit the declaration span")
   (assert-true t
+    (structured-place-overlap-is-projection-sensitive?)
+    "structured places prove known fields, indices, and slices disjoint")
+  (assert-true t
     (creates-specialization-aware-contexts?)
     "ownership contexts distinguish concrete instances and share the root ID space")
   (assert-true t
@@ -405,8 +795,59 @@
     (facts-derivation?)
     "ownership facts are derived from a module's declared delete implementations")
   (assert-true t
+    (delete-implementation-discharges-its-parameter?)
+    "a delete implementation discharges its parameter without recursive implicit cleanup")
+  (assert-true t
+    (nested-facts-derivation?)
+    "nested registered types retain their qualified delete ownership facts")
+  (assert-true t
     (accepts-calling-captured-function?)
     "invoking a captured function borrows rather than consumes the closure")
+  (assert-true t
+    (infers-default-foreign-contract?)
+    "reachable external functions receive explicit default ownership contracts")
+  (assert-true t
+    (retains-explicit-unique-foreign-contract?)
+    "declared unique foreign parameters survive specialization and ownership planning")
+  (assert-true t
+    (rejects-copy-contract-for-owned-parameter?)
+    "an explicit copy contract cannot disguise an owned parameter move")
+  (assert-true t
+    (rejects-take-contract-for-unmanaged-parameter?)
+    "an explicit take contract cannot claim consumption of an unmanaged parameter")
+  (assert-true t
+    (infers-phantom-view-result-borrow?)
+    "registered by-value views retain phantom owner-reference lifetimes")
+  (assert-true t
+    (rejects-unique-foreign-call-with-live-alias?)
+    "a unique foreign borrow rejects an overlapping live alias")
+  (assert-true t
+    (rejects-unique-foreign-call-through-alias?)
+    "a unique foreign argument must be a direct borrow of its owner")
+  (assert-true t
+    (rejects-unique-foreign-call-with-overlapping-argument?)
+    "a unique foreign borrow rejects another argument derived from the same owner")
+  (assert-true t
+    (rejects-take-before-unique-of-same-owner?)
+    "a taken value cannot also be uniquely borrowed later in the same call")
+  (assert-true t
+    (rejects-unique-before-take-of-same-owner?)
+    "a unique borrow cannot also be taken later in the same call")
+  (assert-true t
+    (accepts-unique-foreign-call-after-alias-scope?)
+    "a unique foreign borrow is accepted once an earlier alias leaves scope")
+  (assert-true t
+    (summarizes-forwarded-reference-as-unique?)
+    "forwarding a reference into a unique foreign call upgrades the wrapper contract")
+  (assert-true t
+    (transitive-unique-requirements-reach-wrappers?)
+    "unique requirements propagate through ordinary Carp wrappers")
+  (assert-true t
+    (rejects-alias-before-transitively-unique-call?)
+    "transitively unique Carp calls reject an overlapping alias")
+  (assert-true t
+    (mutation-intrinsics-require-unique-parameters?)
+    "in-place array mutation upgrades its reference parameter to unique")
   (assert-true t
     (plans-delete-for-unused-owned?)
     "an unused owned local is scheduled for deletion at scope exit")
@@ -420,8 +861,17 @@
     (plans-move-for-aliased-owned?)
     "an owned value aliased into a let binding is planned as a move")
   (assert-true t
+    (normalizes-actions-to-place-accesses?)
+    "ownership actions are normalized into structured place accesses")
+  (assert-true t
     (accepts-parameter-borrow?)
     "a reference to a parameter may be returned")
+  (assert-true t
+    (summarizes-parameter-and-result-contract?)
+    "function summaries retain parameter ownership and result borrow relations")
+  (assert-true t
+    (strict-loans-reject-taken-result-borrow?)
+    "strict loan contracts reject returning a borrow into a taken parameter")
   (assert-true t
     (rejects-escaped-borrow?)
     "a reference to a local value that escapes its scope is rejected")
@@ -446,6 +896,9 @@
   (assert-true t
     (accepts-unmanaged-borrow-after-pass?)
     "borrowing an unmanaged value and using it after passing it (a copy) is accepted")
+  (assert-true t
+    (rejects-owned-reuse-after-dynamic-closure-call?)
+    "passing an owned value to a dynamic closure moves it")
   (assert-true t
     (rejects-mutation-escape?)
     "a set! that repoints a returned reference at a local is rejected")
