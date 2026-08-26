@@ -60,16 +60,20 @@ reserved in the stable vocabulary for expression-level access collection.
 Each concrete body receives an `OwnershipFunctionSummary`. Parameters are
 classified as `Copy`, `Take`, `SharedBorrow`, or `UniqueBorrow`; the result
 separately records its ownership class and the parameter indices whose
-lifetimes it may retain. `Ownership.validate-strict-loans` is an opt-in check
-for Rust-like affine boundaries. It currently rejects a result which borrows
-from a by-value `Take` parameter, a contract legacy Carp accepts but cannot
-soundly express as a Rust return lifetime.
+lifetimes it may retain. `Ownership.validate-strict-loans` is applied by
+reusable-library emission and is also callable directly by compiler clients. It
+currently rejects a result which borrows from a by-value `Take` parameter, a
+contract legacy executable compilation accepts but cannot soundly expose as a
+Rust-like return lifetime.
 
 Reachable `register`ed C/Rust symbols receive `OwnershipForeignContract`
 records keyed by Carp identity and emitted symbol. Signature-derived reference
 parameters default to `SharedBorrow`. A register may declare parameter modes as
 an optional final array, for example `[unique copy]`; mode count and reference
-shape are checked during resolution. At every `unique` call, the ownership pass
+shape are checked during resolution. After specialization, explicit modes are
+also checked against concrete ownership classification: an owned parameter
+cannot be declared `copy`, and an unmanaged parameter cannot be declared
+`take`. At every `unique` call, the ownership pass
 requires a direct borrow of a named owner or a forwarded reference parameter,
 and rejects a live alias or another argument derived from that owner. Forwarding
 upgrades that parameter in the caller's summary to `UniqueBorrow`, and both the

@@ -2393,12 +2393,84 @@ of its owned arguments and must release any it neither returns nor passes on.")
   (hidden foreign-contracts)
   (private core-foreign-mode)
   (hidden core-foreign-mode)
+  (private declared-mode-compatible?)
+  (hidden declared-mode-compatible?)
+  (private foreign-parameter-contract-error)
+  (hidden foreign-parameter-contract-error)
+  (private validate-foreign-parameter-contracts)
+  (hidden validate-foreign-parameter-contracts)
   (defn core-foreign-mode [mode]
     (match-ref mode
       (CoreForeignParameterMode.Copy) (OwnershipParameterMode.Copy)
       (CoreForeignParameterMode.Take) (OwnershipParameterMode.Take)
       (CoreForeignParameterMode.Shared) (OwnershipParameterMode.SharedBorrow)
       (CoreForeignParameterMode.Unique) (OwnershipParameterMode.UniqueBorrow)))
+
+  (defn declared-mode-compatible? [mode type facts]
+    (match (OwnershipClassify.classify type facts)
+      (OwnershipClass.Unmanaged)
+        (match-ref mode (CoreForeignParameterMode.Copy) true _ false)
+      (OwnershipClass.Owned)
+        (match-ref mode (CoreForeignParameterMode.Take) true _ false)
+      (OwnershipClass.Borrowed)
+        (match-ref mode
+          (CoreForeignParameterMode.Shared) true
+          (CoreForeignParameterMode.Unique) true
+          _ false)))
+
+  (defn foreign-parameter-contract-error [primitive facts]
+    (match-ref (SpecializedPrimitive.source primitive)
+      (Maybe.Just source)
+        (match-ref (SpecializedBuiltinSource.payload source)
+          (CoreBuiltinPayload.External _ declared-modes)
+            (match-ref declared-modes
+              (Maybe.Just modes)
+                (let [specialization
+                        (SpecializedPrimitive.specialization primitive)]
+                  (match-ref (Box.peek
+                      (Specialization.signature specialization))
+                    (MonoType.Function argument-types _)
+                      (let-do [error (the (Maybe OwnershipError)
+                                          (Maybe.Nothing))]
+                        (for [i 0 (Int.min (Array.length modes)
+                                            (Array.length argument-types))]
+                          (when (and (Maybe.nothing? &error)
+                                     (not (declared-mode-compatible?
+                                            (Array.unsafe-nth modes i)
+                                            (Box.peek
+                                              (Array.unsafe-nth argument-types i))
+                                            facts)))
+                            (set! error
+                              (Maybe.Just
+                                (OwnershipError.init
+                                  (fmt
+                                    "foreign parameter mode %d of %s disagrees with its concrete ownership class"
+                                    i
+                                    (CoreRef.name
+                                      (Specialization.reference
+                                        specialization))))))))
+                        error)
+                    _ (Maybe.Nothing)))
+              (Maybe.Nothing) (Maybe.Nothing))
+          _ (Maybe.Nothing))
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (doc validate-foreign-parameter-contracts "checks declared foreign modes
+against the concrete ownership classification used by call analysis. This
+prevents an ABI manifest from claiming `copy` for a value the compiler moves,
+or `take` for an unmanaged value it actually copies. Shared and unique remain
+the two valid refinements of a reference parameter.")
+  (defn validate-foreign-parameter-contracts [specialized facts]
+    (let-do [result (the (Result () OwnershipError) (Result.Success ()))
+             primitives (SpecializationModule.primitives specialized)]
+      (for [i 0 (Array.length primitives)]
+        (when (Result.success? &result)
+          (match (foreign-parameter-contract-error
+                   (Array.unsafe-nth primitives i)
+                   facts)
+            (Maybe.Just error) (set! result (Result.Error error))
+            (Maybe.Nothing) ())))
+      result))
 
   (defn foreign-contracts [specialized facts]
     (let-do [result (the (Array OwnershipForeignContract) [])
@@ -2665,7 +2737,10 @@ summaries; a wrapper therefore cannot erase a callee's unique obligation.")
 specialization-aware namespaces, and plans ownership deletes for owned values
 that are not moved out of their scope. Types are classified from `facts`.")
   (defn prepare [specialized facts]
-    (let-do [effective-facts (inferred-call-facts specialized facts)
+    (match (validate-foreign-parameter-contracts specialized facts)
+      (Result.Error error) (Result.Error error)
+      (Result.Success _)
+        (let-do [effective-facts (inferred-call-facts specialized facts)
              contexts (the (Array OwnershipContext) [])
              actions (the (Array OwnershipAction) [])
              summaries (the (Array OwnershipFunctionSummary) [])
@@ -2781,4 +2856,4 @@ that are not moved out of their scope. Types are classified from `facts`.")
                             reqs))))
               (Result.Error error) (set! result (Result.Error error))))
         (Result.Error _) ())
-      result)))
+          result))))

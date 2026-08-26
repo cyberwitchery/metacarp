@@ -245,6 +245,12 @@ without making editor transport part of this compiler.
 [`docs/carp-session.md`](docs/carp-session.md) records the original design and
 implementation history.
 
+[`docs/semantic-delta.md`](docs/semantic-delta.md) separates the branch's
+language changes from compiler-correctness and hosting work, maps its affine
+contracts to Rust, and records the deliberately weaker parts of that mapping.
+[`docs/rust-affine-interop.md`](docs/rust-affine-interop.md) contains the
+lower-level ownership design.
+
 ## Limitations
 
 - Target configuration is detected from the build host; an explicit

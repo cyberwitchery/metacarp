@@ -14,7 +14,8 @@ The ownership IR therefore separates representation from proof:
 - `OwnershipFunctionSummary` describes Carp entry/exit effects.
 - `OwnershipForeignContract` describes reachable registered symbols.
 - `Ownership.validate-strict-loans` rejects contracts which cannot safely cross
-  a Rust-like boundary.
+  a Rust-like boundary and is applied automatically during reusable-library
+  emission.
 
 Signature-derived foreign references remain shared. An explicit register
 contract can refine a reference parameter to unique:
@@ -97,7 +98,7 @@ storage validity; loan guards govern temporary shared/unique access.
    default behavior change.
 2. Land normalized access facts and function summaries.
 3. Land foreign-contract records with shared defaults.
-4. Land strict validation behind an explicit compiler/session option.
+4. Land strict validation at the explicit reusable-library/session boundary.
 5. ~~Add declaration syntax for unique foreign parameters and enforce it at
    call sites before changing C lowering.~~ Implemented at whole-root lexical
    precision.

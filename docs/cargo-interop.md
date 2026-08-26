@@ -26,7 +26,9 @@ The Carp binding module owns typed declarations and foreign ownership modes:
 
 Resolution checks that the mode list matches function arity, that `shared` and
 `unique` are used only for reference parameters, and that by-value parameters
-use `copy` or `take`. The ownership pass:
+use `copy` or `take`. After specialization, the ownership pass also checks the
+declared mode against concrete ownership classification, so `copy` cannot hide
+an owned move and `take` cannot misdescribe an unmanaged copy. It then:
 
 - preserves these contracts in its structured manifest;
 - rejects overlapping strict unique access, including another argument that
@@ -35,6 +37,10 @@ use `copy` or `take`. The ownership pass:
 - marks owned values passed by value to global or dynamic closure calls as
   moved; and
 - uses the same move/borrow/delete plan for C emission and session reports.
+
+Reusable-library emission rejects a returned borrow into a consumed by-value
+parameter. Ordinary executable compilation retains legacy Carp behavior; the
+strict rule belongs to the new host-visible boundary.
 
 `Session.emit-library` emits an entry-point-free C translation unit for
 explicit roots. `Session.emit-library-with-build` carries caller-resolved
