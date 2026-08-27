@@ -9,7 +9,10 @@ and implementations can be committed and queried with `Session.upsert`,
 `Session.remove`, and `Session.definitions`. Warm editor queries expose
 ownership plans, macro expansion, completion, and structured documentation.
 `Session.emit-cell` emits a deterministic executable C translation unit without
-mutating the session. `Session.create` loads and checks Core once; subsequent
+mutating the session; `Session.lower-cell`/`Session.lower-cell-plain` stop the
+same transactional pipeline at the lowered `BackendModule` for alternative
+backends (the LLVM session JIT in `carp-llvm-backend/carp-session-jit.carp` —
+carp-session itself stays free of libLLVM). `Session.create` loads and checks Core once; subsequent
 cells and definition rebuilds reuse the warm Core expansion, resolution, and
 inference snapshots.
 

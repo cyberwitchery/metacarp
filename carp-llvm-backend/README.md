@@ -79,8 +79,22 @@ the test compiles it with clang into a dylib and `dlopen`s it with
 link the shim object instead. Since both backends read the same lowered
 `BackendModule`, the mangled symbols agree by construction.
 
+The backend also powers a session JIT (`carp-session-jit.carp`): a
+notebook/editor host loads it beside carp-session and gets
+`SessionJit.run-cell` — the transactional cell pipeline stops at the lowered
+`BackendModule` (`Session.lower-cell-plain`), which is emitted into a fresh
+LLVM module and executed in-process by a fresh MCJIT engine. Template
+specializations live in one shim dylib compiled on the first cell and reused
+until a cell introduces a new specialization; a warm cell pays no clang at
+all. `run-cell` returns the cell's last integer-typed top-level value;
+`run-cell-echoed` prints the result the way a driver-built binary would.
+Measured on an Apple arm64 host against the real Core: first cell ≈ 1.0 s
+(includes the one shim clang), warm cells ≈ 96 ms — the emit-C → clang → run
+path measures ≈ 360 ms per cell (`test/jit-benchmark.carp`).
+
 ```bash
 carp -x test/carp-llvm-backend.carp
+CARP_DIR=<carp checkout> carp -x test/carp-session-jit.carp
 ```
 
 The backend also has a driver: `carp -b --optimize main-llvm.carp` at the

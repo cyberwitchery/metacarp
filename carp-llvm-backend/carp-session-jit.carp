@@ -1,0 +1,205 @@
+;; carp-session-jit — the LLVM session JIT: runs a session cell natively
+;; through MCJIT instead of emitting C for a clang round-trip.
+;;
+;; The split keeps carp-session free of libLLVM: `Session.lower-cell` stops
+;; the transactional cell pipeline at the lowered BackendModule, and this
+;; component (loaded only by hosts that want the JIT) does the LLVM work.
+;;
+;; Per session there is one LLVM context, target machine, and data layout,
+;; plus one C shim dylib holding the template specializations (deftemplate
+;; bodies, primitive templates, wrappers): clang compiles it ONCE, on the
+;; first cell, and again only when a later cell introduces a template
+;; specialization the dylib does not have yet. A cell whose templates are all
+;; materialized pays no clang at all: its BackendModule is emitted into a
+;; fresh LLVM module, JIT-compiled by a fresh MCJIT engine (which resolves
+;; the template symbols from the dlopened shim), and its roots function runs
+;; in-process — echo output prints to the host's stdout, and the returned
+;; Int is the last integer-typed top-level's value, like the driver's.
+;;
+;; Cells keep emit-cell's whole-program semantics: each run is a fresh
+;; program over the committed session state (globals re-initialize per run).
+
+(load "../carp-session/carp-session.carp")
+(load "carp-llvm-backend.carp")
+
+(system-include "dlfcn.h")
+
+(deftemplate carp-jit-dlopen-global (Fn [(Ptr CChar)] Long)
+  "Long $NAME(char* path)"
+  "$DECL { void* h = dlopen(path, RTLD_NOW | RTLD_GLOBAL); return (Long)(intptr_t)h; }")
+(hidden carp-jit-dlopen-global)
+
+(deftype JitSession
+  [context LLVMContext
+   machine LLVMTargetMachine
+   data LLVMTargetData
+   triple String
+   core-dir String
+   scratch String
+   materialized (Array String)
+   serial Int])
+
+(defmodule SessionJit
+  (doc create "creates a warm JIT for one session: the native target is
+initialized, MCJIT linked in, and one context, target machine, and data
+layout are set up for every cell to share. `core-dir` locates the runtime
+headers the shim compiles against; `scratch` is a writable directory for the
+shim C file and dylib.")
+  (defn create [core-dir scratch]
+    (let-do [_init (do (ignore (LLVM.initialize-native-target))
+                       (ignore (LLVM.initialize-native-asm-printer))
+                       (LLVM.link-in-mcjit)
+                       0)
+             ctx (LLVM.context-create)
+             triple (LLVM.default-target-triple)
+             tm (LLVM.create-target-machine (LLVM.target-from-triple (String.cstr &triple))
+                                            (String.cstr &triple)
+                                            (String.cstr &@"") (String.cstr &@"")
+                                            LLVM.codegen-level-default LLVM.reloc-pic
+                                            LLVM.codemodel-default)
+             td (LLVM.create-target-data-layout tm)]
+      (LLVMBackend.use-carp-allocator!)
+      (JitSession.init ctx tm td triple (String.copy core-dir) (String.copy scratch)
+                       (the (Array String) []) 0)))
+
+  (doc dispose "frees the JIT's target data, machine, and context. Cells'
+modules and engines are already per-run and freed by `run-cell`.")
+  (defn dispose [js]
+    (do
+      (LLVM.dispose-target-data (LLVM.dup (JitSession.data js)))
+      (LLVM.dispose-target-machine (LLVM.dup (JitSession.machine js)))
+      (LLVM.context-dispose (LLVM.dup (JitSession.context js)))))
+
+  (private template-symbols)
+  (hidden template-symbols)
+  (defn template-symbols [backend]
+    (let-do [symbols (the (Array String) [])
+             declarations (BackendModule.declarations backend)]
+      (for [i 0 (Array.length declarations)]
+        (match-ref (Array.unsafe-nth declarations i)
+          (BackendDeclaration.Template symbol _ _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          (BackendDeclaration.SourceTemplate symbol _ _ _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          _ ()))
+      symbols))
+
+  (private materialized?)
+  (hidden materialized?)
+  (defn materialized? [js symbol]
+    (let-do [found false]
+      (for [i 0 (Array.length (JitSession.materialized js))]
+        (when (String.= (Array.unsafe-nth (JitSession.materialized js) i) symbol)
+          (set! found true)))
+      found))
+
+  (private jit-diagnostic)
+  (hidden jit-diagnostic)
+  (defn jit-diagnostic [message]
+    (Diagnostic.init @"jit" message (the (Maybe SourceSpan) (Maybe.Nothing))))
+
+  (doc ensure-shim! "makes every template specialization `backend` needs
+resolvable in the process: when one is missing from the materialized set, the
+full shim translation unit is rendered, clang-compiled to a dylib (the one
+clang invocation a session pays, repeated only when new specializations
+appear), and dlopened RTLD_GLOBAL so MCJIT's process resolver finds the
+symbols.")
+  (defn ensure-shim! [js backend]
+    (let-do [needed (template-symbols backend)
+             missing false]
+      (for [i 0 (Array.length &needed)]
+        (unless (materialized? js (Array.unsafe-nth &needed i))
+          (set! missing true)))
+      (if (not missing)
+        (Result.Success ())
+        (match (LLVMBackend.shim-translation-unit backend)
+          (Result.Error error)
+            (Result.Error (jit-diagnostic @(BackendError.message &error)))
+          (Result.Success shim)
+            (let-do [serial @(JitSession.serial js)
+                     base (fmt "%s/carp-jit-shim-%d" (JitSession.scratch js) serial)
+                     c-path (fmt "%s.c" &base)
+                     dylib-path (fmt "%s.dylib" &base)]
+              (JitSession.set-serial! js (Int.inc serial))
+              (match (IO.write-file &shim &c-path)
+                (Result.Error e)
+                  (Result.Error (jit-diagnostic (fmt "cannot write shim: %s" &e)))
+                (Result.Success _)
+                  (if (Int./= 0 (System.system
+                                  &(fmt "clang -dynamiclib -undefined dynamic_lookup -o %s %s -I %s %s"
+                                        &dylib-path &c-path (JitSession.core-dir js)
+                                        &(String.join " " &(CtEval.collected-cflags)))))
+                    (Result.Error (jit-diagnostic @"shim clang failed"))
+                    (if (Long.= 0l (carp-jit-dlopen-global (String.cstr &dylib-path)))
+                      (Result.Error (jit-diagnostic @"shim dlopen failed"))
+                      (let-do [known (JitSession.materialized js)]
+                        (for [i 0 (Array.length &needed)]
+                          (unless (materialized? js (Array.unsafe-nth &needed i))
+                            (Array.push-back! known
+                                              (String.copy (Array.unsafe-nth &needed i)))))
+                        (Result.Success ()))))))))))
+
+  (private run-lowered)
+  (hidden run-lowered)
+  (defn run-lowered [js lowered]
+    (match lowered
+      (Result.Error diagnostic) (Result.Error diagnostic)
+      (Result.Success backend)
+        (match (ensure-shim! js &backend)
+          (Result.Error diagnostic) (Result.Error diagnostic)
+          (Result.Success _)
+            (let-do [ctx (LLVM.dup (JitSession.context js))
+                     td (LLVM.dup (JitSession.data js))
+                     cell-name (fmt "carp-jit-cell-%d" @(JitSession.serial js))
+                     mod (LLVM.module-create (String.cstr &cell-name) ctx)
+                     builder (LLVM.builder-create ctx)]
+              (JitSession.set-serial! js (Int.inc @(JitSession.serial js)))
+              (LLVM.set-target mod (String.cstr (JitSession.triple js)))
+              (LLVM.set-module-data-layout mod td)
+              (match (LLVMBackend.emit-module ctx builder mod td &backend)
+                (Result.Error message)
+                  (do
+                    (LLVM.builder-dispose builder)
+                    (LLVM.module-dispose mod)
+                    (Result.Error (jit-diagnostic (fmt "llvm backend: %s" &message))))
+                (Result.Success _)
+                  (let [verify (LLVM.verify-module mod)]
+                    (if (not (String.empty? &verify))
+                      (do
+                        (LLVM.builder-dispose builder)
+                        (LLVM.module-dispose mod)
+                        (Result.Error (jit-diagnostic (fmt "llvm verifier: %s" &verify))))
+                      ;; the engine takes ownership of the module
+                      (let [engine (LLVM.create-execution-engine mod)]
+                        (if (LLVM.engine-null? engine)
+                          (do
+                            (LLVM.builder-dispose builder)
+                            (Result.Error (jit-diagnostic @"engine creation failed")))
+                          (let-do [roots (LLVMBackend.roots-symbol)
+                                   address (LLVM.function-address engine (String.cstr &roots))]
+                            (if (Long.= 0l address)
+                              (do
+                                (LLVM.engine-dispose engine)
+                                (LLVM.builder-dispose builder)
+                                (Result.Error (jit-diagnostic @"roots symbol not found")))
+                              (let-do [value (LLVM.call-i32 address)]
+                                (LLVM.engine-dispose engine)
+                                (LLVM.builder-dispose builder)
+                                (Result.Success value)))))))))))))
+
+  (doc run-cell "checks, lowers, JIT-compiles, and RUNS `input` against the
+session: `Session.lower-cell-plain`'s transactional BackendModule is emitted
+into a fresh LLVM module, a fresh MCJIT engine compiles it (template symbols
+resolve from the shim dylib), and the roots function executes in-process.
+Returns the cell's value: the last integer-typed top-level's result, 0
+otherwise.")
+  (defn run-cell [js session input]
+    (run-lowered js (Session.lower-cell-plain session input)))
+
+  (doc run-cell-echoed "as `run-cell`, but with the driver's top-level result
+echo: the cell's value is PRINTED to stdout by the same `str` a driver-built
+binary would pick, and the returned Int is the echoed roots value (0 — the
+echo wrapping consumes the top level).")
+  (defn run-cell-echoed [js session input]
+    (run-lowered js (Session.lower-cell session input)))
+)

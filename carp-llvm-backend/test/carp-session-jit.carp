@@ -1,0 +1,127 @@
+(load "../carp-session-jit.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+(defn core-dir []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Just root)
+      (if (or (String.ends-with? &root "/core")
+              (String.ends-with? &root "/core/"))
+        root
+        (String.append &root (if (String.ends-with? &root "/") "core" "/core")))
+    (Maybe.Nothing) (String.copy "../../../../carp/core")))
+
+(defn diagnostic-line [diagnostic]
+  (String.concat &[(String.copy (Diagnostic.phase diagnostic))
+                   @": "
+                   (String.copy (Diagnostic.message diagnostic))]))
+
+(defn run-int [js session id source]
+  (let [cell (SourceInput.init (String.copy id) (String.copy source))]
+    (match (SessionJit.run-cell js session &cell)
+      (Result.Success value) value
+      (Result.Error diagnostic)
+        (do
+          (IO.println &(diagnostic-line &diagnostic))
+          -1))))
+
+;; results of the one shared scenario, in order:
+;;   0 (Int.+ 1 2)                             expected 3
+;;   1 (Int.* 6 7)                             expected 42
+;;   2 new templates between cells 1 and 2     expected 0
+;;   3 string cell                             expected 4
+;;   4 committed definition cell               expected 42
+;;   5 unknown-symbol cell failed              expected 1
+;;   6 cell after the failed one               expected 5
+(def *jit-results* (the (Array Int) []))
+
+(defn jit-scenario! []
+  (let-do [dir (core-dir)
+           _mk (ignore (System.system "mkdir -p out"))
+           js (SessionJit.create &dir "out")
+           results (the (Array Int) [])]
+    (match (Session.create &dir)
+      (Result.Error diagnostic)
+        (IO.println &(diagnostic-line &diagnostic))
+      (Result.Success session)
+        (do
+          (Array.push-back! &results (run-int &js &session "cell:add" "(Int.+ 1 2)"))
+          (let-do [after-first (Array.length (JitSession.materialized &js))
+                   second (run-int &js &session "cell:mul" "(Int.* 6 7)")
+                   after-second (Array.length (JitSession.materialized &js))]
+            (Array.push-back! &results second)
+            (Array.push-back! &results (Int.- after-second after-first)))
+          (Array.push-back!
+            &results
+            (run-int &js &session "cell:string"
+                     "(String.length &(String.append \"ab\" \"cd\"))"))
+          (let [definition (SourceInput.init (String.copy "definition:twice")
+                                             (String.copy "(defn twice [x] (Int.* 2 x))"))]
+            (match (Session.upsert &session &definition)
+              (Result.Error diagnostic)
+                (do
+                  (IO.println &(diagnostic-line &diagnostic))
+                  (Array.push-back! &results -1))
+              (Result.Success _)
+                (Array.push-back! &results
+                                  (run-int &js &session "cell:twice" "(twice 21)"))))
+          (let [bad (SourceInput.init (String.copy "cell:bad")
+                                      (String.copy "(no-such-function 1)"))]
+            (match (SessionJit.run-cell &js &session &bad)
+              (Result.Success _) (Array.push-back! &results 0)
+              (Result.Error _) (Array.push-back! &results 1)))
+          (Array.push-back! &results
+                            (run-int &js &session "cell:after-bad" "(Int.+ 2 3)"))
+          (let [echoed (SourceInput.init (String.copy "cell:echoed")
+                                         (String.copy "(Int.+ 40 2)"))]
+            (match (SessionJit.run-cell-echoed &js &session &echoed)
+              (Result.Success _) (Array.push-back! &results 1)
+              (Result.Error diagnostic)
+                (do
+                  (IO.println &(diagnostic-line &diagnostic))
+                  (Array.push-back! &results 0))))
+          (SessionJit.dispose &js)))
+    results))
+
+(deftest test
+  (let-do [results (jit-scenario!)]
+    (do
+      (set! *jit-results* results)
+      (assert-equal test
+                    8
+                    (Array.length &*jit-results*)
+                    "the jit scenario ran every step")))
+  (assert-equal test
+                3
+                @(Array.unsafe-nth &*jit-results* 0)
+                "jit runs an integer cell (echo prints, value returned)")
+  (assert-equal test
+                42
+                @(Array.unsafe-nth &*jit-results* 1)
+                "a second cell runs")
+  (assert-equal test
+                0
+                @(Array.unsafe-nth &*jit-results* 2)
+                "a same-shape cell reuses the shim (no new templates)")
+  (assert-equal test
+                4
+                @(Array.unsafe-nth &*jit-results* 3)
+                "jit runs a string cell across the shim")
+  (assert-equal test
+                42
+                @(Array.unsafe-nth &*jit-results* 4)
+                "jit runs a cell against a committed definition")
+  (assert-equal test
+                1
+                @(Array.unsafe-nth &*jit-results* 5)
+                "an unknown symbol is refused before the jit")
+  (assert-equal test
+                5
+                @(Array.unsafe-nth &*jit-results* 6)
+                "a failed cell leaves the jit session usable")
+  (assert-equal test
+                1
+                @(Array.unsafe-nth &*jit-results* 7)
+                "an echoed cell runs and prints its value"))
