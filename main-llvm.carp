@@ -1,0 +1,267 @@
+;; carp-compiler-llvm — the LLVM driver: the same front half as main.carp
+;; (loading, expansion, resolution, inference, specialization, ownership,
+;; lowering), then carp-llvm-backend instead of C rendering. The default
+;; action prints LLVM IR; -b/-x emit a native object through the LLVM target
+;; machine and link it with clang against the C shim (deftemplate sources,
+;; primitive templates, and a generated main).
+;;
+;; Experimental: the backend covers the example tiers (see
+;; carp-llvm-backend/README.md); constructs beyond them are reported as
+;; errors, never mis-lowered. Requires libLLVM (see LLVM.setup).
+
+(load "carp-compiler.carp")
+(load "driver-load.carp")
+(load "carp-llvm-backend/carp-llvm-backend.carp")
+(Project.config "title" "carp-compiler-llvm")
+(Project.no-echo)
+;; same stack reservation as the C driver: the compile-time evaluator recurses
+;; deeply through dynamic Map code
+(when (= (host-os) "darwin") (add-cflag "-Wl,-stack_size,0x20000000"))
+
+(defn print-llvm-help []
+  (do
+    (IO.println "usage: carp-compiler-llvm [options] <source.carp>")
+    (IO.println "")
+    (IO.println "  -b, --build           compile to an executable instead of IR (needs --core)")
+    (IO.println "  -x, --execute         compile to an executable and run it (needs --core)")
+    (IO.println "  -c, --core <dir>      compile against the Carp standard library in <dir>")
+    (IO.println "  -o, --output <file>   output path — the IR file, or the executable under -b")
+    (IO.println "  --no-core             skip the implicit Core load")
+    (IO.println "  -h, --help            show this help and exit")
+    (IO.println "  -v, --version         show version and exit")
+    (IO.println "")
+    (IO.println "with no -b/-x, the LLVM IR is written to standard output (or -o).")
+    (IO.println "diagnostics go to standard error and name the rejecting phase.")))
+
+(defn lower-input [input core-dir no-core]
+  (match (load-with-core input core-dir no-core)
+    (Maybe.Nothing) (the (Maybe BackendModule) (Maybe.Nothing))
+    (Maybe.Just pair)
+      (match (CarpCompiler.lower-module-full (Pair.a &pair)
+                                             &(ExpandConfig.init [@"Dynamic"])
+                                             &(collect-check-names (Pair.b &pair))
+                                             false)
+        (Result.Success backend) (Maybe.Just backend)
+        (Result.Error error)
+          (do
+            (IO.errorln &(CompileError.render &error))
+            (the (Maybe BackendModule) (Maybe.Nothing))))))
+
+(doc emit-llvm "emits `backend` into a fresh module for the host target and
+returns its textual IR, additionally writing a native object file when
+`obj-path` is given. The module is verified before anything is produced.")
+(defn emit-llvm [backend obj-path]
+  (let-do [ctx (LLVM.context-create)
+           builder (LLVM.builder-create ctx)
+           mod (LLVM.module-create (String.cstr &@"carp") ctx)
+           _init (do (ignore (LLVM.initialize-native-target))
+                     (ignore (LLVM.initialize-native-asm-printer))
+                     0)
+           triple (LLVM.default-target-triple)
+           tm (LLVM.create-target-machine (LLVM.target-from-triple (String.cstr &triple))
+                                          (String.cstr &triple)
+                                          (String.cstr &@"") (String.cstr &@"")
+                                          LLVM.codegen-level-default LLVM.reloc-pic
+                                          LLVM.codemodel-default)
+           td (LLVM.create-target-data-layout tm)
+           _setup (do (LLVM.set-target mod (String.cstr &triple))
+                      (LLVM.set-module-data-layout mod td)
+                      0)
+           emit-result (LLVMBackend.emit-module ctx builder mod td backend)
+           verify (LLVM.verify-module mod)
+           result (match emit-result
+                    (Result.Error message)
+                      (Result.Error (fmt "llvm backend: %s" &message))
+                    (Result.Success _)
+                      (if (not (String.empty? &verify))
+                        (Result.Error (fmt "llvm verifier: %s" &verify))
+                        (match-ref obj-path
+                          (Maybe.Nothing) (Result.Success (LLVM.print-module mod))
+                          (Maybe.Just path)
+                            (let [emit-error (LLVM.emit-to-file tm mod (String.cstr path)
+                                                                LLVM.filetype-object)]
+                              (if (String.empty? &emit-error)
+                                (Result.Success (LLVM.print-module mod))
+                                (Result.Error (fmt "llvm codegen: %s" &emit-error)))))))]
+    (LLVM.dispose-target-data td)
+    (LLVM.dispose-target-machine tm)
+    (LLVM.module-dispose mod)
+    (LLVM.builder-dispose builder)
+    (LLVM.context-dispose ctx)
+    result))
+
+(doc executable-shim "the C translation unit linked beside the emitted object:
+the C-native declarations plus a `main` that runs the synthesized roots
+function (which itself runs the global initializers first).")
+(defn executable-shim [backend]
+  (match (LLVMBackend.shim-translation-unit backend)
+    (Result.Success shim)
+      (let [entry (find-entry backend)
+            main-c (match-ref &entry
+              (Maybe.Just pair)
+                (if @(Pair.b pair)
+                  (fmt "int %s(void);
+int main(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
+  (void)carp_llvm_roots();
+  return %s();
+}
+" (Pair.a pair) (Pair.a pair))
+                  (fmt "void %s(void);
+int main(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
+  (void)carp_llvm_roots();
+  %s();
+  return 0;
+}
+" (Pair.a pair) (Pair.a pair)))
+              (Maybe.Nothing)
+                @"int main(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
+  (void)carp_llvm_roots();
+  return 0;
+}
+")]
+        (Result.Success (String.concat &[shim @"
+int carp_llvm_roots(void);
+" main-c])))
+    (Result.Error error) (Result.Error @(BackendError.message &error))))
+
+(defn build-llvm [backend core-dir binary]
+  (let-do [obj (fmt "/tmp/carp-llvm-%d.o" (compiler-process-id))
+           shim-c (fmt "/tmp/carp-llvm-%d-shim.c" (compiler-process-id))
+           ok false]
+    (match (emit-llvm backend &(Maybe.Just @&obj))
+      (Result.Error e) (IO.errorln &(fmt "carp-compiler-llvm: %s" &e))
+      (Result.Success _)
+        (match (executable-shim backend)
+          (Result.Error e) (IO.errorln &(fmt "carp-compiler-llvm: %s" &e))
+          (Result.Success shim)
+            (match (IO.write-file &shim &shim-c)
+              (Result.Error e)
+                (IO.errorln &(fmt "carp-compiler-llvm: cannot write shim: %s" &e))
+              (Result.Success _)
+                (if (Int.= 0 (System.system &(fmt "clang -I . -I %s %s %s -lm -o %s"
+                                                  core-dir &shim-c &obj binary)))
+                  (set! ok true)
+                  (IO.errorln "carp-compiler-llvm: clang failed")))))
+    (compiler-remove-file &obj)
+    (compiler-remove-file &shim-c)
+    ok))
+
+(defn llvm-build-action [backend core-dir output]
+  (let [binary (match-ref output
+          (Maybe.Just p) @p
+          (Maybe.Nothing) @"a.out")]
+    (if (build-llvm backend core-dir &binary)
+      (do
+        (IO.println
+          &(String.append "carp-compiler-llvm: wrote executable " &binary))
+        0)
+      1)))
+
+(defn llvm-execute-action [backend core-dir]
+  (do
+    (ignore (System.system "mkdir -p out"))
+    (if (build-llvm backend core-dir &(String.copy temp-bin))
+      (let [status (System.system &(String.copy temp-bin))]
+        (compiler-system-exit-code status))
+      1)))
+
+(defn llvm-emit-action [backend output]
+  (match (emit-llvm backend &(the (Maybe String) (Maybe.Nothing)))
+    (Result.Error e)
+      (do (IO.errorln &(fmt "carp-compiler-llvm: %s" &e)) 1)
+    (Result.Success ir)
+      (match-ref output
+        (Maybe.Just path)
+          (match (IO.write-file &ir path)
+            (Result.Success _) 0
+            (Result.Error e)
+              (do
+                (IO.errorln &(fmt "carp-compiler-llvm: cannot write '%s': %s" path &e))
+                1))
+        (Maybe.Nothing) (do (IO.print &ir) 0))))
+
+(defn run-llvm [input core-dir output action no-core]
+  (match-ref core-dir
+    (Maybe.Nothing)
+      (do
+        (IO.errorln "carp-compiler-llvm: --core <dir> is required (--no-core still needs it for load resolution)")
+        1)
+    (Maybe.Just dir)
+      (match (lower-input input dir no-core)
+        (Maybe.Nothing) 1
+        (Maybe.Just backend)
+          (cond
+            (Int.= action 1) (llvm-build-action &backend dir output)
+            (Int.= action 2) (llvm-execute-action &backend dir)
+            (llvm-emit-action &backend output)))))
+
+(defn main []
+  (let-do [args &System.args
+           n (StaticArray.length args)
+           input (the (Maybe String) (Maybe.Nothing))
+           output (the (Maybe String) (Maybe.Nothing))
+           core-dir (the (Maybe String) (Maybe.Nothing))
+           have-input false
+           no-core false
+           action 0
+           ; 0 = compile, 1 = help, 2 = version, 3 = argument error
+           mode 0
+           i 1]
+    (while-do (and (Int.< i n) (Int.= mode 0))
+      (let-do [arg @(StaticArray.unsafe-nth args i)]
+        (cond
+          (or (String.= &arg "-h") (String.= &arg "--help")) (set! mode 1)
+          (or (String.= &arg "-v") (String.= &arg "--version")) (set! mode 2)
+          (or (String.= &arg "-b") (String.= &arg "--build")) (set! action 1)
+          (or (String.= &arg "-x") (String.= &arg "--execute")) (set! action 2)
+          (String.= &arg "--no-core") (set! no-core true)
+          (or (String.= &arg "-o") (String.= &arg "--output"))
+            (if (Int.< (Int.inc i) n)
+              (do
+                (set! output
+                      (Maybe.Just @(StaticArray.unsafe-nth args (Int.inc i))))
+                (set! i (Int.inc i)))
+              (do
+                (IO.errorln
+                  "carp-compiler-llvm: option '-o' requires a file argument")
+                (set! mode 3)))
+          (or (String.= &arg "-c") (String.= &arg "--core"))
+            (if (Int.< (Int.inc i) n)
+              (do
+                (set! core-dir
+                      (Maybe.Just @(StaticArray.unsafe-nth args (Int.inc i))))
+                (set! i (Int.inc i)))
+              (do
+                (IO.errorln
+                  "carp-compiler-llvm: option '-c' requires a directory argument")
+                (set! mode 3)))
+          (String.starts-with? &arg "-")
+            (do
+              (IO.errorln &(fmt "carp-compiler-llvm: unknown option '%s'" &arg))
+              (set! mode 3))
+          have-input
+            (do
+              (IO.errorln "carp-compiler-llvm: more than one input file given")
+              (set! mode 3))
+          (do (set! input (Maybe.Just @&arg)) (set! have-input true))))
+      (set! i (Int.inc i)))
+    (cond
+      (Int.= mode 1) (print-llvm-help)
+      (Int.= mode 2) (IO.println &(String.append "carp-compiler-llvm " version))
+      (Int.= mode 3)
+        (do (IO.errorln "try 'carp-compiler-llvm --help' for usage.")
+            (System.exit 2))
+      (match input
+        (Maybe.Just path)
+          (System.exit (run-llvm &path &core-dir &output action no-core))
+        (Maybe.Nothing)
+          (do
+            (IO.errorln "carp-compiler-llvm: no input file")
+            (IO.errorln "try 'carp-compiler-llvm --help' for usage.")
+            (System.exit 2))))))

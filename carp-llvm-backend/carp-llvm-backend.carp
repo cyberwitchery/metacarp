@@ -70,6 +70,14 @@
 (def *llvm-argspill-pos* (the (Array Int) []))
 (def *llvm-argspill-ptrs* (the (Array LLVMValue) []))
 
+;; the module's closure functions, for construction sites and definitions.
+(def *llvm-closures* (the (Array ClosureFunction) []))
+
+;; type-key -> deleter/copier C symbols from the ownership plan, for managed
+;; captures and environment fields.
+(def *llvm-delete-symbols* (the (Array (Pair String String)) []))
+(def *llvm-copy-symbols* (the (Array (Pair String String)) []))
+
 ;; sum-type layout cache (context-bound, reset per emit-module).
 (def *llvm-sum-names* (the (Array String) []))
 (def *llvm-sum-types* (the (Array LLVMType) []))
@@ -243,6 +251,44 @@
         (set! found true)))
     found))
 
+(doc llvm-lambda-type "the runtime Lambda struct `{ callback, env, delete,
+copy }` — every function value shares it.")
+(hidden llvm-lambda-type)
+(defn llvm-lambda-type [ctx]
+  (LLVM.struct-type ctx
+                    &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                      (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                      (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                      (LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                    false))
+
+(hidden llvm-closure-index)
+(defn llvm-closure-index [symbol]
+  (let-do [found -1]
+    (for [i 0 (Array.length &*llvm-closures*)]
+      (when (String.= (ClosureFunction.symbol (Array.unsafe-nth &*llvm-closures* i))
+                      symbol)
+        (set! found i)))
+    found))
+
+(hidden llvm-managed-symbol)
+(defn llvm-managed-symbol [pairs type]
+  (let-do [result (the (Maybe String) (Maybe.Nothing))
+           key (CAbi.type-key type)]
+    (for [i 0 (Array.length pairs)]
+      (let [entry (Array.unsafe-nth pairs i)]
+        (when (String.= (Pair.a entry) &key)
+          (set! result (Maybe.Just (String.copy (Pair.b entry)))))))
+    result))
+
+(doc llvm-runtime-fn "the named function, declared with `fnty` on first use.")
+(hidden llvm-runtime-fn)
+(defn llvm-runtime-fn [mod name fnty]
+  (let [found (LLVM.get-named-function mod (llvm-cstr name))]
+    (if (LLVM.value-null? found)
+      (LLVM.add-function mod (llvm-cstr name) fnty)
+      found)))
+
 (hidden llvm-target-data)
 (defn llvm-target-data []
   (LLVM.dup (Array.unsafe-nth &*llvm-target-data* 0)))
@@ -331,23 +377,60 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
       (llvm-collect-set-targets! (Box.peek body))
     _ ()))
 
-(hidden llvm-monotype-of-coretype)
-(defn llvm-monotype-of-coretype [type]
+(doc llvm-monotype-of-coretype-with "a constructor field's concrete type:
+the declared CoreType with the instance's variable bindings substituted.")
+(hidden llvm-monotype-of-coretype-with)
+(defn llvm-monotype-of-coretype-with [names types type]
   (match-ref type
     (CoreType.Integer) (Type.integer)
     (CoreType.Boolean) (Type.boolean)
     (CoreType.String) (Type.string)
     (CoreType.Unit) (Type.unit)
+    (CoreType.Variable vname)
+      (let-do [result (the (Maybe MonoType) (Maybe.Nothing))]
+        (for [i 0 (Array.length names)]
+          (when (String.= (Array.unsafe-nth names i) vname)
+            (set! result (Maybe.Just (MonoType.copy (Array.unsafe-nth types i))))))
+        (match result
+          (Maybe.Just concrete) concrete
+          (Maybe.Nothing)
+            (do
+              (llvm-emit-error! (fmt "unbound type variable %s in llvm backend" vname))
+              (Type.integer))))
     (CoreType.Named name arguments)
       (let-do [lowered (the (Array (Box MonoType)) [])]
         (for [i 0 (Array.length arguments)]
           (Array.push-back! &lowered
-                            (Box.init (llvm-monotype-of-coretype
+                            (Box.init (llvm-monotype-of-coretype-with names types
                                         (Box.peek (Array.unsafe-nth arguments i))))))
         (Type.named name lowered))
     _ (do
         (llvm-emit-error! @"unsupported constructor field type in llvm backend")
         (Type.integer))))
+
+(doc llvm-instance-bindings! "fills `names`/`types` with the variable bindings
+that specialize a constructor's declared result to the concrete `instance`.
+False when the shapes do not line up.")
+(hidden llvm-instance-bindings!)
+(defn llvm-instance-bindings! [decl instance names types]
+  (match-ref (Box.peek (CoreConstructorDeclaration.result decl))
+    (CoreType.Named _ vars)
+      (match-ref instance
+        (MonoType.Named _ concrete)
+          (if (Int./= (Array.length vars) (Array.length concrete))
+            false
+            (let-do [ok true]
+              (for [i 0 (Array.length vars)]
+                (match-ref (Box.peek (Array.unsafe-nth vars i))
+                  (CoreType.Variable vname)
+                    (do
+                      (Array.push-back! names (String.copy vname))
+                      (Array.push-back! types
+                                        (MonoType.copy (Box.peek (Array.unsafe-nth concrete i)))))
+                  _ (set! ok false)))
+              ok))
+        _ false)
+    _ false))
 
 (hidden llvm-sum-variant-of?)
 (defn llvm-sum-variant-of? [decl name]
@@ -356,10 +439,10 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
     _ false))
 
 (hidden llvm-sum-cache-index)
-(defn llvm-sum-cache-index [name]
+(defn llvm-sum-cache-index [key]
   (let-do [found -1]
     (for [i 0 (Array.length &*llvm-sum-names*)]
-      (when (String.= (Array.unsafe-nth &*llvm-sum-names* i) name)
+      (when (String.= (Array.unsafe-nth &*llvm-sum-names* i) key)
         (set! found i)))
     found))
 
@@ -379,6 +462,7 @@ through a pointer-only wrapper.")
 (hidden llvm-aggregate-monotype?)
 (defn llvm-aggregate-monotype? [type]
   (match-ref type
+    (MonoType.Function _ _) true
     (MonoType.Named name _)
       (cond
         (String.= name "Long") false
@@ -412,6 +496,7 @@ through a pointer-only wrapper.")
     (MonoType.Unit) (LLVM.void-type ctx)
     (MonoType.String) (LLVM.pointer-type (LLVM.int8-type ctx) 0)
     (MonoType.Reference _ _) (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+    (MonoType.Function _ _) (llvm-lambda-type ctx)
     (MonoType.Named name arguments)
       (cond
         (String.= name "Long") (LLVM.int64-type ctx)
@@ -419,41 +504,59 @@ through a pointer-only wrapper.")
         (String.= name "Char") (LLVM.int32-type ctx)
         (String.= name "Double") (LLVM.double-type ctx)
         (String.= name "Float") (LLVM.float-type ctx)
+        (String.= name "Uint8") (LLVM.int8-type ctx)
+        (String.= name "Uint16") (LLVM.int16-type ctx)
+        (String.= name "Uint32") (LLVM.int32-type ctx)
+        (String.= name "Uint64") (LLVM.int64-type ctx)
+        (String.= name "Int8") (LLVM.int8-type ctx)
+        (String.= name "Int16") (LLVM.int16-type ctx)
+        (String.= name "Int32") (LLVM.int32-type ctx)
+        (String.= name "Int64") (LLVM.int64-type ctx)
+        (String.= name "CChar") (LLVM.int8-type ctx)
+        (String.= name "Pattern") (LLVM.pointer-type (LLVM.int8-type ctx) 0)
         (String.= name "Array") (llvm-array-type ctx)
         (String.= name "Ptr") (LLVM.pointer-type (LLVM.int8-type ctx) 0)
         (String.= name "Box") (LLVM.pointer-type (LLVM.int8-type ctx) 0)
-        (Int.= 0 (Array.length arguments)) (llvm-sum-type-for ctx name)
-        (do
-          (llvm-emit-error! (fmt "unsupported generic type %s in llvm backend" name))
-          (LLVM.int32-type ctx)))
+        (llvm-sum-type-for ctx type))
     _ (do
         (llvm-emit-error! @"unsupported type form in llvm backend")
         (LLVM.int32-type ctx))))
 
-(defn llvm-sum-type-for [ctx name]
-  (let [cached (llvm-sum-cache-index name)]
+(defn llvm-sum-type-for [ctx instance]
+  (let [cached (llvm-sum-cache-index &(CAbi.type-key instance))]
     (if (Int.>= cached 0)
       (LLVM.dup (Array.unsafe-nth &*llvm-sum-types* cached))
-      (llvm-build-sum-type ctx name))))
+      (llvm-build-sum-type ctx instance))))
 
-(defn llvm-variant-struct [ctx name tag]
+(hidden llvm-instance-name)
+(defn llvm-instance-name [instance]
+  (match-ref instance
+    (MonoType.Named name _) (String.copy name)
+    _ @""))
+
+(defn llvm-variant-struct [ctx instance tag]
   (let-do [fields (the (Array LLVMType) [])
-           found false]
+           found false
+           name (llvm-instance-name instance)]
     (for [i 0 (Array.length &*llvm-backend-constructors*)]
       (let [decl (Array.unsafe-nth &*llvm-backend-constructors* i)]
-        (when (and (llvm-sum-variant-of? decl name)
+        (when (and (llvm-sum-variant-of? decl &name)
                    (Int.= @(CoreConstructorDeclaration.tag decl) tag))
-          (do
+          (let-do [names (the (Array String) [])
+                   types (the (Array MonoType) [])]
             (set! found true)
-            (let [arguments (CoreConstructorDeclaration.arguments decl)]
-              (for [j 0 (Array.length arguments)]
-                (Array.push-back! &fields
-                                  (llvm-lower-type ctx
-                                                   &(llvm-monotype-of-coretype
-                                                      (Box.peek (Array.unsafe-nth arguments j)))))))))))
+            (if (llvm-instance-bindings! decl instance &names &types)
+              (let [arguments (CoreConstructorDeclaration.arguments decl)]
+                (for [j 0 (Array.length arguments)]
+                  (Array.push-back! &fields
+                                    (llvm-lower-type ctx
+                                                     &(llvm-monotype-of-coretype-with &names &types
+                                                        (Box.peek (Array.unsafe-nth arguments j)))))))
+              (llvm-emit-error! (fmt "constructor instance mismatch for %s in llvm backend"
+                                     &name)))))))
     (unless found
       (llvm-emit-error! (fmt "missing tag %d constructor for type %s in llvm backend"
-                             tag name)))
+                             tag &name)))
     ;; a nullary variant is `{ i8 }` like the C backend's `unsigned char unused`
     (when (Int.= 0 (Array.length &fields))
       (Array.push-back! &fields (LLVM.int8-type ctx)))
@@ -468,21 +571,23 @@ union-rep is the strictest-aligned variant struct padded with bytes up to the
 union's ABI size (max variant size rounded to max variant alignment), so tag
 offset and total size match the C backend's `struct { union {...} data; int
 tag; }` under the same data layout.")
-(defn llvm-build-sum-type [ctx name]
-  (let-do [outer (LLVM.struct-create-named ctx (llvm-cstr name))
+(defn llvm-build-sum-type [ctx instance]
+  (let-do [key (CAbi.type-key instance)
+           name (llvm-instance-name instance)
+           outer (LLVM.struct-create-named ctx (llvm-cstr &(CAbi.identifier &key)))
            variant-count 0]
     ;; cache before building the body so a recursive occurrence resolves
-    (Array.push-back! &*llvm-sum-names* (String.copy name))
+    (Array.push-back! &*llvm-sum-names* (String.copy &key))
     (Array.push-back! &*llvm-sum-types* outer)
     (for [i 0 (Array.length &*llvm-backend-constructors*)]
-      (when (llvm-sum-variant-of? (Array.unsafe-nth &*llvm-backend-constructors* i) name)
+      (when (llvm-sum-variant-of? (Array.unsafe-nth &*llvm-backend-constructors* i) &name)
         (set! variant-count (Int.+ variant-count 1))))
     (if (or (Int.= 0 variant-count) (Int.= 0 (Array.length &*llvm-target-data*)))
       (do
         (llvm-emit-error!
           (if (Int.= 0 variant-count)
-            (fmt "no constructors for type %s in llvm backend" name)
-            (fmt "no target data for type %s in llvm backend" name)))
+            (fmt "no constructors for type %s in llvm backend" &name)
+            (fmt "no target data for type %s in llvm backend" &name)))
         outer)
       (let-do [td (llvm-target-data)
                variants (the (Array LLVMType) [])
@@ -490,7 +595,7 @@ tag; }` under the same data layout.")
                union-align 1l
                strictest 0]
         (for [tag 0 variant-count]
-          (Array.push-back! &variants (llvm-variant-struct ctx name tag)))
+          (Array.push-back! &variants (llvm-variant-struct ctx instance tag)))
         (for [tag 0 variant-count]
           (let-do [variant (LLVM.dup (Array.unsafe-nth &variants tag))
                    size (LLVM.abi-size-of-type td variant)
@@ -528,22 +633,23 @@ tag; }` under the same data layout.")
 (defn llvm-ctor-tag-at [index]
   @(CoreConstructorDeclaration.tag (Array.unsafe-nth &*llvm-backend-constructors* index)))
 
-(hidden llvm-ctor-name-at)
-(defn llvm-ctor-name-at [index]
-  (match-ref (Box.peek (CoreConstructorDeclaration.result
-                         (Array.unsafe-nth &*llvm-backend-constructors* index)))
-    (CoreType.Named result-name _) (String.copy result-name)
-    _ @""))
-
-(hidden llvm-ctor-field-type-at)
-(defn llvm-ctor-field-type-at [ctx index field]
-  (llvm-lower-type ctx
-                   &(llvm-monotype-of-coretype
-                      (Box.peek
-                        (Array.unsafe-nth
-                          (CoreConstructorDeclaration.arguments
-                            (Array.unsafe-nth &*llvm-backend-constructors* index))
-                          field)))))
+(doc llvm-ctor-field-monotype "the concrete type of one constructor field
+under the given instance.")
+(hidden llvm-ctor-field-monotype)
+(defn llvm-ctor-field-monotype [index instance field]
+  (let-do [names (the (Array String) [])
+           types (the (Array MonoType) [])]
+    (if (llvm-instance-bindings! (Array.unsafe-nth &*llvm-backend-constructors* index)
+                                 instance &names &types)
+      (llvm-monotype-of-coretype-with &names &types
+                                      (Box.peek
+                                        (Array.unsafe-nth
+                                          (CoreConstructorDeclaration.arguments
+                                            (Array.unsafe-nth &*llvm-backend-constructors* index))
+                                          field)))
+      (do
+        (llvm-emit-error! @"constructor instance mismatch in llvm backend")
+        (Type.integer)))))
 
 (hidden llvm-lower-function-type)
 (defn llvm-lower-function-type [ctx signature]
@@ -568,7 +674,6 @@ tag; }` under the same data layout.")
 (defn llvm-unsupported-name [expression]
   (match-ref expression
     (SpecializedExpr.StaticArrayLit _ _ _) @"static array literal"
-    (SpecializedExpr.Call _ _ _ _) @"indirect call"
     (SpecializedExpr.Lambda _ _ _ _) @"lambda"
     _ @"expression"))
 
@@ -586,7 +691,7 @@ matches `pattern`. Loads run unconditionally and are and-ed — reading an
 inactive variant's bytes is defined, and a false outer tag test makes the
 whole conjunction false regardless.")
 (hidden llvm-emit-pattern-test)
-(defn llvm-emit-pattern-test [ctx builder pattern ptr]
+(defn llvm-emit-pattern-test [ctx builder pattern ptr instance]
   (match-ref pattern
     (CorePattern.Ignore) (LLVM.const-int (LLVM.int1-type ctx) 1l 0)
     (CorePattern.Bind _) (LLVM.const-int (LLVM.int1-type ctx) 1l 0)
@@ -595,8 +700,8 @@ whole conjunction false regardless.")
         (if (Int.< index 0)
           (LLVM.const-int (LLVM.int1-type ctx) 0l 0)
           (let-do [tag (llvm-ctor-tag-at index)
-                   outer-ty (llvm-sum-type-for ctx &(llvm-ctor-name-at index))
-                   variant-ty (llvm-variant-struct ctx &(llvm-ctor-name-at index) tag)
+                   outer-ty (llvm-sum-type-for ctx instance)
+                   variant-ty (llvm-variant-struct ctx instance tag)
                    tagp (LLVM.build-struct-gep builder outer-ty ptr 1 (llvm-cstr &@"tagp"))
                    tagv (LLVM.build-load builder (LLVM.int32-type ctx) tagp (llvm-cstr &@"tag"))
                    test (LLVM.build-icmp builder LLVM.int-eq tagv
@@ -609,7 +714,8 @@ whole conjunction false regardless.")
                     (LLVM.build-and builder test
                                     (llvm-emit-pattern-test ctx builder
                                                             (Box.peek (Array.unsafe-nth subpatterns i))
-                                                            (LLVM.build-struct-gep builder variant-ty unionp i (llvm-cstr &@"fieldp")))
+                                                            (LLVM.build-struct-gep builder variant-ty unionp i (llvm-cstr &@"fieldp"))
+                                                            &(llvm-ctor-field-monotype index instance i))
                                     (llvm-cstr &@"and"))))
             test)))))
 
@@ -618,13 +724,14 @@ behind `ptr` (slot store for mutated binders, SSA push otherwise) and returns
 how many SSA pushes must be popped after the branch body. `ty` is the LLVM
 type of the value at `ptr`, for a whole-value bind.")
 (hidden llvm-bind-pattern!)
-(defn llvm-bind-pattern! [ctx builder pattern ptr ty]
+(defn llvm-bind-pattern! [ctx builder pattern ptr instance]
   (match-ref pattern
     (CorePattern.Ignore) 0
     (CorePattern.Bind reference)
       (let [id @(CoreRef.id reference)
             si (llvm-slot-index id)
-            value (LLVM.build-load builder ty ptr (llvm-cstr &@"bindload"))]
+            value (LLVM.build-load builder (llvm-lower-type ctx instance) ptr
+                                   (llvm-cstr &@"bindload"))]
         (if (Int.>= si 0)
           (do (ignore (LLVM.build-store builder value (llvm-slot-ptr si))) 0)
           (do (llvm-env-push! id value) 1)))
@@ -633,8 +740,8 @@ type of the value at `ptr`, for a whole-value bind.")
         (if (Int.< index 0)
           0
           (let-do [tag (llvm-ctor-tag-at index)
-                   outer-ty (llvm-sum-type-for ctx &(llvm-ctor-name-at index))
-                   variant-ty (llvm-variant-struct ctx &(llvm-ctor-name-at index) tag)
+                   outer-ty (llvm-sum-type-for ctx instance)
+                   variant-ty (llvm-variant-struct ctx instance tag)
                    unionp (LLVM.build-struct-gep builder outer-ty ptr 0 (llvm-cstr &@"bunionp"))
                    pushed 0]
             (for [i 0 (Array.length subpatterns)]
@@ -643,14 +750,23 @@ type of the value at `ptr`, for a whole-value bind.")
                            (llvm-bind-pattern! ctx builder
                                                (Box.peek (Array.unsafe-nth subpatterns i))
                                                (LLVM.build-struct-gep builder variant-ty unionp i (llvm-cstr &@"bfieldp"))
-                                               (llvm-ctor-field-type-at ctx index i)))))
+                                               &(llvm-ctor-field-monotype index instance i)))))
             pushed)))))
 
 (hidden llvm-match-scrutinee-ok?)
 (defn llvm-match-scrutinee-ok? [scrutinee]
   (match (Specialize.expression-type scrutinee)
-    (MonoType.Named _ arguments) (Int.= 0 (Array.length &arguments))
+    (MonoType.Named _ _) true
     _ false))
+
+(hidden llvm-closure-env-type)
+(defn llvm-closure-env-type [ctx captures]
+  (let-do [fields (the (Array LLVMType) [])]
+    (for [i 0 (Array.length captures)]
+      (Array.push-back! &fields
+                        (llvm-lower-type ctx
+                                         (Box.peek (Pair.b (Array.unsafe-nth captures i))))))
+    (LLVM.struct-type ctx &fields false)))
 
 (doc llvm-emit-ref-builtin "the `ref` builtin (id 5): the address of its
 operand. A slotted local or a global yields its storage directly (real
@@ -704,6 +820,110 @@ returned value is the address of that variable.")
     (LLVM.set-linkage holder LLVM.linkage-private)
     holder))
 
+(doc llvm-emit-closure-construction "a `_carp_closure_N` site: malloc the
+environment, store the captured values, and assemble a Lambda over
+`_carp_lambda_N` and its environment delete/copy functions.")
+(defn llvm-emit-closure-construction [ctx builder mod func symbol arguments]
+  (let-do [suffix (String.suffix symbol 14)
+           lambda-symbol (String.concat &[@"_carp_lambda_" (String.copy &suffix)])
+           ci (llvm-closure-index &lambda-symbol)]
+    (if (Int.< ci 0)
+      (do
+        (llvm-emit-error! (fmt "unknown closure %s in llvm backend" symbol))
+        (llvm-dummy-value ctx))
+      (let-do [captures @(ClosureFunction.captures (Array.unsafe-nth &*llvm-closures* ci))
+               env-ty (llvm-closure-env-type ctx &captures)
+               env-size (if (Int.= 0 (Array.length &*llvm-target-data*))
+                          8l
+                          (LLVM.abi-size-of-type (llvm-target-data) env-ty))
+               malloc-fnty (LLVM.function-type (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                               &[(LLVM.int64-type ctx)] false)
+               envp (LLVM.build-call builder malloc-fnty
+                                     (llvm-runtime-fn mod "malloc" malloc-fnty)
+                                     &[(LLVM.const-int (LLVM.int64-type ctx) env-size 0)]
+                                     (llvm-cstr &@"envp"))]
+        (for [i 0 (Array.length arguments)]
+          (let-do [value (llvm-emit-expr ctx builder mod func
+                                         (Box.peek (Array.unsafe-nth arguments i)))]
+            ;; a managed capture must be deep-copied into the environment;
+            ;; that path is not built yet, so report it rather than alias
+            (when (Int.< i (Array.length &captures))
+              (match (llvm-managed-symbol &*llvm-copy-symbols*
+                                          (Box.peek (Pair.b (Array.unsafe-nth &captures i))))
+                (Maybe.Just _)
+                  (llvm-emit-error! @"unsupported managed capture in llvm backend")
+                (Maybe.Nothing) ()))
+            (ignore (LLVM.build-store builder value
+                                      (LLVM.build-struct-gep builder env-ty envp i
+                                                             (llvm-cstr &@"capf"))))))
+        (let-do [fnv (LLVM.get-named-function mod (llvm-cstr &lambda-symbol))
+                 envdel (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_delete" &lambda-symbol)))
+                 envcopy (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_copy" &lambda-symbol)))
+                 value (LLVM.const-null (llvm-lambda-type ctx))]
+          (set! value (LLVM.build-insert-value builder value fnv 0 (llvm-cstr &@"lcb")))
+          (set! value (LLVM.build-insert-value builder value envp 1 (llvm-cstr &@"lenv")))
+          (set! value (LLVM.build-insert-value builder value envdel 2 (llvm-cstr &@"ldel")))
+          (LLVM.build-insert-value builder value envcopy 3 (llvm-cstr &@"lcpy")))))))
+
+(doc llvm-emit-indirect-call "a call through a Lambda value: branch on the
+environment pointer, calling the callback env-first when one is present and
+plain otherwise — the C backend's `env ? cb(env, args) : cb(args)`.")
+(defn llvm-emit-indirect-call [ctx builder mod func callee arguments]
+  (match (Specialize.expression-type (Box.peek callee))
+    (MonoType.Function fargs fret)
+      (let-do [lam (llvm-emit-expr ctx builder mod func (Box.peek callee))
+               cb (LLVM.build-extract-value builder lam 0 (llvm-cstr &@"cb"))
+               env (LLVM.build-extract-value builder lam 1 (llvm-cstr &@"env"))
+               argument-values (the (Array LLVMValue) [])
+               n (Array.length arguments)]
+        (for [i 0 n]
+          (Array.push-back! &argument-values
+                            (llvm-emit-expr ctx builder mod func
+                                            (Box.peek (Array.unsafe-nth arguments i)))))
+        (let-do [ret-ty (llvm-lower-type ctx (Box.peek &fret))
+                 ret-unit (unit-type? (Box.peek &fret))
+                 ptr-ty (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                 plain-types (the (Array LLVMType) [])
+                 env-types (the (Array LLVMType) [ptr-ty])
+                 env-args (the (Array LLVMValue) [env])]
+          (for [i 0 (Array.length &fargs)]
+            (let [t (llvm-lower-type ctx (Box.peek (Array.unsafe-nth &fargs i)))]
+              (do
+                (Array.push-back! &plain-types t)
+                (Array.push-back! &env-types t))))
+          (for [i 0 n]
+            (Array.push-back! &env-args (LLVM.dup (Array.unsafe-nth &argument-values i))))
+          (let-do [flag (LLVM.build-icmp builder LLVM.int-ne env
+                                         (LLVM.const-null ptr-ty)
+                                         (llvm-cstr &@"hasenv"))
+                   env-block (LLVM.append-block ctx func (llvm-cstr &@"callenv"))
+                   plain-block (LLVM.append-block ctx func (llvm-cstr &@"callplain"))
+                   merge-block (LLVM.append-block ctx func (llvm-cstr &@"callmerge"))]
+            (ignore (LLVM.build-cond-br builder flag env-block plain-block))
+            (LLVM.position-at-end builder env-block)
+            (let-do [env-fnty (LLVM.function-type ret-ty &env-types false)
+                     env-value (if ret-unit
+                                 (LLVM.build-call builder env-fnty cb &env-args (llvm-cstr &@""))
+                                 (LLVM.build-call builder env-fnty cb &env-args (llvm-cstr &@"cenv")))
+                     env-end (LLVM.get-insert-block builder)]
+              (ignore (LLVM.build-br builder merge-block))
+              (LLVM.position-at-end builder plain-block)
+              (let-do [plain-fnty (LLVM.function-type ret-ty &plain-types false)
+                       plain-value (if ret-unit
+                                     (LLVM.build-call builder plain-fnty cb &argument-values (llvm-cstr &@""))
+                                     (LLVM.build-call builder plain-fnty cb &argument-values (llvm-cstr &@"cplain")))
+                       plain-end (LLVM.get-insert-block builder)]
+                (ignore (LLVM.build-br builder merge-block))
+                (LLVM.position-at-end builder merge-block)
+                (if ret-unit
+                  (llvm-dummy-value ctx)
+                  (let-do [phi (LLVM.build-phi builder ret-ty (llvm-cstr &@"callv"))]
+                    (LLVM.add-incoming phi &[env-value plain-value] &[env-end plain-end])
+                    phi)))))))
+    _ (do
+        (llvm-emit-error! @"indirect call without function type in llvm backend")
+        (llvm-dummy-value ctx))))
+
 ;; llvm-emit-expr and the construct emitters below are mutually recursive.
 (defn llvm-emit-expr [ctx builder mod func expression]
   (match-ref expression
@@ -745,15 +965,29 @@ returned value is the address of that variable.")
             (LLVM.build-load builder (llvm-lower-type ctx (Box.peek type))
                              (llvm-slot-ptr si) (llvm-cstr &@"loadslot"))
             (llvm-env-lookup ctx @(CoreRef.id reference) (CoreRef.name reference)))))
-    (SpecializedExpr.GlobalValue _ value-type reference _ symbol _)
+    (SpecializedExpr.GlobalValue _ value-type reference _ symbol lambda-var)
       (cond
         ;; the NULL builtin (id 7) is a null pointer constant, not a global
         (Int.= @(CoreRef.id reference) 7)
           (LLVM.const-null (LLVM.pointer-type (LLVM.int8-type ctx) 0))
+        ;; a function value: a def global already holds a Lambda; a plain
+        ;; function symbol is wrapped in one with no environment
         (match-ref (Box.peek value-type) (MonoType.Function _ _) true _ false)
-          (do
-            (llvm-emit-error! @"unsupported function-valued global in llvm backend")
-            (llvm-dummy-value ctx))
+          (if @lambda-var
+            (let [g (LLVM.get-named-global mod (llvm-cstr symbol))]
+              (if (LLVM.value-null? g)
+                (do
+                  (llvm-emit-error! (fmt "unknown global %s in llvm backend" symbol))
+                  (llvm-dummy-value ctx))
+                (LLVM.build-load builder (llvm-lambda-type ctx) g (llvm-cstr &@"glambda"))))
+            (let-do [found (LLVM.get-named-function mod (llvm-cstr symbol))
+                     fnv (if (LLVM.value-null? found)
+                           (LLVM.add-function mod (llvm-cstr symbol)
+                                              (llvm-lower-function-type ctx (Box.peek value-type)))
+                           found)]
+              (LLVM.build-insert-value builder
+                                       (LLVM.const-null (llvm-lambda-type ctx))
+                                       fnv 0 (llvm-cstr &@"mklambda"))))
         (let [g (LLVM.get-named-global mod (llvm-cstr symbol))]
           (if (LLVM.value-null? g)
             (do
@@ -796,6 +1030,18 @@ returned value is the address of that variable.")
                      (Int.= 75 @(CoreRef.id reference))))
              (Int.= 1 (Array.length arguments)))
           (llvm-dummy-value ctx)
+        ;; a closure construction site assembles a Lambda over its lifted
+        ;; function and heap environment
+        (String.starts-with? symbol "_carp_closure_")
+          (llvm-emit-closure-construction ctx builder mod func symbol arguments)
+        ;; allocate (ids 14/15): uninitialized Array storage
+        (and (or (Int.= 14 @(CoreRef.id reference)) (Int.= 15 @(CoreRef.id reference)))
+             (Int.= 1 (Array.length arguments)))
+          (llvm-emit-array-allocate ctx builder mod func result-type arguments)
+        ;; aset-uninitialized! (ids 16/17): store through the array reference
+        (and (or (Int.= 16 @(CoreRef.id reference)) (Int.= 17 @(CoreRef.id reference)))
+             (Int.= 3 (Array.length arguments)))
+          (llvm-emit-array-aset ctx builder mod func arguments)
         ;; Array.length (id 9): load `.len` behind the array ref, as Int
         (and (Int.= 9 @(CoreRef.id reference)) (Int.= 1 (Array.length arguments)))
           (let [aref (llvm-emit-expr ctx builder mod func
@@ -863,6 +1109,8 @@ returned value is the address of that variable.")
             (LLVM.position-at-end builder
                                   (LLVM.append-block ctx func (llvm-cstr &@"afterbreak")))
             (llvm-dummy-value ctx))))
+    (SpecializedExpr.Call _ _ callee arguments)
+      (llvm-emit-indirect-call ctx builder mod func callee arguments)
     (SpecializedExpr.Annotation _ _ inner _)
       (llvm-emit-expr ctx builder mod func (Box.peek inner))
     _ (do
@@ -950,6 +1198,55 @@ through an out-pointer. Pointer-only signatures are ABI-safe on every target.")
       (if (llvm-returns-unit? (Box.peek callee-signature))
         (LLVM.build-call builder fnty callee &argument-values (llvm-cstr &@""))
         (LLVM.build-call builder fnty callee &argument-values (llvm-cstr &@"call"))))))
+
+(doc llvm-emit-array-allocate "the `allocate` builtins (ids 14/15): an Array
+with `n` elements of uninitialized malloc'd storage.")
+(defn llvm-emit-array-allocate [ctx builder mod func result-type arguments]
+  (let-do [n32 (llvm-emit-expr ctx builder mod func
+                               (Box.peek (Array.unsafe-nth arguments 0)))
+           n64 (LLVM.build-sext builder n32 (LLVM.int64-type ctx) (llvm-cstr &@"alen64"))
+           element-monotype (match-ref (Box.peek result-type)
+                              (MonoType.Named _ targs)
+                                (if (Int.= 1 (Array.length targs))
+                                  (MonoType.copy (Box.peek (Array.unsafe-nth targs 0)))
+                                  (Type.integer))
+                              _ (Type.integer))
+           element-type (llvm-lower-type ctx &element-monotype)
+           element-size (if (Int.= 0 (Array.length &*llvm-target-data*))
+                          8l
+                          (LLVM.abi-size-of-type (llvm-target-data) element-type))
+           malloc-fnty (LLVM.function-type (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                           &[(LLVM.int64-type ctx)] false)
+           byte-count (LLVM.build-mul builder n64
+                                      (LLVM.const-int (LLVM.int64-type ctx) element-size 0)
+                                      (llvm-cstr &@"abytes"))
+           data (LLVM.build-call builder malloc-fnty
+                                 (llvm-runtime-fn mod "malloc" malloc-fnty)
+                                 &[byte-count] (llvm-cstr &@"adata"))
+           value (LLVM.const-null (llvm-array-type ctx))]
+    (set! value (LLVM.build-insert-value builder value n64 0 (llvm-cstr &@"alen")))
+    (set! value (LLVM.build-insert-value builder value n64 1 (llvm-cstr &@"acap")))
+    (LLVM.build-insert-value builder value data 2 (llvm-cstr &@"abuilt"))))
+
+(doc llvm-emit-array-aset "the `aset-uninitialized!` builtins (ids 16/17):
+store `value` at index `idx` of the array behind the reference.")
+(defn llvm-emit-array-aset [ctx builder mod func arguments]
+  (let-do [aref (llvm-emit-expr ctx builder mod func
+                                (Box.peek (Array.unsafe-nth arguments 0)))
+           idx (llvm-emit-expr ctx builder mod func
+                               (Box.peek (Array.unsafe-nth arguments 1)))
+           value-monotype (Specialize.expression-type (Box.peek (Array.unsafe-nth arguments 2)))
+           value (llvm-emit-expr ctx builder mod func
+                                 (Box.peek (Array.unsafe-nth arguments 2)))
+           element-type (llvm-lower-type ctx &value-monotype)
+           data (LLVM.build-load builder (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                 (LLVM.build-struct-gep builder (llvm-array-type ctx)
+                                                        aref 2 (llvm-cstr &@"datap"))
+                                 (llvm-cstr &@"data"))]
+    (ignore (LLVM.build-store builder value
+                              (LLVM.build-gep builder element-type data &[idx]
+                                              (llvm-cstr &@"aslot"))))
+    (llvm-dummy-value ctx)))
 
 (doc llvm-emit-array-lit "an Array value: malloc the backing data, store the
 elements through a typed GEP, and build `{ len, capacity, data }`, mirroring
@@ -1069,8 +1366,7 @@ the C backend's designated-initializer rendering.")
         (llvm-emit-error! @"unsupported match scrutinee in llvm backend")
         (llvm-dummy-value ctx))
       (let-do [scrutinee-value (llvm-emit-expr ctx builder mod func (Box.peek scrutinee))
-               scrutinee-ty (llvm-lower-type ctx
-                                             &(Specialize.expression-type (Box.peek scrutinee)))
+               scrutinee-monotype (Specialize.expression-type (Box.peek scrutinee))
                ptr (llvm-matchspill-ptr (llvm-matchspill-index id))
                merge-block (LLVM.append-block ctx func (llvm-cstr &@"matchmerge"))
                incoming-values (the (Array LLVMValue) [])
@@ -1080,12 +1376,12 @@ the C backend's designated-initializer rendering.")
         (for [i 0 n]
           (let-do [branch (Array.unsafe-nth branches i)
                    pattern (SpecializedMatchBranch.pattern branch)
-                   test (llvm-emit-pattern-test ctx builder pattern ptr)
+                   test (llvm-emit-pattern-test ctx builder pattern ptr &scrutinee-monotype)
                    body-block (LLVM.append-block ctx func (llvm-cstr &@"matchbody"))
                    next-block (LLVM.append-block ctx func (llvm-cstr &@"matchnext"))]
             (ignore (LLVM.build-cond-br builder test body-block next-block))
             (LLVM.position-at-end builder body-block)
-            (let-do [pushed (llvm-bind-pattern! ctx builder pattern ptr scrutinee-ty)
+            (let-do [pushed (llvm-bind-pattern! ctx builder pattern ptr &scrutinee-monotype)
                      body-value (llvm-emit-expr ctx builder mod func
                                                 (Box.peek (SpecializedMatchBranch.body branch)))
                      end-block (LLVM.get-insert-block builder)]
@@ -1214,10 +1510,7 @@ typed GEP to store the fields, and return the loaded whole value.")
                                                     (Long.from-int tag) 0)
                                     tagp))
           (when (Int.> n 0)
-            (let-do [sum-name (match-ref (Box.peek (CoreConstructorDeclaration.result decl))
-                                (CoreType.Named named-result _) (String.copy named-result)
-                                _ @"")
-                     variant-ty (llvm-variant-struct ctx &sum-name tag)
+            (let-do [variant-ty (llvm-variant-struct ctx (Box.peek ret) tag)
                      unionp (LLVM.build-struct-gep builder outer-ty slot 0 (llvm-cstr &@"unionp"))]
               (for [i 0 n]
                 (ignore (LLVM.build-store builder (LLVM.get-param func i)
@@ -1226,6 +1519,108 @@ typed GEP to store the fields, and return the loaded whole value.")
                                   (LLVM.build-load builder outer-ty slot (llvm-cstr &@"ctorval")))))
       _ (llvm-emit-error! (fmt "constructor %s without function type in llvm backend"
                                symbol)))))
+
+(hidden llvm-declare-closure!)
+(defn llvm-declare-closure! [ctx mod closure]
+  (match-ref (Box.peek (ClosureFunction.signature closure))
+    (MonoType.Function fargs fret)
+      (let-do [ptr-ty (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+               param-types (the (Array LLVMType) [ptr-ty])
+               symbol (ClosureFunction.symbol closure)]
+        (for [i 0 (Array.length fargs)]
+          (Array.push-back! &param-types
+                            (llvm-lower-type ctx (Box.peek (Array.unsafe-nth fargs i)))))
+        (ignore (LLVM.add-function mod (llvm-cstr symbol)
+                                   (LLVM.function-type (llvm-lower-type ctx (Box.peek fret))
+                                                       &param-types false)))
+        (ignore (LLVM.add-function mod (llvm-cstr &(fmt "%s_env_delete" symbol))
+                                   (LLVM.function-type (LLVM.void-type ctx) &[ptr-ty] false)))
+        (ignore (LLVM.add-function mod (llvm-cstr &(fmt "%s_env_copy" symbol))
+                                   (LLVM.function-type ptr-ty &[ptr-ty] false))))
+    _ (llvm-emit-error! @"closure without function type in llvm backend")))
+
+(doc llvm-define-closure! "defines a lifted closure function: the leading
+parameter is the environment pointer, captures load from it (into slots when
+set!), and the declared parameters follow shifted by one.")
+(hidden llvm-define-closure!)
+(defn llvm-define-closure! [ctx builder mod closure]
+  (match-ref (Box.peek (ClosureFunction.signature closure))
+    (MonoType.Function _ fret)
+      (let-do [symbol (ClosureFunction.symbol closure)
+               captures (ClosureFunction.captures closure)
+               parameters (ClosureFunction.parameters closure)
+               body (ClosureFunction.body closure)
+               func (LLVM.get-named-function mod (llvm-cstr symbol))
+               entry (LLVM.append-block ctx func (llvm-cstr &@"entry"))
+               env-ty (llvm-closure-env-type ctx captures)]
+        (LLVM.position-at-end builder entry)
+        (llvm-env-reset!)
+        (llvm-slot-reset!)
+        (llvm-pending-reset!)
+        (llvm-collect-set-targets! (Box.peek body))
+        (llvm-emit-slots! ctx builder)
+        (for [i 0 (Array.length captures)]
+          (let-do [capture (Array.unsafe-nth captures i)
+                   id @(CoreRef.id (Pair.a capture))
+                   value (LLVM.build-load builder
+                                          (llvm-lower-type ctx (Box.peek (Pair.b capture)))
+                                          (LLVM.build-struct-gep builder env-ty
+                                                                 (LLVM.get-param func 0) i
+                                                                 (llvm-cstr &@"cap"))
+                                          (llvm-cstr &@"capv"))
+                   si (llvm-slot-index id)]
+            (if (Int.>= si 0)
+              (ignore (LLVM.build-store builder value (llvm-slot-ptr si)))
+              (llvm-env-push! id value))))
+        (for [i 0 (Array.length parameters)]
+          (let [id @(CoreRef.id (Array.unsafe-nth parameters i))
+                si (llvm-slot-index id)]
+            (if (Int.>= si 0)
+              (ignore (LLVM.build-store builder (LLVM.get-param func (Int.inc i))
+                                        (llvm-slot-ptr si)))
+              (llvm-env-push! id (LLVM.get-param func (Int.inc i))))))
+        (let [result (llvm-emit-expr ctx builder mod func (Box.peek body))]
+          (if (unit-type? (Box.peek fret))
+            (ignore (LLVM.build-ret-void builder))
+            (ignore (LLVM.build-ret builder result)))))
+    _ ()))
+
+(doc llvm-define-closure-env-fns! "defines the environment delete and copy
+functions the constructed Lambda carries. Only unmanaged captures reach
+construction today, so delete has nothing to free field-wise and copy is a
+malloc plus a field-wise move.")
+(hidden llvm-define-closure-env-fns!)
+(defn llvm-define-closure-env-fns! [ctx builder mod closure]
+  (let-do [symbol (ClosureFunction.symbol closure)
+           captures (ClosureFunction.captures closure)
+           env-ty (llvm-closure-env-type ctx captures)
+           del (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_delete" symbol)))
+           del-entry (LLVM.append-block ctx del (llvm-cstr &@"entry"))]
+    (LLVM.position-at-end builder del-entry)
+    (ignore (LLVM.build-ret-void builder))
+    (let-do [cpy (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_copy" symbol)))
+             cpy-entry (LLVM.append-block ctx cpy (llvm-cstr &@"entry"))
+             malloc-fnty (LLVM.function-type (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                             &[(LLVM.int64-type ctx)] false)
+             env-size (if (Int.= 0 (Array.length &*llvm-target-data*))
+                        8l
+                        (LLVM.abi-size-of-type (llvm-target-data) env-ty))]
+      (LLVM.position-at-end builder cpy-entry)
+      (let-do [dst (LLVM.build-call builder malloc-fnty
+                                    (llvm-runtime-fn mod "malloc" malloc-fnty)
+                                    &[(LLVM.const-int (LLVM.int64-type ctx) env-size 0)]
+                                    (llvm-cstr &@"envdst"))]
+        (for [i 0 (Array.length captures)]
+          (let [field (LLVM.build-load builder
+                                       (llvm-lower-type ctx (Box.peek (Pair.b (Array.unsafe-nth captures i))))
+                                       (LLVM.build-struct-gep builder env-ty
+                                                              (LLVM.get-param cpy 0) i
+                                                              (llvm-cstr &@"srcf"))
+                                       (llvm-cstr &@"srcv"))]
+            (ignore (LLVM.build-store builder field
+                                      (LLVM.build-struct-gep builder env-ty dst i
+                                                             (llvm-cstr &@"dstf"))))))
+        (ignore (LLVM.build-ret builder dst))))))
 
 (hidden llvm-integer-root?)
 (defn llvm-integer-root? [expression]
@@ -1357,7 +1752,8 @@ layout under `td`, for parity checks against the C backend's struct.")
       (set! *llvm-sum-names* [])
       (set! *llvm-sum-types* [])
       (set! *llvm-target-data* [td])
-      (let [ty (llvm-sum-type-for ctx name)]
+      (let [ty (llvm-sum-type-for ctx
+                                  &(Type.named name (the (Array (Box MonoType)) [])))]
         (Pair.init (Long.to-int (LLVM.abi-size-of-type td ty))
                    (Long.to-int (LLVM.offset-of-element td ty 1))))))
 
@@ -1422,6 +1818,9 @@ mis-lowered.")
       (set! *llvm-sum-types* [])
       (set! *llvm-target-data* [td])
       (set! *llvm-cnative-symbols* [])
+      (set! *llvm-closures* (Array.copy (BackendModule.closure-functions backend)))
+      (set! *llvm-delete-symbols* (Array.copy (BackendModule.delete-symbols backend)))
+      (set! *llvm-copy-symbols* (Array.copy (BackendModule.copy-symbols backend)))
       (let-do [declarations (BackendModule.declarations backend)
                n (Array.length declarations)]
         (for [i 0 n]
@@ -1430,13 +1829,14 @@ mis-lowered.")
               (Array.push-back! &*llvm-cnative-symbols* (String.copy symbol))
             (BackendDeclaration.SourceTemplate symbol _ _ _ _)
               (Array.push-back! &*llvm-cnative-symbols* (String.copy symbol))
-            (BackendDeclaration.Intrinsic symbol _ _)
-              (Array.push-back! &*llvm-cnative-symbols* (String.copy symbol))
+            (BackendDeclaration.Intrinsic symbol _ external)
+              (when (match-ref external (Maybe.Just _) true (Maybe.Nothing) false)
+                (Array.push-back! &*llvm-cnative-symbols* (String.copy symbol)))
             _ ()))
-        (unless (Int.= 0 (Array.length (BackendModule.closure-functions backend)))
-          (llvm-emit-error! @"unsupported closure functions in llvm backend"))
         (for [i 0 n]
           (llvm-declare-one! ctx mod (Array.unsafe-nth declarations i)))
+        (for [i 0 (Array.length &*llvm-closures*)]
+          (llvm-declare-closure! ctx mod (Array.unsafe-nth &*llvm-closures* i)))
         (for [i 0 n]
           (match-ref (Array.unsafe-nth declarations i)
             (BackendDeclaration.Function symbol signature parameters body)
@@ -1444,6 +1844,10 @@ mis-lowered.")
             (BackendDeclaration.Constructor symbol signature decl)
               (llvm-define-constructor! ctx builder mod symbol signature decl)
             _ ()))
+        (for [i 0 (Array.length &*llvm-closures*)]
+          (do
+            (llvm-define-closure! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))
+            (llvm-define-closure-env-fns! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))))
         (llvm-define-global-inits! ctx builder mod declarations &(init-symbol))
         (llvm-define-roots! ctx builder mod (BackendModule.roots backend)
                             &(roots-symbol) &(init-symbol))

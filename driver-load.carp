@@ -1,0 +1,667 @@
+;; Shared driver plumbing: host probes, core/source loading, load-target and
+;; check-name collection, and the module loader front door (load-with-core).
+;; Loaded by main.carp (the C driver) and main-llvm.carp (the LLVM driver).
+
+(load "carp-compiler.carp")
+
+(deftemplate compiler-host-arch (Fn [] String) "String $NAME(void)" "$DECL {
+  String value =
+#if defined(__aarch64__) || defined(_M_ARM64)
+    \"aarch64\";
+#elif defined(__x86_64__) || defined(_M_X64)
+    \"x86_64\";
+#elif defined(__i386__) || defined(_M_IX86)
+    \"i386\";
+#elif defined(__arm__) || defined(_M_ARM)
+    \"arm\";
+#elif defined(__wasm32__)
+    \"wasm32\";
+#else
+    \"unknown\";
+#endif
+  return String_copy(&value);
+}")
+
+(deftemplate compiler-host-os (Fn [] String) "String $NAME(void)" "$DECL {
+  String value =
+#if defined(__APPLE__) && defined(__MACH__)
+    \"darwin\";
+#elif defined(_WIN32)
+    \"mingw32\";
+#elif defined(__linux__)
+    \"linux\";
+#elif defined(__FreeBSD__)
+    \"freebsd\";
+#elif defined(__NetBSD__)
+    \"netbsd\";
+#elif defined(__OpenBSD__)
+    \"openbsd\";
+#else
+    \"unknown\";
+#endif
+  return String_copy(&value);
+}")
+
+(deftemplate compiler-system-exit-code
+             (Fn [Int] Int)
+             "int $NAME(int status)"
+             "$DECL {
+#if defined(_WIN32)
+  return status;
+#else
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 1;
+#endif
+}")
+
+;; Build and execute actions may run concurrently in CI or editor hosts. Give
+;; each compiler process its own temporary C translation unit instead of
+;; racing through one process-global /tmp/carp-compiler-out.c.
+(deftemplate compiler-process-id (Fn [] Int) "int $NAME(void)" "$DECL {
+#if defined(_WIN32)
+  return (int)_getpid();
+#else
+  return (int)getpid();
+#endif
+}")
+
+(deftemplate compiler-remove-file
+             (Fn [(Ref String)] Unit)
+             "void $NAME(String const *path)"
+             "$DECL {
+  (void)remove(*path);
+}")
+
+(def version "0.1.0")
+
+(def core-files
+  [@"Core.carp"
+   @"Interfaces.carp"
+   @"Blitable.carp"
+   @"Bool.carp"
+   @"Box.carp"
+   @"Macros.carp"
+   @"BoolExtras.carp"
+   @"List.carp"
+   @"Derive.carp"
+   @"Gensym.carp"
+   @"ControlMacros.carp"
+   @"Project.carp"
+   @"Platform.carp"
+   @"Introspect.carp"
+   @"Quasiquote.carp"
+   @"Pointer.carp"
+   @"Unsafe.carp"
+   @"Function.carp"
+   @"Generics.carp"
+   @"Maybe.carp"
+   @"Result.carp"
+   @"Dynamic.carp"
+   @"Format.carp"
+   @"Byte.carp"
+   @"Int.carp"
+   @"Long.carp"
+   @"Double.carp"
+   @"Float.carp"
+   @"Tuples.carp"
+   @"Array.carp"
+   @"StaticArray.carp"
+   @"StdInt.carp"
+   @"Char.carp"
+   @"String.carp"
+   @"ArrayExt.carp"
+   @"System.carp"
+   @"IO.carp"
+   @"Pattern.carp"
+   @"Debug.carp"
+   @"Random.carp"
+   @"Map.carp"
+   @"Heap.carp"
+   @"Sort.carp"
+   @"Binary.carp"
+   @"Control.carp"
+   @"Opaque.carp"
+   @"Unit.carp"])
+
+(defn read-core [dir]
+  (let-do [result (the (Array ModuleSource) [])]
+    (for [i 0 (Array.length &core-files)]
+      (let [name @(Array.unsafe-nth &core-files i)
+            file (String.concat &[@dir @"/" @&name])
+            text (IO.unsafe-read-file &file)]
+        (Array.push-back! &result (ModuleSource.init name file text))))
+    result))
+
+(defn parsed-forms [src]
+  (match (Surface.parse src)
+    (Result.Success m) @(SurfaceModule.forms &m)
+    (Result.Error _) (the (Array (Box SurfaceNode)) [])))
+
+(defn append-forms [left right]
+  (let-do [result (Array.copy left)]
+    (for [i 0 (Array.length right)]
+      (set! result
+            (Array.push-back result
+                             (Box.init
+                               (SurfaceNode.copy (Box.peek (Array.unsafe-nth right
+                                                                             i)))))))
+    result))
+
+; compiles a single standalone source (primitives only) to a C string, or prints
+; the error and returns Nothing.
+(defn symbol-named? [node name]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.Symbol segments)
+      (and (Int.= 1 (Array.length segments))
+           (String.= (Array.unsafe-nth segments 0) name))
+    _ false))
+
+(defn load-symbol? [node]
+  (or (symbol-named? node "load") (symbol-named? node "load-once")))
+
+; returns the file a load directive names: `(load "X.carp")`/`(load-once "X.carp")`
+; give the literal string; `(load-and-use X)` gives "X.carp".
+(defn form-load-target [node]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.List items)
+      (if (Int.= 2 (Array.length items))
+        (let [head (Box.peek (Array.unsafe-nth items 0))
+              arg (Box.peek (Array.unsafe-nth items 1))]
+          (cond
+            (load-symbol? head)
+              (match-ref (SurfaceNode.form arg)
+                ;; `(load "core/Foo.carp")` names a Core file relative to the Carp
+                ;; root; the core dir already IS core, so drop the prefix (this
+                ;; also dedups against the same file loaded plainly as "Foo.carp").
+                (SurfaceForm.StringLit path)
+                (Maybe.Just
+                  (if (String.starts-with? path "core/")
+                    (String.suffix path 5)
+                    @path))
+                _
+                (the (Maybe String) (Maybe.Nothing)))
+            (symbol-named? head "load-and-use")
+              (match-ref (SurfaceNode.form arg)
+                (SurfaceForm.Symbol segments)
+                  (if (Int.= 1 (Array.length segments))
+                    (Maybe.Just
+                      (String.concat &[@(Array.unsafe-nth segments 0) @".carp"]))
+                    (the (Maybe String) (Maybe.Nothing)))
+                _ (the (Maybe String) (Maybe.Nothing)))
+            (the (Maybe String) (Maybe.Nothing))))
+        (the (Maybe String) (Maybe.Nothing)))
+    _ (the (Maybe String) (Maybe.Nothing))))
+
+(defn collect-load-targets [forms]
+  (let-do [result (the (Array String) [])]
+    (for [i 0 (Array.length forms)]
+      (match (form-load-target (Box.peek (Array.unsafe-nth forms i)))
+        (Maybe.Just name) (Array.push-back! &result name)
+        (Maybe.Nothing) ()))
+    result))
+
+; the name a `(defn name ...)`/`(defn- name ...)` form defines, if any.
+(defn defn-name [node]
+  (match-ref (SurfaceNode.form node)
+    (SurfaceForm.List items)
+      (if (Int.< 2 (Array.length items))
+        (let [head (Box.peek (Array.unsafe-nth items 0))
+              name-node (Box.peek (Array.unsafe-nth items 1))]
+          (if (or (symbol-named? head "defn") (symbol-named? head "defn-"))
+            (match-ref (SurfaceNode.form name-node)
+              (SurfaceForm.Symbol segments)
+                (if (Int.= 1 (Array.length segments))
+                  (Maybe.Just @(Array.unsafe-nth segments 0))
+                  (the (Maybe String) (Maybe.Nothing)))
+              _ (the (Maybe String) (Maybe.Nothing)))
+            (the (Maybe String) (Maybe.Nothing))))
+        (the (Maybe String) (Maybe.Nothing)))
+    _ (the (Maybe String) (Maybe.Nothing))))
+
+; collects the qualified name of every defn in the user's own source (walking
+; defmodule nesting), so the driver can demand-check those definitions even
+; when nothing calls them (the reference checks every definition it loads).
+(sig collect-check-names!
+     (Fn [(Ref (Array (Box SurfaceNode))) String (Ref (Array String))] ()))
+(defn collect-check-names! [forms prefix acc]
+  (for [i 0 (Array.length forms)]
+    (let-do [node (Box.peek (Array.unsafe-nth forms i))]
+      (match (defn-name node)
+        (Maybe.Just name)
+          (Array.push-back! acc (String.concat &[@&prefix @&name]))
+        (Maybe.Nothing) ())
+      ;; `(derive T f)` expands to a `T.f` defn implementing interface `f`;
+      ;; seed it so the derived body is checked even when nothing calls it.
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List items)
+          (when (and (Int.= 3 (Array.length items))
+                     (symbol-named? (Box.peek (Array.unsafe-nth items 0))
+                                    "derive"))
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 1)))
+              (SurfaceForm.Symbol type-segments)
+                (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 2)))
+                  (SurfaceForm.Symbol fn-segments)
+                    (when (and (Int.= 1 (Array.length type-segments))
+                               (Int.= 1 (Array.length fn-segments)))
+                      (Array.push-back! acc
+                                        (String.concat
+                                          &[@&prefix
+                                            @(Array.unsafe-nth type-segments 0)
+                                            @"."
+                                            @(Array.unsafe-nth fn-segments 0)])))
+                  _ ())
+              _ ()))
+        _ ())
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List items)
+          (when (and (Int.< 2 (Array.length items))
+                     (symbol-named? (Box.peek (Array.unsafe-nth items 0))
+                                    "defmodule"))
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 1)))
+              (SurfaceForm.Symbol segments)
+                (when (Int.= 1 (Array.length segments))
+                  (let-do [inner-prefix (String.concat
+                             &[@&prefix @(Array.unsafe-nth segments 0) @"."])
+                           body (the (Array (Box SurfaceNode)) [])]
+                    (for [j 2 (Array.length items)]
+                      (Array.push-back! &body
+                                        (Box.init
+                                          (SurfaceNode.copy (Box.peek (Array.unsafe-nth items
+                                                                                        j))))))
+                    (collect-check-names! &body inner-prefix acc)))
+              _ ()))
+        _ ()))))
+
+(defn collect-check-names [source]
+  (let-do [acc (the (Array String) [])]
+    (match (Surface.parse source)
+      (Result.Success user-module)
+        (collect-check-names! (SurfaceModule.forms &user-module) @"" &acc)
+      (Result.Error _) ())
+    acc))
+
+; whether the user source keeps top-level result echo on. The reference echoes
+; every top-level expression result unless the program calls (Project.no-echo).
+(defn echo-enabled? [forms]
+  (let-do [echo true]
+    (for [i 0 (Array.length forms)]
+      (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth forms i)))
+        (SurfaceForm.List items)
+          (when (Int.> (Array.length items) 0)
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 0)))
+              (SurfaceForm.Symbol segments)
+                (when (and (Int.= 2 (Array.length segments))
+                           (and
+                             (String.= (Array.unsafe-nth segments 0) "Project")
+                             (String.= (Array.unsafe-nth segments 1) "no-echo")))
+                  (set! echo false))
+              _ ()))
+        _ ()))
+    echo))
+
+(defn source-echo-enabled? [source]
+  (match (Surface.parse source)
+    (Result.Success user-module)
+      (echo-enabled? (SurfaceModule.forms &user-module))
+    (Result.Error _) false))
+
+(defn source-present? [registry name]
+  (let-do [found false]
+    (for [i 0 (Array.length registry)]
+      (when (String.= (ModuleSource.path (Array.unsafe-nth registry i)) name)
+        (set! found true)))
+    found))
+
+(defn read-core-file [core-dir name]
+  (match (IO.read-file &(String.concat &[@core-dir @"/" @name]))
+    (Result.Success text) (Maybe.Just text)
+    (Result.Error _) (the (Maybe String) (Maybe.Nothing))))
+
+; --- git-reference loads ---
+; a load target containing `@` names a git checkout, the reference compiler's
+; install semantics: the part after the LAST `@` is the tag, the rest the
+; remote. Checkouts live under `<cache>/carp/libs/<dir>/<tag>` where `<dir>`
+; strips the user prefix or URL scheme and turns `:` into `_COLON_`
+; (e.g. git@github.com:carpentry-org/strbuf -> github.com_COLON_carpentry-org/strbuf).
+; The file loaded from the checkout is `<repo>.carp`, falling back to
+; `main.carp`; a missing checkout is installed with git.
+
+(defn git-ref? [name] (Int.> (String.index-of name \@) -1))
+
+(defn last-at-index [name]
+  (let-do [result -1
+           i 0
+           n (String.length name)]
+    (while-do (Int.< i n)
+      (when (Char.= (String.char-at name i) \@) (set! result i))
+      (set! i (Int.inc i)))
+    result))
+
+(defn git-ref-url [name] (String.prefix name (last-at-index name)))
+
+(defn git-ref-tag [name] (String.suffix name (Int.inc (last-at-index name))))
+
+(defn git-ref-cache-dir [url]
+  (cond
+    (String.starts-with? url "https://") (String.suffix url 8)
+    (String.starts-with? url "http://") (String.suffix url 7)
+    (let [after-user (if (git-ref? url)
+            (String.suffix url (Int.inc (String.index-of url \@)))
+            @url)]
+      (String.join "_COLON_" &(String.split-by &after-user &[\:])))))
+
+(defn git-ref-repo-file [url]
+  (let-do [segments (String.split-by url &[\/ \:])
+           repo (if (Int.> (Array.length &segments) 0)
+             @(Array.unsafe-nth &segments (Int.dec (Array.length &segments)))
+             @"main")]
+    (when (String.ends-with? &repo ".git")
+      (set! repo (String.prefix &repo (Int.- (String.length &repo) 4))))
+    (unless (String.ends-with? &repo ".carp")
+      (set! repo (String.append &repo ".carp")))
+    repo))
+
+(defn git-cache-root []
+  (match (IO.getenv "XDG_CACHE_HOME")
+    (Maybe.Just cache) (String.append &cache "/carp/libs")
+    (Maybe.Nothing)
+      (match (IO.getenv "HOME")
+        (Maybe.Just home) (String.append &home "/.cache/carp/libs")
+        (Maybe.Nothing) @"/tmp/carp-libs")))
+
+(defn git-install! [dir url tag]
+  (ignore
+    (System.system
+      &(fmt
+        "mkdir -p '%s' && cd '%s' && git init -q && git remote add origin '%s' && git fetch -q --all --tags && git checkout -q '%s'"
+        dir
+        dir
+        url
+        tag))))
+
+; reads a git-referenced module out of the cache, installing the checkout
+; first when it is missing.
+(defn read-git-source [name]
+  (let [url (git-ref-url name)
+        dir (String.concat
+          &[(git-cache-root)
+            @"/"
+            (git-ref-cache-dir &url)
+            @"/"
+            (git-ref-tag name)])
+        lib-file (String.concat
+          &[(String.copy &dir) @"/" (git-ref-repo-file &url)])
+        main-file (String.append &dir "/main.carp")]
+    (match (IO.read-file &lib-file)
+      (Result.Success text) (Maybe.Just (Pair.init @&lib-file text))
+      (Result.Error _)
+        (match (IO.read-file &main-file)
+          (Result.Success text) (Maybe.Just (Pair.init @&main-file text))
+          (Result.Error _)
+            (do
+              (git-install! &dir &url &(git-ref-tag name))
+              (match (IO.read-file &lib-file)
+                (Result.Success text) (Maybe.Just (Pair.init @&lib-file text))
+                (Result.Error _)
+                  (match (IO.read-file &main-file)
+                    (Result.Success text)
+                      (Maybe.Just (Pair.init @&main-file text))
+                    (Result.Error _)
+                      (the (Maybe (Pair String String)) (Maybe.Nothing)))))))))
+
+; the directory portion of a path ("." when there is none).
+(defn dir-of [path]
+  (let-do [slash -1
+           i 0
+           n (String.length path)]
+    (while-do (Int.< i n)
+      (when (Char.= (String.char-at path i) \/) (set! slash i))
+      (set! i (Int.inc i)))
+    (if (Int.< slash 0) @"." (String.prefix path slash))))
+
+; collapses "." and ".." segments textually so the same file reached through
+; different load spellings gets one canonical path (the loader dedups by it).
+(defn normalize-path [path]
+  (let-do [segments (String.split-by path &[\/])
+           kept (the (Array String) [])
+           absolute (String.starts-with? path "/")]
+    (for [i 0 (Array.length &segments)]
+      (let [segment (Array.unsafe-nth &segments i)]
+        (cond
+          (or (String.= segment "") (String.= segment ".")) ()
+          (String.= segment "..")
+            (if (and (Int.> (Array.length &kept) 0)
+                     (not
+                       (String.=
+                         (Array.unsafe-nth &kept (Int.dec (Array.length &kept)))
+                         "..")))
+              (ignore (Array.pop-back! &kept))
+              (Array.push-back! &kept @segment))
+          (Array.push-back! &kept @segment))))
+    (if absolute
+      (String.append "/" &(String.join "/" &kept))
+      (String.join "/" &kept))))
+
+; reads every file transitively named by a `(load ...)` in `seed` (and in the
+; files those name): git references from the cache, plain names relative to the
+; REQUESTING file's directory first, then core-dir. Files already present (the
+; Core set) are left untouched; the loader dedups shared files reached through
+; different spellings by their canonical path.
+; byte-wise ASCII case-insensitive path equality: on a case-insensitive
+; filesystem a file can resolve to ITSELF through a load name differing only
+; by case (test/filepath.carp loading "Filepath.carp" means core's, not the
+; test), so self-resolution must fall through to core-dir.
+(defn same-path-ignoring-case? [a b]
+  (let-do [n (String.length a)
+           equal (Int.= n (String.length b))
+           i 0]
+    (while-do (and equal (Int.< i n))
+      (let [ca (Char.to-int (String.char-at a i))
+            cb (Char.to-int (String.char-at b i))
+            la (if (and (Int.>= ca 65) (Int.<= ca 90)) (Int.+ ca 32) ca)
+            lb (if (and (Int.>= cb 65) (Int.<= cb 90)) (Int.+ cb 32) cb)]
+        (unless (Int.= la lb) (set! equal false)))
+      (set! i (Int.inc i)))
+    equal))
+
+; resolves one plain load target against the requesting file's directory, then
+; core-dir; git references go to the cache. A target that names an absolute
+; path IS the path — joining it onto the requester's directory could only ever
+; produce a file that does not exist. The Pair is (canonical file, text).
+(defn resolve-load-target [core-dir requester-file name]
+  (if (git-ref? name)
+    (read-git-source name)
+    (let [requester-dir (dir-of requester-file)
+          local (if (String.starts-with? name "/")
+            (normalize-path name)
+            (normalize-path
+              &(String.concat
+                &[(String.copy &requester-dir) @"/" (String.copy name)])))]
+      (match (if (same-path-ignoring-case? &local
+                                           &(normalize-path requester-file))
+          (Result.Error @"self")
+          (IO.read-file &local))
+        (Result.Success text) (Maybe.Just (Pair.init @&local text))
+        (Result.Error _)
+          (match (read-core-file core-dir name)
+            (Maybe.Just found)
+              (Maybe.Just
+                (Pair.init
+                  (String.concat &[@core-dir @"/" (String.copy name)])
+                  found))
+            (Maybe.Nothing) (the (Maybe (Pair String String)) (Maybe.Nothing)))))))
+
+(defn ensure-sources [registry core-dir seed]
+  (let-do [result registry
+           work @seed]
+    (while (Int.< 0 (Array.length &work))
+      (let-do [item (Array.pop-back! &work)
+               requester-file (Pair.a &item)
+               name (Pair.b &item)]
+        (unless (source-present? &result name)
+          (match (resolve-load-target core-dir requester-file name)
+            (Maybe.Just entry)
+              (let-do [file @(Pair.a &entry)
+                       text @(Pair.b &entry)]
+                (set! result
+                      (Array.push-back result
+                                       (ModuleSource.init (String.copy name)
+                                                          (String.copy &file)
+                                                          (String.copy &text))))
+                (match (Surface.parse &text)
+                  (Result.Success m)
+                    (let-do [targets (collect-load-targets (SurfaceModule.forms &m))]
+                      (for [i 0 (Array.length &targets)]
+                        (set! work
+                              (Array.push-back work
+                                               (Pair.init (String.copy &file)
+                                                          @(Array.unsafe-nth &targets
+                                                                             i))))))
+                  (Result.Error _) ()))
+            (Maybe.Nothing) ()))))
+    result))
+
+; compiles a source with the standard library from core-dir loaded ahead of it.
+; host arch/os are stamped from this compiler binary. The source's own
+; `(load "X.carp")` directives are honored against core-dir, so a file that
+; loads Test.carp (or Vector, SafeInt, ...) pulls those in like the reference
+; compiler does.
+(defn phase! [name]
+  (match (IO.getenv "CARP_DEBUG_PHASES")
+    (Maybe.Just _) (IO.errorln &(String.append "phase: " name))
+    (Maybe.Nothing) ()))
+
+; loads the user program with the boot prelude and standard library into a
+; surface module ready for the pipeline; answers it with the user source.
+(defn load-with-core [input core-dir no-core]
+  (match (IO.read-file input)
+    (Result.Error e)
+      (do
+        (IO.errorln &(fmt "carp-compiler: cannot read '%s': %s" input &e))
+        (the (Maybe (Pair SurfaceModule String)) (Maybe.Nothing)))
+    (Result.Success source)
+      (match (if no-core
+          (Result.Success @"")
+          (IO.read-file &(String.concat &[@core-dir @"/Core.carp"])))
+        (Result.Error _)
+          (do
+            (IO.errorln &(fmt "carp-compiler: no Core.carp under '%s'" core-dir))
+            (the (Maybe (Pair SurfaceModule String)) (Maybe.Nothing)))
+        (Result.Success _)
+          (let [host-arch (compiler-host-arch)
+                host-os (compiler-host-os)
+                boot (String.concat
+                  &[@"(defndynamic host-arch [] \""
+                    (String.copy &host-arch)
+                    @"\")
+(defndynamic host-os [] \""
+                    (String.copy &host-os)
+                    @"\")
+(def target-arch \""
+                    host-arch
+                    @"\")
+(def target-os \""
+                    host-os
+                    @"\")
+(def target-abi \"unknown\")
+(defmodule Project
+  (defndynamic config [key value] ())
+  (defndynamic no-echo [] ())
+  (defndynamic get-config [key]
+    (cond
+      (= key \"echo-c\") false
+      (= key \"title\") \"Untitled\"
+      (= key \"output-directory\") \"out\"
+      (= key \"load-stack\") (Unsafe.load-stack)
+      (= key \"cflag\") '()
+      (= key \"libflag\") '()
+      (= key \"pkgconfigflag\") '()
+      \"native\")))"])
+                root-name "__carp-compiler-main__.carp"
+                ;; `add-c` must be redefined AFTER Core loads (core's Dynamic.carp
+                ;; defines it via the Project \"cmod\" config we do not track);
+                ;; this variant textually includes the C module instead.
+                root-text (String.concat &[@&boot (if no-core @"
+" @"
+(load \"Core.carp\")
+") @"(defmacro add-c [relpath]
+  (list (quote Unsafe.preproc)
+        (list (quote Unsafe.emit-c)
+              (String.concat [\"#include \\\"\" (relative-to (current-file) relpath) \"\\\"\"]))))
+(defmacro relative-include [path]
+  (list (quote Unsafe.preproc)
+        (list (quote Unsafe.emit-c)
+              (String.concat [\"#include \\\"\" (relative-to (current-file) path) \"\\\"\"]))))
+(load \"__input__\")
+"])]
+            (match (Surface.parse &root-text)
+              (Result.Error _)
+                (do
+                  (IO.errorln "carp-compiler: cannot parse input")
+                  (the (Maybe (Pair SurfaceModule String)) (Maybe.Nothing)))
+              (Result.Success root-module)
+                (let-do [targets (collect-load-targets (SurfaceModule.forms &root-module))
+                         user-targets (match (Surface.parse &source)
+                           (Result.Success user-module)
+                             (collect-load-targets (SurfaceModule.forms &user-module))
+                           (Result.Error _) (the (Array String) []))
+                         seed (the (Array (Pair String String)) [])
+                         _ignored-seed (for [i 0 (Array.length &targets)]
+                           (Array.push-back! &seed
+                                             (Pair.init (String.copy input)
+                                                        @(Array.unsafe-nth &targets
+                                                                           i))))
+                         _ignored-user-seed (for [i
+                                                  0
+                                                  (Array.length &user-targets)]
+                           (Array.push-back! &seed
+                                             (Pair.init (String.copy input)
+                                                        @(Array.unsafe-nth &user-targets
+                                                                           i))))
+                         registry (ensure-sources (read-core core-dir)
+                                                  core-dir
+                                                  &seed)]
+                  ;; the user's file is a source of its own rather than text
+                  ;; pasted after the prelude, so a position in it is a
+                  ;; position in it — which is what a reader, and an editor
+                  ;; underlining a diagnostic, needs
+                  (set! registry
+                        (Array.push-back registry
+                                         (ModuleSource.init @"__input__"
+                                                            (String.copy input)
+                                                            (String.copy &source))))
+                  (set! registry
+                        (Array.push-back registry
+                                         (ModuleSource.init @root-name
+                                                            @root-name
+                                                            @&root-text)))
+                  (phase! "sources-ready")
+                  ;; a debug build turns spans back into lines afterwards, and
+                  ;; only the text a span points into can say which line it is:
+                  ;; keep the registry's texts before the loader consumes it
+                  (when-do *want-source-map*
+                    (set! *source-map-files* [])
+                    (set! *source-map-texts* [])
+                    (for [i 0 (Array.length &registry)]
+                      (let-do [entry (Array.unsafe-nth &registry i)]
+                        (Array.push-back! &*source-map-files*
+                                          (String.copy (ModuleSource.file entry)))
+                        (Array.push-back! &*source-map-texts*
+                                          (String.copy (ModuleSource.text entry))))))
+                  (match (ModuleLoader.load &registry &(String.copy root-name))
+                    (Result.Error e)
+                      (do
+                        (IO.errorln
+                          &(String.append "carp-compiler: cannot load: "
+                                          (ModuleError.message &e)))
+                        (the (Maybe (Pair SurfaceModule String)) (Maybe.Nothing)))
+                    (Result.Success loaded)
+                      (let-do [_ignored-phase (phase! "loaded")
+                               module (ModuleLoader.with-compiler-prelude &loaded)]
+                        (Maybe.Just (Pair.init module source))))))))))
+
+
+;; `-x` builds to the reference compiler's default output path, so programs
+;; observing their own argv (System.args) see the same value.
+(def temp-bin "out/Untitled")

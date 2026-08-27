@@ -6,10 +6,14 @@ same lowered form `CBackend` renders to C) to LLVM IR through the
 `BackendLower`; everything upstream — specialization, ownership planning,
 lambda lifting — is shared with the C backend unchanged.
 
-Scope covers the `examples/simple.carp`, `nominal.carp`, and `hello.carp`
-tiers plus owned strings and arrays with ownership-planned deletes: concrete
-functions over Int, Bool, Long, Double, Float, Char, Byte,
-and Unit; array literals; string and pattern literals (borrowed static storage); `if`, `let`,
+Scope covers every example tier plus owned strings, arrays, closures, and
+generic sum-type instances, with ownership-planned deletes: concrete
+functions over Int, Bool, Long, Double, Float, Char, Byte, the fixed-width
+registered types, and Unit; array literals and the allocate/aset-uninitialized!
+builtins; lambdas (non-capturing wrapped over their lifted function, capturing
+constructed over a heap environment with generated env delete/copy) and calls
+through Lambda values (env-first when an environment is present, the C
+backend's convention); string and pattern literals (borrowed static storage); `if`, `let`,
 `do`, `set!`, `while`, and `break`; direct global calls; `def` globals with
 runtime initializers, global reads (`Reference`/`GlobalValue`, including the
 NULL builtin), and global `set!`; concrete sum types with constructors and
@@ -78,6 +82,19 @@ link the shim object instead. Since both backends read the same lowered
 ```bash
 carp -x test/carp-llvm-backend.carp
 ```
+
+The backend also has a driver: `carp -b --optimize main-llvm.carp` at the
+repository root builds `out/carp-compiler-llvm`, which shares the C driver's
+whole front half (`driver-load.carp`) and prints LLVM IR by default, or builds
+and runs a native executable under `-b`/`-x` (object file through the LLVM
+target machine, linked by clang against the C shim plus a generated `main`).
+every runnable example — `hello.carp`, `nominal.carp`, `nested-pattern.carp`,
+`signature-nominal.carp`, `polymorphic-nominal.carp`, and `squares.carp` (the
+full standard library: lambdas, `copy-map`, string formatting) — runs end to
+end and prints what the C driver's build prints. A Carp `(defn main ...)`
+becomes the executable's entry through the shim (roots first, then main, like
+the C backend). `simple.carp` fails at link on its deliberately undefined
+`int_inc` in both drivers alike.
 
 The test lowers `examples/simple.carp`, `examples/hello.carp`,
 `examples/nominal.carp`, and two inline programs end to end, verifies every
