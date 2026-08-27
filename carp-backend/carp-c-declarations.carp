@@ -406,7 +406,7 @@ binder in the body, first-of-a-name wins.")
     (Result.Success ())
     (match-ref type
       (MonoType.Named name arguments)
-      (if (source-nominal? constructors name)
+      (if (and (source-nominal? constructors name) (not (String.= name "Box")))
         (if (concrete-type-listed? visiting type)
           (Result.Error
             (BackendError.init
@@ -716,16 +716,37 @@ concrete application. Each constructor receives its stable source-order tag.")
             (Result.Success output)
               (match (render-type (Box.peek (Array.unsafe-nth &applications i)))
                 (Result.Success c-name)
-                  (set! result
-                        (Result.Success
-                          (String.concat
-                            &[(String.copy output)
-                              @"typedef struct "
-                              (String.copy &c-name)
-                              @" "
-                              (String.copy &c-name)
-                              @";
-"])))
+                  (let-do [next-output (String.concat
+                             &[(String.copy output)
+                               @"typedef struct "
+                               (String.copy &c-name)
+                               @" "
+                               (String.copy &c-name)
+                               @";
+"])]
+                    (match-ref (Box.peek (Array.unsafe-nth &applications i))
+                      (MonoType.Named source-name arguments)
+                        (if (and (= source-name "Box")
+                                 (Int.= 1 (Array.length arguments)))
+                          (match (render-type
+                              (Box.peek (Array.unsafe-nth arguments 0)))
+                            (Result.Success arg-c-name)
+                              (let [alias-name (String.concat &[@"Box__"
+                                                                (String.copy &arg-c-name)])]
+                                (set! result
+                                      (Result.Success
+                                        (String.concat
+                                          &[(String.copy &next-output)
+                                            @"typedef struct "
+                                            (String.copy &c-name)
+                                            @" "
+                                            (String.copy &alias-name)
+                                            @";
+"]))))
+                            (Result.Error error)
+                              (set! result (Result.Error error)))
+                          (set! result (Result.Success next-output)))
+                      _ (set! result (Result.Success next-output))))
                 (Result.Error error) (set! result (Result.Error error)))
             (Result.Error _) ()))
         (for [i 0 n]
@@ -1621,35 +1642,6 @@ selected by specialization.")
               (Result.Error
                 (BackendError.init
                   @"function delete template must not have dependencies")))
-            (PrimitiveTemplate.BoxCopy _)
-            (if (Int.= 1 (Array.length dependencies))
-              (match (template-element-type (Box.peek signature))
-                (Result.Success element)
-                  (match (CBackend.render-type &element)
-                    (Result.Success rendered-element)
-                      (let [dependency (Array.unsafe-nth dependencies 0)
-                            dependency-symbol (sanitize (BackendDependency.symbol dependency))]
-                        (let-do [buffer (StringBuf.create)
-                                 _ignored-head (StringBuf.append-str &buffer
-                                                                     &head)]
-                          (StringBuf.append-str &buffer " {
-  ")
-                          (StringBuf.append-str &buffer &rendered-element)
-                          (StringBuf.append-str &buffer
-                                                "* copy = CARP_MALLOC(sizeof(")
-                          (StringBuf.append-str &buffer &rendered-element)
-                          (StringBuf.append-str &buffer "));
-  *copy = ")
-                          (StringBuf.append-str &buffer &dependency-symbol)
-                          (StringBuf.append-str &buffer "(*arg0);
-  return copy;
-}")
-                          (Result.Success (StringBuf.to-string &buffer))))
-                    (Result.Error error) (Result.Error error))
-                (Result.Error error) (Result.Error error))
-              (Result.Error
-                (BackendError.init
-                  @"box copy template requires one copy dependency")))
             (PrimitiveTemplate.PairCopy _)
             (if (Int.= 2 (Array.length dependencies))
               (match-ref (Box.peek signature)
@@ -1686,72 +1678,7 @@ selected by specialization.")
               (Result.Error
                 (BackendError.init
                   @"pair copy template requires two copy dependencies")))
-            (PrimitiveTemplate.BoxStr _)
-            (if (Int.= 1 (Array.length dependencies))
-              (let-do [dependency (Array.unsafe-nth dependencies 0)
-                       dependency-symbol (sanitize (BackendDependency.symbol dependency))
-                       by-ref (match-ref (Box.peek (BackendDependency.signature dependency))
-                         (MonoType.Function str-arguments _)
-                           (if (Int.= 1 (Array.length str-arguments))
-                             (match-ref (Box.peek (Array.unsafe-nth str-arguments
-                                                                    0))
-                               (MonoType.Reference _ _) true
-                               _ false)
-                             false)
-                         _ false)
-                       ;; `arg0` is elt**: the boxed element pointer is *arg0.
-                       str-call (if by-ref
-                         (fmt "String temp = %s(*arg0);" &dependency-symbol)
-                         (fmt "String temp = %s(**arg0);" &dependency-symbol))
-                       buffer (StringBuf.create)
-                       _ignored-head (StringBuf.append-str &buffer &head)]
-                (StringBuf.append-str &buffer " {
-  ")
-                (StringBuf.append-str &buffer &str-call)
-                (StringBuf.append-str &buffer "
-  int size = snprintf(NULL, 0, \"(Box %s)\", temp) + 1;
-  String buffer = CARP_MALLOC(size);
-  snprintf(buffer, size, \"(Box %s)\", temp);
-  if(temp) { CARP_FREE(temp); temp = NULL; }
-  return buffer;
-}")
-                (Result.Success (StringBuf.to-string &buffer)))
-              (Result.Error
-                (BackendError.init
-                  @"box str template requires one str dependency")))
-            ;; a Box is a bare element pointer: delete the boxed element when
-            ;; it is managed (one delete dependency), then free the cell.
-            (PrimitiveTemplate.BoxDelete _)
-            (match-ref (Box.peek signature)
-              (MonoType.Function box-delete-arguments _)
-                (if (Int.= 1 (Array.length box-delete-arguments))
-                  (let-do [buffer (StringBuf.create)
-                           ;; a function starts somewhere of its own; without
-                           ;; this its head belongs to the last line of the
-                           ;; function before it
-                           _ignored-reset (LineMap.mark-reset! &buffer)
-                           _ignored-head (StringBuf.append-str &buffer &head)]
-                    (StringBuf.append-str &buffer " {
-  if (arg0) {
-")
-                    (when (Int.= 1 (Array.length dependencies))
-                      (let-do [dependency (Array.unsafe-nth dependencies 0)
-                               dependency-symbol (sanitize (BackendDependency.symbol dependency))]
-                        (StringBuf.append-str &buffer "    ")
-                        (StringBuf.append-str &buffer &dependency-symbol)
-                        (StringBuf.append-str &buffer "(*arg0);
-")))
-                    (StringBuf.append-str &buffer "    CARP_FREE(arg0);
-  }
-}")
-                    (Result.Success (StringBuf.to-string &buffer)))
-                  (Result.Error
-                    (BackendError.init
-                      @"box delete template must have one argument")))
-              _
-                (Result.Error
-                  (BackendError.init
-                    @"box delete template needs a function signature")))
+
             (PrimitiveTemplate.ArrayDelete _)
             (match-ref (Box.peek signature)
               (MonoType.Function delete-arguments _)
