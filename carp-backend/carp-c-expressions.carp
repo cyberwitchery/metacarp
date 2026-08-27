@@ -923,6 +923,35 @@ environment deleter.")
 (defn append-indent! [buffer depth]
   (for [i 0 depth] (StringBuf.append-str buffer "  ")))
 
+(doc append-line-directive! "says which Carp line the C about to be written
+came from, when a caller installed a source map and the expression has a place
+in it.
+
+A directive claims every line after it, so one is written per change rather
+than per statement, and generated code with no place of its own keeps the
+claim of the form it came out of — which is the form a reader would point at
+anyway.")
+(defn append-line-directive! [buffer id]
+  (when-do *emit-line-directives*
+    (let [line (LineMap.line-of id)]
+      (if (Int.> line 0)
+        (let-do [file (LineMap.file-of id)]
+          ;; a directive owns the line it stands on, so it starts one
+          (StringBuf.append-str buffer "
+#line ")
+          (StringBuf.append-str buffer &(Int.str line))
+          (StringBuf.append-str buffer " \"")
+          (StringBuf.append-str buffer &file)
+          (StringBuf.append-str buffer "\"
+")
+          (set! *line-last-line* line)
+          (set! *line-last-file* file))
+        ;; nowhere to point: put the file back on itself. A directive claims
+        ;; every line after it, counting up, so code with no place of its own
+        ;; would otherwise be walked through as lines of a Carp file that stop
+        ;; existing a few lines in
+        (LineMap.mark-reset! buffer)))))
+
 (defn array-element-type [array-type]
   (let [storage-type (deref-type array-type)]
     (match-ref &storage-type
@@ -1327,88 +1356,201 @@ binding so the value is the binding itself.")
       result)))
 
 (defn append-statement! [constructors buffer expression depth]
-  (match-ref expression
-    (SpecializedExpr.Do _ _ expressions)
-      (let-do [result (the (Result Unit BackendError) (Result.Success ()))
-               n (Array.length expressions)]
-        (for [i 0 n]
-          (match-ref &result
-            (Result.Success _)
-              (set! result
-                    (append-statement! constructors
-                                       buffer
-                                       (Box.peek (Array.unsafe-nth expressions i))
-                                       depth))
-            (Result.Error _) ()))
-        result)
-    (SpecializedExpr.Let _ _ reference value body)
-      (match (append-local-declaration! constructors
-                                        buffer
-                                        reference
-                                        (Box.peek value)
-                                        depth)
-        (Result.Success _)
-          (append-statement! constructors buffer (Box.peek body) depth)
-        (Result.Error error) (Result.Error error))
-    (SpecializedExpr.Set _ _ reference value)
-      (match (render-value-expression constructors (Box.peek value))
-        (Result.Success rendered)
-          (let-do [target (if @(CoreRef.global reference)
-                     ;; assign the global through its reconstructed C symbol.
-                     (sanitize
-                       &(CAbi.mangle (CoreRef.name reference)
-                                     &(specialized-type (Box.peek value))))
-                     (local-symbol reference))]
-            (append-indent! buffer depth)
-            (StringBuf.append-str buffer &target)
-            (StringBuf.append-str buffer " = ")
-            (StringBuf.append-str buffer &rendered)
-            (StringBuf.append-str buffer ";
-")
-            (Result.Success ()))
-        (Result.Error error) (Result.Error error))
-    (SpecializedExpr.While _ _ condition body)
-      (append-cached-while! constructors
-                            buffer
-                            (Box.peek condition)
-                            (Box.peek body)
-                            depth)
-    (SpecializedExpr.Break _ _)
-      (do (append-indent! buffer depth) (StringBuf.append-str buffer "break;
-") (Result.Success ()))
-    (SpecializedExpr.If _ _ condition then-branch else-branch)
-      (match (render-value-expression constructors (Box.peek condition))
-        (Result.Success rendered-condition)
-          (do
-            (append-indent! buffer depth)
-            (StringBuf.append-str buffer "if (")
-            (StringBuf.append-str buffer &rendered-condition)
-            (StringBuf.append-str buffer ") {
-")
-            (match (append-statement! constructors
-                                      buffer
-                                      (Box.peek then-branch)
-                                      (Int.inc depth))
+  (let-do [_ignored-line (append-line-directive! buffer
+                                                 (Specialize.expression-id expression))]
+    (match-ref expression
+      (SpecializedExpr.Do _ _ expressions)
+        (let-do [result (the (Result Unit BackendError) (Result.Success ()))
+                 n (Array.length expressions)]
+          (for [i 0 n]
+            (match-ref &result
               (Result.Success _)
-                (do
-                  (append-indent! buffer depth)
-                  (StringBuf.append-str buffer "} else {
+                (set! result
+                      (append-statement! constructors
+                                         buffer
+                                         (Box.peek (Array.unsafe-nth expressions
+                                                                     i))
+                                         depth))
+              (Result.Error _) ()))
+          result)
+      (SpecializedExpr.Let _ _ reference value body)
+        (match (append-local-declaration! constructors
+                                          buffer
+                                          reference
+                                          (Box.peek value)
+                                          depth)
+          (Result.Success _)
+            (append-statement! constructors buffer (Box.peek body) depth)
+          (Result.Error error) (Result.Error error))
+      (SpecializedExpr.Set _ _ reference value)
+        (match (render-value-expression constructors (Box.peek value))
+          (Result.Success rendered)
+            (let-do [target (if @(CoreRef.global reference)
+                       ;; assign the global through its reconstructed C symbol.
+                       (sanitize
+                         &(CAbi.mangle (CoreRef.name reference)
+                                       &(specialized-type (Box.peek value))))
+                       (local-symbol reference))]
+              (append-indent! buffer depth)
+              (StringBuf.append-str buffer &target)
+              (StringBuf.append-str buffer " = ")
+              (StringBuf.append-str buffer &rendered)
+              (StringBuf.append-str buffer ";
 ")
-                  (match (append-statement! constructors
-                                            buffer
-                                            (Box.peek else-branch)
-                                            (Int.inc depth))
-                    (Result.Success _)
-                      (do
-                        (append-indent! buffer depth)
-                        (StringBuf.append-str buffer "}
+              (Result.Success ()))
+          (Result.Error error) (Result.Error error))
+      (SpecializedExpr.While _ _ condition body)
+        (append-cached-while! constructors
+                              buffer
+                              (Box.peek condition)
+                              (Box.peek body)
+                              depth)
+      (SpecializedExpr.Break _ _)
+        (do (append-indent! buffer depth) (StringBuf.append-str buffer "break;
+") (Result.Success ()))
+      (SpecializedExpr.If _ _ condition then-branch else-branch)
+        (match (render-value-expression constructors (Box.peek condition))
+          (Result.Success rendered-condition)
+            (do
+              (append-indent! buffer depth)
+              (StringBuf.append-str buffer "if (")
+              (StringBuf.append-str buffer &rendered-condition)
+              (StringBuf.append-str buffer ") {
 ")
-                        (Result.Success ()))
-                    (Result.Error error) (Result.Error error)))
-              (Result.Error error) (Result.Error error)))
-        (Result.Error error) (Result.Error error))
-    (SpecializedExpr.Match id _ by-reference scrutinee branches)
-      (let [destination (ResultDestination.Return (Box.init (Type.unit)))]
+              (match (append-statement! constructors
+                                        buffer
+                                        (Box.peek then-branch)
+                                        (Int.inc depth))
+                (Result.Success _)
+                  (do
+                    (append-indent! buffer depth)
+                    (StringBuf.append-str buffer "} else {
+")
+                    (match (append-statement! constructors
+                                              buffer
+                                              (Box.peek else-branch)
+                                              (Int.inc depth))
+                      (Result.Success _)
+                        (do
+                          (append-indent! buffer depth)
+                          (StringBuf.append-str buffer "}
+")
+                          (Result.Success ()))
+                      (Result.Error error) (Result.Error error)))
+                (Result.Error error) (Result.Error error)))
+          (Result.Error error) (Result.Error error))
+      (SpecializedExpr.Match id _ by-reference scrutinee branches)
+        (let [destination (ResultDestination.Return (Box.init (Type.unit)))]
+          (append-match! constructors
+                         buffer
+                         @id
+                         @by-reference
+                         (Box.peek scrutinee)
+                         branches
+                         depth
+                         false
+                         &destination))
+      _
+        (match (render-value-expression constructors expression)
+          (Result.Success rendered)
+            (do
+              (append-indent! buffer depth)
+              (StringBuf.append-str buffer &rendered)
+              (StringBuf.append-str buffer ";
+")
+              (Result.Success ()))
+          (Result.Error error) (Result.Error error)))))
+
+(defn append-result! [constructors buffer expression destination depth]
+  (let-do [_ignored-line (append-line-directive! buffer
+                                                 (Specialize.expression-id expression))]
+    (match-ref expression
+      (SpecializedExpr.Do _ _ expressions)
+        (let [n (Array.length expressions)]
+          (if (Int.= n 0)
+            (match-ref destination
+              (ResultDestination.Return result-type)
+                (if (match-ref (Box.peek result-type)
+                    (MonoType.Unit) true
+                    _ false)
+                  (do
+                    (append-indent! buffer depth)
+                    (StringBuf.append-str buffer "return;
+")
+                    (Result.Success ()))
+                  (Result.Error
+                    (BackendError.init @"empty do has a non-unit result")))
+              (ResultDestination.Assign _ _)
+                (Result.Error
+                  (BackendError.init
+                    @"empty do cannot initialize a scalar global")))
+            (let-do [result (the (Result Unit BackendError) (Result.Success ()))]
+              (for [i 0 (Int.dec n)]
+                (match-ref &result
+                  (Result.Success _)
+                    (set! result
+                          (append-statement! constructors
+                                             buffer
+                                             (Box.peek (Array.unsafe-nth expressions
+                                                                         i))
+                                             depth))
+                  (Result.Error _) ()))
+              (match-ref &result
+                (Result.Success _)
+                  (append-result! constructors
+                                  buffer
+                                  (Box.peek
+                                    (Array.unsafe-nth expressions (Int.dec n)))
+                                  destination
+                                  depth)
+                (Result.Error error) (Result.Error @error)))))
+      (SpecializedExpr.Let _ _ reference value body)
+        (match (append-local-declaration! constructors
+                                          buffer
+                                          reference
+                                          (Box.peek value)
+                                          depth)
+          (Result.Success _)
+            (append-result! constructors
+                            buffer
+                            (Box.peek body)
+                            destination
+                            depth)
+          (Result.Error error) (Result.Error error))
+      (SpecializedExpr.If _ _ condition then-branch else-branch)
+        (match (render-value-expression constructors (Box.peek condition))
+          (Result.Success rendered-condition)
+            (do
+              (append-indent! buffer depth)
+              (StringBuf.append-str buffer "if (")
+              (StringBuf.append-str buffer &rendered-condition)
+              (StringBuf.append-str buffer ") {
+")
+              (match (append-result! constructors
+                                     buffer
+                                     (Box.peek then-branch)
+                                     destination
+                                     (Int.inc depth))
+                (Result.Success _)
+                  (do
+                    (append-indent! buffer depth)
+                    (StringBuf.append-str buffer "} else {
+")
+                    (match (append-result! constructors
+                                           buffer
+                                           (Box.peek else-branch)
+                                           destination
+                                           (Int.inc depth))
+                      (Result.Success _)
+                        (do
+                          (append-indent! buffer depth)
+                          (StringBuf.append-str buffer "}
+")
+                          (Result.Success ()))
+                      (Result.Error error) (Result.Error error)))
+                (Result.Error error) (Result.Error error)))
+          (Result.Error error) (Result.Error error))
+      (SpecializedExpr.Match id _ by-reference scrutinee branches)
         (append-match! constructors
                        buffer
                        @id
@@ -1416,163 +1558,62 @@ binding so the value is the binding itself.")
                        (Box.peek scrutinee)
                        branches
                        depth
-                       false
-                       &destination))
-    _
-      (match (render-value-expression constructors expression)
-        (Result.Success rendered)
-          (do
-            (append-indent! buffer depth)
-            (StringBuf.append-str buffer &rendered)
-            (StringBuf.append-str buffer ";
+                       true
+                       destination)
+      _
+        (match-ref destination
+          (ResultDestination.Return return-type)
+            (if (match-ref (Box.peek return-type) (MonoType.Unit) true _ false)
+              (let [statement-result (the (Result Unit BackendError)
+                                          (append-statement! constructors
+                                                             buffer
+                                                             expression
+                                                             depth))]
+                (match statement-result
+                  (Result.Success _)
+                    (do
+                      (append-indent! buffer depth)
+                      (StringBuf.append-str buffer "return;
 ")
-            (Result.Success ()))
-        (Result.Error error) (Result.Error error))))
-
-(defn append-result! [constructors buffer expression destination depth]
-  (match-ref expression
-    (SpecializedExpr.Do _ _ expressions)
-      (let [n (Array.length expressions)]
-        (if (Int.= n 0)
-          (match-ref destination
-            (ResultDestination.Return result-type)
-              (if (match-ref (Box.peek result-type) (MonoType.Unit) true _ false)
-                (do
-                  (append-indent! buffer depth)
-                  (StringBuf.append-str buffer "return;
-")
-                  (Result.Success ()))
-                (Result.Error
-                  (BackendError.init @"empty do has a non-unit result")))
-            (ResultDestination.Assign _ _)
-              (Result.Error
-                (BackendError.init @"empty do cannot initialize a scalar global")))
-          (let-do [result (the (Result Unit BackendError) (Result.Success ()))]
-            (for [i 0 (Int.dec n)]
-              (match-ref &result
-                (Result.Success _)
-                  (set! result
-                        (append-statement! constructors
-                                           buffer
-                                           (Box.peek (Array.unsafe-nth expressions
-                                                                       i))
-                                           depth))
-                (Result.Error _) ()))
-            (match-ref &result
-              (Result.Success _)
-                (append-result! constructors
-                                buffer
-                                (Box.peek
-                                  (Array.unsafe-nth expressions (Int.dec n)))
-                                destination
-                                depth)
-              (Result.Error error) (Result.Error @error)))))
-    (SpecializedExpr.Let _ _ reference value body)
-      (match (append-local-declaration! constructors
-                                        buffer
-                                        reference
-                                        (Box.peek value)
-                                        depth)
-        (Result.Success _)
-          (append-result! constructors buffer (Box.peek body) destination depth)
-        (Result.Error error) (Result.Error error))
-    (SpecializedExpr.If _ _ condition then-branch else-branch)
-      (match (render-value-expression constructors (Box.peek condition))
-        (Result.Success rendered-condition)
-          (do
-            (append-indent! buffer depth)
-            (StringBuf.append-str buffer "if (")
-            (StringBuf.append-str buffer &rendered-condition)
-            (StringBuf.append-str buffer ") {
-")
-            (match (append-result! constructors
-                                   buffer
-                                   (Box.peek then-branch)
-                                   destination
-                                   (Int.inc depth))
-              (Result.Success _)
-                (do
-                  (append-indent! buffer depth)
-                  (StringBuf.append-str buffer "} else {
-")
-                  (match (append-result! constructors
-                                         buffer
-                                         (Box.peek else-branch)
-                                         destination
-                                         (Int.inc depth))
-                    (Result.Success _)
-                      (do
-                        (append-indent! buffer depth)
-                        (StringBuf.append-str buffer "}
-")
-                        (Result.Success ()))
-                    (Result.Error error) (Result.Error error)))
-              (Result.Error error) (Result.Error error)))
-        (Result.Error error) (Result.Error error))
-    (SpecializedExpr.Match id _ by-reference scrutinee branches)
-      (append-match! constructors
-                     buffer
-                     @id
-                     @by-reference
-                     (Box.peek scrutinee)
-                     branches
-                     depth
-                     true
-                     destination)
-    _
-      (match-ref destination
-        (ResultDestination.Return return-type)
-          (if (match-ref (Box.peek return-type) (MonoType.Unit) true _ false)
-            (let [statement-result (the (Result Unit BackendError)
-                                        (append-statement! constructors
-                                                           buffer
-                                                           expression
-                                                           depth))]
-              (match statement-result
-                (Result.Success _)
-                  (do
-                    (append-indent! buffer depth)
-                    (StringBuf.append-str buffer "return;
-")
-                    (Result.Success ()))
-                (Result.Error error) (Result.Error error)))
-            ;; a closure constructed directly in return position escapes its
-            ;; frame: its environment moves to the heap.
-            (match (match-ref expression
-                (SpecializedExpr.GlobalCall _ _ _ _ call-symbol call-arguments)
-                  (if (String.starts-with? call-symbol "_carp_closure_")
-                    (render-closure-construction-heap constructors
-                                                      call-symbol
-                                                      call-arguments)
-                    (render-value-expression constructors expression))
-                _ (render-value-expression constructors expression))
-              (Result.Success rendered)
-                (do
-                  (append-indent! buffer depth)
-                  (StringBuf.append-str buffer "return ")
-                  (StringBuf.append-str buffer &rendered)
-                  (StringBuf.append-str buffer ";
-")
-                  (Result.Success ()))
-              (Result.Error error) (Result.Error error)))
-        (ResultDestination.Assign target result-type)
-          (let [expression-type (specialized-type expression)]
-            (if (Type.same-representation? &expression-type
-                                           (Box.peek result-type))
-              (match (render-value-expression constructors expression)
+                      (Result.Success ()))
+                  (Result.Error error) (Result.Error error)))
+              ;; a closure constructed directly in return position escapes its
+              ;; frame: its environment moves to the heap.
+              (match (match-ref expression
+                  (SpecializedExpr.GlobalCall _ _ _ _ call-symbol call-arguments)
+                    (if (String.starts-with? call-symbol "_carp_closure_")
+                      (render-closure-construction-heap constructors
+                                                        call-symbol
+                                                        call-arguments)
+                      (render-value-expression constructors expression))
+                  _ (render-value-expression constructors expression))
                 (Result.Success rendered)
                   (do
                     (append-indent! buffer depth)
-                    (StringBuf.append-str buffer target)
-                    (StringBuf.append-str buffer " = ")
+                    (StringBuf.append-str buffer "return ")
                     (StringBuf.append-str buffer &rendered)
                     (StringBuf.append-str buffer ";
 ")
                     (Result.Success ()))
-                (Result.Error error) (Result.Error error))
-              (Result.Error
-                (BackendError.init
-                  @"global initializer result type does not match storage")))))))
+                (Result.Error error) (Result.Error error)))
+          (ResultDestination.Assign target result-type)
+            (let [expression-type (specialized-type expression)]
+              (if (Type.same-representation? &expression-type
+                                             (Box.peek result-type))
+                (match (render-value-expression constructors expression)
+                  (Result.Success rendered)
+                    (do
+                      (append-indent! buffer depth)
+                      (StringBuf.append-str buffer target)
+                      (StringBuf.append-str buffer " = ")
+                      (StringBuf.append-str buffer &rendered)
+                      (StringBuf.append-str buffer ";
+")
+                      (Result.Success ()))
+                  (Result.Error error) (Result.Error error))
+                (Result.Error
+                  (BackendError.init
+                    @"global initializer result type does not match storage"))))))))
 
 (defn unmanaged-signature? [constructors signature]
   (match-ref signature

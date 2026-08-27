@@ -17,12 +17,15 @@ to use generated-program values.")
   (Macro [(Box CtClosure)]))
 
 (doc CtClosure "is a lexical compile-time function. It retains the stable ID
-of its defining frame, so captures are shared without copying values.")
+of its defining frame, so captures are shared without copying values, and the
+file it was written in, so a step inside its body can say where it is. The
+file is empty when the closure was defined from source that had none.")
 (deftype CtClosure
   [parameters (Array String)
    rest (Maybe String)
    body (Box SurfaceNode)
-   defining-frame FrameId])
+   defining-frame FrameId
+   file String])
 
 (deftype CtParameters [fixed (Array String)
                        rest (Maybe String)])
@@ -49,8 +52,168 @@ span points to the macro body or invocation that caused the failure.")
 ;; (Core Dynamic) reads it through the `Unsafe.load-stack` builtin.
 (def *ct-load-stack* (the (Array String) []))
 
+;; where the FORMS BEING EVALUATED are written, innermost last. This is not
+;; the load stack: `current-file` (and so `relative-include`) means the file
+;; being loaded, which stays the caller's while a macro from another file
+;; runs. A debugger needs the opposite — the file the running body is written
+;; in — and the two must not be confused for each other.
+(def *ct-step-files* (the (Array String) []))
+
+(doc CtBinding "one name in scope at a step, and what it held at that moment.
+The value is text because that is all a reader of a recording can use: the
+value itself belongs to an evaluation that has already finished.")
+(deftype CtBinding [name String
+                    value String])
+
+(doc CtStep "one step of compile-time evaluation: the form that was about to
+be evaluated, where it came from, which frame it ran in, how deep in the
+evaluation it was, and what was in scope. A trace of these is what the
+dynamic debugger walks.
+
+Scope is captured per step rather than reconstructed afterwards: a binding
+can be rebound as evaluation proceeds, so the environment at the end does not
+say what a step in the middle saw.")
+(deftype CtStep
+  [form String
+   file String
+   span SurfaceSpan
+   frame Int
+   depth Int
+   bindings (Array CtBinding)])
+
+;; Compile-time evaluation is deterministic, so a debugger does not have to
+;; suspend it: record every step of one run, and stepping is walking the
+;; recording. Off by default — a compiler that is not being debugged pays one
+;; boolean test per form.
+(def *ct-tracing* false)
+(def *ct-trace* (the (Array CtStep) []))
+(def *ct-depth* 0)
+
 (defmodule CtEval
   (defn reset-load-stack! [] (set! *ct-load-stack* []))
+
+  (doc push-step-file! "enters a file for the purpose of recording steps: the
+body about to run is written there. Push the empty string when the file is
+unknown, so a body cannot inherit its caller's.")
+  (defn push-step-file! [path] (Array.push-back! &*ct-step-files* @path))
+
+  (defn pop-step-file! []
+    (when (Int.> (Array.length &*ct-step-files*) 0)
+      (ignore (Array.pop-back! &*ct-step-files*))))
+
+  (private current-step-file)
+  (hidden current-step-file)
+  (doc current-step-file "the file the forms being evaluated are written in,
+or the empty string when nothing has claimed one.")
+  (defn current-step-file []
+    (let [n (Array.length &*ct-step-files*)]
+      (if (Int.= n 0) @"" @(Array.unsafe-nth &*ct-step-files* (Int.dec n)))))
+
+  (doc current-load-file "the file being loaded, innermost first. This stays
+the caller's file while a macro from somewhere else runs, which is what
+`current-file` and so `relative-include` mean by it. Where the running body
+is written is a different question, and `current-step-file` answers it.")
+  (defn current-load-file []
+    (let [n (Array.length &*ct-load-stack*)]
+      (if (Int.= n 0) @"" @(Array.unsafe-nth &*ct-load-stack* (Int.dec n)))))
+
+  (doc definition-file "the file a definition being read is written in. A
+file being loaded says so through the load stack; source handed over as text
+says so through the step file, which is the only thing that knows where a
+macro defined in a cell lives.")
+  (defn definition-file []
+    (let [inner (current-step-file)]
+      (if (String.empty? &inner) (current-load-file) inner)))
+
+  (doc trace-on! "starts recording compile-time steps, dropping whatever an
+earlier run recorded.")
+  (defn trace-on! []
+    (do (set! *ct-tracing* true) (set! *ct-trace* []) (set! *ct-depth* 0)))
+
+  (doc trace-off! "stops recording. What was recorded stays until the next
+run starts.")
+  (defn trace-off! [] (set! *ct-tracing* false))
+
+  (doc trace "the steps the last recorded run took, in the order it took
+them.")
+  (defn trace [] (Array.copy &*ct-trace*))
+
+  (private binding-text)
+  (hidden binding-text)
+  (doc binding-text "what a compile-time value looks like to a reader of a
+recording. Syntax renders as the code it is; the rest say what they are,
+because a closure or a builtin has no text worth showing.")
+  (defn binding-text [value]
+    (match-ref value
+      (CtValue.Syntax syntax) (Surface.render (Box.peek syntax))
+      (CtValue.Collection values) (fmt "«%d values»" (Array.length values))
+      (CtValue.Closure _) @"«compile-time function»"
+      (CtValue.Macro _) @"«macro»"
+      (CtValue.Builtin name) (fmt "«builtin %s»" name)))
+
+  (private step-bindings)
+  (hidden step-bindings)
+  (doc step-bindings "what is in scope at a step: the names bound in its frame
+and in the frames it is nested inside, innermost first.
+
+The root frame is left out on purpose. It holds every global the session
+knows, so including it would bury the handful of names a reader is actually
+looking at, and would copy that list once per recorded step. The walk is
+capped for the same reason.")
+  (defn step-bindings [state frame]
+    (let-do [result (the (Array CtBinding) [])
+             store (CtState.environment state)
+             root @(FrameId.index (CtState.root state))
+             current (Maybe.Just @frame)
+             frames-left 8]
+      (while-do (and (Int.> frames-left 0)
+                     (match-ref &current
+                       (Maybe.Just _) true
+                       (Maybe.Nothing) false))
+        (let-do [here (match-ref &current
+                   (Maybe.Just f) @f
+                   (Maybe.Nothing) (FrameId.init 0))]
+          (if (Int.= @(FrameId.index &here) root)
+            (set! current (the (Maybe FrameId) (Maybe.Nothing)))
+            (let-do [bindings (CtEnv.local-bindings store &here)
+                     n (Array.length &bindings)]
+              (for [i 0 n]
+                (when (Int.< (Array.length &result) 64)
+                  (let [binding (Array.unsafe-nth &bindings i)]
+                    (match (CtEnv.read-cell store (CtEnvBinding.cell binding))
+                      (Maybe.Just value)
+                        (Array.push-back! &result
+                                          (CtBinding.init @(CtEnvBinding.name binding)
+                                                          (binding-text &value)))
+                      (Maybe.Nothing) ()))))
+              (set! current (CtEnv.parent-frame store &here))
+              (set! frames-left (Int.dec frames-left))))))
+      result))
+
+  (private record-step!)
+  (hidden record-step!)
+  (defn record-step! [body state frame]
+    (Array.push-back! &*ct-trace*
+                      (CtStep.init (Surface.render body)
+                                   (current-step-file)
+                                   @(SurfaceNode.span body)
+                                   @(FrameId.index frame)
+                                   *ct-depth*
+                                   (step-bindings state frame))))
+
+  (doc enter-call! "records a call the expander is about to run the body of,
+and enters it. Expanding a macro evaluates its body without ever evaluating
+the call, so without this the recording starts inside the macro and a reader
+has no way to see what invoked it. The call is recorded before the macro's
+file is entered, so it keeps the caller's.")
+  (defn enter-call! [call state frame]
+    (when-do *ct-tracing*
+      (record-step! call state frame)
+      (set! *ct-depth* (Int.inc *ct-depth*))))
+
+  (doc leave-call! "leaves a call entered by `enter-call!`.")
+  (defn leave-call! []
+    (when *ct-tracing* (set! *ct-depth* (Int.dec *ct-depth*))))
 
   (defn push-load-file! [path] (Array.push-back! &*ct-load-stack* @path))
 
@@ -470,7 +633,11 @@ that only need syntax parameters; closures and collections return `Nothing`.")
           (Result.Success frame)))))
 
   (doc define-function "creates a lexical compile-time closure from a
-parameter array and body. Macro loaders use this for `defndynamic` bindings.")
+parameter array and body. Macro loaders use this for `defndynamic` bindings.
+
+The closure keeps the file it is being defined in, which is the only moment
+that file is known: by the time it is called, the caller's file is the one
+being loaded.")
   (defn define-function [parameters body frame]
     (match (closure-parameters parameters)
       (Result.Success parsed)
@@ -480,7 +647,8 @@ parameter array and body. Macro loaders use this for `defndynamic` bindings.")
               (CtClosure.init @(CtParameters.fixed &parsed)
                               @(CtParameters.rest &parsed)
                               (Box.init (SurfaceNode.copy body))
-                              @frame))))
+                              @frame
+                              (definition-file)))))
       (Result.Error error) (Result.Error error)))
 
   (doc define-dynamic-function "creates a top-level `defndynamic` closure in
@@ -1931,748 +2099,855 @@ its definition frame.")
           (Ref CtState)
           (Ref FrameId)]
          (Result CtValue CtError)))
+  (sig eval-closure-body
+       (Fn
+         [(Ref CtClosure) (Ref CtState) (Ref FrameId)]
+         (Result CtValue CtError)))
 
   (doc eval-value "evaluates a compile-time expression to syntax, a lexical
 closure, or a collection of compile-time values. It never evaluates target
 program code.")
   (defn eval-value [body state frame]
-    (match (symbol-key body)
-      (Maybe.Just name)
-        (match (lookup-status state frame &name)
-          (CtEnvLookup.Found cell)
-            (match (read-cell state &cell)
-              (Maybe.Just value) (Result.Success value)
-              (Maybe.Nothing)
-                (Result.Error (error-at body @"invalid compile-time cell")))
-          (CtEnvLookup.Ambiguous)
-            (Result.Error
-              (error-at body
-                        (String.append "ambiguous compile-time binding: " &name)))
-          (CtEnvLookup.Missing)
-            (if (builtin-name? body &name)
-              (Result.Success (CtValue.Builtin name))
-              (Result.Error
-                (error-at body
-                          (String.append "unknown compile-time symbol: " &name)))))
-      (Maybe.Nothing)
-        (match-ref (SurfaceNode.form body)
-          (SurfaceForm.List items)
-          (if (Int.= 0 (Array.length items))
-            (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy body))))
-            (let [head (Box.peek (Array.unsafe-nth items 0))]
-              (cond
-                (named? head @"quote")
-                (if (Int.= 2 (Array.length items))
-                  (Result.Success
-                    (CtValue.Syntax
-                      (Box.init
-                        (SurfaceNode.copy (Box.peek (Array.unsafe-nth items 1))))))
-                  (Result.Error (error-at body @"quote expects one argument")))
-                (named? head @"apply")
-                (let [apply-items (semantic-items items)]
-                  (eval-apply body &apply-items state frame))
-                (named? head @"expand")
-                (let [expand-items (semantic-items items)]
-                  (eval-expand body &expand-items state frame))
-                ;; `eval` runs a compile-time expression: evaluate the argument
-                ;; to a value, and if that value is a piece of syntax (a form),
-                ;; evaluate the form itself.
-                (named? head @"eval")
-                (let [eval-items (semantic-items items)]
-                  (if (Int.= 2 (Array.length &eval-items))
-                    (match (eval-value
-                        (Box.peek (Array.unsafe-nth &eval-items 1))
-                        state
-                        frame)
-                      (Result.Success evaluated)
-                        (match evaluated
-                          (CtValue.Syntax node)
-                            (let [syntax (Box.peek &node)]
-                              (match (symbol-key syntax)
-                                (Maybe.Just syntax-name)
-                                  (match (lookup-status state frame &syntax-name)
-                                    (CtEnvLookup.Missing)
-                                      (if (builtin-name? syntax &syntax-name)
-                                        (eval-value syntax state frame)
-                                        (Result.Success
-                                          (CtValue.Syntax (Box.init (SurfaceNode.copy syntax)))))
-                                    _ (eval-value syntax state frame))
-                                (Maybe.Nothing) (eval-value syntax state frame)))
-                          other (Result.Success other))
-                      (Result.Error error) (Result.Error error))
-                    (Result.Error (error-at body @"eval expects one argument"))))
-                ;; `members` returns a type's members as `[[name type] ...]`.
-                ;; The expander records them under `__members_<TypeName>` when it
-                ;; sees the `deftype`; the argument is an unevaluated type symbol.
-                (named? head @"members")
-                (if (Int.= 2 (Array.length items))
-                  (match (symbol-key (Box.peek (Array.unsafe-nth items 1)))
-                    (Maybe.Just type-name)
-                      (let [binding-name (String.concat
-                              &[@"__members_" (String.copy &type-name)])]
-                        (match (lookup-status state frame &binding-name)
-                          (CtEnvLookup.Found cell)
-                            (match (read-cell state &cell)
-                              (Maybe.Just value) (Result.Success value)
-                              (Maybe.Nothing)
-                                (Result.Error (error-at body
-                                                        @"members: invalid cell")))
-                          _
-                            (Result.Error
-                              (error-at body
-                                        (String.append "not a type: " &type-name)))))
-                    (Maybe.Nothing)
-                      (Result.Error
-                        (error-at body @"members expects a type symbol")))
-                  (Result.Error (error-at body @"members expects one argument")))
-                (named? head @"managed?")
-                (if (Int.= 2 (Array.length items))
-                  (match (symbol-key (Box.peek (Array.unsafe-nth items 1)))
-                    (Maybe.Just type-name)
-                      (let [binding-name (String.concat
-                              &[@"__managed_" (String.copy &type-name)])]
-                        (match (lookup-status state frame &binding-name)
-                          (CtEnvLookup.Found _)
-                            (Result.Success (syntax-bool body true))
-                          _ (Result.Success (syntax-bool body false))))
-                    (Maybe.Nothing)
-                      (Result.Error
-                        (error-at body @"managed? expects a type symbol")))
-                  (Result.Error (error-at body @"managed? expects one argument")))
-                (named? head @"s-expr")
-                (if (Int.= 2 (Array.length items))
-                  (let [argument (Box.peek (Array.unsafe-nth items 1))]
-                    (match (symbol-key argument)
-                      (Maybe.Just binding)
-                        (match (lookup-status state frame &binding)
-                          (CtEnvLookup.Found _)
-                            (match (eval-value argument state frame)
-                              (Result.Success value)
-                                (sexpr-from-value state frame body &value)
-                              (Result.Error error) (Result.Error error))
-                          (CtEnvLookup.Ambiguous)
-                            (Result.Error
-                              (error-at body
-                                        (String.append "ambiguous compile-time binding: "
-                                                       &binding)))
-                          (CtEnvLookup.Missing)
-                            (sexpr-for-binding state frame body &binding))
-                      (Maybe.Nothing)
-                        (match (eval-value argument state frame)
-                          (Result.Success value)
-                            (sexpr-from-value state frame body &value)
-                          (Result.Error error) (Result.Error error))))
-                  (Result.Error (error-at body @"s-expr expects one argument")))
-                (named? head @"use")
-                (if (Int.= 2 (Array.length items))
-                  (let [target (Box.peek (Array.unsafe-nth items 1))]
-                    (match (symbol-key target)
-                      (Maybe.Just path)
-                        (match (module-frame state &path)
-                          (Maybe.Just imported)
-                            (if (import! state frame &imported)
-                              (Result.Success (syntax-empty body))
-                              (Result.Error
-                                (error-at target
-                                          @"invalid compile-time module frame")))
-                          (Maybe.Nothing)
-                            (Result.Error
-                              (error-at target
-                                        (String.append "unknown compile-time module: "
-                                                       &path))))
-                      (Maybe.Nothing)
-                        (Result.Error
-                          (error-at target @"use expects a module symbol"))))
-                  (Result.Error (error-at body @"use expects one module")))
-                (named? head @"Dynamic.compose")
-                (let [compose-items (semantic-items items)]
-                  (eval-compose body &compose-items state frame))
-                (named? head @"fn")
-                (let [fn-items (semantic-items items)]
-                  (if (Int.= 3 (Array.length &fn-items))
-                    (let [parameters (Box.peek (Array.unsafe-nth &fn-items 1))
-                          fn-body (Box.peek (Array.unsafe-nth &fn-items 2))]
-                      (define-function parameters fn-body frame))
-                    (Result.Error
-                      (error-at body @"fn expects parameters and a body"))))
-                (named? head @"do")
-                (let-do [result (the (Result CtValue CtError)
-                                     (Result.Success
-                                       (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))
-                         n (Array.length items)]
-                  (for [i 1 n]
-                    (match-ref &result
-                      (Result.Success _)
-                        (set! result
-                              (eval-value (Box.peek (Array.unsafe-nth items i))
-                                          state
-                                          frame))
-                      (Result.Error error) (set! result (Result.Error @error))))
-                  result)
-                (named? head @"let-do")
-                (eval-let-do body items state frame)
-                (named? head @"if")
-                (let [if-items (semantic-items items)]
-                  (if (Int.= 4 (Array.length &if-items))
-                    (let [condition (Box.peek (Array.unsafe-nth &if-items 1))
-                          then-branch (Box.peek (Array.unsafe-nth &if-items 2))
-                          else-branch (Box.peek (Array.unsafe-nth &if-items 3))]
-                      (match (eval-value condition state frame)
-                        (Result.Success condition-value)
-                          (match-ref &condition-value
-                            (CtValue.Syntax syntax)
-                              (match-ref (SurfaceNode.form (Box.peek syntax))
-                                (SurfaceForm.BoolLit value)
-                                  (if @value
-                                    (eval-value then-branch state frame)
-                                    (eval-value else-branch state frame))
-                                _
-                                  (Result.Error
-                                    (error-at condition
-                                              @"compile-time if condition must evaluate to Bool syntax")))
-                            _
-                              (Result.Error
-                                (error-at condition
-                                          @"compile-time if condition must evaluate to Bool syntax")))
-                        (Result.Error error) (Result.Error error)))
-                    (Result.Error
-                      (error-at body
-                                @"if expects condition, then, and else forms"))))
-                (named? head @"when")
-                (if (Int.= 3 (Array.length items))
-                  (let [condition (Box.peek (Array.unsafe-nth items 1))
-                        then-branch (Box.peek (Array.unsafe-nth items 2))]
-                    (match (eval-value condition state frame)
-                      (Result.Success condition-value)
-                        (match (bool-argument condition &condition-value)
-                          (Result.Success value)
-                            (if value
-                              (eval-value then-branch state frame)
-                              (Result.Success (syntax-empty body)))
-                          (Result.Error error) (Result.Error error))
-                      (Result.Error error) (Result.Error error)))
-                  (Result.Error
-                    (error-at body @"when expects a condition and a body")))
-                (named? head @"and")
-                (let-do [result (the (Result CtValue CtError)
-                                     (Result.Success (syntax-bool body true)))
-                         stopped false
-                         n (Array.length items)]
-                  (for [i 1 n]
-                    (match-ref &result
-                      (Result.Success _)
-                        (unless stopped
-                          (let [form (Box.peek (Array.unsafe-nth items i))]
-                            (match (eval-value form state frame)
-                              (Result.Success value)
-                                (if (Int.= i (Int.dec n))
-                                  (set! result (Result.Success value))
-                                  (match (bool-argument form &value)
-                                    (Result.Success boolean)
-                                      (unless-do boolean
-                                        (set! result (Result.Success value))
-                                        (set! stopped true))
-                                    (Result.Error error)
-                                      (set! result (Result.Error error))))
-                              (Result.Error error)
-                                (set! result (Result.Error error)))))
-                      (Result.Error error) (set! result (Result.Error @error))))
-                  result)
-                (named? head @"or")
-                (let-do [result (the (Result CtValue CtError)
-                                     (Result.Success (syntax-bool body false)))
-                         stopped false
-                         n (Array.length items)]
-                  (for [i 1 n]
-                    (match-ref &result
-                      (Result.Success _)
-                        (unless stopped
-                          (let [form (Box.peek (Array.unsafe-nth items i))]
-                            (match (eval-value form state frame)
-                              (Result.Success value)
-                                (if (Int.= i (Int.dec n))
-                                  (set! result (Result.Success value))
-                                  (match (bool-argument form &value)
-                                    (Result.Success boolean)
-                                      (when-do boolean
-                                        (set! result (Result.Success value))
-                                        (set! stopped true))
-                                    (Result.Error error)
-                                      (set! result (Result.Error error))))
-                              (Result.Error error)
-                                (set! result (Result.Error error)))))
-                      (Result.Error error) (set! result (Result.Error @error))))
-                  result)
-                (named? head @"set!")
-                (if (Int.= 3 (Array.length items))
-                  (let [target (Box.peek (Array.unsafe-nth items 1))
-                        value-node (Box.peek (Array.unsafe-nth items 2))]
-                    (match (symbol-key target)
-                      (Maybe.Just target-name)
-                        (match (eval-value value-node state frame)
-                          (Result.Success value)
-                            (if (CtEnv.set! (CtState.environment state)
-                                            frame
-                                            &target-name
-                                            (CtValue.copy &value))
-                              (Result.Success value)
-                              (Result.Error
-                                (error-at target
-                                          (String.append "unknown compile-time set! target: "
-                                                         &target-name))))
-                          (Result.Error error) (Result.Error error))
-                      (Maybe.Nothing)
-                        (Result.Error
-                          (error-at target @"set! target must be a symbol"))))
-                  (Result.Error
-                    (error-at body @"set! expects a name and a value")))
-                (named? head @"let")
-                (if (Int.= 3 (Array.length items))
-                  (let [binding-form (Box.peek (Array.unsafe-nth items 1))
-                        let-body (Box.peek (Array.unsafe-nth items 2))]
-                    (match-ref (SurfaceNode.form binding-form)
-                      (SurfaceForm.Array pair)
-                        (let [binding-items (semantic-items pair)]
-                          (if (Int.= (mod (Array.length &binding-items) 2) 0)
-                            (let-do [let-frame (child! state frame)
-                                     failure (the (Maybe CtError)
-                                                  (Maybe.Nothing))
-                                     n (Array.length &binding-items)]
-                              (for [binding-index 0 (/ n 2)]
-                                (match-ref &failure
-                                  (Maybe.Nothing)
-                                    (let [index (* binding-index 2)
-                                          name-form (Box.peek (Array.unsafe-nth &binding-items
-                                                                                index))
-                                          value-form (Box.peek
-                                            (Array.unsafe-nth &binding-items
-                                                              (Int.inc index)))]
-                                      (match (symbol-name name-form)
-                                        (Maybe.Just name)
-                                          (match (eval-value value-form
-                                                             state
-                                                             &let-frame)
-                                            (Result.Success value)
-                                              (ignore (define! state
-                                                               &let-frame
-                                                               &name
-                                                               value))
-                                            (Result.Error error)
-                                              (set! failure (Maybe.Just error)))
-                                        (Maybe.Nothing)
-                                          (set! failure
-                                                (Maybe.Just
-                                                  (error-at name-form
-                                                            @"compile-time let binding must have a symbol name")))))
-                                  (Maybe.Just _) ()))
-                              (match failure
-                                (Maybe.Nothing)
-                                  (eval-value let-body state &let-frame)
-                                (Maybe.Just error) (Result.Error error)))
-                            (Result.Error
-                              (error-at binding-form
-                                        @"compile-time let bindings must contain name/value pairs"))))
-                      _
-                        (Result.Error
-                          (error-at binding-form
-                                    @"compile-time let bindings must be an array"))))
-                  (Result.Error
-                    (error-at body @"let expects bindings and a body")))
-                (named? head @"while")
-                (if (Int.= 3 (Array.length items))
-                  (let [condition (Box.peek (Array.unsafe-nth items 1))
-                        loop-body (Box.peek (Array.unsafe-nth items 2))]
-                    (let-do [result (the (Result CtValue CtError)
-                                         (Result.Success (syntax-empty body)))
-                             running true]
-                      (while-do running
-                        (match-ref &result
-                          (Result.Success _)
-                            (match (eval-value condition state frame)
-                              (Result.Success condition-value)
-                                (match (bool-argument condition &condition-value)
-                                  (Result.Success boolean)
-                                    (if boolean
-                                      (match (eval-value loop-body state frame)
-                                        (Result.Success _) ()
-                                        (Result.Error error)
-                                          (do
-                                            (set! result (Result.Error error))
-                                            (set! running false)))
-                                      (set! running false))
-                                  (Result.Error error)
-                                    (do
-                                      (set! result (Result.Error error))
-                                      (set! running false)))
-                              (Result.Error error)
-                                (do
-                                  (set! result (Result.Error error))
-                                  (set! running false)))
-                          (Result.Error _) (set! running false)))
-                      result))
-                  (Result.Error
-                    (error-at body @"while expects a condition and a body")))
-                (named? head @"for")
-                (eval-for body items state frame)
-                (named? head @"case")
-                (if (Int.> (Array.length items) 2)
-                  (let [target-form (Box.peek (Array.unsafe-nth items 1))]
-                    (match (eval-value target-form state frame)
-                      (Result.Success target-value)
-                        (match (syntax-from-value target-form &target-value)
-                          (Result.Success target)
-                            (let-do [result (the (Result CtValue CtError)
-                                                 (Result.Error
-                                                   (error-at body
-                                                             @"compile-time case has no matching branch")))
-                                     expect-pattern true
-                                     take-branch false
-                                     settled false
-                                     n (Array.length items)]
-                              (for [i 2 n]
-                                (match-ref &result
-                                  (Result.Success _) ()
-                                  (Result.Error _)
-                                    (unless settled
-                                      (let [form (Box.peek (Array.unsafe-nth items
-                                                                             i))]
-                                        (cond
-                                          expect-pattern
-                                            (if (Int.= i (Int.dec n))
-                                              (do
-                                                (set! result
-                                                      (eval-value form
+    (let-do [_step (when-do *ct-tracing*
+               (record-step! body state frame)
+               (set! *ct-depth* (Int.inc *ct-depth*)))
+             result (match (symbol-key body)
+               (Maybe.Just name)
+                 (match (lookup-status state frame &name)
+                   (CtEnvLookup.Found cell)
+                     (match (read-cell state &cell)
+                       (Maybe.Just value) (Result.Success value)
+                       (Maybe.Nothing)
+                         (Result.Error
+                           (error-at body @"invalid compile-time cell")))
+                   (CtEnvLookup.Ambiguous)
+                     (Result.Error
+                       (error-at body
+                                 (String.append "ambiguous compile-time binding: "
+                                                &name)))
+                   (CtEnvLookup.Missing)
+                     (if (builtin-name? body &name)
+                       (Result.Success (CtValue.Builtin name))
+                       (Result.Error
+                         (error-at body
+                                   (String.append "unknown compile-time symbol: "
+                                                  &name)))))
+               (Maybe.Nothing)
+                 (match-ref (SurfaceNode.form body)
+                   (SurfaceForm.List items)
+                   (if (Int.= 0 (Array.length items))
+                     (Result.Success
+                       (CtValue.Syntax (Box.init (SurfaceNode.copy body))))
+                     (let [head (Box.peek (Array.unsafe-nth items 0))]
+                       (cond
+                         (named? head @"quote")
+                         (if (Int.= 2 (Array.length items))
+                           (Result.Success
+                             (CtValue.Syntax
+                               (Box.init
+                                 (SurfaceNode.copy (Box.peek (Array.unsafe-nth items
+                                                                               1))))))
+                           (Result.Error
+                             (error-at body @"quote expects one argument")))
+                         (named? head @"apply")
+                         (let [apply-items (semantic-items items)]
+                           (eval-apply body &apply-items state frame))
+                         (named? head @"expand")
+                         (let [expand-items (semantic-items items)]
+                           (eval-expand body &expand-items state frame))
+                         ;; `eval` runs a compile-time expression: evaluate the argument
+                         ;; to a value, and if that value is a piece of syntax (a form),
+                         ;; evaluate the form itself.
+                         (named? head @"eval")
+                         (let [eval-items (semantic-items items)]
+                           (if (Int.= 2 (Array.length &eval-items))
+                             (match (eval-value
+                                 (Box.peek (Array.unsafe-nth &eval-items 1))
+                                 state
+                                 frame)
+                               (Result.Success evaluated)
+                                 (match evaluated
+                                   (CtValue.Syntax node)
+                                     (let [syntax (Box.peek &node)]
+                                       (match (symbol-key syntax)
+                                         (Maybe.Just syntax-name)
+                                           (match (lookup-status state
+                                                                 frame
+                                                                 &syntax-name)
+                                             (CtEnvLookup.Missing)
+                                               (if (builtin-name? syntax
+                                                                  &syntax-name)
+                                                 (eval-value syntax state frame)
+                                                 (Result.Success
+                                                   (CtValue.Syntax (Box.init (SurfaceNode.copy syntax)))))
+                                             _ (eval-value syntax state frame))
+                                         (Maybe.Nothing)
+                                           (eval-value syntax state frame)))
+                                   other (Result.Success other))
+                               (Result.Error error) (Result.Error error))
+                             (Result.Error
+                               (error-at body @"eval expects one argument"))))
+                         ;; `members` returns a type's members as `[[name type] ...]`.
+                         ;; The expander records them under `__members_<TypeName>` when it
+                         ;; sees the `deftype`; the argument is an unevaluated type symbol.
+                         (named? head @"members")
+                         (if (Int.= 2 (Array.length items))
+                           (match (symbol-key (Box.peek (Array.unsafe-nth items
+                                                                          1)))
+                             (Maybe.Just type-name)
+                               (let [binding-name (String.concat
+                                       &[@"__members_" (String.copy &type-name)])]
+                                 (match (lookup-status state frame &binding-name)
+                                   (CtEnvLookup.Found cell)
+                                     (match (read-cell state &cell)
+                                       (Maybe.Just value) (Result.Success value)
+                                       (Maybe.Nothing)
+                                         (Result.Error (error-at body
+                                                                 @"members: invalid cell")))
+                                   _
+                                     (Result.Error
+                                       (error-at body
+                                                 (String.append "not a type: "
+                                                                &type-name)))))
+                             (Maybe.Nothing)
+                               (Result.Error
+                                 (error-at body @"members expects a type symbol")))
+                           (Result.Error
+                             (error-at body @"members expects one argument")))
+                         (named? head @"managed?")
+                         (if (Int.= 2 (Array.length items))
+                           (match (symbol-key (Box.peek (Array.unsafe-nth items
+                                                                          1)))
+                             (Maybe.Just type-name)
+                               (let [binding-name (String.concat
+                                       &[@"__managed_" (String.copy &type-name)])]
+                                 (match (lookup-status state frame &binding-name)
+                                   (CtEnvLookup.Found _)
+                                     (Result.Success (syntax-bool body true))
+                                   _ (Result.Success (syntax-bool body false))))
+                             (Maybe.Nothing)
+                               (Result.Error
+                                 (error-at body
+                                           @"managed? expects a type symbol")))
+                           (Result.Error
+                             (error-at body @"managed? expects one argument")))
+                         (named? head @"s-expr")
+                         (if (Int.= 2 (Array.length items))
+                           (let [argument (Box.peek (Array.unsafe-nth items 1))]
+                             (match (symbol-key argument)
+                               (Maybe.Just binding)
+                                 (match (lookup-status state frame &binding)
+                                   (CtEnvLookup.Found _)
+                                     (match (eval-value argument state frame)
+                                       (Result.Success value)
+                                         (sexpr-from-value state
+                                                           frame
+                                                           body
+                                                           &value)
+                                       (Result.Error error) (Result.Error error))
+                                   (CtEnvLookup.Ambiguous)
+                                     (Result.Error
+                                       (error-at body
+                                                 (String.append "ambiguous compile-time binding: "
+                                                                &binding)))
+                                   (CtEnvLookup.Missing)
+                                     (sexpr-for-binding state
+                                                        frame
+                                                        body
+                                                        &binding))
+                               (Maybe.Nothing)
+                                 (match (eval-value argument state frame)
+                                   (Result.Success value)
+                                     (sexpr-from-value state frame body &value)
+                                   (Result.Error error) (Result.Error error))))
+                           (Result.Error
+                             (error-at body @"s-expr expects one argument")))
+                         (named? head @"use")
+                         (if (Int.= 2 (Array.length items))
+                           (let [target (Box.peek (Array.unsafe-nth items 1))]
+                             (match (symbol-key target)
+                               (Maybe.Just path)
+                                 (match (module-frame state &path)
+                                   (Maybe.Just imported)
+                                     (if (import! state frame &imported)
+                                       (Result.Success (syntax-empty body))
+                                       (Result.Error
+                                         (error-at target
+                                                   @"invalid compile-time module frame")))
+                                   (Maybe.Nothing)
+                                     (Result.Error
+                                       (error-at target
+                                                 (String.append "unknown compile-time module: "
+                                                                &path))))
+                               (Maybe.Nothing)
+                                 (Result.Error
+                                   (error-at target
+                                             @"use expects a module symbol"))))
+                           (Result.Error
+                             (error-at body @"use expects one module")))
+                         (named? head @"Dynamic.compose")
+                         (let [compose-items (semantic-items items)]
+                           (eval-compose body &compose-items state frame))
+                         (named? head @"fn")
+                         (let [fn-items (semantic-items items)]
+                           (if (Int.= 3 (Array.length &fn-items))
+                             (let [parameters (Box.peek (Array.unsafe-nth &fn-items
+                                                                          1))
+                                   fn-body (Box.peek (Array.unsafe-nth &fn-items
+                                                                       2))]
+                               (define-function parameters fn-body frame))
+                             (Result.Error
+                               (error-at body
+                                         @"fn expects parameters and a body"))))
+                         (named? head @"do")
+                         (let-do [result (the (Result CtValue CtError)
+                                              (Result.Success
+                                                (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))
+                                  n (Array.length items)]
+                           (for [i 1 n]
+                             (match-ref &result
+                               (Result.Success _)
+                                 (set! result
+                                       (eval-value (Box.peek (Array.unsafe-nth items
+                                                                               i))
+                                                   state
+                                                   frame))
+                               (Result.Error error)
+                                 (set! result (Result.Error @error))))
+                           result)
+                         (named? head @"let-do")
+                         (eval-let-do body items state frame)
+                         (named? head @"if")
+                         (let [if-items (semantic-items items)]
+                           (if (Int.= 4 (Array.length &if-items))
+                             (let [condition (Box.peek (Array.unsafe-nth &if-items
+                                                                         1))
+                                   then-branch (Box.peek (Array.unsafe-nth &if-items
+                                                                           2))
+                                   else-branch (Box.peek (Array.unsafe-nth &if-items
+                                                                           3))]
+                               (match (eval-value condition state frame)
+                                 (Result.Success condition-value)
+                                   (match-ref &condition-value
+                                     (CtValue.Syntax syntax)
+                                       (match-ref (SurfaceNode.form (Box.peek syntax))
+                                         (SurfaceForm.BoolLit value)
+                                           (if @value
+                                             (eval-value then-branch state frame)
+                                             (eval-value else-branch state frame))
+                                         _
+                                           (Result.Error
+                                             (error-at condition
+                                                       @"compile-time if condition must evaluate to Bool syntax")))
+                                     _
+                                       (Result.Error
+                                         (error-at condition
+                                                   @"compile-time if condition must evaluate to Bool syntax")))
+                                 (Result.Error error) (Result.Error error)))
+                             (Result.Error
+                               (error-at body
+                                         @"if expects condition, then, and else forms"))))
+                         (named? head @"when")
+                         (if (Int.= 3 (Array.length items))
+                           (let [condition (Box.peek (Array.unsafe-nth items 1))
+                                 then-branch (Box.peek (Array.unsafe-nth items 2))]
+                             (match (eval-value condition state frame)
+                               (Result.Success condition-value)
+                                 (match (bool-argument condition
+                                                       &condition-value)
+                                   (Result.Success value)
+                                     (if value
+                                       (eval-value then-branch state frame)
+                                       (Result.Success (syntax-empty body)))
+                                   (Result.Error error) (Result.Error error))
+                               (Result.Error error) (Result.Error error)))
+                           (Result.Error
+                             (error-at body
+                                       @"when expects a condition and a body")))
+                         (named? head @"and")
+                         (let-do [result (the (Result CtValue CtError)
+                                              (Result.Success (syntax-bool body
+                                                                           true)))
+                                  stopped false
+                                  n (Array.length items)]
+                           (for [i 1 n]
+                             (match-ref &result
+                               (Result.Success _)
+                                 (unless stopped
+                                   (let [form (Box.peek (Array.unsafe-nth items
+                                                                          i))]
+                                     (match (eval-value form state frame)
+                                       (Result.Success value)
+                                         (if (Int.= i (Int.dec n))
+                                           (set! result (Result.Success value))
+                                           (match (bool-argument form &value)
+                                             (Result.Success boolean)
+                                               (unless-do boolean
+                                                 (set! result
+                                                       (Result.Success value))
+                                                 (set! stopped true))
+                                             (Result.Error error)
+                                               (set! result (Result.Error error))))
+                                       (Result.Error error)
+                                         (set! result (Result.Error error)))))
+                               (Result.Error error)
+                                 (set! result (Result.Error @error))))
+                           result)
+                         (named? head @"or")
+                         (let-do [result (the (Result CtValue CtError)
+                                              (Result.Success (syntax-bool body
+                                                                           false)))
+                                  stopped false
+                                  n (Array.length items)]
+                           (for [i 1 n]
+                             (match-ref &result
+                               (Result.Success _)
+                                 (unless stopped
+                                   (let [form (Box.peek (Array.unsafe-nth items
+                                                                          i))]
+                                     (match (eval-value form state frame)
+                                       (Result.Success value)
+                                         (if (Int.= i (Int.dec n))
+                                           (set! result (Result.Success value))
+                                           (match (bool-argument form &value)
+                                             (Result.Success boolean)
+                                               (when-do boolean
+                                                 (set! result
+                                                       (Result.Success value))
+                                                 (set! stopped true))
+                                             (Result.Error error)
+                                               (set! result (Result.Error error))))
+                                       (Result.Error error)
+                                         (set! result (Result.Error error)))))
+                               (Result.Error error)
+                                 (set! result (Result.Error @error))))
+                           result)
+                         (named? head @"set!")
+                         (if (Int.= 3 (Array.length items))
+                           (let [target (Box.peek (Array.unsafe-nth items 1))
+                                 value-node (Box.peek (Array.unsafe-nth items 2))]
+                             (match (symbol-key target)
+                               (Maybe.Just target-name)
+                                 (match (eval-value value-node state frame)
+                                   (Result.Success value)
+                                     (if (CtEnv.set! (CtState.environment state)
+                                                     frame
+                                                     &target-name
+                                                     (CtValue.copy &value))
+                                       (Result.Success value)
+                                       (Result.Error
+                                         (error-at target
+                                                   (String.append "unknown compile-time set! target: "
+                                                                  &target-name))))
+                                   (Result.Error error) (Result.Error error))
+                               (Maybe.Nothing)
+                                 (Result.Error
+                                   (error-at target
+                                             @"set! target must be a symbol"))))
+                           (Result.Error
+                             (error-at body @"set! expects a name and a value")))
+                         (named? head @"let")
+                         (if (Int.= 3 (Array.length items))
+                           (let [binding-form (Box.peek (Array.unsafe-nth items
+                                                                          1))
+                                 let-body (Box.peek (Array.unsafe-nth items 2))]
+                             (match-ref (SurfaceNode.form binding-form)
+                               (SurfaceForm.Array pair)
+                                 (let [binding-items (semantic-items pair)]
+                                   (if (Int.= (mod (Array.length &binding-items)
+                                                   2)
+                                              0)
+                                     (let-do [let-frame (child! state frame)
+                                              failure (the (Maybe CtError)
+                                                           (Maybe.Nothing))
+                                              n (Array.length &binding-items)]
+                                       (for [binding-index 0 (/ n 2)]
+                                         (match-ref &failure
+                                           (Maybe.Nothing)
+                                             (let [index (* binding-index 2)
+                                                   name-form (Box.peek (Array.unsafe-nth &binding-items
+                                                                                         index))
+                                                   value-form (Box.peek
+                                                     (Array.unsafe-nth &binding-items
+                                                                       (Int.inc index)))]
+                                               (match (symbol-name name-form)
+                                                 (Maybe.Just name)
+                                                   (match (eval-value value-form
+                                                                      state
+                                                                      &let-frame)
+                                                     (Result.Success value)
+                                                       (ignore (define! state
+                                                                        &let-frame
+                                                                        &name
+                                                                        value))
+                                                     (Result.Error error)
+                                                       (set! failure
+                                                             (Maybe.Just error)))
+                                                 (Maybe.Nothing)
+                                                   (set! failure
+                                                         (Maybe.Just
+                                                           (error-at name-form
+                                                                     @"compile-time let binding must have a symbol name")))))
+                                           (Maybe.Just _) ()))
+                                       (match failure
+                                         (Maybe.Nothing)
+                                           (eval-value let-body state &let-frame)
+                                         (Maybe.Just error) (Result.Error error)))
+                                     (Result.Error
+                                       (error-at binding-form
+                                                 @"compile-time let bindings must contain name/value pairs"))))
+                               _
+                                 (Result.Error
+                                   (error-at binding-form
+                                             @"compile-time let bindings must be an array"))))
+                           (Result.Error
+                             (error-at body @"let expects bindings and a body")))
+                         (named? head @"while")
+                         (if (Int.= 3 (Array.length items))
+                           (let [condition (Box.peek (Array.unsafe-nth items 1))
+                                 loop-body (Box.peek (Array.unsafe-nth items 2))]
+                             (let-do [result (the (Result CtValue CtError)
+                                                  (Result.Success (syntax-empty body)))
+                                      running true]
+                               (while-do running
+                                 (match-ref &result
+                                   (Result.Success _)
+                                     (match (eval-value condition state frame)
+                                       (Result.Success condition-value)
+                                         (match (bool-argument condition
+                                                               &condition-value)
+                                           (Result.Success boolean)
+                                             (if boolean
+                                               (match (eval-value loop-body
                                                                   state
-                                                                  frame))
-                                                (set! settled true))
-                                              (match (eval-value form
+                                                                  frame)
+                                                 (Result.Success _) ()
+                                                 (Result.Error error)
+                                                   (do
+                                                     (set! result
+                                                           (Result.Error error))
+                                                     (set! running false)))
+                                               (set! running false))
+                                           (Result.Error error)
+                                             (do
+                                               (set! result (Result.Error error))
+                                               (set! running false)))
+                                       (Result.Error error)
+                                         (do
+                                           (set! result (Result.Error error))
+                                           (set! running false)))
+                                   (Result.Error _) (set! running false)))
+                               result))
+                           (Result.Error
+                             (error-at body
+                                       @"while expects a condition and a body")))
+                         (named? head @"for")
+                         (eval-for body items state frame)
+                         (named? head @"case")
+                         (if (Int.> (Array.length items) 2)
+                           (let [target-form (Box.peek (Array.unsafe-nth items 1))]
+                             (match (eval-value target-form state frame)
+                               (Result.Success target-value)
+                                 (match (syntax-from-value target-form
+                                                           &target-value)
+                                   (Result.Success target)
+                                     (let-do [result (the (Result CtValue
+                                                                  CtError)
+                                                          (Result.Error
+                                                            (error-at body
+                                                                      @"compile-time case has no matching branch")))
+                                              expect-pattern true
+                                              take-branch false
+                                              settled false
+                                              n (Array.length items)]
+                                       (for [i 2 n]
+                                         (match-ref &result
+                                           (Result.Success _) ()
+                                           (Result.Error _)
+                                             (unless settled
+                                               (let [form (Box.peek (Array.unsafe-nth items
+                                                                                      i))]
+                                                 (cond
+                                                   expect-pattern
+                                                     (if (Int.= i (Int.dec n))
+                                                       (do
+                                                         (set! result
+                                                               (eval-value form
+                                                                           state
+                                                                           frame))
+                                                         (set! settled true))
+                                                       (match (eval-value form
+                                                                          state
+                                                                          frame)
+                                                         (Result.Success candidate-value)
+                                                           (match (syntax-from-value form
+                                                                                     &candidate-value)
+                                                             (Result.Success candidate)
+                                                               (do
+                                                                 (set! take-branch
+                                                                       (syntax-equal? &target
+                                                                                      &candidate))
+                                                                 (set! expect-pattern
+                                                                       false))
+                                                             (Result.Error error)
+                                                               (set! result
+                                                                     (Result.Error error)))
+                                                         (Result.Error error)
+                                                           (set! result
+                                                                 (Result.Error error))))
+                                                   take-branch
+                                                     (do
+                                                       (set! result
+                                                             (eval-value form
+                                                                         state
+                                                                         frame))
+                                                       (set! settled true))
+                                                   (set! expect-pattern true))))))
+                                       result)
+                                   (Result.Error error) (Result.Error error))
+                               (Result.Error error) (Result.Error error)))
+                           (Result.Error
+                             (error-at body @"case expects a value and branches")))
+                         (named? head @"cond")
+                         (let-do [result (the (Result CtValue CtError)
+                                              (Result.Success
+                                                (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))
+                                  expect-condition true
+                                  take-branch false
+                                  settled false
+                                  n (Array.length items)]
+                           (for [i 1 n]
+                             (match-ref &result
+                               (Result.Success _)
+                                 (unless settled
+                                   (let [form (Box.peek (Array.unsafe-nth items
+                                                                          i))]
+                                     (cond
+                                       expect-condition
+                                         (if (Int.= i (Int.dec n))
+                                           (do
+                                             (set! result
+                                                   (eval-value form state frame))
+                                             (set! settled true))
+                                           (match (eval-value form state frame)
+                                             (Result.Success condition)
+                                               (match (bool-argument form
+                                                                     &condition)
+                                                 (Result.Success boolean)
+                                                   (do
+                                                     (set! take-branch boolean)
+                                                     (set! expect-condition
+                                                           false))
+                                                 (Result.Error error)
+                                                   (set! result
+                                                         (Result.Error error)))
+                                             (Result.Error error)
+                                               (set! result (Result.Error error))))
+                                       take-branch
+                                         (do
+                                           (set! result
+                                                 (eval-value form state frame))
+                                           (set! settled true))
+                                       (set! expect-condition true))))
+                               (Result.Error error)
+                                 (set! result (Result.Error @error))))
+                           result)
+                         (named? head @"with-test-internal")
+                         (eval-with-test-internal body items state frame)
+                         (named? head @"concat")
+                         (if (Int.= 3 (Array.length items))
+                           (let [left (Box.peek (Array.unsafe-nth items 1))
+                                 right (Box.peek (Array.unsafe-nth items 2))]
+                             (match (eval-value left state frame)
+                               (Result.Success left-value)
+                                 (match (eval-value right state frame)
+                                   (Result.Success right-value)
+                                     (match-ref &left-value
+                                       (CtValue.Collection left-items)
+                                         (match-ref &right-value
+                                           (CtValue.Collection right-items)
+                                             (let-do [items @left-items
+                                                      n (Array.length right-items)]
+                                               (for [i 0 n]
+                                                 (set! items
+                                                       (Array.push-back items
+                                                                        (Box.init
+                                                                          (CtValue.copy
+                                                                            (Box.peek (Array.unsafe-nth right-items
+                                                                                                        i)))))))
+                                               (Result.Success (CtValue.Collection items)))
+                                           _
+                                             (Result.Error
+                                               (error-at right
+                                                         @"concat expects compile-time collections")))
+                                       _
+                                         (Result.Error
+                                           (error-at left
+                                                     @"concat expects compile-time collections")))
+                                   (Result.Error error) (Result.Error error))
+                               (Result.Error error) (Result.Error error)))
+                           (Result.Error
+                             (error-at body @"concat expects two collections")))
+                         (match (the (Maybe CtClosure)
+                                     (macro-closure-for head state frame))
+                           (Maybe.Just macro-closure)
+                             (apply-ct-macro body
+                                             &macro-closure
+                                             items
+                                             state
+                                             frame)
+                           (Maybe.Nothing)
+                             (let-do [arguments (the (Result (Array (Box CtValue))
+                                                             CtError)
+                                                     (Result.Success []))
+                                      n (Array.length items)]
+                               (for [i 1 n]
+                                 (match-ref &arguments
+                                   (Result.Success values)
+                                     (let [argument (Box.peek (Array.unsafe-nth items
+                                                                                i))]
+                                       (match (match (symbol-key argument)
+                                           (Maybe.Just name)
+                                             (if (or (named? head
+                                                             @"Dynamic.compose")
+                                                     (and (named? head
+                                                                  @"Dynamic.curry*")
+                                                          (Int.= i 1)))
+                                               (match (sexpr-for-binding state
+                                                                         frame
+                                                                         body
+                                                                         &name)
+                                                 (Result.Success value)
+                                                   (Result.Success value)
+                                                 (Result.Error _)
+                                                   (eval-value argument
+                                                               state
+                                                               frame))
+                                               (match (lookup-status state
+                                                                     frame
+                                                                     &name)
+                                                 (CtEnvLookup.Missing)
+                                                   (if (builtin-name? argument
+                                                                      &name)
+                                                     (eval-value argument
                                                                  state
                                                                  frame)
-                                                (Result.Success candidate-value)
-                                                  (match (syntax-from-value form
-                                                                            &candidate-value)
-                                                    (Result.Success candidate)
-                                                      (do
-                                                        (set! take-branch
-                                                              (syntax-equal? &target
-                                                                             &candidate))
-                                                        (set! expect-pattern
-                                                              false))
-                                                    (Result.Error error)
-                                                      (set! result
-                                                            (Result.Error error)))
-                                                (Result.Error error)
-                                                  (set! result
-                                                        (Result.Error error))))
-                                          take-branch
-                                            (do
-                                              (set! result
-                                                    (eval-value form state frame))
-                                              (set! settled true))
-                                          (set! expect-pattern true))))))
-                              result)
-                          (Result.Error error) (Result.Error error))
-                      (Result.Error error) (Result.Error error)))
-                  (Result.Error
-                    (error-at body @"case expects a value and branches")))
-                (named? head @"cond")
-                (let-do [result (the (Result CtValue CtError)
-                                     (Result.Success
-                                       (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))
-                         expect-condition true
-                         take-branch false
-                         settled false
-                         n (Array.length items)]
-                  (for [i 1 n]
-                    (match-ref &result
-                      (Result.Success _)
-                        (unless settled
-                          (let [form (Box.peek (Array.unsafe-nth items i))]
-                            (cond
-                              expect-condition
-                                (if (Int.= i (Int.dec n))
-                                  (do
-                                    (set! result (eval-value form state frame))
-                                    (set! settled true))
-                                  (match (eval-value form state frame)
-                                    (Result.Success condition)
-                                      (match (bool-argument form &condition)
-                                        (Result.Success boolean)
-                                          (do
-                                            (set! take-branch boolean)
-                                            (set! expect-condition false))
-                                        (Result.Error error)
-                                          (set! result (Result.Error error)))
-                                    (Result.Error error)
-                                      (set! result (Result.Error error))))
-                              take-branch
-                                (do
-                                  (set! result (eval-value form state frame))
-                                  (set! settled true))
-                              (set! expect-condition true))))
-                      (Result.Error error) (set! result (Result.Error @error))))
-                  result)
-                (named? head @"with-test-internal")
-                (eval-with-test-internal body items state frame)
-                (named? head @"concat")
-                (if (Int.= 3 (Array.length items))
-                  (let [left (Box.peek (Array.unsafe-nth items 1))
-                        right (Box.peek (Array.unsafe-nth items 2))]
-                    (match (eval-value left state frame)
-                      (Result.Success left-value)
-                        (match (eval-value right state frame)
-                          (Result.Success right-value)
-                            (match-ref &left-value
-                              (CtValue.Collection left-items)
-                                (match-ref &right-value
-                                  (CtValue.Collection right-items)
-                                    (let-do [items @left-items
-                                             n (Array.length right-items)]
-                                      (for [i 0 n]
-                                        (set! items
-                                              (Array.push-back items
-                                                               (Box.init
-                                                                 (CtValue.copy
-                                                                   (Box.peek (Array.unsafe-nth right-items
-                                                                                               i)))))))
-                                      (Result.Success (CtValue.Collection items)))
-                                  _
-                                    (Result.Error
-                                      (error-at right
-                                                @"concat expects compile-time collections")))
-                              _
-                                (Result.Error
-                                  (error-at left
-                                            @"concat expects compile-time collections")))
-                          (Result.Error error) (Result.Error error))
-                      (Result.Error error) (Result.Error error)))
-                  (Result.Error
-                    (error-at body @"concat expects two collections")))
-                (match (the (Maybe CtClosure)
-                            (macro-closure-for head state frame))
-                  (Maybe.Just macro-closure)
-                    (apply-ct-macro body &macro-closure items state frame)
-                  (Maybe.Nothing)
-                    (let-do [arguments (the (Result (Array (Box CtValue))
-                                                    CtError)
-                                            (Result.Success []))
-                             n (Array.length items)]
-                      (for [i 1 n]
-                        (match-ref &arguments
-                          (Result.Success values)
-                            (let [argument (Box.peek (Array.unsafe-nth items i))]
-                              (match (match (symbol-key argument)
-                                  (Maybe.Just name)
-                                    (if (or (named? head @"Dynamic.compose")
-                                            (and (named? head @"Dynamic.curry*")
-                                                 (Int.= i 1)))
-                                      (match (sexpr-for-binding state
-                                                                frame
-                                                                body
-                                                                &name)
-                                        (Result.Success value)
-                                          (Result.Success value)
-                                        (Result.Error _)
-                                          (eval-value argument state frame))
-                                      (match (lookup-status state frame &name)
-                                        (CtEnvLookup.Missing)
-                                          (if (builtin-name? argument &name)
-                                            (eval-value argument state frame)
-                                            (Result.Success
-                                              (CtValue.Syntax (Box.init (SurfaceNode.copy argument)))))
-                                        _ (eval-value argument state frame)))
-                                  (Maybe.Nothing)
-                                    (eval-value argument state frame))
-                                (Result.Success value)
-                                  (set! arguments
-                                        (Result.Success
-                                          (Array.push-back @values
-                                                           (Box.init value))))
-                                (Result.Error error)
-                                  (set! arguments (Result.Error error))))
-                          (Result.Error error)
-                            (set! arguments (Result.Error @error))))
-                      (match arguments
-                        (Result.Success values)
-                          (match (apply-builtin body head &values)
-                            (Maybe.Just builtin-result) builtin-result
-                            (Maybe.Nothing)
-                              (match (symbol-key head)
-                                (Maybe.Just function-name)
-                                  (match (lookup-status state
-                                                        frame
-                                                        &function-name)
-                                    (CtEnvLookup.Found cell)
-                                      (match (read-cell state &cell)
-                                        (Maybe.Just function-value)
-                                          (match function-value
-                                            (CtValue.Closure closure)
-                                            (match (bind-closure body
-                                                                 state
-                                                                 (Box.peek &closure)
-                                                                 &values)
-                                              (Result.Success closure-frame)
-                                                (match (eval-value
-                                                    (Box.peek (CtClosure.body (Box.peek &closure)))
-                                                    state
-                                                    &closure-frame)
-                                                  (Result.Success value)
-                                                    (Result.Success value)
-                                                  (Result.Error error)
-                                                    (Result.Error error))
-                                              (Result.Error error)
-                                                (Result.Error error))
-                                            (CtValue.Builtin builtin-name)
-                                            (match (apply-builtin-name body
-                                                                       &builtin-name
-                                                                       &values)
-                                              (Maybe.Just result) result
-                                              (Maybe.Nothing)
-                                                (Result.Error
-                                                  (error-at body
-                                                            @"unknown compile-time builtin")))
-                                            ;; a parameter bound to function-naming
-                                            ;; syntax (e.g. a macro receiving
-                                            ;; `list-equal-unordered`) resolves
-                                            ;; through evaluation before applying.
-                                            (CtValue.Syntax function-syntax)
-                                            (match (eval-value (Box.peek &function-syntax)
+                                                     (Result.Success
+                                                       (CtValue.Syntax (Box.init (SurfaceNode.copy argument)))))
+                                                 _
+                                                   (eval-value argument
                                                                state
-                                                               frame)
-                                              (Result.Success resolved)
-                                                (match resolved
-                                                  (CtValue.Closure resolved-closure)
-                                                    (match (bind-closure body
-                                                                         state
-                                                                         (Box.peek &resolved-closure)
-                                                                         &values)
-                                                      (Result.Success resolved-frame)
-                                                        (eval-value
-                                                          (Box.peek
-                                                            (CtClosure.body (Box.peek &resolved-closure)))
-                                                          state
-                                                          &resolved-frame)
-                                                      (Result.Error error)
-                                                        (Result.Error error))
-                                                  (CtValue.Builtin resolved-builtin)
-                                                    (match (apply-builtin-name body
-                                                                               &resolved-builtin
-                                                                               &values)
-                                                      (Maybe.Just result) result
-                                                      (Maybe.Nothing)
-                                                        (Result.Error
-                                                          (error-at body
-                                                                    @"unknown compile-time builtin")))
-                                                  (CtValue.Macro resolved-macro)
-                                                    (apply-macro-to-values body
-                                                                           (Box.peek &resolved-macro)
-                                                                           &values
-                                                                           state
-                                                                           frame)
-                                                  _
-                                                    (Result.Error
-                                                      (error-at body
-                                                                @"compile-time application expects a function")))
-                                              (Result.Error error)
-                                                (Result.Error error))
-                                            (CtValue.Macro cell-macro)
-                                            (apply-macro-to-values body
-                                                                   (Box.peek &cell-macro)
-                                                                   &values
-                                                                   state
-                                                                   frame)
-                                            _
-                                            (Result.Error
-                                              (error-at body
-                                                        @"compile-time application expects a function")))
-                                        (Maybe.Nothing)
-                                          (Result.Error
-                                            (error-at body
-                                                      @"invalid compile-time cell")))
-                                    (CtEnvLookup.Ambiguous)
-                                      (Result.Error
-                                        (error-at body
-                                                  (String.append "ambiguous compile-time function: "
-                                                                 &function-name)))
-                                    (CtEnvLookup.Missing)
-                                      (Result.Error
-                                        (error-at body
-                                                  (String.append "unknown compile-time function: "
-                                                                 &function-name))))
-                                (Maybe.Nothing)
-                                  (match (eval-value head state frame)
-                                    (Result.Success function-value)
-                                      (apply-function-value body
-                                                            &function-value
-                                                            &values
-                                                            state
-                                                            frame)
-                                    (Result.Error error) (Result.Error error))))
-                        (Result.Error error) (Result.Error error)))))))
-          (SurfaceForm.Array items)
-          (let-do [result (the (Result (Array (Box CtValue)) CtError)
-                               (Result.Success []))
-                   n (Array.length items)]
-            (for [i 0 n]
-              (match-ref &result
-                (Result.Success values)
-                  (match (eval-value (Box.peek (Array.unsafe-nth items i))
-                                     state
-                                     frame)
-                    (Result.Success value)
-                      (set! result
-                            (Result.Success
-                              (Array.push-back @values (Box.init value))))
-                    (Result.Error error) (set! result (Result.Error error)))
-                (Result.Error error) (set! result (Result.Error @error))))
-            (match result
-              (Result.Success values)
-                (Result.Success (CtValue.Collection values))
-              (Result.Error error) (Result.Error error)))
-          ;; `{k v ...}` desugars to `(Map.from-array [(Pair.init k v) ...])`,
-          ;; exactly like the reference parser; in dynamic code the call then
-          ;; resolves through the `Dynamic` module.
-          (SurfaceForm.Dictionary entries)
-          (let [pairs (semantic-items entries)]
-            (if (Int./= 0 (Int.mod (Array.length &pairs) 2))
-              (Result.Error
-                (error-at body
-                          @"dictionary literal needs an even number of forms"))
-              (let-do [span @(SurfaceNode.span body)
-                       pair-nodes (the (Array (Box SurfaceNode)) [])
-                       n (Array.length &pairs)
-                       i 0]
-                (while-do (Int.< i n)
-                  (Array.push-back! &pair-nodes
-                                    (Box.init
-                                      (SurfaceNode.init @&span
-                                                        (SurfaceForm.List
-                                                          [(Box.init
-                                                             (SurfaceNode.init @&span
-                                                                               (SurfaceForm.Symbol [@"Pair"
-                                                                                                    @"init"])))
-                                                           (Box.init
-                                                             (SurfaceNode.copy (Box.peek (Array.unsafe-nth &pairs
-                                                                                                           i))))
-                                                           (Box.init
-                                                             (SurfaceNode.copy
-                                                               (Box.peek (Array.unsafe-nth &pairs
-                                                                                           (Int.inc i)))))]))))
-                  (set! i (Int.+ i 2)))
-                (eval-value
-                  &(SurfaceNode.init @&span
-                                     (SurfaceForm.List
-                                       [(Box.init
-                                          (SurfaceNode.init @&span
-                                                            (SurfaceForm.Symbol [@"Map"
-                                                                                 @"from-array"])))
-                                        (Box.init
-                                          (SurfaceNode.init @&span
-                                                            (SurfaceForm.Array pair-nodes)))]))
-                  state
-                  frame))))
-          _
-          (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy body)))))))
+                                                               frame)))
+                                           (Maybe.Nothing)
+                                             (eval-value argument state frame))
+                                         (Result.Success value)
+                                           (set! arguments
+                                                 (Result.Success
+                                                   (Array.push-back @values
+                                                                    (Box.init value))))
+                                         (Result.Error error)
+                                           (set! arguments (Result.Error error))))
+                                   (Result.Error error)
+                                     (set! arguments (Result.Error @error))))
+                               (match arguments
+                                 (Result.Success values)
+                                   (match (apply-builtin body head &values)
+                                     (Maybe.Just builtin-result) builtin-result
+                                     (Maybe.Nothing)
+                                       (match (symbol-key head)
+                                         (Maybe.Just function-name)
+                                           (match (lookup-status state
+                                                                 frame
+                                                                 &function-name)
+                                             (CtEnvLookup.Found cell)
+                                               (match (read-cell state &cell)
+                                                 (Maybe.Just function-value)
+                                                   (match function-value
+                                                     (CtValue.Closure closure)
+                                                     (match (bind-closure body
+                                                                          state
+                                                                          (Box.peek &closure)
+                                                                          &values)
+                                                       (Result.Success closure-frame)
+                                                         (match (eval-closure-body (Box.peek &closure)
+                                                                                   state
+                                                                                   &closure-frame)
+                                                           (Result.Success value)
+                                                             (Result.Success value)
+                                                           (Result.Error error)
+                                                             (Result.Error error))
+                                                       (Result.Error error)
+                                                         (Result.Error error))
+                                                     (CtValue.Builtin builtin-name)
+                                                     (match (apply-builtin-name body
+                                                                                &builtin-name
+                                                                                &values)
+                                                       (Maybe.Just result)
+                                                         result
+                                                       (Maybe.Nothing)
+                                                         (Result.Error
+                                                           (error-at body
+                                                                     @"unknown compile-time builtin")))
+                                                     ;; a parameter bound to function-naming
+                                                     ;; syntax (e.g. a macro receiving
+                                                     ;; `list-equal-unordered`) resolves
+                                                     ;; through evaluation before applying.
+                                                     (CtValue.Syntax function-syntax)
+                                                     (match (eval-value (Box.peek &function-syntax)
+                                                                        state
+                                                                        frame)
+                                                       (Result.Success resolved)
+                                                         (match resolved
+                                                           (CtValue.Closure resolved-closure)
+                                                             (match (bind-closure body
+                                                                                  state
+                                                                                  (Box.peek &resolved-closure)
+                                                                                  &values)
+                                                               (Result.Success resolved-frame)
+                                                                 (eval-closure-body (Box.peek &resolved-closure)
+                                                                                    state
+                                                                                    &resolved-frame)
+                                                               (Result.Error error)
+                                                                 (Result.Error error))
+                                                           (CtValue.Builtin resolved-builtin)
+                                                             (match (apply-builtin-name body
+                                                                                        &resolved-builtin
+                                                                                        &values)
+                                                               (Maybe.Just result)
+                                                                 result
+                                                               (Maybe.Nothing)
+                                                                 (Result.Error
+                                                                   (error-at body
+                                                                             @"unknown compile-time builtin")))
+                                                           (CtValue.Macro resolved-macro)
+                                                             (apply-macro-to-values body
+                                                                                    (Box.peek &resolved-macro)
+                                                                                    &values
+                                                                                    state
+                                                                                    frame)
+                                                           _
+                                                             (Result.Error
+                                                               (error-at body
+                                                                         @"compile-time application expects a function")))
+                                                       (Result.Error error)
+                                                         (Result.Error error))
+                                                     (CtValue.Macro cell-macro)
+                                                     (apply-macro-to-values body
+                                                                            (Box.peek &cell-macro)
+                                                                            &values
+                                                                            state
+                                                                            frame)
+                                                     _
+                                                     (Result.Error
+                                                       (error-at body
+                                                                 @"compile-time application expects a function")))
+                                                 (Maybe.Nothing)
+                                                   (Result.Error
+                                                     (error-at body
+                                                               @"invalid compile-time cell")))
+                                             (CtEnvLookup.Ambiguous)
+                                               (Result.Error
+                                                 (error-at body
+                                                           (String.append "ambiguous compile-time function: "
+                                                                          &function-name)))
+                                             (CtEnvLookup.Missing)
+                                               (Result.Error
+                                                 (error-at body
+                                                           (String.append "unknown compile-time function: "
+                                                                          &function-name))))
+                                         (Maybe.Nothing)
+                                           (match (eval-value head state frame)
+                                             (Result.Success function-value)
+                                               (apply-function-value body
+                                                                     &function-value
+                                                                     &values
+                                                                     state
+                                                                     frame)
+                                             (Result.Error error)
+                                               (Result.Error error))))
+                                 (Result.Error error) (Result.Error error)))))))
+                   (SurfaceForm.Array items)
+                   (let-do [result (the (Result (Array (Box CtValue)) CtError)
+                                        (Result.Success []))
+                            n (Array.length items)]
+                     (for [i 0 n]
+                       (match-ref &result
+                         (Result.Success values)
+                           (match (eval-value (Box.peek (Array.unsafe-nth items
+                                                                          i))
+                                              state
+                                              frame)
+                             (Result.Success value)
+                               (set! result
+                                     (Result.Success
+                                       (Array.push-back @values (Box.init value))))
+                             (Result.Error error)
+                               (set! result (Result.Error error)))
+                         (Result.Error error)
+                           (set! result (Result.Error @error))))
+                     (match result
+                       (Result.Success values)
+                         (Result.Success (CtValue.Collection values))
+                       (Result.Error error) (Result.Error error)))
+                   ;; `{k v ...}` desugars to `(Map.from-array [(Pair.init k v) ...])`,
+                   ;; exactly like the reference parser; in dynamic code the call then
+                   ;; resolves through the `Dynamic` module.
+                   (SurfaceForm.Dictionary entries)
+                   (let [pairs (semantic-items entries)]
+                     (if (Int./= 0 (Int.mod (Array.length &pairs) 2))
+                       (Result.Error
+                         (error-at body
+                                   @"dictionary literal needs an even number of forms"))
+                       (let-do [span @(SurfaceNode.span body)
+                                pair-nodes (the (Array (Box SurfaceNode)) [])
+                                n (Array.length &pairs)
+                                i 0]
+                         (while-do (Int.< i n)
+                           (Array.push-back! &pair-nodes
+                                             (Box.init
+                                               (SurfaceNode.init @&span
+                                                                 (SurfaceForm.List
+                                                                   [(Box.init
+                                                                      (SurfaceNode.init @&span
+                                                                                        (SurfaceForm.Symbol [@"Pair"
+                                                                                                             @"init"])))
+                                                                    (Box.init
+                                                                      (SurfaceNode.copy (Box.peek (Array.unsafe-nth &pairs
+                                                                                                                    i))))
+                                                                    (Box.init
+                                                                      (SurfaceNode.copy
+                                                                        (Box.peek (Array.unsafe-nth &pairs
+                                                                                                    (Int.inc i)))))]))))
+                           (set! i (Int.+ i 2)))
+                         (eval-value
+                           &(SurfaceNode.init @&span
+                                              (SurfaceForm.List
+                                                [(Box.init
+                                                   (SurfaceNode.init @&span
+                                                                     (SurfaceForm.Symbol [@"Map"
+                                                                                          @"from-array"])))
+                                                 (Box.init
+                                                   (SurfaceNode.init @&span
+                                                                     (SurfaceForm.Array pair-nodes)))]))
+                           state
+                           frame))))
+                   _
+                   (Result.Success
+                     (CtValue.Syntax (Box.init (SurfaceNode.copy body))))))]
+      (when *ct-tracing* (set! *ct-depth* (Int.dec *ct-depth*)))
+      result))
+
+  (private eval-closure-body)
+  (hidden eval-closure-body)
+  (doc eval-closure-body "evaluates a closure's body in the closure's own
+file. Stepping through a compile-time function is stepping through the file
+that defines it, and a closure that does not know its file says so rather
+than inheriting the caller's.")
+  (defn eval-closure-body [closure state frame]
+    (let-do [_pushed (push-step-file! (CtClosure.file closure))
+             result (eval-value (Box.peek (CtClosure.body closure)) state frame)
+             _popped (pop-step-file!)]
+      result))
 
   (defn apply-function-value [call function-value values state frame]
     (match-ref function-value
@@ -2684,10 +2959,7 @@ program code.")
       (CtValue.Closure closure)
         (match (bind-closure call state (Box.peek closure) values)
           (Result.Success closure-frame)
-            (eval-value
-              (Box.peek (CtClosure.body (Box.peek closure)))
-              state
-              &closure-frame)
+            (eval-closure-body (Box.peek closure) state &closure-frame)
           (Result.Error error) (Result.Error error))
       (CtValue.Builtin builtin-name)
         (match (apply-builtin-name call builtin-name values)
@@ -3094,9 +3366,7 @@ keep it as data (a macro reached through `apply`).")
                              (Box.init
                                (macro-rest-syntax call &arguments fixed-count)))))
               (Maybe.Nothing) ())
-            (match (eval-value (Box.peek (CtClosure.body closure))
-                               state
-                               &macro-frame)
+            (match (eval-closure-body closure state &macro-frame)
               (Result.Success expansion-value)
                 (syntax-from-value call &expansion-value)
               (Result.Error error) (Result.Error error)))))))
@@ -3146,14 +3416,20 @@ REPL does — the knowledge lives here, beside the implementations.")
         (or (String.= name "String.slice") (String.= name "String.index-of"))))
 
   (doc register-macro! "binds a macro into the compile-time environment as a
-CtValue.Macro, making it visible to mid-evaluation expansion.")
+CtValue.Macro, making it visible to mid-evaluation expansion. The macro keeps
+the file it is defined in, the same way a compile-time function does.")
   (defn register-macro! [state frame name fixed rest body defining-frame]
     (ignore
       (define! state
                frame
                name
                (CtValue.Macro
-                 (Box.init (CtClosure.init fixed rest body defining-frame))))))
+                 (Box.init
+                   (CtClosure.init fixed
+                                   rest
+                                   body
+                                   defining-frame
+                                   (definition-file)))))))
 
   (defn eval-template [body state frame]
     (match (eval-value body state frame)
