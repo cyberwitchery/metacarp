@@ -101,6 +101,10 @@
     (IO.println
       "  --optimize           build -b/-x executables with clang -O3 -D NDEBUG")
     (IO.println
+      "  -g, --debug           build with debug info, keeping the C beside the")
+    (IO.println
+      "                        binary so a debugger can read what it runs")
+    (IO.println
       "  --annotate            emit inferred types of global definitions as JSON")
     (IO.println
       "  --ownership           emit the move/borrow/delete plan as JSON")
@@ -699,6 +703,18 @@
                                                             @root-name
                                                             @&root-text)))
                   (phase! "sources-ready")
+                  ;; a debug build turns spans back into lines afterwards, and
+                  ;; only the text a span points into can say which line it is:
+                  ;; keep the registry's texts before the loader consumes it
+                  (when-do *want-source-map*
+                    (set! *source-map-files* [])
+                    (set! *source-map-texts* [])
+                    (for [i 0 (Array.length &registry)]
+                      (let-do [entry (Array.unsafe-nth &registry i)]
+                        (Array.push-back! &*source-map-files*
+                                          (String.copy (ModuleSource.file entry)))
+                        (Array.push-back! &*source-map-texts*
+                                          (String.copy (ModuleSource.text entry))))))
                   (match (ModuleLoader.load &registry &(String.copy root-name))
                     (Result.Error e)
                       (do
@@ -746,11 +762,20 @@
         (IO.errorln &(fmt "carp-compiler: cannot write temporary C: %s" &e))
         false)))
 
+; where a debug build keeps its C: beside the binary rather than in a temporary
+; directory. A debugger reads the source a binary was built from, and the path
+; is recorded in the binary itself, so it has to outlive the build.
+(defn debug-c-path [binary] (String.append binary ".c"))
+
 ; clang the temp C into `binary`, linking against the runtime headers in core-dir.
-(defn clang-build [core-dir binary temp-c log-memory optimize]
+(defn clang-build [core-dir binary temp-c log-memory optimize debug]
   (let [cmd (String.concat
           &[@"clang "
             (if optimize @"-O3 -D NDEBUG " @"")
+            ;; -O0 as well as -g: an optimized build has no line to stop at for
+            ;; much of the program, and its locals live in registers rather
+            ;; than under the names a debugger can show
+            (if debug @"-g -O0 " @"")
             (if log-memory @"-D LOG_MEMORY " @"")
             ;; `-I .` lets `relative-include`/`add-c` quoted includes resolve
             ;; against the directory the compiler was invoked from.
@@ -775,7 +800,7 @@
             1))
     (Maybe.Nothing) (do (IO.print c) 0)))
 
-(defn build [c core-dir output log-memory optimize]
+(defn build [c core-dir output log-memory optimize debug]
   (match-ref core-dir
     (Maybe.Nothing)
       (do (IO.errorln "carp-compiler: -b requires --core <dir>") 1)
@@ -783,14 +808,28 @@
       (let-do [binary (match-ref output
                  (Maybe.Just p) @p
                  (Maybe.Nothing) @"a.out")
-               temp-c (temp-c-path)
-               built (and (write-temp-c c &temp-c)
-                          (clang-build dir &binary &temp-c log-memory optimize))]
-        (compiler-remove-file &temp-c)
+               ;; a debug build keeps its C, and keeps it where the binary says
+               ;; it is; every other build compiles a temporary and removes it
+               temp-c (if debug (debug-c-path &binary) (temp-c-path))
+               ;; the marks the backend left can only become directives once
+               ;; the file they will live in is known, which is here
+               emitted (if debug
+                 (CarpCompiler.resolve-line-resets c &temp-c)
+                 (String.copy c))
+               built (and (write-temp-c &emitted &temp-c)
+                          (clang-build dir
+                                       &binary
+                                       &temp-c
+                                       log-memory
+                                       optimize
+                                       debug))]
+        (unless debug (compiler-remove-file &temp-c))
         (if built
           (do
             (IO.println
               &(String.append "carp-compiler: wrote executable " &binary))
+            (when debug
+              (IO.println &(String.append "carp-compiler: kept C in " &temp-c)))
             0)
           1))))
 
@@ -806,7 +845,8 @@
                                          &(String.copy temp-bin)
                                          &temp-c
                                          log-memory
-                                         optimize))]
+                                         optimize
+                                         false))]
           (compiler-remove-file &temp-c)
           (if built
             ;; Normalize the raw wait status without losing signal termination;
@@ -1141,20 +1181,31 @@ substitution applied; node ids alone collide across definitions.")
     (Maybe.Nothing)
       (do (IO.errorln "carp-compiler: --ownership requires --core") 1)))
 
-(defn run [input core-dir output action log-memory optimize no-core]
+(defn run [input core-dir output action log-memory optimize no-core debug]
   (cond
     (Int.= action 3) (annotate-input input core-dir no-core)
     (Int.= action 4) (ownership-input input core-dir no-core)
-    (run-produce input core-dir output action log-memory optimize no-core)))
+    (run-produce input core-dir output action log-memory optimize no-core debug)))
 
-(defn run-produce [input core-dir output action log-memory optimize no-core]
-  (match (produce-c input core-dir no-core)
-    (Maybe.Nothing) 1
-    (Maybe.Just c)
-      (cond
-        (Int.= action 1) (build &c core-dir output log-memory optimize)
-        (Int.= action 2) (execute &c core-dir log-memory optimize)
-        (emit-c &c output))))
+(defn run-produce [input
+                   core-dir
+                   output
+                   action
+                   log-memory
+                   optimize
+                   no-core
+                   debug]
+  (do
+    ;; a debug build asks the compiler to remember where its C came from, so the
+    ;; C can point back at the Carp each line was written as
+    (set! *want-source-map* debug)
+    (match (produce-c input core-dir no-core)
+      (Maybe.Nothing) 1
+      (Maybe.Just c)
+        (cond
+          (Int.= action 1) (build &c core-dir output log-memory optimize debug)
+          (Int.= action 2) (execute &c core-dir log-memory optimize)
+          (emit-c &c output)))))
 
 (defn main []
   (let-do [args &System.args
@@ -1165,6 +1216,7 @@ substitution applied; node ids alone collide across definitions.")
            have-input false
            log-memory false
            optimize false
+           debug false
            no-core false
            action 0
            ; 0 = compile, 1 = help, 2 = version, 3 = argument error
@@ -1181,6 +1233,7 @@ substitution applied; node ids alone collide across definitions.")
           (String.= &arg "--ownership") (set! action 4)
           (String.= &arg "--log-memory") (set! log-memory true)
           (String.= &arg "--optimize") (set! optimize true)
+          (or (String.= &arg "-g") (String.= &arg "--debug")) (set! debug true)
           (String.= &arg "--no-core") (set! no-core true)
           (or (String.= &arg "-o") (String.= &arg "--output"))
             (if (Int.< (Int.inc i) n)
@@ -1219,7 +1272,14 @@ substitution applied; node ids alone collide across definitions.")
       (match input
         (Maybe.Just path)
           (System.exit
-            (run &path &core-dir &output action log-memory optimize no-core))
+            (run &path
+                 &core-dir
+                 &output
+                 action
+                 log-memory
+                 optimize
+                 no-core
+                 debug))
         (Maybe.Nothing)
           (do (IO.errorln "carp-compiler: no input file") (usage-hint))))))
 ;; dummy comment to force rebuild
