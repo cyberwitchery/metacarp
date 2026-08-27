@@ -72,6 +72,11 @@
 ;; aggregate coercions, LLVM callers use the pointer protocol directly.
 (def *llvm-cimpl-symbols* (the (Array String) []))
 
+;; indirect-call signatures that move aggregates: each gets a C invoke helper
+;; in the shim performing the env-branched call with clang's ABI.
+(def *llvm-invoke-keys* (the (Array String) []))
+(def *llvm-invoke-sigs* (the (Array MonoType) []))
+
 ;; letrec self-capture fields of the closure construction being emitted.
 (def *llvm-selffields* (the (Array Int) []))
 
@@ -348,6 +353,14 @@ call signature is the only structured copy of them.")
 (hidden llvm-collect-init-calls!)
 (defn llvm-collect-init-calls! [expression]
   (match-ref expression
+    (SpecializedExpr.GlobalValue _ value-type _ _ symbol lambda-var)
+      ;; a function wrapped as a value whose signature moves aggregates must
+      ;; compile impl-style: its C-side adapter becomes the stored callback
+      (when (and (not @lambda-var)
+                 (and (match-ref (Box.peek value-type) (MonoType.Function _ _) true _ false)
+                      (llvm-needs-wrapper? (Box.peek value-type))))
+        (unless (llvm-cimpl? symbol)
+          (Array.push-back! &*llvm-cimpl-symbols* (String.copy symbol))))
     (SpecializedExpr.GlobalCall _ _ reference callee-signature symbol arguments)
       (do
         (when (Int.>= (String.index-of-string symbol "_x46_init__") 0)
@@ -531,6 +544,25 @@ copy }` — every function value shares it.")
           (set! result (Maybe.Just (String.copy (Pair.b entry)))))))
     result))
 
+(doc llvm-named-fn "get-named-function with the name String kept alive
+across the call — `(llvm-cstr &(fmt ...))` hands LLVM a pointer into a
+temporary that can be freed first.")
+(hidden llvm-named-fn)
+(defn llvm-named-fn [mod name]
+  (LLVM.get-named-function mod (String.cstr name)))
+
+(hidden llvm-add-fn)
+(defn llvm-add-fn [mod name fnty]
+  (LLVM.add-function mod (String.cstr name) fnty))
+
+(hidden llvm-add-global-named)
+(defn llvm-add-global-named [mod ty name]
+  (LLVM.add-global mod ty (String.cstr name)))
+
+(hidden llvm-struct-named)
+(defn llvm-struct-named [ctx name]
+  (LLVM.struct-create-named ctx (String.cstr name)))
+
 (doc llvm-runtime-fn "the named function, declared with `fnty` on first use.")
 (hidden llvm-runtime-fn)
 (defn llvm-runtime-fn [mod name fnty]
@@ -590,8 +622,20 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
                                       (Box.peek (Array.unsafe-nth arguments 0))))))
         (for [i 0 (Array.length arguments)]
           (llvm-collect-set-targets! (Box.peek (Array.unsafe-nth arguments i)))))
-    (SpecializedExpr.Call _ _ callee arguments)
+    (SpecializedExpr.Call id _ callee arguments)
       (do
+        ;; an aggregate-moving indirect call spills its arguments and result
+        ;; for the shim's invoke helper
+        (match (Specialize.expression-type (Box.peek callee))
+          (MonoType.Function fargs fret)
+            (when (llvm-needs-wrapper? &(Type.function (Array.copy &fargs) (MonoType.copy (Box.peek &fret))))
+              (do
+                (llvm-register-invoke! &(Type.function (Array.copy &fargs) (MonoType.copy (Box.peek &fret))))
+                (for [i 0 (Array.length &fargs)]
+                  (llvm-argspill-add! @id i (MonoType.copy (Box.peek (Array.unsafe-nth &fargs i)))))
+                (unless (unit-type? (Box.peek &fret))
+                  (llvm-argspill-add! @id -1 (MonoType.copy (Box.peek &fret))))))
+          _ ())
         (llvm-collect-set-targets! (Box.peek callee))
         (for [i 0 (Array.length arguments)]
           (llvm-collect-set-targets! (Box.peek (Array.unsafe-nth arguments i)))))
@@ -855,7 +899,7 @@ tag; }` under the same data layout.")
 (defn llvm-build-sum-type [ctx instance]
   (let-do [key (CAbi.type-key instance)
            name (llvm-instance-name instance)
-           outer (LLVM.struct-create-named ctx (llvm-cstr &(CAbi.identifier &key)))
+           outer (llvm-struct-named ctx &(CAbi.identifier &key))
            variant-count 0]
     ;; cache before building the body so a recursive occurrence resolves
     (Array.push-back! &*llvm-sum-names* (String.copy &key))
@@ -1116,6 +1160,22 @@ expression (or the expression's own type when it is not a reference).")
     (MonoType.Reference inner _) (MonoType.copy (Box.peek &inner))
     other other))
 
+(hidden llvm-invoke-key)
+(defn llvm-invoke-key [signature]
+  (CAbi.identifier &(CAbi.type-key signature)))
+
+(hidden llvm-register-invoke!)
+(defn llvm-register-invoke! [signature]
+  (let-do [key (llvm-invoke-key signature)
+           known false]
+    (for [i 0 (Array.length &*llvm-invoke-keys*)]
+      (when (String.= (Array.unsafe-nth &*llvm-invoke-keys* i) &key)
+        (set! known true)))
+    (unless known
+      (do
+        (Array.push-back! &*llvm-invoke-keys* (String.copy &key))
+        (Array.push-back! &*llvm-invoke-sigs* (MonoType.copy signature))))))
+
 (hidden llvm-match-scrutinee-ok?)
 (defn llvm-match-scrutinee-ok? [scrutinee]
   (match (Specialize.expression-type scrutinee)
@@ -1175,9 +1235,9 @@ returned value is the address of that variable.")
   (let-do [serial @(Array.unsafe-nth &*llvm-strlit-counter* 0)
            holder-name (fmt "carp_strlit_%d" serial)
            data (LLVM.build-global-string-ptr builder (llvm-cstr text)
-                                              (llvm-cstr &(fmt "%s_data" &holder-name)))
-           holder (LLVM.add-global mod (LLVM.pointer-type (LLVM.int8-type ctx) 0)
-                                   (llvm-cstr &holder-name))]
+                                              (String.cstr &(fmt "%s_data" &holder-name)))
+           holder (llvm-add-global-named mod (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                      &holder-name)]
     (Array.aset! &*llvm-strlit-counter* 0 (Int.inc serial))
     (LLVM.set-initializer holder data)
     (LLVM.set-linkage holder LLVM.linkage-private)
@@ -1275,8 +1335,8 @@ environment, store the captured values, and assemble a Lambda over
                         (Maybe.Nothing) ())))))))
           (set! *llvm-selffields* self-fields))
         (let-do [fnv (LLVM.get-named-function mod (llvm-cstr &lambda-symbol))
-                 envdel (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_delete" &lambda-symbol)))
-                 envcopy (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_copy" &lambda-symbol)))
+                 envdel (llvm-named-fn mod &(fmt "%s_env_delete" &lambda-symbol))
+                 envcopy (llvm-named-fn mod &(fmt "%s_env_copy" &lambda-symbol))
                  value (LLVM.const-null (llvm-lambda-type ctx))]
           (set! value (LLVM.build-insert-value builder value fnv 0 (llvm-cstr &@"lcb")))
           (set! value (LLVM.build-insert-value builder value envp 1 (llvm-cstr &@"lenv")))
@@ -1298,7 +1358,66 @@ environment, store the captured values, and assemble a Lambda over
 (doc llvm-emit-indirect-call "a call through a Lambda value: branch on the
 environment pointer, calling the callback env-first when one is present and
 plain otherwise — the C backend's `env ? cb(env, args) : cb(args)`.")
-(defn llvm-emit-indirect-call [ctx builder mod func callee arguments]
+(doc llvm-emit-invoke-call "an aggregate-moving indirect call: spill the
+arguments, hand callback + environment + pointers to the shim's per-signature
+invoke helper, and read the result back — clang performs the actual call.")
+(defn llvm-emit-invoke-call [ctx builder mod func id signature callee arguments]
+  (match-ref signature
+    (MonoType.Function fargs fret)
+      (let-do [lam (llvm-emit-expr ctx builder mod func (Box.peek callee))
+               cb (LLVM.build-extract-value builder lam 0 (llvm-cstr &@"icb"))
+               env (LLVM.build-extract-value builder lam 1 (llvm-cstr &@"ienv"))
+               ptr-ty (LLVM.pointer-type (LLVM.int8-type ctx) 0)
+               helper-args (the (Array LLVMValue) [cb env])
+               helper-types (the (Array LLVMType) [(LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                                   (LLVM.pointer-type (LLVM.int8-type ctx) 0)])
+               ret-unit (unit-type? (Box.peek fret))
+               broken false
+               n (Array.length arguments)]
+        (for [i 0 n]
+          (let-do [value (llvm-emit-expr ctx builder mod func
+                                         (Box.peek (Array.unsafe-nth arguments i)))
+                   sp (llvm-argspill-index id i)]
+            (if (Int.< sp 0)
+              (do
+                (llvm-emit-error! @"invoke call without argument slot in llvm backend")
+                (set! broken true))
+              (let-do [slot (llvm-argspill-ptr sp)]
+                (ignore (LLVM.build-store builder value slot))
+                (Array.push-back! &helper-args slot)
+                (Array.push-back! &helper-types (LLVM.pointer-type (LLVM.int8-type ctx) 0))))))
+        (let-do [ret-slot (if ret-unit -1 (llvm-argspill-index id -1))]
+          (when (and (not ret-unit) (Int.< ret-slot 0))
+            (do
+              (llvm-emit-error! @"invoke call without return slot in llvm backend")
+              (set! broken true)))
+          (if broken
+            (llvm-dummy-value ctx)
+            (let-do [helper-name (fmt "carp_invoke_%s" &(llvm-invoke-key signature))]
+              (unless ret-unit
+                (do
+                  (Array.push-back! &helper-args (llvm-argspill-ptr ret-slot))
+                  (Array.push-back! &helper-types (LLVM.pointer-type (LLVM.int8-type ctx) 0))))
+              (let-do [helper-fnty (LLVM.function-type (LLVM.void-type ctx) &helper-types false)]
+                (ignore (LLVM.build-call builder helper-fnty
+                                         (llvm-runtime-fn mod &helper-name helper-fnty)
+                                         &helper-args (llvm-cstr &@"")))
+                (if ret-unit
+                  (llvm-dummy-value ctx)
+                  (LLVM.build-load builder (llvm-lower-type ctx (Box.peek fret))
+                                   (llvm-argspill-ptr ret-slot)
+                                   (llvm-cstr &@"iret"))))))))
+    _ (do
+        (llvm-emit-error! @"invoke call without function type in llvm backend")
+        (llvm-dummy-value ctx))))
+
+(defn llvm-emit-indirect-call [ctx builder mod func id callee arguments]
+  (let [signature (Specialize.expression-type (Box.peek callee))]
+    (if (llvm-needs-wrapper? &signature)
+      (llvm-emit-invoke-call ctx builder mod func id &signature callee arguments)
+      (llvm-emit-plain-indirect-call ctx builder mod func callee arguments))))
+
+(defn llvm-emit-plain-indirect-call [ctx builder mod func callee arguments]
   (match (Specialize.expression-type (Box.peek callee))
     (MonoType.Function fargs fret)
       (let-do [lam (llvm-emit-expr ctx builder mod func (Box.peek callee))
@@ -1445,22 +1564,28 @@ plain otherwise — the C backend's `env ? cb(env, args) : cb(args)`.")
                            (llvm-emit-expr ctx builder mod func
                                            (Box.peek (Array.unsafe-nth arguments 0)))
                            (llvm-cstr &@"deref"))
-        ;; the array-free sentinel is not a function: free the backing data
-        ;; (free(NULL) is defined, so the C backend's null guard is implicit)
+        ;; the array-free sentinel is not a function: free the backing data,
+        ;; guarded on null like the C backend (LOG_MEMORY counts every
+        ;; CARP_FREE, so a free(NULL) would skew the balance)
         (and (String.= symbol "__carp_array_free") (Int.= 1 (Array.length arguments)))
           (let-do [operand (llvm-emit-expr ctx builder mod func
                                            (Box.peek (Array.unsafe-nth arguments 0)))
+                   data (LLVM.build-extract-value builder operand 2
+                                                  (llvm-cstr &@"freedata"))
                    free-fnty (LLVM.function-type (LLVM.void-type ctx)
                                                  &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
                                                  false)
-                   free-found (LLVM.get-named-function mod (llvm-cstr &@"free"))
-                   free-fn (if (LLVM.value-null? free-found)
-                             (LLVM.add-function mod (llvm-cstr &@"free") free-fnty)
-                             free-found)]
-            (ignore (LLVM.build-call builder free-fnty free-fn
-                                     &[(LLVM.build-extract-value builder operand 2
-                                                                 (llvm-cstr &@"freedata"))]
-                                     (llvm-cstr &@"")))
+                   free-fn (llvm-runtime-fn mod &*llvm-free-symbol* free-fnty)
+                   has-data (LLVM.build-icmp builder LLVM.int-ne data
+                                             (LLVM.const-null (LLVM.pointer-type (LLVM.int8-type ctx) 0))
+                                             (llvm-cstr &@"hasdata"))
+                   free-block (LLVM.append-block ctx func (llvm-cstr &@"dofree"))
+                   skip-block (LLVM.append-block ctx func (llvm-cstr &@"skipfree"))]
+            (ignore (LLVM.build-cond-br builder has-data free-block skip-block))
+            (LLVM.position-at-end builder free-block)
+            (ignore (LLVM.build-call builder free-fnty free-fn &[data] (llvm-cstr &@"")))
+            (ignore (LLVM.build-br builder skip-block))
+            (LLVM.position-at-end builder skip-block)
             (llvm-dummy-value ctx))
         ;; build-configuration commands (ids 73-75) are compile-time effects;
         ;; the C emission ignores them and so does this one
@@ -1585,8 +1710,8 @@ plain otherwise — the C backend's `env ? cb(env, args) : cb(args)`.")
             (LLVM.position-at-end builder
                                   (LLVM.append-block ctx func (llvm-cstr &@"afterbreak")))
             (llvm-dummy-value ctx))))
-    (SpecializedExpr.Call _ _ callee arguments)
-      (llvm-emit-indirect-call ctx builder mod func callee arguments)
+    (SpecializedExpr.Call id _ callee arguments)
+      (llvm-emit-indirect-call ctx builder mod func @id callee arguments)
     (SpecializedExpr.Annotation _ _ inner _)
       (llvm-emit-expr ctx builder mod func (Box.peek inner))
     _ (do
@@ -1951,8 +2076,8 @@ backend's abort() when nothing matched.")
   (match-ref declaration
     (BackendDeclaration.Function symbol signature _ _)
       (if (llvm-cimpl? symbol)
-        (ignore (LLVM.add-function mod (llvm-cstr &(fmt "%s_carpimpl" symbol))
-                                   (llvm-impl-fn-type ctx (Box.peek signature))))
+        (ignore (llvm-add-fn mod &(fmt "%s_carpimpl" symbol)
+                             (llvm-impl-fn-type ctx (Box.peek signature))))
         (ignore (LLVM.add-function mod (llvm-cstr symbol)
                                    (llvm-lower-function-type ctx (Box.peek signature)))))
     (BackendDeclaration.Constructor symbol signature _)
@@ -2021,7 +2146,7 @@ trailing out-pointer.")
 (defn llvm-define-impl-function! [ctx builder mod symbol signature parameters body]
   (match-ref (Box.peek signature)
     (MonoType.Function fargs fret)
-      (let-do [func (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_carpimpl" symbol)))
+      (let-do [func (llvm-named-fn mod &(fmt "%s_carpimpl" symbol))
                entry (LLVM.append-block ctx func (llvm-cstr &@"entry"))]
         (LLVM.position-at-end builder entry)
         (llvm-env-reset!)
@@ -2112,6 +2237,7 @@ typed GEP to store the fields, and return the loaded whole value.")
 
 (hidden llvm-declare-closure!)
 (defn llvm-declare-closure! [ctx mod closure]
+  (do
   (match-ref (Box.peek (ClosureFunction.signature closure))
     (MonoType.Function fargs fret)
       (let-do [ptr-ty (LLVM.pointer-type (LLVM.int8-type ctx) 0)
@@ -2120,20 +2246,93 @@ typed GEP to store the fields, and return the loaded whole value.")
         (for [i 0 (Array.length fargs)]
           (Array.push-back! &param-types
                             (llvm-lower-type ctx (Box.peek (Array.unsafe-nth fargs i)))))
-        (ignore (LLVM.add-function mod (llvm-cstr symbol)
-                                   (LLVM.function-type (llvm-lower-type ctx (Box.peek fret))
-                                                       &param-types false)))
-        (ignore (LLVM.add-function mod (llvm-cstr &(fmt "%s_env_delete" symbol))
-                                   (LLVM.function-type (LLVM.void-type ctx) &[ptr-ty] false)))
-        (ignore (LLVM.add-function mod (llvm-cstr &(fmt "%s_env_copy" symbol))
-                                   (LLVM.function-type ptr-ty &[ptr-ty] false))))
-    _ (llvm-emit-error! @"closure without function type in llvm backend")))
+        (if (llvm-needs-wrapper? (Box.peek (ClosureFunction.signature closure)))
+          ;; an aggregate-moving closure compiles impl-style; its C-ABI
+          ;; callback is the shim's adapter under the plain symbol
+          (let-do [impl-params (the (Array LLVMType) [(LLVM.pointer-type (LLVM.int8-type ctx) 0)])]
+            (for [i 0 (Array.length fargs)]
+              (Array.push-back! &impl-params (LLVM.pointer-type (LLVM.int8-type ctx) 0)))
+            (unless (unit-type? (Box.peek fret))
+              (Array.push-back! &impl-params (LLVM.pointer-type (LLVM.int8-type ctx) 0)))
+            (ignore (llvm-add-fn mod &(fmt "%s_carpimpl" symbol)
+                                 (LLVM.function-type (LLVM.void-type ctx) &impl-params false)))
+            (ignore (LLVM.add-function mod (llvm-cstr symbol)
+                                       (LLVM.function-type (LLVM.void-type ctx)
+                                                           &(the (Array LLVMType) []) false))))
+          (ignore (LLVM.add-function mod (llvm-cstr symbol)
+                                     (LLVM.function-type (llvm-lower-type ctx (Box.peek fret))
+                                                         &param-types false))))
+        (ignore (llvm-add-fn mod &(fmt "%s_env_delete" symbol)
+                             (LLVM.function-type (LLVM.void-type ctx) &[ptr-ty] false)))
+        (ignore (llvm-add-fn mod &(fmt "%s_env_copy" symbol)
+                             (LLVM.function-type ptr-ty &[ptr-ty] false))))
+    _ (llvm-emit-error! @"closure without function type in llvm backend"))))
 
 (doc llvm-define-closure! "defines a lifted closure function: the leading
 parameter is the environment pointer, captures load from it (into slots when
 set!), and the declared parameters follow shifted by one.")
 (hidden llvm-define-closure!)
 (defn llvm-define-closure! [ctx builder mod closure]
+  (if (llvm-needs-wrapper? (Box.peek (ClosureFunction.signature closure)))
+    (llvm-define-impl-closure! ctx builder mod closure)
+    (llvm-define-plain-closure! ctx builder mod closure)))
+
+(doc llvm-define-impl-closure! "defines an aggregate-moving closure impl-style:
+environment pointer first, arguments behind pointers, a non-unit result
+through the trailing out-pointer.")
+(hidden llvm-define-impl-closure!)
+(defn llvm-define-impl-closure! [ctx builder mod closure]
+  (do
+  (match-ref (Box.peek (ClosureFunction.signature closure))
+    (MonoType.Function fargs fret)
+      (let-do [symbol (ClosureFunction.symbol closure)
+               captures (ClosureFunction.captures closure)
+               parameters (ClosureFunction.parameters closure)
+               body (ClosureFunction.body closure)
+               func (llvm-named-fn mod &(fmt "%s_carpimpl" symbol))
+               entry (LLVM.append-block ctx func (llvm-cstr &@"entry"))
+               env-ty (llvm-closure-env-type ctx captures)]
+        (LLVM.position-at-end builder entry)
+        (llvm-env-reset!)
+        (llvm-slot-reset!)
+        (llvm-pending-reset!)
+        (llvm-collect-set-targets! (Box.peek body))
+        (llvm-emit-slots! ctx builder)
+        (for [i 0 (Array.length captures)]
+          (let-do [capture (Array.unsafe-nth captures i)
+                   id @(CoreRef.id (Pair.a capture))
+                   value (LLVM.build-load builder
+                                          (llvm-lower-type ctx (Box.peek (Pair.b capture)))
+                                          (LLVM.build-struct-gep builder env-ty
+                                                                 (LLVM.get-param func 0) i
+                                                                 (llvm-cstr &@"cap"))
+                                          (llvm-cstr &@"capv"))
+                   si (llvm-slot-index id)]
+            (if (Int.>= si 0)
+              (ignore (LLVM.build-store builder value (llvm-slot-ptr si)))
+              (llvm-env-push! id value))))
+        (for [i 0 (Array.length parameters)]
+          (let-do [id @(CoreRef.id (Array.unsafe-nth parameters i))
+                   value (LLVM.build-load builder
+                                          (llvm-lower-type ctx (Box.peek (Array.unsafe-nth fargs i)))
+                                          (LLVM.get-param func (Int.inc i))
+                                          (llvm-cstr &@"implcarg"))
+                   si (llvm-slot-index id)]
+            (if (Int.>= si 0)
+              (ignore (LLVM.build-store builder value (llvm-slot-ptr si)))
+              (llvm-env-push! id value))))
+        (let [result (llvm-emit-expr ctx builder mod func (Box.peek body))]
+          (if (unit-type? (Box.peek fret))
+            (ignore (LLVM.build-ret-void builder))
+            (do
+              (ignore (LLVM.build-store builder result
+                                        (LLVM.get-param func
+                                                        (Int.inc (Array.length parameters)))))
+              (ignore (LLVM.build-ret-void builder))))))
+    _ ())))
+
+(hidden llvm-define-plain-closure!)
+(defn llvm-define-plain-closure! [ctx builder mod closure]
   (match-ref (Box.peek (ClosureFunction.signature closure))
     (MonoType.Function _ fret)
       (let-do [symbol (ClosureFunction.symbol closure)
@@ -2184,7 +2383,7 @@ copied through their copiers.")
   (let-do [symbol (ClosureFunction.symbol closure)
            captures (ClosureFunction.captures closure)
            env-ty (llvm-closure-env-type ctx captures)
-           del (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_delete" symbol)))
+           del (llvm-named-fn mod &(fmt "%s_env_delete" symbol))
            del-entry (LLVM.append-block ctx del (llvm-cstr &@"entry"))]
     (LLVM.position-at-end builder del-entry)
     (for [i 0 (Array.length captures)]
@@ -2215,7 +2414,7 @@ copied through their copiers.")
                                          (llvm-cstr &@"")))))
           (Maybe.Nothing) ())))
     (ignore (LLVM.build-ret-void builder))
-    (let-do [cpy (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_copy" symbol)))
+    (let-do [cpy (llvm-named-fn mod &(fmt "%s_env_copy" symbol))
              cpy-entry (LLVM.append-block ctx cpy (llvm-cstr &@"entry"))
              malloc-fnty (LLVM.function-type (LLVM.pointer-type (LLVM.int8-type ctx) 0)
                                              &[(LLVM.int64-type ctx)] false)
@@ -2440,10 +2639,11 @@ void %s(%s) { %s_carpimpl(%s); }
                 (Result.Success rendered-ret)
                   (do
                     (Array.push-back! &proto-params @"void*")
+                    (Array.push-back! &addresses @"(void*)&carp_out")
                     (StringBuf.append-str buffer
                                           &(fmt "
 void %s_carpimpl(%s);
-%s %s(%s) { %s carp_out; %s_carpimpl(%s, (void*)&carp_out); return carp_out; }
+%s %s(%s) { %s carp_out; %s_carpimpl(%s); return carp_out; }
 "
                                                 symbol
                                                 &(String.join ", " &proto-params)
@@ -2453,6 +2653,105 @@ void %s_carpimpl(%s);
                                                 &rendered-ret
                                                 symbol
                                                 &(String.join ", " &addresses))))
+                (Result.Error _) ())))))
+    _ ()))
+
+(doc llvm-append-closure-adapter! "appends the C-ABI callback adapter for an
+aggregate-moving closure: the plain symbol, called by C template code and
+invoke helpers, forwards environment plus pointered arguments to the
+LLVM-side `_carpimpl`.")
+(hidden llvm-append-closure-adapter!)
+(defn llvm-append-closure-adapter! [buffer symbol signature]
+  (match-ref signature
+    (MonoType.Function fargs fret)
+      (let-do [ok true
+               params (the (Array String) [@"void* carp_env"])
+               proto-params (the (Array String) [@"void*"])
+               addresses (the (Array String) [@"carp_env"])]
+        (for [i 0 (Array.length fargs)]
+          (match (CAbi.render-type (Box.peek (Array.unsafe-nth fargs i)))
+            (Result.Success rendered)
+              (do
+                (Array.push-back! &params (fmt "%s a%d" &rendered i))
+                (Array.push-back! &proto-params @"void*")
+                (Array.push-back! &addresses (fmt "(void*)&a%d" i)))
+            (Result.Error _) (set! ok false)))
+        (let [ret-unit (unit-type? (Box.peek fret))]
+          (when ok
+            (if ret-unit
+              (StringBuf.append-str buffer
+                                    &(fmt "\nvoid %s_carpimpl(%s);\nvoid %s(%s) { %s_carpimpl(%s); }\n"
+                                          symbol
+                                          &(String.join ", " &proto-params)
+                                          symbol
+                                          &(String.join ", " &params)
+                                          symbol
+                                          &(String.join ", " &addresses)))
+              (match (CAbi.render-type (Box.peek fret))
+                (Result.Success rendered-ret)
+                  (do
+                    (Array.push-back! &proto-params @"void*")
+                    (Array.push-back! &addresses @"(void*)&carp_out")
+                    (StringBuf.append-str buffer
+                                          &(fmt "\nvoid %s_carpimpl(%s);\n%s %s(%s) { %s carp_out; %s_carpimpl(%s); return carp_out; }\n"
+                                                symbol
+                                                &(String.join ", " &proto-params)
+                                                &rendered-ret
+                                                symbol
+                                                &(String.join ", " &params)
+                                                &rendered-ret
+                                                symbol
+                                                &(String.join ", " &addresses))))
+                (Result.Error _) ())))))
+    _ ()))
+
+(doc llvm-append-invoke-helper! "appends the C invoke helper for one
+aggregate-moving indirect-call signature: it performs the env-branched
+callback call with clang's ABI, reading arguments and writing the result
+through pointers.")
+(hidden llvm-append-invoke-helper!)
+(defn llvm-append-invoke-helper! [buffer key signature]
+  (match-ref signature
+    (MonoType.Function fargs fret)
+      (let-do [ok true
+               types (the (Array String) [])
+               params (the (Array String) [@"void* cb" @"void* env"])
+               derefs (the (Array String) [])]
+        (for [i 0 (Array.length fargs)]
+          (match (CAbi.render-type (Box.peek (Array.unsafe-nth fargs i)))
+            (Result.Success rendered)
+              (do
+                (Array.push-back! &types (String.copy &rendered))
+                (Array.push-back! &params (fmt "%s* a%d" &rendered i))
+                (Array.push-back! &derefs (fmt "(*a%d)" i)))
+            (Result.Error _) (set! ok false)))
+        (let [ret-unit (unit-type? (Box.peek fret))
+              arg-types (String.join ", " &types)
+              env-types (if (Int.= 0 (Array.length &types))
+                          @"void*"
+                          (String.concat &[@"void*, " (String.join ", " &types)]))
+              args (String.join ", " &derefs)
+              env-args (if (Int.= 0 (Array.length &derefs))
+                         @"env"
+                         (String.concat &[@"env, " (String.join ", " &derefs)]))]
+          (when ok
+            (if ret-unit
+              (StringBuf.append-str buffer
+                                    &(fmt "\nvoid carp_invoke_%s(%s) { if (env) { ((void(*)(%s))cb)(%s); } else { ((void(*)(%s))cb)(%s); } }\n"
+                                          key
+                                          &(String.join ", " &params)
+                                          &env-types &env-args
+                                          &arg-types &args))
+              (match (CAbi.render-type (Box.peek fret))
+                (Result.Success rendered-ret)
+                  (do
+                    (Array.push-back! &params (fmt "%s* carp_out" &rendered-ret))
+                    (StringBuf.append-str buffer
+                                          &(fmt "\nvoid carp_invoke_%s(%s) { if (env) { *carp_out = ((%s(*)(%s))cb)(%s); } else { *carp_out = ((%s(*)(%s))cb)(%s); } }\n"
+                                                key
+                                                &(String.join ", " &params)
+                                                &rendered-ret &env-types &env-args
+                                                &rendered-ret &arg-types &args)))
                 (Result.Error _) ())))))
     _ ()))
 
@@ -2510,6 +2809,42 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
           (BackendDeclaration.Intrinsic symbol _ external)
             (when (match-ref external (Maybe.Just _) true (Maybe.Nothing) false)
               (Array.push-back! &template-symbols (String.copy symbol)))
+          _ ()))
+      ;; the adapters, wrappers, and invoke helpers appended below reference
+      ;; types by their C names: carry their signatures as declaration-only
+      ;; intrinsics so the nominal typedef pass renders every instance type
+      ;; they mention (the carrier prototypes themselves are unused externs)
+      (for [i 0 (Array.length &*llvm-invoke-keys*)]
+        (Array.push-back! &filtered
+                          (BackendDeclaration.Intrinsic
+                            (fmt "carp_sig_%s" (Array.unsafe-nth &*llvm-invoke-keys* i))
+                            (Box.init (MonoType.copy (Array.unsafe-nth &*llvm-invoke-sigs* i)))
+                            (the (Maybe String) (Maybe.Nothing)))))
+      (for [i 0 (Array.length &*llvm-preproc-syms*)]
+        (when (llvm-needs-wrapper? (Array.unsafe-nth &*llvm-preproc-sigs* i))
+          (Array.push-back! &filtered
+                            (BackendDeclaration.Intrinsic
+                              (fmt "%s_carpsig" (Array.unsafe-nth &*llvm-preproc-syms* i))
+                              (Box.init (MonoType.copy (Array.unsafe-nth &*llvm-preproc-sigs* i)))
+                              (the (Maybe String) (Maybe.Nothing))))))
+      (let [shim-closures (BackendModule.closure-functions backend)]
+        (for [i 0 (Array.length shim-closures)]
+          (let [closure (Array.unsafe-nth shim-closures i)]
+            (when (llvm-needs-wrapper? (Box.peek (ClosureFunction.signature closure)))
+              (Array.push-back! &filtered
+                                (BackendDeclaration.Intrinsic
+                                  (fmt "%s_carpsig" (ClosureFunction.symbol closure))
+                                  (Box.init (MonoType.copy (Box.peek (ClosureFunction.signature closure))))
+                                  (the (Maybe String) (Maybe.Nothing))))))))
+      (for [i 0 (Array.length declarations)]
+        (match-ref (Array.unsafe-nth declarations i)
+          (BackendDeclaration.Function symbol signature _ _)
+            (when (llvm-cimpl? symbol)
+              (Array.push-back! &filtered
+                                (BackendDeclaration.Intrinsic
+                                  (fmt "%s_carpsig" symbol)
+                                  (Box.init (MonoType.copy (Box.peek signature)))
+                                  (the (Maybe String) (Maybe.Nothing)))))
           _ ()))
       ;; a template's dependencies live on the LLVM side (specialized
       ;; deleters/copiers): give the shim their prototypes, as declaration-only
@@ -2591,6 +2926,20 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
                 (llvm-append-wrapper! &buffer
                                       (Array.unsafe-nth &*llvm-preproc-syms* i)
                                       (Array.unsafe-nth &*llvm-preproc-sigs* i))))
+            ;; aggregate-moving closures: the C-ABI callback adapter under the
+            ;; plain symbol, forwarding by pointer to the LLVM-side impl
+            (let [closures (BackendModule.closure-functions backend)]
+              (for [i 0 (Array.length closures)]
+                (let [closure (Array.unsafe-nth closures i)]
+                  (when (llvm-needs-wrapper? (Box.peek (ClosureFunction.signature closure)))
+                    (llvm-append-closure-adapter! &buffer
+                                                  (ClosureFunction.symbol closure)
+                                                  (Box.peek (ClosureFunction.signature closure)))))))
+            ;; per-signature invoke helpers for aggregate-moving indirect calls
+            (for [i 0 (Array.length &*llvm-invoke-keys*)]
+              (llvm-append-invoke-helper! &buffer
+                                          (Array.unsafe-nth &*llvm-invoke-keys* i)
+                                          (Array.unsafe-nth &*llvm-invoke-sigs* i)))
             (Result.Success (StringBuf.to-string &buffer)))
         (Result.Error error) (Result.Error error))))
 
