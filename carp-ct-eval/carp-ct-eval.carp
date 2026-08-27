@@ -61,6 +61,13 @@ and width 3 or above means the floating field carries the value.")
 ;; (Core Dynamic) reads it through the `Unsafe.load-stack` builtin.
 (def *ct-load-stack* (the (Array String) []))
 
+;; compile-time build commands (`system-include`, `add-cflag`, `add-lib`,
+;; `add-pkg`) applied as dynamic functions: includes become synthesized
+;; top-level forms the expansion drains into its output, flags accumulate for
+;; the driver's compiler invocation.
+(def *ct-pending-includes* (the (Array SurfaceNode) []))
+(def *ct-collected-cflags* (the (Array String) []))
+
 ;; where the FORMS BEING EVALUATED are written, innermost last. This is not
 ;; the load stack: `current-file` (and so `relative-include`) means the file
 ;; being loaded, which stays the caller's while a macro from another file
@@ -100,6 +107,31 @@ say what a step in the middle saw.")
 
 (defmodule CtEval
   (defn reset-load-stack! [] (set! *ct-load-stack* []))
+
+  (doc drain-pending-includes! "the `(system-include ...)` forms compile-time
+evaluation requested since the last drain, cleared on return; the expansion
+appends them to its output so resolution collects them like written ones.")
+  (defn drain-pending-includes! []
+    (let-do [drained (Array.copy &*ct-pending-includes*)]
+      (set! *ct-pending-includes* [])
+      drained))
+
+  (doc collected-cflags "the deduplicated compiler flags (`add-cflag`,
+`add-lib`, `add-pkg`) compile-time evaluation has requested, in first-use
+order, for the driver's C compiler invocation.")
+  (defn collected-cflags []
+    (let-do [flags (the (Array String) [])]
+      (for [i 0 (Array.length &*ct-collected-cflags*)]
+        (let-do [flag (Array.unsafe-nth &*ct-collected-cflags* i)
+                 seen false]
+          (for [j 0 (Array.length &flags)]
+            (when (String.= (Array.unsafe-nth &flags j) flag)
+              (set! seen true)))
+          (unless seen (Array.push-back! &flags @flag))))
+      flags))
+
+  (doc record-cflag! "adds one flag to the collected compiler flags.")
+  (defn record-cflag! [flag] (Array.push-back! &*ct-collected-cflags* @flag))
 
   (doc push-step-file! "enters a file for the purpose of recording steps: the
 body about to run is written there. Push the empty string when the file is
@@ -2025,6 +2057,37 @@ depends on), anything floating divides in the floating domain.")
       (Maybe.Just (Result.Success (syntax-string call "unknown")))
       (named? head @"macro-log")
       (Maybe.Just (Result.Success (syntax-empty call)))
+      ;; the build commands are dynamic functions in the reference; applying
+      ;; one at compile time records its effect for the pipeline
+      (named? head @"system-include")
+      (match (value-at call values 0)
+        (Result.Success value)
+          (match (string-argument call &value)
+            (Result.Success path)
+              (do
+                (Array.push-back!
+                  &*ct-pending-includes*
+                  (SurfaceNode.init
+                    @(SurfaceNode.span call)
+                    (SurfaceForm.List
+                      [(Box.init (SurfaceNode.init @(SurfaceNode.span call)
+                                                   (SurfaceForm.Symbol [@"system-include"])))
+                       (Box.init (SurfaceNode.init @(SurfaceNode.span call)
+                                                   (SurfaceForm.StringLit path)))])))
+                (Maybe.Just (Result.Success (syntax-empty call))))
+            (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Result.Error error) (Maybe.Just (Result.Error error)))
+      (or (named? head @"add-cflag")
+          (or (named? head @"add-lib") (named? head @"add-pkg")))
+      (match (value-at call values 0)
+        (Result.Success value)
+          (match (string-argument call &value)
+            (Result.Success flag)
+              (do
+                (Array.push-back! &*ct-collected-cflags* flag)
+                (Maybe.Just (Result.Success (syntax-empty call))))
+            (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Result.Error error) (Maybe.Just (Result.Error error)))
       (named? head @"str")
       (match (value-at call values 0)
         (Result.Success value)
