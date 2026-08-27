@@ -85,6 +85,14 @@
 (def *llvm-preproc-syms* (the (Array String) []))
 (def *llvm-preproc-sigs* (the (Array MonoType) []))
 
+;; getter-derived external layouts: when a register-returned external type
+;; has no reachable init, its field types are recovered from accessor-getter
+;; call sites in encounter order (correct whenever the fields share a type;
+;; heterogeneous externals normally have a reachable init).
+(def *llvm-getterlay-keys* (the (Array String) []))
+(def *llvm-getterlay-fields* (the (Array (Array MonoType)) []))
+(def *llvm-getterlay-seen* (the (Array String) []))
+
 ;; external registered structs (register-type with fields, C-defined): field
 ;; types recovered from the generated init template's signature, keyed by the
 ;; type's key. The layout is the plain C struct in declaration order.
@@ -111,6 +119,12 @@
 ;; sum-type layout cache (context-bound, reset per emit-module).
 (def *llvm-sum-names* (the (Array String) []))
 (def *llvm-sum-types* (the (Array LLVMType) []))
+
+;; the C symbols backing IR-side heap operations. The driver swaps these for
+;; the carp_llvm_* shim helpers so CARP_MALLOC/CARP_FREE (and LOG_MEMORY
+;; accounting) stay in the loop; the JIT tests keep libc malloc/free.
+(def *llvm-malloc-symbol* @"malloc")
+(def *llvm-free-symbol* @"free")
 
 ;; serial for uniquely naming interned string/pattern literal globals.
 (def *llvm-strlit-counter* (the (Array Int) [0]))
@@ -313,6 +327,20 @@ candidate with the most arguments wins (init carries every field).")
         _ ())
     _ ()))
 
+(doc llvm-intercepted-builtin? "whether a call site is one the emitter
+lowers inline (builtins by id, closure constructions, the array-free
+sentinel) — such a call never becomes a symbol reference.")
+(hidden llvm-intercepted-builtin?)
+(defn llvm-intercepted-builtin? [reference symbol]
+  (let [id @(CoreRef.id reference)]
+    (or (String.starts-with? symbol "_carp_closure_")
+        (or (String.= symbol "__carp_array_free")
+            (or (Int.= id 5) (or (Int.= id 6) (or (Int.= id 9) (or (Int.= id 10)
+            (or (Int.= id 12) (or (Int.= id 13) (or (Int.= id 14) (or (Int.= id 15)
+            (or (Int.= id 16) (or (Int.= id 17) (or (Int.= id 18) (or (Int.= id 21)
+            (or (Int.= id 48) (or (Int.= id 49) (or (Int.= id 73) (or (Int.= id 74)
+            (Int.= id 75)))))))))))))))))))))
+
 (doc llvm-collect-init-calls! "walks a body recording external layouts from
 `.init`-shaped call sites: a registered type's fields are the init's argument
 types, and with register-type accessors arriving as raw preprocessor text the
@@ -324,11 +352,11 @@ call signature is the only structured copy of them.")
       (do
         (when (Int.>= (String.index-of-string symbol "_x46_init__") 0)
           (llvm-collect-external-layout! (Box.peek callee-signature)))
-        ;; a call to a symbol nothing declares is a preprocessor-provided C
-        ;; function; builtins (small reference ids, intercepted inline) and
-        ;; closure constructions are not
-        (when (and (Int.> @(CoreRef.id reference) 100)
-                   (not (String.starts-with? symbol "_carp_closure_")))
+        ;; a call to a symbol nothing declares (or that only a builtin-style
+        ;; declaration covers, like register-type accessors riding the
+        ;; preprocessor channel) is a C function; inline-lowered builtins are
+        ;; not calls at all
+        (when (not (llvm-intercepted-builtin? reference symbol))
           (let-do [known false]
             (for [i 0 (Array.length &*llvm-declared-symbols*)]
               (when (String.= (Array.unsafe-nth &*llvm-declared-symbols* i) symbol)
@@ -340,7 +368,8 @@ call signature is the only structured copy of them.")
               (do
                 (Array.push-back! &*llvm-preproc-syms* (String.copy symbol))
                 (Array.push-back! &*llvm-preproc-sigs*
-                                  (MonoType.copy (Box.peek callee-signature)))))))
+                                  (MonoType.copy (Box.peek callee-signature)))))
+            (llvm-record-getter-layout! symbol (Box.peek callee-signature))))
         (for [i 0 (Array.length arguments)]
           (llvm-collect-init-calls! (Box.peek (Array.unsafe-nth arguments i)))))
     (SpecializedExpr.Call _ _ callee arguments)
@@ -384,11 +413,58 @@ call signature is the only structured copy of them.")
       (llvm-collect-init-calls! (Box.peek body))
     _ ()))
 
+(doc llvm-record-getter-layout! "records one accessor-getter call
+(`(Ref T) -> (Ref F)`) as a field of T's getter-derived layout, deduplicated
+by accessor symbol.")
+(hidden llvm-record-getter-layout!)
+(defn llvm-record-getter-layout! [symbol signature]
+  (match-ref signature
+    (MonoType.Function fargs fret)
+      (when (Int.= 1 (Array.length fargs))
+        (match-ref (Box.peek (Array.unsafe-nth fargs 0))
+          (MonoType.Reference self-inner _)
+            (match-ref (Box.peek fret)
+              (MonoType.Reference field-inner _)
+                (match-ref (Box.peek self-inner)
+                  (MonoType.Named _ _)
+                    (let-do [key (CAbi.type-key (Box.peek self-inner))
+                             seen false]
+                      (for [i 0 (Array.length &*llvm-getterlay-seen*)]
+                        (when (String.= (Array.unsafe-nth &*llvm-getterlay-seen* i) symbol)
+                          (set! seen true)))
+                      (unless seen
+                        (do
+                          (Array.push-back! &*llvm-getterlay-seen* (String.copy symbol))
+                          (let-do [existing -1]
+                            (for [i 0 (Array.length &*llvm-getterlay-keys*)]
+                              (when (String.= (Array.unsafe-nth &*llvm-getterlay-keys* i) &key)
+                                (set! existing i)))
+                            (if (Int.< existing 0)
+                              (do
+                                (Array.push-back! &*llvm-getterlay-keys* (String.copy &key))
+                                (Array.push-back! &*llvm-getterlay-fields*
+                                                  [(MonoType.copy (Box.peek field-inner))]))
+                              (let-do [fields @(Array.unsafe-nth &*llvm-getterlay-fields* existing)]
+                                (Array.push-back! &fields (MonoType.copy (Box.peek field-inner)))
+                                (Array.aset! &*llvm-getterlay-fields* existing fields)))))))
+                  _ ())
+              _ ())
+          _ ()))
+    _ ()))
+
 (hidden llvm-external-index)
 (defn llvm-external-index [key]
   (let-do [found -1]
     (for [i 0 (Array.length &*llvm-external-keys*)]
       (when (String.= (Array.unsafe-nth &*llvm-external-keys* i) key)
+        (set! found i)))
+    found))
+
+(hidden llvm-getterlay-index)
+(defn llvm-getterlay-index [key]
+  (let-do [found -1]
+    (for [i 0 (Array.length &*llvm-getterlay-keys*)]
+      (when (String.= (Array.unsafe-nth &*llvm-getterlay-keys* i) key)
         (set! found i)))
     found))
 
@@ -773,14 +849,21 @@ tag; }` under the same data layout.")
         (if (Int.= 0 variant-count)
           ;; an external registered struct: the plain C struct of its
           ;; recovered field types, in declaration order
-          (let [ei (llvm-external-index &key)]
-            (if (Int.< ei 0)
+          (let-do [ei (llvm-external-index &key)
+                   gi (if (Int.>= ei 0) -1 (llvm-getterlay-index &key))]
+            (if (and (Int.< ei 0) (Int.< gi 0))
               (llvm-emit-error! (fmt "no constructors for type %s in llvm backend" &name))
               (let-do [fields (the (Array LLVMType) [])
-                       montypes (Array.unsafe-nth &*llvm-external-fields* ei)]
+                       montypes (if (Int.>= ei 0)
+                                  (Array.unsafe-nth &*llvm-external-fields* ei)
+                                  (Array.unsafe-nth &*llvm-getterlay-fields* gi))]
                 (for [i 0 (Array.length montypes)]
                   (Array.push-back! &fields
                                     (llvm-lower-type ctx (Array.unsafe-nth montypes i))))
+                ;; a representation-string register-type (e.g. "void*") shows
+                ;; no fields at all: treat it as a pointer-sized opaque
+                (when (Int.= 0 (Array.length &fields))
+                  (Array.push-back! &fields (LLVM.pointer-type (LLVM.int8-type ctx) 0)))
                 (LLVM.struct-set-body outer &fields false))))
           (llvm-emit-error! (fmt "no target data for type %s in llvm backend" &name)))
         outer)
@@ -1114,7 +1197,7 @@ environment, store the captured values, and assemble a Lambda over
                malloc-fnty (LLVM.function-type (LLVM.pointer-type (LLVM.int8-type ctx) 0)
                                                &[(LLVM.int64-type ctx)] false)
                envp (LLVM.build-call builder malloc-fnty
-                                     (llvm-runtime-fn mod "malloc" malloc-fnty)
+                                     (llvm-runtime-fn mod &*llvm-malloc-symbol* malloc-fnty)
                                      &[(LLVM.const-int (LLVM.int64-type ctx) env-size 0)]
                                      (llvm-cstr &@"envp"))]
         (let-do [self-fields (the (Array Int) [])]
@@ -1575,7 +1658,7 @@ with `n` elements of uninitialized malloc'd storage.")
                                       (LLVM.const-int (LLVM.int64-type ctx) element-size 0)
                                       (llvm-cstr &@"abytes"))
            data (LLVM.build-call builder malloc-fnty
-                                 (llvm-runtime-fn mod "malloc" malloc-fnty)
+                                 (llvm-runtime-fn mod &*llvm-malloc-symbol* malloc-fnty)
                                  &[byte-count] (llvm-cstr &@"adata"))
            value (LLVM.const-null (llvm-array-type ctx))]
     (set! value (LLVM.build-insert-value builder value n64 0 (llvm-cstr &@"alen")))
@@ -2086,7 +2169,7 @@ copied through their copiers.")
                         (LLVM.abi-size-of-type (llvm-target-data) env-ty))]
       (LLVM.position-at-end builder cpy-entry)
       (let-do [dst (LLVM.build-call builder malloc-fnty
-                                    (llvm-runtime-fn mod "malloc" malloc-fnty)
+                                    (llvm-runtime-fn mod &*llvm-malloc-symbol* malloc-fnty)
                                     &[(LLVM.const-int (LLVM.int64-type ctx) env-size 0)]
                                     (llvm-cstr &@"envdst"))]
         (for [i 0 (Array.length captures)]
@@ -2360,8 +2443,12 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
                                     (Array.copy (BackendModule.delete-symbols backend))
                                     (Array.copy (BackendModule.copy-symbols backend))))
         (Result.Success unit-c)
-          (let-do [buffer (StringBuf.create)]
+          (let-do [buffer (StringBuf.create)
+                   emitted-getters (the (Array String) [])]
             (StringBuf.append-str &buffer &unit-c)
+            ;; heap helpers keeping CARP_MALLOC/CARP_FREE (and LOG_MEMORY) in
+            ;; the loop for IR-side allocations
+            (StringBuf.append-str &buffer "\nvoid* carp_llvm_malloc(size_t n) { return CARP_MALLOC(n); }\nvoid carp_llvm_free(void* p) { CARP_FREE(p); }\n")
             (for [i 0 (Array.length declarations)]
               (match-ref (Array.unsafe-nth declarations i)
                 (BackendDeclaration.Template symbol signature _ _)
@@ -2380,12 +2467,19 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
                       (MonoType.Function _ _)
                         (when (llvm-needs-wrapper? (Box.peek signature))
                           (llvm-append-wrapper! &buffer symbol (Box.peek signature)))
-                      _ (match (CAbi.render-type (Box.peek signature))
-                          (Result.Success rendered)
-                            (StringBuf.append-str &buffer
-                                                  &(fmt "\n%s %s_carpvalue(void) { return %s; }\n"
-                                                        &rendered symbol symbol))
-                          (Result.Error _) ())))
+                      _ (let-do [dup false]
+                          (for [k 0 (Array.length &emitted-getters)]
+                            (when (String.= (Array.unsafe-nth &emitted-getters k) symbol)
+                              (set! dup true)))
+                          (unless dup
+                            (do
+                              (Array.push-back! &emitted-getters (String.copy symbol))
+                              (match (CAbi.render-type (Box.peek signature))
+                                (Result.Success rendered)
+                                  (StringBuf.append-str &buffer
+                                                        &(fmt "\n%s %s_carpvalue(void) { return %s; }\n"
+                                                              &rendered symbol symbol))
+                                (Result.Error _) ()))))))
                 _ ()))
             (for [i 0 (Array.length declarations)]
               (match-ref (Array.unsafe-nth declarations i)
@@ -2400,6 +2494,14 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
                                       (Array.unsafe-nth &*llvm-preproc-sigs* i))))
             (Result.Success (StringBuf.to-string &buffer)))
         (Result.Error error) (Result.Error error))))
+
+  (doc use-carp-allocator! "routes IR-side heap operations through the shim's
+carp_llvm_malloc/free helpers (CARP_MALLOC/CARP_FREE, honoring LOG_MEMORY).
+Call once before emitting; builds that link no shim must not use it.")
+  (defn use-carp-allocator! []
+    (do
+      (set! *llvm-malloc-symbol* @"carp_llvm_malloc")
+      (set! *llvm-free-symbol* @"carp_llvm_free")))
 
   (doc emit-module "lowers `backend` into the LLVM module `mod`: declares every
 function, constructor, and intrinsic, defines the function and constructor
@@ -2423,6 +2525,9 @@ mis-lowered.")
       (set! *llvm-declared-symbols* [])
       (set! *llvm-preproc-syms* [])
       (set! *llvm-preproc-sigs* [])
+      (set! *llvm-getterlay-keys* [])
+      (set! *llvm-getterlay-fields* [])
+      (set! *llvm-getterlay-seen* [])
       (set! *llvm-closures* (Array.copy (BackendModule.closure-functions backend)))
       (set! *llvm-delete-symbols* (Array.copy (BackendModule.delete-symbols backend)))
       (set! *llvm-copy-symbols* (Array.copy (BackendModule.copy-symbols backend)))
@@ -2459,8 +2564,9 @@ mis-lowered.")
               (Array.push-back! &*llvm-declared-symbols* (String.copy symbol))
             (BackendDeclaration.Global symbol _ _)
               (Array.push-back! &*llvm-declared-symbols* (String.copy symbol))
-            (BackendDeclaration.Intrinsic symbol _ _)
-              (Array.push-back! &*llvm-declared-symbols* (String.copy symbol))
+            (BackendDeclaration.Intrinsic symbol _ external)
+              (when (match-ref external (Maybe.Just _) true (Maybe.Nothing) false)
+                (Array.push-back! &*llvm-declared-symbols* (String.copy symbol)))
             (BackendDeclaration.Constructor symbol _ _)
               (Array.push-back! &*llvm-declared-symbols* (String.copy symbol))
             (BackendDeclaration.Template symbol _ _ _)
