@@ -1,6 +1,6 @@
 # carp-llvm-backend
 
-**Status: spike.** An alternative backend that lowers a `BackendModule` (the
+**Status: reference-suite parity.** An alternative backend that lowers a `BackendModule` (the
 same lowered form `CBackend` renders to C) to LLVM IR through the
 [carpentry-org/llvm](../../llvm) bindings. It consumes the pipeline after
 `BackendLower`; everything upstream — specialization, ownership planning,
@@ -95,6 +95,15 @@ end and prints what the C driver's build prints. A Carp `(defn main ...)`
 becomes the executable's entry through the shim (roots first, then main, like
 the C backend). `simple.carp` fails at link on its deliberately undefined
 `int_inc` in both drivers alike.
+
+The driver passes the reference test suite at parity with the C driver:
+`CARP_COMPILER=$PWD/out/carp-compiler-llvm scripts/run-carp-suite-self.sh`
+reports the same score as the C driver (every test and example, with the one
+suite-sanctioned `memory.carp` gap both drivers share). The driver is also
+self-hosting: gen-1 metacarp builds `main-llvm.carp` (compile-time
+`system-include`/`add-cflag` from `LLVM.setup` flow through expansion into
+the resolver and the clang command), and the self-built driver reproduces
+the same suite score.
 
 The test lowers `examples/simple.carp`, `examples/hello.carp`,
 `examples/nominal.carp`, and two inline programs end to end, verifies every
