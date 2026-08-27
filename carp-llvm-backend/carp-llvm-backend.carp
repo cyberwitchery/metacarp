@@ -484,6 +484,15 @@ by accessor symbol.")
         (set! found true)))
     found))
 
+(doc llvm-protocol-target "the pointer-protocol entry for a symbol: its
+`_carpimpl` when the function lives LLVM-side, else its shim `_carpabi`
+wrapper.")
+(hidden llvm-protocol-target)
+(defn llvm-protocol-target [symbol]
+  (if (llvm-cimpl? symbol)
+    (fmt "%s_carpimpl" symbol)
+    (fmt "%s_carpabi" symbol)))
+
 (hidden llvm-cnative?)
 (defn llvm-cnative? [symbol]
   (let-do [found false]
@@ -557,6 +566,16 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
                 (unless (unit-type? (Box.peek fret))
                   (llvm-argspill-add! @id -1 (MonoType.copy (Box.peek fret)))))
             _ ()))
+        ;; an aggregate managed capture is deep-copied through the pointer
+        ;; protocol, which needs a slot holding the field pointer
+        (when (String.starts-with? symbol "_carp_closure_")
+          (for [i 0 (Array.length arguments)]
+            (let [t (Specialize.expression-type (Box.peek (Array.unsafe-nth arguments i)))]
+              (when (and (llvm-aggregate-monotype? &t)
+                         (match (llvm-managed-symbol &*llvm-copy-symbols* &t)
+                           (Maybe.Just _) true
+                           (Maybe.Nothing) false))
+                (llvm-argspill-add! @id i (Type.reference t (MonoLifetime.Static)))))))
         ;; the `ref` builtin (id 5) needs an addressable operand: a local gets
         ;; a slot, a temporary gets a spill slot keyed by this call's id
         (when (and (Int.= 5 @(CoreRef.id reference))
@@ -852,7 +871,13 @@ tag; }` under the same data layout.")
           (let-do [ei (llvm-external-index &key)
                    gi (if (Int.>= ei 0) -1 (llvm-getterlay-index &key))]
             (if (and (Int.< ei 0) (Int.< gi 0))
-              (llvm-emit-error! (fmt "no constructors for type %s in llvm backend" &name))
+              ;; a representation-string register-type with no recoverable
+              ;; fields: a pointer-sized opaque slot. Every C crossing is
+              ;; pointer-mediated, so only the storage size matters, and a
+              ;; smaller representation just leaves slack in the slot.
+              (LLVM.struct-set-body outer
+                                    &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                                    false)
               (let-do [fields (the (Array LLVMType) [])
                        montypes (if (Int.>= ei 0)
                                   (Array.unsafe-nth &*llvm-external-fields* ei)
@@ -1181,7 +1206,7 @@ assembly (the C backend's `_carp_self` two-phase init).")
 (doc llvm-emit-closure-construction "a `_carp_closure_N` site: malloc the
 environment, store the captured values, and assemble a Lambda over
 `_carp_lambda_N` and its environment delete/copy functions.")
-(defn llvm-emit-closure-construction [ctx builder mod func symbol arguments]
+(defn llvm-emit-closure-construction [ctx builder mod func id symbol arguments]
   (let-do [suffix (String.suffix symbol 14)
            lambda-symbol (String.concat &[@"_carp_lambda_" (String.copy &suffix)])
            ci (llvm-closure-index &lambda-symbol)]
@@ -1220,15 +1245,33 @@ environment, store the captured values, and assemble a Lambda over
                     (let [capture-type (Box.peek (Pair.b (Array.unsafe-nth &captures i)))]
                       (match (llvm-managed-symbol &*llvm-copy-symbols* capture-type)
                         (Maybe.Just copier)
-                          (let [copier-fnty (LLVM.function-type (llvm-lower-type ctx capture-type)
-                                                                &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
-                                                                false)]
-                            (ignore (LLVM.build-store builder
-                                                      (LLVM.build-call builder copier-fnty
-                                                                       (llvm-runtime-fn mod &copier copier-fnty)
-                                                                       &[(LLVM.dup &fieldp)]
-                                                                       (llvm-cstr &@"capcopy"))
-                                                      fieldp)))
+                          (if (llvm-aggregate-monotype? capture-type)
+                            ;; the copier moves an aggregate: pointer protocol
+                            ;; through the prescanned ref slot, out into the field
+                            (let-do [sp (llvm-argspill-index id i)]
+                              (if (Int.< sp 0)
+                                (llvm-emit-error! @"capture copy without ref slot in llvm backend")
+                                (let-do [refslot (llvm-argspill-ptr sp)
+                                         pfnty (LLVM.function-type (LLVM.void-type ctx)
+                                                                   &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)
+                                                                     (LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                                                                   false)]
+                                  (ignore (LLVM.build-store builder (LLVM.dup &fieldp) refslot))
+                                  (ignore (LLVM.build-call builder pfnty
+                                                           (llvm-runtime-fn mod
+                                                                            &(llvm-protocol-target &copier)
+                                                                            pfnty)
+                                                           &[refslot (LLVM.dup &fieldp)]
+                                                           (llvm-cstr &@""))))))
+                            (let [copier-fnty (LLVM.function-type (llvm-lower-type ctx capture-type)
+                                                                  &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                                                                  false)]
+                              (ignore (LLVM.build-store builder
+                                                        (LLVM.build-call builder copier-fnty
+                                                                         (llvm-runtime-fn mod &copier copier-fnty)
+                                                                         &[(LLVM.dup &fieldp)]
+                                                                         (llvm-cstr &@"capcopy"))
+                                                        fieldp))))
                         (Maybe.Nothing) ())))))))
           (set! *llvm-selffields* self-fields))
         (let-do [fnv (LLVM.get-named-function mod (llvm-cstr &lambda-symbol))
@@ -1429,7 +1472,7 @@ plain otherwise — the C backend's `env ? cb(env, args) : cb(args)`.")
         ;; a closure construction site assembles a Lambda over its lifted
         ;; function and heap environment
         (String.starts-with? symbol "_carp_closure_")
-          (llvm-emit-closure-construction ctx builder mod func symbol arguments)
+          (llvm-emit-closure-construction ctx builder mod func @id symbol arguments)
         ;; allocate (ids 14/15): uninitialized Array storage
         (and (or (Int.= 14 @(CoreRef.id reference)) (Int.= 15 @(CoreRef.id reference)))
              (Int.= 1 (Array.length arguments)))
@@ -2148,16 +2191,28 @@ copied through their copiers.")
       (let [capture-type (Box.peek (Pair.b (Array.unsafe-nth captures i)))]
         (match (llvm-managed-symbol &*llvm-delete-symbols* capture-type)
           (Maybe.Just deleter)
-            (let [field-ty (llvm-lower-type ctx capture-type)
-                  deleter-fnty (LLVM.function-type (LLVM.void-type ctx) &[field-ty] false)]
-              (ignore (LLVM.build-call builder deleter-fnty
-                                       (llvm-runtime-fn mod &deleter deleter-fnty)
-                                       &[(LLVM.build-load builder field-ty
-                                                          (LLVM.build-struct-gep builder env-ty
-                                                                                 (LLVM.get-param del 0) i
-                                                                                 (llvm-cstr &@"delf"))
-                                                          (llvm-cstr &@"delv"))]
-                                       (llvm-cstr &@""))))
+            (if (llvm-aggregate-monotype? capture-type)
+              ;; an aggregate field deletes through the pointer protocol,
+              ;; straight at the field
+              (let [pfnty (LLVM.function-type (LLVM.void-type ctx)
+                                              &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                                              false)]
+                (ignore (LLVM.build-call builder pfnty
+                                         (llvm-runtime-fn mod &(llvm-protocol-target &deleter) pfnty)
+                                         &[(LLVM.build-struct-gep builder env-ty
+                                                                  (LLVM.get-param del 0) i
+                                                                  (llvm-cstr &@"delf"))]
+                                         (llvm-cstr &@""))))
+              (let [field-ty (llvm-lower-type ctx capture-type)
+                    deleter-fnty (LLVM.function-type (LLVM.void-type ctx) &[field-ty] false)]
+                (ignore (LLVM.build-call builder deleter-fnty
+                                         (llvm-runtime-fn mod &deleter deleter-fnty)
+                                         &[(LLVM.build-load builder field-ty
+                                                            (LLVM.build-struct-gep builder env-ty
+                                                                                   (LLVM.get-param del 0) i
+                                                                                   (llvm-cstr &@"delf"))
+                                                            (llvm-cstr &@"delv"))]
+                                         (llvm-cstr &@"")))))
           (Maybe.Nothing) ())))
     (ignore (LLVM.build-ret-void builder))
     (let-do [cpy (LLVM.get-named-function mod (llvm-cstr &(fmt "%s_env_copy" symbol)))
@@ -2177,22 +2232,66 @@ copied through their copiers.")
                    field-ty (llvm-lower-type ctx capture-type)
                    srcp (LLVM.build-struct-gep builder env-ty (LLVM.get-param cpy 0) i
                                                (llvm-cstr &@"srcf"))
-                   dstp (LLVM.build-struct-gep builder env-ty dst i (llvm-cstr &@"dstf"))]
-            (match (llvm-managed-symbol &*llvm-copy-symbols* capture-type)
-              (Maybe.Just copier)
-                (let [copier-fnty (LLVM.function-type field-ty
-                                                      &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
-                                                      false)]
+                   dstp (LLVM.build-struct-gep builder env-ty dst i (llvm-cstr &@"dstf"))
+                   lambda-field (match-ref capture-type
+                                  (MonoType.Function _ _) true
+                                  _ false)]
+            (if lambda-field
+              ;; a captured Lambda may be the letrec weak self: give the copy
+              ;; its own weak self instead of aliasing (or arity-copying) the
+              ;; source's, like the C backend's cycle check
+              (let-do [srcv (LLVM.build-load builder field-ty srcp (llvm-cstr &@"srclam"))
+                       this-fn (LLVM.get-named-function mod (llvm-cstr symbol))
+                       is-self (LLVM.build-and builder
+                                 (LLVM.build-icmp builder LLVM.int-eq
+                                                  (LLVM.build-extract-value builder srcv 1 (llvm-cstr &@"srcenv"))
+                                                  (LLVM.get-param cpy 0)
+                                                  (llvm-cstr &@"envmatch"))
+                                 (LLVM.build-icmp builder LLVM.int-eq
+                                                  (LLVM.build-extract-value builder srcv 0 (llvm-cstr &@"srccb"))
+                                                  this-fn
+                                                  (llvm-cstr &@"cbmatch"))
+                                 (llvm-cstr &@"isself"))
+                       self-block (LLVM.append-block ctx cpy (llvm-cstr &@"cpyself"))
+                       other-block (LLVM.append-block ctx cpy (llvm-cstr &@"cpyother"))
+                       done-block (LLVM.append-block ctx cpy (llvm-cstr &@"cpydone"))]
+                (ignore (LLVM.build-cond-br builder is-self self-block other-block))
+                (LLVM.position-at-end builder self-block)
+                (let-do [weak (LLVM.const-null (llvm-lambda-type ctx))]
+                  (set! weak (LLVM.build-insert-value builder weak this-fn 0 (llvm-cstr &@"wcb2")))
+                  (set! weak (LLVM.build-insert-value builder weak dst 1 (llvm-cstr &@"wenv2")))
+                  (ignore (LLVM.build-store builder weak dstp))
+                  (ignore (LLVM.build-br builder done-block)))
+                (LLVM.position-at-end builder other-block)
+                (match (llvm-managed-symbol &*llvm-copy-symbols* capture-type)
+                  (Maybe.Just copier)
+                    (let [copier-fnty (LLVM.function-type field-ty
+                                                          &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                                                          false)]
+                      (ignore (LLVM.build-store builder
+                                                (LLVM.build-call builder copier-fnty
+                                                                 (llvm-runtime-fn mod &copier copier-fnty)
+                                                                 &[(LLVM.dup &srcp)] (llvm-cstr &@"cpv"))
+                                                dstp)))
+                  (Maybe.Nothing)
+                    (ignore (LLVM.build-store builder srcv dstp)))
+                (ignore (LLVM.build-br builder done-block))
+                (LLVM.position-at-end builder done-block))
+              (match (llvm-managed-symbol &*llvm-copy-symbols* capture-type)
+                (Maybe.Just copier)
+                  (let [copier-fnty (LLVM.function-type field-ty
+                                                        &[(LLVM.pointer-type (LLVM.int8-type ctx) 0)]
+                                                        false)]
+                    (ignore (LLVM.build-store builder
+                                              (LLVM.build-call builder copier-fnty
+                                                               (llvm-runtime-fn mod &copier copier-fnty)
+                                                               &[srcp] (llvm-cstr &@"cpv"))
+                                              dstp)))
+                (Maybe.Nothing)
                   (ignore (LLVM.build-store builder
-                                            (LLVM.build-call builder copier-fnty
-                                                             (llvm-runtime-fn mod &copier copier-fnty)
-                                                             &[srcp] (llvm-cstr &@"cpv"))
-                                            dstp)))
-              (Maybe.Nothing)
-                (ignore (LLVM.build-store builder
-                                          (LLVM.build-load builder field-ty srcp
-                                                           (llvm-cstr &@"srcv"))
-                                          dstp)))))
+                                            (LLVM.build-load builder field-ty srcp
+                                                             (llvm-cstr &@"srcv"))
+                                            dstp))))))
         (ignore (LLVM.build-ret builder dst))))))
 
 (hidden llvm-integer-root?)
@@ -2548,16 +2647,31 @@ mis-lowered.")
             (BackendDeclaration.SourceTemplate _ signature _ _ _)
               (llvm-collect-external-layout! (Box.peek signature))
             _ ()))
-        (for [i 0 n]
-          (match-ref (Array.unsafe-nth declarations i)
-            (BackendDeclaration.Template _ _ _ dependencies)
-              (for [j 0 (Array.length dependencies)]
-                (let [dep (Array.unsafe-nth dependencies j)]
-                  (when (and (llvm-needs-wrapper? (Box.peek (BackendDependency.signature dep)))
-                             (not (llvm-cimpl? (BackendDependency.symbol dep))))
-                    (Array.push-back! &*llvm-cimpl-symbols*
-                                      (String.copy (BackendDependency.symbol dep))))))
-            _ ()))
+        (let-do [function-symbols (the (Array String) [])]
+          (for [i 0 n]
+            (match-ref (Array.unsafe-nth declarations i)
+              (BackendDeclaration.Function symbol _ _ _)
+                (Array.push-back! &function-symbols (String.copy symbol))
+              _ ()))
+          (for [i 0 n]
+            (match-ref (Array.unsafe-nth declarations i)
+              (BackendDeclaration.Template _ _ _ dependencies)
+                (for [j 0 (Array.length dependencies)]
+                  (let-do [dep (Array.unsafe-nth dependencies j)
+                           dep-is-function false]
+                    (for [k 0 (Array.length &function-symbols)]
+                      (when (String.= (Array.unsafe-nth &function-symbols k)
+                                      (BackendDependency.symbol dep))
+                        (set! dep-is-function true)))
+                    ;; only LLVM-side functions need the impl treatment:
+                    ;; template and header-backed dependencies are C-side
+                    ;; already, with clang doing their aggregate ABI
+                    (when (and dep-is-function
+                               (and (llvm-needs-wrapper? (Box.peek (BackendDependency.signature dep)))
+                                    (not (llvm-cimpl? (BackendDependency.symbol dep)))))
+                      (Array.push-back! &*llvm-cimpl-symbols*
+                                        (String.copy (BackendDependency.symbol dep))))))
+              _ ())))
         (for [i 0 n]
           (match-ref (Array.unsafe-nth declarations i)
             (BackendDeclaration.Function symbol _ _ _)
