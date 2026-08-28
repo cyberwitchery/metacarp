@@ -16,15 +16,8 @@
 ;; in-process — echo output prints to the host's stdout, and the returned
 ;; Int is the last integer-typed top-level's value, like the driver's.
 ;;
-;; Runtime state PERSISTS across cells: one MCJIT engine holds every cell's
-;; module. A cell defines only what earlier cells did not (functions,
-;; constructors, and globals dedupe by their mangled names; already-defined
-;; ones are declared extern), so a global keeps the value earlier cells left
-;; in it, and MCJIT compiles only each cell's new code. Closures never dedupe
-;; — every cell lifts its lambdas in a private id band, so their symbols stay
-;; unique across the engine's modules. Committing new code (`upsert`/
-;; `remove`) resets the engine: MCJIT cannot replace a symbol, so the next
-;; cell rebuilds the world — and runtime state — from the new definitions.
+;; Cells keep emit-cell's whole-program semantics: each run is a fresh
+;; program over the committed session state (globals re-initialize per run).
 
 (load "../carp-session/carp-session.carp")
 (load "carp-llvm-backend.carp")
@@ -36,18 +29,6 @@
   "$DECL { void* h = dlopen(path, RTLD_NOW | RTLD_GLOBAL); return (Long)(intptr_t)h; }")
 (hidden carp-jit-dlopen-global)
 
-;; the persistent engine rides in the session record as a Long handle: an
-;; LLVMEngine member would need a derived array `prn` the reference compiler
-;; cannot build for registered types.
-(deftemplate carp-jit-engine-handle (Fn [LLVMEngine] Long)
-  "Long $NAME(LLVMExecutionEngineRef e)"
-  "$DECL { return (Long)(intptr_t)e; }")
-(hidden carp-jit-engine-handle)
-(deftemplate carp-jit-engine-of (Fn [Long] LLVMEngine)
-  "LLVMExecutionEngineRef $NAME(Long l)"
-  "$DECL { return (LLVMExecutionEngineRef)(intptr_t)l; }")
-(hidden carp-jit-engine-of)
-
 (deftype JitSession
   [context LLVMContext
    machine LLVMTargetMachine
@@ -56,8 +37,6 @@
    core-dir String
    scratch String
    materialized (Array String)
-   engine Long
-   code (Array String)
    serial Int])
 
 (defmodule SessionJit
@@ -81,27 +60,12 @@ shim C file and dylib.")
              td (LLVM.create-target-data-layout tm)]
       (LLVMBackend.use-carp-allocator!)
       (JitSession.init ctx tm td triple (String.copy core-dir) (String.copy scratch)
-                       (the (Array String) []) 0l (the (Array String) []) 0)))
+                       (the (Array String) []) 0)))
 
-  (doc reset-code! "drops the engine (and with it every cell's compiled code
-AND runtime state — globals reinitialize on the next cell) and clears the
-defined-symbol set. Call after `Session.upsert`/`Session.remove` — MCJIT
-cannot replace a symbol, so committed code changes need a fresh engine; the
-`upsert`/`remove` wrappers below do it for you. The template shim stays
-materialized.")
-  (defn reset-code! [js]
-    (do
-      (unless (Long.= 0l @(JitSession.engine js))
-        (do
-          (LLVM.engine-dispose (carp-jit-engine-of @(JitSession.engine js)))
-          (JitSession.set-engine! js 0l)))
-      (JitSession.set-code! js (the (Array String) []))))
-
-  (doc dispose "frees the JIT's engine (and every cell module it owns),
-target data, machine, and context.")
+  (doc dispose "frees the JIT's target data, machine, and context. Cells'
+modules and engines are already per-run and freed by `run-cell`.")
   (defn dispose [js]
     (do
-      (reset-code! js)
       (LLVM.dispose-target-data (LLVM.dup (JitSession.data js)))
       (LLVM.dispose-target-machine (LLVM.dup (JitSession.machine js)))
       (LLVM.context-dispose (LLVM.dup (JitSession.context js)))))
@@ -186,17 +150,13 @@ symbols.")
           (Result.Success _)
             (let-do [ctx (LLVM.dup (JitSession.context js))
                      td (LLVM.dup (JitSession.data js))
-                     serial @(JitSession.serial js)
-                     cell-name (fmt "carp-jit-cell-%d" serial)
-                     roots-name (fmt "carp_llvm_roots_%d" serial)
-                     init-name (fmt "carp_llvm_init_globals_%d" serial)
+                     cell-name (fmt "carp-jit-cell-%d" @(JitSession.serial js))
                      mod (LLVM.module-create (String.cstr &cell-name) ctx)
                      builder (LLVM.builder-create ctx)]
+              (JitSession.set-serial! js (Int.inc @(JitSession.serial js)))
               (LLVM.set-target mod (String.cstr (JitSession.triple js)))
               (LLVM.set-module-data-layout mod td)
-              (match (LLVMBackend.emit-module-incremental ctx builder mod td &backend
-                                                          (JitSession.code js)
-                                                          &roots-name &init-name)
+              (match (LLVMBackend.emit-module ctx builder mod td &backend)
                 (Result.Error message)
                   (do
                     (LLVM.builder-dispose builder)
@@ -209,39 +169,21 @@ symbols.")
                         (LLVM.builder-dispose builder)
                         (LLVM.module-dispose mod)
                         (Result.Error (jit-diagnostic (fmt "llvm verifier: %s" &verify))))
-                      ;; the persistent engine owns every cell module; the
-                      ;; first cell creates it, later cells add to it
-                      (let-do [created (Long.= 0l @(JitSession.engine js))
-                               engine (if created
-                                        (LLVM.create-execution-engine mod)
-                                        (carp-jit-engine-of @(JitSession.engine js)))]
-                        (unless created
-                          (LLVM.add-module engine mod))
+                      ;; the engine takes ownership of the module
+                      (let [engine (LLVM.create-execution-engine mod)]
                         (if (LLVM.engine-null? engine)
                           (do
                             (LLVM.builder-dispose builder)
                             (Result.Error (jit-diagnostic @"engine creation failed")))
-                          (let-do [address (LLVM.function-address engine (String.cstr &roots-name))]
-                            (when created
-                              (JitSession.set-engine! js (carp-jit-engine-handle engine)))
-                            (JitSession.set-serial! js (Int.inc serial))
+                          (let-do [roots (LLVMBackend.roots-symbol)
+                                   address (LLVM.function-address engine (String.cstr &roots))]
                             (if (Long.= 0l address)
                               (do
+                                (LLVM.engine-dispose engine)
                                 (LLVM.builder-dispose builder)
                                 (Result.Error (jit-diagnostic @"roots symbol not found")))
-                              (let-do [value (LLVM.call-i32 address)
-                                       defined (LLVMBackend.defined-symbols &backend)]
-                                ;; everything this cell defined is predefined
-                                ;; for the next one
-                                (for [i 0 (Array.length &defined)]
-                                  (let-do [symbol (Array.unsafe-nth &defined i)
-                                           known false]
-                                    (for [j 0 (Array.length (JitSession.code js))]
-                                      (when (String.= (Array.unsafe-nth (JitSession.code js) j) symbol)
-                                        (set! known true)))
-                                    (unless known
-                                      (Array.push-back! (JitSession.code js)
-                                                        (String.copy symbol)))))
+                              (let-do [value (LLVM.call-i32 address)]
+                                (LLVM.engine-dispose engine)
                                 (LLVM.builder-dispose builder)
                                 (Result.Success value)))))))))))))
 
@@ -252,39 +194,12 @@ resolve from the shim dylib), and the roots function executes in-process.
 Returns the cell's value: the last integer-typed top-level's result, 0
 otherwise.")
   (defn run-cell [js session input]
-    (do
-      ;; a private lambda-lift id band per cell keeps closure symbols unique
-      ;; across the engine's persistent modules
-      (BackendLower.set-lambda-lift-base!
-        (Int.+ 30000000 (Int.* 65536 @(JitSession.serial js))))
-      (run-lowered js (Session.lower-cell-plain session input))))
+    (run-lowered js (Session.lower-cell-plain session input)))
 
   (doc run-cell-echoed "as `run-cell`, but with the driver's top-level result
 echo: the cell's value is PRINTED to stdout by the same `str` a driver-built
 binary would pick, and the returned Int is the echoed roots value (0 — the
 echo wrapping consumes the top level).")
   (defn run-cell-echoed [js session input]
-    (do
-      (BackendLower.set-lambda-lift-base!
-        (Int.+ 30000000 (Int.* 65536 @(JitSession.serial js))))
-      (run-lowered js (Session.lower-cell session input))))
-
-  (doc upsert "commits a definition through `Session.upsert` and resets the
-engine: the next cell rebuilds — and reinitializes — the world from the new
-definitions.")
-  (defn upsert [js session input]
-    (let-do [result (Session.upsert session input)]
-      (match-ref &result
-        (Result.Success _) (reset-code! js)
-        (Result.Error _) ())
-      result))
-
-  (doc remove "removes a definition through `Session.remove` and resets the
-engine, like `upsert`.")
-  (defn remove [js session name]
-    (let-do [result (Session.remove session name)]
-      (match-ref &result
-        (Result.Success _) (reset-code! js)
-        (Result.Error _) ())
-      result))
+    (run-lowered js (Session.lower-cell session input)))
 )

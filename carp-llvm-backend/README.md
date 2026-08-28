@@ -83,22 +83,14 @@ The backend also powers a session JIT (`carp-session-jit.carp`): a
 notebook/editor host loads it beside carp-session and gets
 `SessionJit.run-cell` — the transactional cell pipeline stops at the lowered
 `BackendModule` (`Session.lower-cell-plain`), which is emitted into a fresh
-LLVM module and added to one persistent MCJIT engine. Runtime state persists
-across cells: functions, constructors, and globals dedupe by their mangled
-names (already-defined ones are declared extern), so a committed global keeps
-the value one cell leaves for the next; closures never dedupe — each cell
-lifts its lambdas in a private id band so their symbols stay unique across
-the engine's modules. Committing code (`SessionJit.upsert`/`remove`, which
-wrap the session calls) resets the engine — MCJIT cannot replace a symbol —
-so the next cell rebuilds the world, and its state, from the new definitions.
-Template specializations live in one shim dylib compiled on the first cell
-and reused until a cell introduces a new specialization; a warm cell pays no
-clang at all. `run-cell` returns the cell's last integer-typed top-level
-value; `run-cell-echoed` prints the result the way a driver-built binary
-would. Measured on an Apple arm64 host against the real Core: first cell
-≈ 1.0 s (includes the one shim clang), warm cells ≈ 96 ms — the
-emit-C → clang → run path measures ≈ 360 ms per cell
-(`test/jit-benchmark.carp`).
+LLVM module and executed in-process by a fresh MCJIT engine. Template
+specializations live in one shim dylib compiled on the first cell and reused
+until a cell introduces a new specialization; a warm cell pays no clang at
+all. `run-cell` returns the cell's last integer-typed top-level value;
+`run-cell-echoed` prints the result the way a driver-built binary would.
+Measured on an Apple arm64 host against the real Core: first cell ≈ 1.0 s
+(includes the one shim clang), warm cells ≈ 96 ms — the emit-C → clang → run
+path measures ≈ 360 ms per cell (`test/jit-benchmark.carp`).
 
 ```bash
 carp -x test/carp-llvm-backend.carp
