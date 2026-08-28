@@ -94,6 +94,11 @@
 (def *llvm-preproc-syms* (the (Array String) []))
 (def *llvm-preproc-sigs* (the (Array MonoType) []))
 
+;; symbols an incremental caller has already defined in earlier modules of
+;; the same engine: declared extern here, never redefined, and a predefined
+;; global's initializer does not run again — its state persists.
+(def *llvm-predefined-symbols* (the (Array String) []))
+
 ;; scope-dependent asm macros (`Unsafe.C.asm`): `#define <sym>() __asm__(...)`
 ;; preamble lines whose expansions reference caller locals by name. Calls
 ;; route through a generated shim thunk that rebinds those names.
@@ -544,6 +549,16 @@ wrapper.")
   (let-do [found false]
     (for [i 0 (Array.length &*llvm-cnative-symbols*)]
       (when (String.= (Array.unsafe-nth &*llvm-cnative-symbols* i) symbol)
+        (set! found true)))
+    found))
+
+(doc llvm-predefined? "whether an incremental caller already defined
+`symbol` in an earlier module of the same engine.")
+(hidden llvm-predefined?)
+(defn llvm-predefined? [symbol]
+  (let-do [found false]
+    (for [i 0 (Array.length &*llvm-predefined-symbols*)]
+      (when (String.= (Array.unsafe-nth &*llvm-predefined-symbols* i) symbol)
         (set! found true)))
     found))
 
@@ -2541,11 +2556,14 @@ backend's abort() when nothing matched.")
         _ (when (match-ref external (Maybe.Just _) true (Maybe.Nothing) false)
             (Array.push-back! &*llvm-value-intrinsics* (String.copy symbol))))
     (BackendDeclaration.Global symbol signature _)
-      ;; a unit-typed global has no storage
+      ;; a unit-typed global has no storage; a predefined one lives in an
+      ;; earlier module and is declared extern (no initializer)
       (unless (unit-type? (Box.peek signature))
         (let [ty (llvm-lower-type ctx (Box.peek signature))]
-          (LLVM.set-initializer (LLVM.add-global mod ty (llvm-cstr symbol))
-                                (LLVM.const-null ty))))
+          (if (llvm-predefined? symbol)
+            (ignore (LLVM.add-global mod ty (llvm-cstr symbol)))
+            (LLVM.set-initializer (LLVM.add-global mod ty (llvm-cstr symbol))
+                                  (LLVM.const-null ty)))))
     ;; templates are C-native: declared here, defined by the C shim
     (BackendDeclaration.Template symbol signature _ _)
       (match-ref (Box.peek signature)
@@ -3009,13 +3027,16 @@ order — the LLVM backend's carp_init_globals."
     (llvm-pending-reset!)
     (for [i 0 n]
       (match-ref (Array.unsafe-nth declarations i)
-        (BackendDeclaration.Global _ _ initializer)
-          (llvm-collect-set-targets! (Box.peek initializer))
+        (BackendDeclaration.Global global-symbol _ initializer)
+          (unless (llvm-predefined? global-symbol)
+            (llvm-collect-set-targets! (Box.peek initializer)))
         _ ()))
     (llvm-emit-slots! ctx builder)
     (for [i 0 n]
       (match-ref (Array.unsafe-nth declarations i)
         (BackendDeclaration.Global global-symbol signature initializer)
+          ;; a predefined global keeps the value earlier cells left in it
+          (unless (llvm-predefined? global-symbol)
           (let [value (llvm-emit-expr ctx builder mod func (Box.peek initializer))]
             (if (unit-type? (Box.peek signature))
               ()
@@ -3023,7 +3044,7 @@ order — the LLVM backend's carp_init_globals."
                 (if (LLVM.value-null? g)
                   (llvm-emit-error! (fmt "undeclared global %s in llvm backend"
                                          global-symbol))
-                  (ignore (LLVM.build-store builder value g))))))
+                  (ignore (LLVM.build-store builder value g)))))))
         _ ()))
     (ignore (LLVM.build-ret-void builder))))
 
@@ -3500,6 +3521,30 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
             (Result.Success (StringBuf.to-string &buffer)))
         (Result.Error error) (Result.Error error))))
 
+  (doc defined-symbols "the symbols `emit-module` would DEFINE for `backend`
+— functions, constructors, globals, closures and their environment functions
+— for an incremental caller's predefined-set bookkeeping.")
+  (defn defined-symbols [backend]
+    (let-do [symbols (the (Array String) [])
+             declarations (BackendModule.declarations backend)]
+      (for [i 0 (Array.length declarations)]
+        (match-ref (Array.unsafe-nth declarations i)
+          (BackendDeclaration.Function symbol _ _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          (BackendDeclaration.Constructor symbol _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          (BackendDeclaration.Global symbol _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          _ ()))
+      (let [closures (BackendModule.closure-functions backend)]
+        (for [i 0 (Array.length closures)]
+          (let [symbol (ClosureFunction.symbol (Array.unsafe-nth closures i))]
+            (do
+              (Array.push-back! &symbols (String.copy symbol))
+              (Array.push-back! &symbols (fmt "%s_env_delete" symbol))
+              (Array.push-back! &symbols (fmt "%s_env_copy" symbol))))))
+      symbols))
+
   (doc use-carp-allocator! "routes IR-side heap operations through the shim's
 carp_llvm_malloc/free helpers (CARP_MALLOC/CARP_FREE, honoring LOG_MEMORY).
 Call once before emitting; builds that link no shim must not use it.")
@@ -3514,9 +3559,12 @@ bodies, and collects the top-level expressions into one function named by
 `roots-symbol`. Returns () or the collected emission errors. The scope is the
 simple and nominal example tiers; constructs beyond it are reported, never
 mis-lowered.")
-  (defn emit-module [ctx builder mod td backend]
+  (private emit-module-with)
+  (hidden emit-module-with)
+  (defn emit-module-with [ctx builder mod td backend predefined roots-name roots-init-name]
     (do
       (set! *llvm-backend-errors* [])
+      (set! *llvm-predefined-symbols* (Array.copy predefined))
       (set! *llvm-backend-constructors*
             (Array.copy (BackendModule.constructors backend)))
       (set! *llvm-sum-names* [])
@@ -3629,18 +3677,33 @@ mis-lowered.")
         (for [i 0 n]
           (match-ref (Array.unsafe-nth declarations i)
             (BackendDeclaration.Function symbol signature parameters body)
-              (llvm-define-function! ctx builder mod symbol signature parameters body)
+              (unless (llvm-predefined? symbol)
+                (llvm-define-function! ctx builder mod symbol signature parameters body))
             (BackendDeclaration.Constructor symbol signature decl)
-              (llvm-define-constructor! ctx builder mod symbol signature decl)
+              (unless (llvm-predefined? symbol)
+                (llvm-define-constructor! ctx builder mod symbol signature decl))
             _ ()))
         (for [i 0 (Array.length &*llvm-closures*)]
-          (do
-            (llvm-define-closure! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))
-            (llvm-define-closure-env-fns! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))))
-        (llvm-define-global-inits! ctx builder mod declarations &(init-symbol))
+          (unless (llvm-predefined? (ClosureFunction.symbol (Array.unsafe-nth &*llvm-closures* i)))
+            (do
+              (llvm-define-closure! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))
+              (llvm-define-closure-env-fns! ctx builder mod (Array.unsafe-nth &*llvm-closures* i)))))
+        (llvm-define-global-inits! ctx builder mod declarations roots-init-name)
         (llvm-define-roots! ctx builder mod (BackendModule.roots backend)
-                            &(roots-symbol) &(init-symbol))
+                            roots-name roots-init-name)
         (if (Int.= 0 (Array.length &*llvm-backend-errors*))
           (Result.Success ())
           (Result.Error (String.join "; " &*llvm-backend-errors*))))))
+
+  (doc emit-module-incremental "as `emit-module`, for one cell of a
+persistent engine: symbols in `predefined` were defined by earlier modules —
+they are declared extern and never redefined, and predefined globals skip
+their initializers so their state persists. The synthesized entry points take
+the caller's per-cell names.")
+  (defn emit-module-incremental [ctx builder mod td backend predefined roots-name init-name]
+    (emit-module-with ctx builder mod td backend predefined roots-name init-name))
+
+  (defn emit-module [ctx builder mod td backend]
+    (emit-module-with ctx builder mod td backend
+                      &(the (Array String) []) &(roots-symbol) &(init-symbol)))
 )
