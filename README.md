@@ -34,6 +34,7 @@ carp-compiler [options] <source.carp>
   -c, --core <dir>      compile against the Carp standard library in <dir>
   -o, --output <file>   output path — the C file, or the executable under -b
   --optimize            build -b/-x executables with clang -O3 -D NDEBUG
+  --library             emit a translation unit without main (needs --core)
   --no-core             skip the implicit Core load; the source's own
                         (load "X.carp") directives still resolve in --core
   -h, --help            show this help and exit
@@ -44,6 +45,11 @@ With no `-b`/`-x`, the C translation unit is written to standard output (or
 `-o`). Diagnostics go to standard error and name the rejecting compiler phase.
 `-b`/`-x` require `--core`, because linking needs the runtime headers the
 standard library ships with.
+
+`--library` emits an entry-point-free translation unit rooted at the named
+definitions in the input source. It is intended for embedding in a shared or
+static library whose host supplies the stable exported boundary; it does not
+emit executable startup or `main` glue.
 
 `(load ...)` resolves like the reference compiler's: relative to the loading
 file, then the Core directory — and git references install into the shared
@@ -176,7 +182,8 @@ Escaping closures heap-allocate their environments.
 
 The reusable entry point is `CarpCompiler.compile-source`, or
 `CarpCompiler.compile-sources` when the caller already holds an in-memory source
-registry.
+registry. Embedders can use `CarpCompiler.compile-inferred-library-roots` to
+retain explicit source-level roots while omitting the process entry point.
 
 ## Session library
 
