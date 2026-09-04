@@ -2762,6 +2762,18 @@ retains that phase's diagnostic.")
 (deftype CompileError [phase String
                        message String])
 
+(doc IncrementalClosed "is one ownership-closed specialization delta plus
+the complete concrete instance cache that produced it.")
+(deftype IncrementalClosed
+  [closed (Pair SpecializationModule OwnershipPlan)
+   instances (Array Specialization)])
+
+(doc IncrementalLowering "is the backend delta for one cell plus the complete
+concrete specialization cache to commit after that cell succeeds.")
+(deftype IncrementalLowering
+  [module BackendModule
+   instances (Array Specialization)])
+
 (defmodule CompileError
   (defn render [error]
     (String.concat
@@ -2903,18 +2915,19 @@ closed over their copiers as well as their deleters.")
         (set! result (Array.push-back result @(Array.unsafe-nth extra i))))
       result))
 
-  (private specialize-closed)
-  (hidden specialize-closed)
-  (doc specialize-closed "specializes the reachable program, then repeatedly
+  (private specialize-closed-known)
+  (hidden specialize-closed-known)
+  (doc specialize-closed-known "specializes the reachable program, seeded by
+concrete instances already compiled by a session, then repeatedly
 extends specialization with the deleters its ownership plan requires until the
 requirement set reaches a fixed point. The driver, not the ownership phase,
 owns this loop; termination follows from the finite, deduplicated set of
 concrete owned types.")
-  (defn specialize-closed [core inferred facts seeds]
+  (defn specialize-closed-known [core inferred facts seeds known]
     (let-do [requested (the (Array MonoType) [])
              requested-copies (the (Array MonoType) [])
              outcome (the
-               (Result (Pair SpecializationModule OwnershipPlan) CompileError)
+               (Result IncrementalClosed CompileError)
                (Result.Error
                  (CompileError.init (String.copy "specialize")
                                     (String.copy "no fixed point"))))
@@ -2924,9 +2937,14 @@ concrete owned types.")
                 (append-requests (delete-requests-for &requested)
                                  &(copy-requests-for &requested-copies))
                 seeds)]
-          (match (Specialize.module-with core inferred &extra)
-            (Result.Success raw-specialized)
-              (let-do [specialized (RefLift.module &raw-specialized)]
+          (match (Specialize.module-with-known core inferred &extra known)
+            (Result.Success incremental)
+              (let-do [raw-specialized @(IncrementalSpecialization.module
+                                          &incremental)
+                       instances (Array.copy
+                                   (IncrementalSpecialization.instances
+                                     &incremental))
+                       specialized (RefLift.module &raw-specialized)]
                 (match (Ownership.prepare &specialized facts)
                   (Result.Success ownership)
                     (let [requirements (with-closure-delete-requirements (OwnershipPlan.requirements &ownership)
@@ -2940,7 +2958,10 @@ concrete owned types.")
                                (Int.= 0 (Array.length &fresh-copies)))
                         (do
                           (set! outcome
-                                (Result.Success (Pair.init specialized ownership)))
+                                (Result.Success
+                                  (IncrementalClosed.init
+                                    (Pair.init specialized ownership)
+                                    instances)))
                           (set! done true))
                         (let-do [m (Array.length &fresh)
                                  mc (Array.length &fresh-copies)]
@@ -2968,6 +2989,20 @@ concrete owned types.")
                                            @(SpecializeError.message &error))))
                 (set! done true)))))
       outcome))
+
+  (private specialize-closed)
+  (hidden specialize-closed)
+  (doc specialize-closed "specializes and ownership-closes a whole module
+without an incremental instance cache.")
+  (defn specialize-closed [core inferred facts seeds]
+    (match (specialize-closed-known core
+                                    inferred
+                                    facts
+                                    seeds
+                                    &(the (Array Specialization) []))
+      (Result.Success incremental)
+        (Result.Success @(IncrementalClosed.closed &incremental))
+      (Result.Error error) (Result.Error error)))
 
   (private implements-delete?)
   (hidden implements-delete?)
@@ -3298,14 +3333,14 @@ IO.println symbol, and the String deleter. Nothing when a piece is missing.")
               (Maybe.Nothing) (the (Maybe EchoPlan) (Maybe.Nothing)))
           (Maybe.Nothing) (the (Maybe EchoPlan) (Maybe.Nothing))))))
 
-  (private echo-augment)
-  (hidden echo-augment)
-  (doc echo-augment "extends a closed specialization with top-level echo
-demands: a str per distinct non-unit root type, IO.println, and the String
-deleter, then re-closes. Returns the (possibly re-closed) specialization and
-the echo plan for the backend; the plan is Nothing when nothing echoes.")
-  (defn echo-augment [core inferred facts seeds closed]
-    (let-do [roots (SpecializationModule.roots (Pair.a closed))
+  (private echo-augment-known)
+  (hidden echo-augment-known)
+  (doc echo-augment-known "extends an incremental closed specialization with
+top-level echo demands, re-closing from the same prior-cell cache so its final
+delta still contains every definition introduced by this cell.")
+  (defn echo-augment-known [core inferred facts seeds incremental known]
+    (let-do [roots (SpecializationModule.roots
+                     (Pair.a (IncrementalClosed.closed incremental)))
              keys (the (Array MonoType) [])
              by-refs (the (Array (Pair String Bool)) [])
              requests (the (Array SpecializationRequest) [])]
@@ -3326,7 +3361,8 @@ the echo plan for the backend; the plan is Nothing when nothing echoes.")
                   (Maybe.Nothing) ())))))
       (if (Int.= 0 (Array.length &requests))
         (Result.Success
-          (Pair.init (Pair.copy closed) (the (Maybe EchoPlan) (Maybe.Nothing))))
+          (Pair.init (IncrementalClosed.copy incremental)
+                     (the (Maybe EchoPlan) (Maybe.Nothing))))
         (let-do [all-seeds (append-requests (Array.copy seeds) &requests)]
           (set! all-seeds
                 (append-requests all-seeds
@@ -3336,11 +3372,31 @@ the echo plan for the backend; the plan is Nothing when nothing echoes.")
           (set! all-seeds
                 (Array.push-back all-seeds
                                  (Specialize.delete-request &(MonoType.String))))
-          (match (specialize-closed core inferred facts &all-seeds)
-            (Result.Success closed2)
-              (let [plan (build-echo-plan core (Pair.a &closed2) &by-refs)]
-                (Result.Success (Pair.init closed2 plan)))
+          (match (specialize-closed-known core inferred facts &all-seeds known)
+            (Result.Success incremental2)
+              (let [plan (build-echo-plan
+                           core
+                           (Pair.a (IncrementalClosed.closed &incremental2))
+                           &by-refs)]
+                (Result.Success (Pair.init incremental2 plan)))
             (Result.Error error) (Result.Error error))))))
+
+  (private echo-augment)
+  (hidden echo-augment)
+  (doc echo-augment "extends a closed specialization with top-level echo
+demands: a str per distinct non-unit root type, IO.println, and the String
+deleter, then re-closes. Returns the (possibly re-closed) specialization and
+the echo plan for the backend; the plan is Nothing when nothing echoes.")
+  (defn echo-augment [core inferred facts seeds closed]
+    (let [known (the (Array Specialization) [])
+          incremental (IncrementalClosed.init (Pair.copy closed)
+                                               (Array.copy &known))]
+      (match (echo-augment-known core inferred facts seeds &incremental &known)
+        (Result.Success with-echo)
+          (Result.Success
+            (Pair.init @(IncrementalClosed.closed (Pair.a &with-echo))
+                       @(Pair.b &with-echo)))
+        (Result.Error error) (Result.Error error))))
 
   (private debug-describe-expr)
   (hidden debug-describe-expr)
@@ -3608,9 +3664,9 @@ declaration when a fallback span is available.")
   ;; Lowering and rendering each construct another large whole-program
   ;; representation. Consume their inputs at function boundaries so the
   ;; specialized Core IR, backend IR, and final C string do not all overlap.
-  (private lower-owned)
-  (hidden lower-owned)
-  (defn lower-owned [closed-with-echo delete-symbols copy-symbols]
+  (private lower-owned-raw)
+  (hidden lower-owned-raw)
+  (defn lower-owned-raw [closed-with-echo delete-symbols copy-symbols]
     (let [final (Pair.a &closed-with-echo)
           echo-plan (Pair.b &closed-with-echo)]
       (BackendLower.module-with-ownership-echoed (Pair.a final)
@@ -3645,6 +3701,14 @@ than a scan of the whole file each time.")
             (set! high (Int.dec middle)))))
       (Int.inc low)))
 
+  (private column-at)
+  (hidden column-at)
+  (doc column-at "the one-based byte column of an offset, given the source's
+line-start index.")
+  (defn column-at [starts offset]
+    (let [line (Int.dec (line-at starts offset))]
+      (Int.inc (Int.- offset @(Array.unsafe-nth starts line)))))
+
   (private text-of-file)
   (hidden text-of-file)
   (defn text-of-file [file]
@@ -3657,17 +3721,17 @@ than a scan of the whole file each time.")
                   (String.copy (Array.unsafe-nth &*source-map-texts* i))))))
       found))
 
-  (private install-source-map!)
-  (hidden install-source-map!)
-  (doc install-source-map! "turns the resolver's spans into the file and line
-each expression was written at, and hands them to the backend.
+  (private backend-line-map)
+  (hidden backend-line-map)
+  (doc backend-line-map "turns the resolver's spans into the explicit file,
+line, and column table carried by the lowered backend module.
 
 A span is a byte range into a file; a debugger wants a line, so each file is
 indexed once and every span into it is answered by search. Spans in files this
 compilation did not read — code a phase made up, or a string parsed without a
 name — are left out, and the C they produce keeps the line of whatever form it
 came from.")
-  (defn install-source-map! []
+  (defn backend-line-map []
     (let-do [nodes (CoreProvenance.nodes &*source-map*)
              count (Array.length nodes)
              highest -1]
@@ -3677,6 +3741,7 @@ came from.")
       (let-do [size (Int.inc (Int.max highest 0))
                files (Array.replicate size &@"")
                lines (Array.replicate size &-1)
+               columns (Array.replicate size &0)
                ;; one index per file, built the first time a span points into it
                indexed-names (the (Array String) [])
                indexed-starts (the (Array (Array Int)) [])]
@@ -3701,10 +3766,10 @@ came from.")
                     (Maybe.Nothing) ()))
                 (when-do (Int.>= slot 0)
                   (Array.aset! &files id (String.copy file))
-                  (Array.aset! &lines
-                               id
-                               (line-at (Array.unsafe-nth &indexed-starts slot)
-                                        @(SourceSpan.start span))))))))
+                  (let-do [starts (Array.unsafe-nth &indexed-starts slot)
+                           offset @(SourceSpan.start span)]
+                    (Array.aset! &lines id (line-at starts offset))
+                    (Array.aset! &columns id (column-at starts offset))))))))
         (match (IO.getenv "CARP_DEBUG_SOURCE_MAP")
           (Maybe.Just _)
             (IO.errorln
@@ -3714,7 +3779,18 @@ came from.")
                 highest
                 (Array.length &indexed-names)))
           (Maybe.Nothing) ())
-        (LineMap.install! &files &lines))))
+        (BackendLineMap.init files lines columns))))
+
+  (private lower-owned)
+  (hidden lower-owned)
+  (defn lower-owned [closed-with-echo delete-symbols copy-symbols]
+    (match (lower-owned-raw closed-with-echo delete-symbols copy-symbols)
+      (Result.Success backend)
+        (do
+          (when *want-source-map*
+            (BackendModule.set-line-map! &backend (backend-line-map)))
+          (Result.Success backend))
+      (Result.Error error) (Result.Error error)))
 
   (doc resolve-line-resets "turns the marks the backend left at function
 boundaries into directives naming the generated file itself.
@@ -3747,36 +3823,55 @@ because only here is the whole unit written.")
   (hidden render-owned)
   (defn render-owned [backend]
     (let-do [_ignored (phase-mark! "phase: lowered")
-             _ignored-map (when *want-source-map* (install-source-map!))
+             _ignored-map (LineMap.install! (BackendModule.line-map &backend))
              rendered (CBackend.executable-translation-unit &backend)]
       rendered))
 
-  (private lower-inferred-module-with)
-  (hidden lower-inferred-module-with)
-  (defn lower-inferred-module-with [core inferred echo]
+  (doc lower-inferred-module-with-known "lowers one inferred cell against
+concrete instances already compiled by its session. The backend module is a
+delta; the returned instance array is the complete cache to commit only after
+the cell succeeds.")
+  (defn lower-inferred-module-with-known [core inferred echo known]
     (let-do [facts (OwnershipClassify.facts-from-module core)
              seeds (Specialize.named-requests core
                                               inferred
                                               &(the (Array String) []))]
-      (match (specialize-closed core inferred &facts &seeds)
-        (Result.Success closed)
+      (match (specialize-closed-known core inferred &facts &seeds known)
+        (Result.Success incremental)
           (match (if echo
-              (echo-augment core inferred &facts &seeds &closed)
+              (echo-augment-known core inferred &facts &seeds &incremental known)
               (Result.Success
-                (Pair.init (Pair.copy &closed)
+                (Pair.init (IncrementalClosed.copy &incremental)
                            (the (Maybe EchoPlan) (Maybe.Nothing)))))
             (Result.Success closed-with-echo)
               (let [final (Pair.a &closed-with-echo)
-                    delete-symbols (delete-symbols-for core (Pair.a final))
-                    copy-symbols (copy-symbols-for core (Pair.a final))]
-                (match (lower-owned closed-with-echo delete-symbols copy-symbols)
-                  (Result.Success backend) (Result.Success backend)
+                    closed (IncrementalClosed.closed final)
+                    specialized (Pair.a closed)
+                    delete-symbols (delete-symbols-for core specialized)
+                    copy-symbols (copy-symbols-for core specialized)
+                    lowering-input (Pair.init (Pair.copy closed)
+                                              @(Pair.b &closed-with-echo))]
+                (match (lower-owned lowering-input delete-symbols copy-symbols)
+                  (Result.Success backend)
+                    (Result.Success
+                      (IncrementalLowering.init
+                        backend
+                        @(IncrementalClosed.instances final)))
                   (Result.Error error)
                     (Result.Error
                       (CompileError.init (String.copy "backend")
                                          @(BackendError.message &error)))))
             (Result.Error error) (Result.Error error))
         (Result.Error error) (Result.Error error))))
+
+  (private lower-inferred-module-with)
+  (hidden lower-inferred-module-with)
+  (defn lower-inferred-module-with [core inferred echo]
+    (match (lower-inferred-module-with-known
+             core inferred echo &(the (Array Specialization) []))
+      (Result.Success incremental)
+        (Result.Success @(IncrementalLowering.module &incremental))
+      (Result.Error error) (Result.Error error)))
 
   (doc lower-inferred-module "specializes, ownership-plans, and lowers an
 already derived and inferred module to its `BackendModule` without rendering

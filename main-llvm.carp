@@ -27,6 +27,7 @@
     (IO.println "  -c, --core <dir>      compile against the Carp standard library in <dir>")
     (IO.println "  -o, --output <file>   output path — the IR file, or the executable under -b")
     (IO.println "  --no-core             skip the implicit Core load")
+    (IO.println "  -g, --debug           emit DWARF line information from Carp source spans")
     (IO.println "  -h, --help            show this help and exit")
     (IO.println "  -v, --version         show version and exit")
     (IO.println "")
@@ -133,7 +134,7 @@ int carp_llvm_roots(void);
 " main-c])))
     (Result.Error error) (Result.Error @(BackendError.message &error))))
 
-(defn build-llvm [backend core-dir binary log-memory]
+(defn build-llvm [backend core-dir binary log-memory debug bundle-debug]
   (let-do [obj (fmt "/tmp/carp-llvm-%d.o" (compiler-process-id))
            shim-c (fmt "/tmp/carp-llvm-%d-shim.c" (compiler-process-id))
            ok false]
@@ -152,27 +153,32 @@ int carp_llvm_roots(void);
                                                   core-dir
                                                   &(String.join " " &(CtEval.collected-cflags))
                                                   &shim-c &obj binary)))
-                  (set! ok true)
+                  (if (and debug bundle-debug
+                           (String.= &(compiler-host-os) "darwin"))
+                    (if (Int.= 0 (System.system &(fmt "dsymutil %s" binary)))
+                      (set! ok true)
+                      (IO.errorln "carp-compiler-llvm: dsymutil failed"))
+                    (set! ok true))
                   (IO.errorln "carp-compiler-llvm: clang failed")))))
     (compiler-remove-file &obj)
     (compiler-remove-file &shim-c)
     ok))
 
-(defn llvm-build-action [backend core-dir output log-memory]
+(defn llvm-build-action [backend core-dir output log-memory debug]
   (let [binary (match-ref output
           (Maybe.Just p) @p
           (Maybe.Nothing) @"a.out")]
-    (if (build-llvm backend core-dir &binary log-memory)
+    (if (build-llvm backend core-dir &binary log-memory debug true)
       (do
         (IO.println
           &(String.append "carp-compiler-llvm: wrote executable " &binary))
         0)
       1)))
 
-(defn llvm-execute-action [backend core-dir log-memory]
+(defn llvm-execute-action [backend core-dir log-memory debug]
   (do
     (ignore (System.system "mkdir -p out"))
-    (if (build-llvm backend core-dir &(String.copy temp-bin) log-memory)
+    (if (build-llvm backend core-dir &(String.copy temp-bin) log-memory debug false)
       (let [status (System.system &(String.copy temp-bin))]
         (compiler-system-exit-code status))
       1)))
@@ -192,20 +198,22 @@ int carp_llvm_roots(void);
                 1))
         (Maybe.Nothing) (do (IO.print &ir) 0))))
 
-(defn run-llvm [input core-dir output action no-core log-memory]
-  (match-ref core-dir
-    (Maybe.Nothing)
-      (do
-        (IO.errorln "carp-compiler-llvm: --core <dir> is required (--no-core still needs it for load resolution)")
-        1)
-    (Maybe.Just dir)
-      (match (lower-input input dir no-core)
-        (Maybe.Nothing) 1
-        (Maybe.Just backend)
-          (cond
-            (Int.= action 1) (llvm-build-action &backend dir output log-memory)
-            (Int.= action 2) (llvm-execute-action &backend dir log-memory)
-            (llvm-emit-action &backend output)))))
+(defn run-llvm [input core-dir output action no-core log-memory debug]
+  (do
+    (set! *want-source-map* debug)
+    (match-ref core-dir
+      (Maybe.Nothing)
+        (do
+          (IO.errorln "carp-compiler-llvm: --core <dir> is required (--no-core still needs it for load resolution)")
+          1)
+      (Maybe.Just dir)
+        (match (lower-input input dir no-core)
+          (Maybe.Nothing) 1
+          (Maybe.Just backend)
+            (cond
+              (Int.= action 1) (llvm-build-action &backend dir output log-memory debug)
+              (Int.= action 2) (llvm-execute-action &backend dir log-memory debug)
+              (llvm-emit-action &backend output))))))
 
 (defn main []
   (let-do [args &System.args
@@ -216,6 +224,7 @@ int carp_llvm_roots(void);
            have-input false
            no-core false
            log-memory false
+           debug false
            action 0
            ; 0 = compile, 1 = help, 2 = version, 3 = argument error
            mode 0
@@ -229,6 +238,7 @@ int carp_llvm_roots(void);
           (or (String.= &arg "-x") (String.= &arg "--execute")) (set! action 2)
           (String.= &arg "--no-core") (set! no-core true)
           (String.= &arg "--log-memory") (set! log-memory true)
+          (or (String.= &arg "-g") (String.= &arg "--debug")) (set! debug true)
           (or (String.= &arg "-o") (String.= &arg "--output"))
             (if (Int.< (Int.inc i) n)
               (do
@@ -271,7 +281,7 @@ int carp_llvm_roots(void);
             ;; the driver's builds always link the shim, so IR-side heap
             ;; operations go through its CARP_MALLOC/CARP_FREE helpers
             (LLVMBackend.use-carp-allocator!)
-            (System.exit (run-llvm &path &core-dir &output action no-core log-memory)))
+            (System.exit (run-llvm &path &core-dir &output action no-core log-memory debug)))
         (Maybe.Nothing)
           (do
             (IO.errorln "carp-compiler-llvm: no input file")

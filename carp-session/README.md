@@ -16,6 +16,14 @@ carp-session itself stays free of libLLVM). `Session.create` loads and checks Co
 cells and definition rebuilds reuse the warm Core expansion, resolution, and
 inference snapshots.
 
+The LLVM host adds a second persistent layer: one ORC LLJIT and thread-safe
+LLVM context per compiler session. Each cell contributes an incremental module
+containing only symbols not already published, so compiled globals and their
+mutable storage survive later cells. `SessionJit.upsert` and
+`SessionJit.remove` conservatively invalidate published native code after a
+committed source change while retaining the context, target state, and C
+template shim.
+
 The immutable base expansion snapshot is shared with the current overlay via
 `Rc`; it is copied only when expansion actually commits a user definition.
 This keeps cheap reset support without duplicating the resident Core state.

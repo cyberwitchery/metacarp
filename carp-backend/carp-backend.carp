@@ -23,6 +23,12 @@ temp can never collide with an existing binder — the retired hardcoded
 offsets could, once a program grew large enough.")
 (def *backend-local-cell* (the (Array Int) [-1048577]))
 
+; Batch lowering uses a private counter because historical owner-local node IDs
+; may collide. A provenanced session can opt into deterministic lambda symbols
+; derived from its globally unique expression IDs and concrete signatures.
+(def *stable-lambda-symbols* false)
+(def *lambda-symbol-salt* (String.copy ""))
+
 (defn seed-backend-locals! [specialized]
   (Array.aset! &*backend-local-cell*
                0
@@ -59,6 +65,18 @@ an environment struct of the captured values.")
    parameters (Array CoreRef)
    body (Box SpecializedExpr)])
 
+(doc BackendLineMap "is the backend-neutral source location table. Its arrays
+are indexed by expression identity; an empty file or a non-positive line means
+the compiler generated that expression and no caller source owns it.")
+(deftype BackendLineMap
+  [files (Array String)
+   lines (Array Int)
+   columns (Array Int)])
+
+(defmodule BackendLineMap
+  (doc empty "is a source map with no caller-owned locations.")
+  (defn empty [] (BackendLineMap.init [] [] [])))
+
 (deftype BackendModule
   [declarations (Array BackendDeclaration)
    roots (Array (Box SpecializedExpr))
@@ -66,7 +84,8 @@ an environment struct of the captured values.")
    system-includes (Array String)
    closure-functions (Array ClosureFunction)
    delete-symbols (Array (Pair String String))
-   copy-symbols (Array (Pair String String))])
+   copy-symbols (Array (Pair String String))
+   line-map BackendLineMap])
 
 (deftype BackendError [message String])
 
@@ -288,7 +307,8 @@ reflift wrapper's binding type, which would mislabel the result.")
                                 @(SpecializationModule.system-includes specialized)
                                 @closures
                                 (Array.copy delete-symbols)
-                                (Array.copy copy-symbols))))))
+                                (Array.copy copy-symbols)
+                                (BackendLineMap.empty))))))
 
   (private lookup-delete-symbol)
   (hidden lookup-delete-symbol)
@@ -851,9 +871,16 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
                                            lifted
                                            closures)
                  captures (free-vars &lifted-body parameters)
-                 fresh-id (next-hoist counter)]
+                 fresh-id (if *stable-lambda-symbols* @id (next-hoist counter))]
           (if (Int.= 0 (Array.length &captures))
-            (let-do [symbol (String.concat &[@"_carp_lambda_" (Int.str fresh-id)])
+            (let-do [symbol (if *stable-lambda-symbols*
+                       (CAbi.identifier
+                         &(CAbi.mangle
+                           &(fmt "_carp_lambda_%s%d"
+                                 &*lambda-symbol-salt*
+                                 fresh-id)
+                           (Box.peek type)))
+                       (String.concat &[@"_carp_lambda_" (Int.str fresh-id)]))
                      reference (CoreRef.init fresh-id (String.copy &symbol) true)]
               (Array.push-back! lifted
                                 (SpecializedBody.init
@@ -869,10 +896,22 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
                                            (Box.init (MonoType.copy (Box.peek type)))
                                            symbol
                                            false))
-            (let-do [lambda-symbol (String.concat &[@"_carp_lambda_"
-                                                    (Int.str fresh-id)])
-                     closure-symbol (String.concat &[@"_carp_closure_"
-                                                     (Int.str fresh-id)])
+            (let-do [lambda-symbol (if *stable-lambda-symbols*
+                       (CAbi.identifier
+                         &(CAbi.mangle
+                           &(fmt "_carp_lambda_%s%d"
+                                 &*lambda-symbol-salt*
+                                 fresh-id)
+                           (Box.peek type)))
+                       (String.concat &[@"_carp_lambda_" (Int.str fresh-id)]))
+                     closure-symbol (if *stable-lambda-symbols*
+                       (CAbi.identifier
+                         &(CAbi.mangle
+                           &(fmt "_carp_closure_%s%d"
+                                 &*lambda-symbol-salt*
+                                 fresh-id)
+                           (Box.peek type)))
+                       (String.concat &[@"_carp_closure_" (Int.str fresh-id)]))
                      capture-exprs (the (Array (Box SpecializedExpr)) [])]
               (for [i 0 (Array.length &captures)]
                 (let [capture (Array.unsafe-nth &captures i)]
@@ -1046,6 +1085,18 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
           @(SpecializationModule.constructors specialized)
           @(SpecializationModule.system-includes specialized))
         closures)))
+
+  (doc use-stable-lambda-symbols! "uses provenanced expression identities and
+concrete signatures for deterministic lifted-lambda symbols. Persistent
+sessions enable this; batch compilation keeps counter-based symbols.")
+  (defn use-stable-lambda-symbols! [enabled]
+    (set! *stable-lambda-symbols* enabled))
+
+  (doc use-lambda-symbol-salt! "names transient session lambdas within one
+cell's symbol namespace. Transactional cells can reuse expression IDs, so the
+JIT supplies a distinct salt before lowering each cell.")
+  (defn use-lambda-symbol-salt! [salt]
+    (set! *lambda-symbol-salt* (String.copy salt)))
 
   (private insert-cleanup)
   (hidden insert-cleanup)

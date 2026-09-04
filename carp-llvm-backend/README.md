@@ -2,9 +2,10 @@
 
 **Status: reference-suite parity.** An alternative backend that lowers a `BackendModule` (the
 same lowered form `CBackend` renders to C) to LLVM IR through the
-[carpentry-org/llvm](../../llvm) bindings. It consumes the pipeline after
-`BackendLower`; everything upstream — specialization, ownership planning,
-lambda lifting — is shared with the C backend unchanged.
+[carpentry-org/llvm](https://github.com/carpentry-org/llvm) bindings. It
+consumes the pipeline after `BackendLower`; everything upstream —
+specialization, ownership planning, lambda lifting — is shared with the C
+backend unchanged.
 
 Scope covers every example tier plus owned strings, arrays, closures, and
 generic sum-type instances, with ownership-planned deletes: concrete
@@ -77,20 +78,34 @@ into an entry-point-free C translation unit via the C backend's own renderer;
 the test compiles it with clang into a dylib and `dlopen`s it with
 `RTLD_GLOBAL`, so MCJIT resolves the template symbols — an AOT build would
 link the shim object instead. Since both backends read the same lowered
-`BackendModule`, the mangled symbols agree by construction.
+`BackendModule`, the mangled symbols agree by construction. A `BackendModule`
+also carries its backend-neutral `BackendLineMap`; when populated, the LLVM
+emitter builds compile units, subprograms, file-specific lexical scopes, and
+instruction locations from expression identities.
 
 The backend also powers a session JIT (`carp-session-jit.carp`): a
 notebook/editor host loads it beside carp-session and gets
 `SessionJit.run-cell` — the transactional cell pipeline stops at the lowered
-`BackendModule` (`Session.lower-cell-plain`), which is emitted into a fresh
-LLVM module and executed in-process by a fresh MCJIT engine. Template
+`BackendModule` (`Session.lower-cell-plain`), which is emitted as an incremental
+module into one persistent ORC LLJIT and thread-safe LLVM context. Definitions,
+closures, globals, and their storage stay published across cells; later modules
+declare rather than redefine those symbols and carry uniquely named roots and
+global-init functions. Per-cell resource trackers roll back a module if roots
+lookup fails. A committed definition edit conservatively clears published
+native code while retaining the LLJIT, context, target state, and template
+shim. The semantic session likewise retains one merged Core/inference view;
+each transient cell appends and retracts only its own IR and inference traces.
+Concrete specializations are cached across successful cells, so a later cell
+materializes and lowers only newly reached definitions. Template
 specializations live in one shim dylib compiled on the first cell and reused
 until a cell introduces a new specialization; a warm cell pays no clang at
 all. `run-cell` returns the cell's last integer-typed top-level value;
 `run-cell-echoed` prints the result the way a driver-built binary would.
-Measured on an Apple arm64 host against the real Core: first cell ≈ 1.0 s
-(includes the one shim clang), warm cells ≈ 96 ms — the emit-C → clang → run
-path measures ≈ 360 ms per cell (`test/jit-benchmark.carp`).
+Measured on an Apple arm64 host against the real Core: first cell 1.07 s
+(includes the one shim clang), warm cells 62.8 ms, and the emit-C → clang → run
+path 382.0 ms per cell (`test/jit-benchmark.carp`). Before the resident semantic
+view and specialization cache, the same persistent-ORC path took 99.5 ms per
+warm cell.
 
 ```bash
 carp -x test/carp-llvm-backend.carp
@@ -102,6 +117,10 @@ repository root builds `out/carp-compiler-llvm`, which shares the C driver's
 whole front half (`driver-load.carp`) and prints LLVM IR by default, or builds
 and runs a native executable under `-b`/`-x` (object file through the LLVM
 target machine, linked by clang against the C shim plus a generated `main`).
+`-g`/`--debug` preserves the loader's source texts and provenance, attaches
+DWARF line and byte-column locations to LLVM IR, and emits a `.dSYM` beside a
+Darwin `-b` executable before its temporary object is removed. ELF targets
+retain the object DWARF in the linked executable.
 every runnable example — `hello.carp`, `nominal.carp`, `nested-pattern.carp`,
 `signature-nominal.carp`, `polymorphic-nominal.carp`, and `squares.carp` (the
 full standard library: lambdas, `copy-map`, string formatting) — runs end to

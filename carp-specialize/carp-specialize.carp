@@ -88,6 +88,12 @@
    constructors (Array CoreConstructorDeclaration)
    system-includes (Array String)])
 
+(doc IncrementalSpecialization "contains the materialized delta for one cell
+and the complete concrete instance cache after satisfying that cell's roots.")
+(deftype IncrementalSpecialization
+  [module SpecializationModule
+   instances (Array Specialization)])
+
 (deftype SpecializeError [message String])
 
 (deftype SpecializationRequest [call CallSite
@@ -104,6 +110,12 @@
 ;; instance. Empty buckets (an unprimed standalone call) fall back to the
 ;; linear scan.
 (def *instance-buckets* (the (Array (Array Int)) []))
+
+;; Persistent native sessions compile transactional cells into one symbol
+;; table. Their Core identities intentionally repeat, so the host supplies a
+;; per-cell namespace. Batch compilation leaves this empty.
+(def *specialization-symbol-salt* (String.copy ""))
+(def *specialization-symbol-references* (the (Array CoreRef) []))
 
 ;; per-trace-position memo of node types with the module substitution applied,
 ;; filled lazily on first touch (normalization is instance-independent, so a
@@ -516,6 +528,42 @@ locals). `cursor` is a one-element counter array the recursion advances.")
 
   (private symbol-for)
   (hidden symbol-for)
+  (doc use-symbol-namespace! "prefixes symbols for the supplied definitions.
+A persistent JIT passes one transactional cell's definition provenance so new
+native generations coexist while stable Core symbols retain their shared
+names.")
+  (defn use-symbol-namespace! [salt references]
+    (do
+      (set! *specialization-symbol-salt* (String.copy salt))
+      (set! *specialization-symbol-references* (Array.copy references))))
+
+  (defn clear-symbol-namespace! []
+    (do
+      (set! *specialization-symbol-salt* (String.copy ""))
+      (set! *specialization-symbol-references* (the (Array CoreRef) []))))
+
+  (private namespaced-reference?)
+  (hidden namespaced-reference?)
+  (defn namespaced-reference? [reference]
+    (let-do [found false]
+      (for [i 0 (Array.length &*specialization-symbol-references*)]
+        (when (CoreIR.same-ref?
+            (Array.unsafe-nth &*specialization-symbol-references* i)
+            reference)
+          (set! found true)))
+      found))
+
+  (private mangled-symbol)
+  (hidden mangled-symbol)
+  (defn mangled-symbol [reference signature]
+    (CAbi.mangle
+      &(String.concat
+        &[(if (namespaced-reference? reference)
+            (String.copy &*specialization-symbol-salt*)
+            (String.copy ""))
+          (String.copy (CoreRef.name reference))])
+      signature))
+
   (private builtin-source-for)
   (hidden builtin-source-for)
   (defn builtin-source-for [core reference]
@@ -539,9 +587,8 @@ locals). `cursor` is a one-element counter array the recursion advances.")
             (match-ref external-name
               (Maybe.Just name) (String.copy name)
               (Maybe.Nothing) (CAbi.runtime-symbol (CoreRef.name reference)))
-          (CoreBuiltinPayload.Template _ _)
-            (CAbi.mangle (CoreRef.name reference) signature))
-      (Maybe.Nothing) (CAbi.mangle (CoreRef.name reference) signature)))
+          (CoreBuiltinPayload.Template _ _) (mangled-symbol reference signature))
+      (Maybe.Nothing) (mangled-symbol reference signature)))
 
   (private scheme-for-linear)
   (hidden scheme-for-linear)
@@ -2349,9 +2396,9 @@ per-expression trace scan becomes an array lookup.")
         (Result.Error
           (SpecializeError.init @"missing scheme for specialized body"))))
 
-  (private materialize-output)
-  (hidden materialize-output)
-  (defn materialize-output [core inferred instances]
+  (private materialize-output-from)
+  (hidden materialize-output-from)
+  (defn materialize-output-from [core inferred instances first]
     ;; Accumulate payload arrays directly. Rebuilding a SpecializationModule
     ;; through a borrowed Result on every iteration copies all earlier bodies.
     (let-do [bodies (the (Array SpecializedBody) [])
@@ -2361,7 +2408,7 @@ per-expression trace scan becomes an array lookup.")
              values (CoreModule.values core)
              builtins (CoreModule.builtins core)
              n (Array.length instances)]
-      (for [i 0 n]
+      (for [i first n]
         (match-ref &failure
           (Maybe.Nothing)
             (let [instance (Array.unsafe-nth instances i)
@@ -2453,6 +2500,11 @@ per-expression trace scan becomes an array lookup.")
                   (Result.Error error) (Result.Error error)))
             (Result.Error error) (Result.Error error))
         (Maybe.Just error) (Result.Error error))))
+
+  (private materialize-output)
+  (hidden materialize-output)
+  (defn materialize-output [core inferred instances]
+    (materialize-output-from core inferred instances 0))
 
   (doc module "starts from top-level global calls, creates one instance per
 function/signature pair, and traverses the global calls recorded in each newly
@@ -2584,14 +2636,16 @@ implementation exists for the type.")
               (Result.Error _)
                 (the (Maybe (Pair SpecializationRequest Bool)) (Maybe.Nothing)))))))
 
-  (doc module-with "specializes the reachable program plus `extra-requests`
-(e.g. ownership delete demands), sharing one worklist so introduced calls use
-the same interface selection and instance deduplication as user calls.")
-  (defn module-with [core inferred extra-requests]
+  (doc module-with-known "specializes the reachable program plus
+`extra-requests`, seeded with concrete instances already compiled by an
+incremental session. The returned module contains only newly discovered
+definitions while its instance cache contains both old and new instances.")
+  (defn module-with-known [core inferred extra-requests known]
     (let-do [_ignored-index (prime-schemes! (InferredModule.environment inferred))
              _ignored-trace (prime-trace! inferred)
              _ignored-buckets (buckets-reset! (CoreIR.max-declared-global-id core))
-             instances (the (Array Specialization) [])
+             instances (Array.copy known)
+             first-new (Array.length &instances)
              failed false
              failure (String.copy "")
              functions (CoreModule.functions core)
@@ -2603,6 +2657,9 @@ the same interface selection and instance deduplication as user calls.")
                (Result.Success found) (Array.copy found)
                (Result.Error _) [])
              cursor 0]
+      (for [i 0 first-new]
+        (let [reference (Specialization.reference (Array.unsafe-nth &instances i))]
+          (buckets-note! reference i)))
       (match-ref &queue-result
         (Result.Success _) ()
         (Result.Error error)
@@ -2678,9 +2735,28 @@ the same interface selection and instance deduplication as user calls.")
         (set! cursor (Int.inc cursor)))
       (let-do [result (if failed
                  (Result.Error (SpecializeError.init failure))
-                 (materialize-output core inferred &instances))]
+                 (match (materialize-output-from core
+                                                 inferred
+                                                 &instances
+                                                 first-new)
+                   (Result.Success delta)
+                     (Result.Success
+                       (IncrementalSpecialization.init delta instances))
+                   (Result.Error error) (Result.Error error)))]
         (clear-caches!)
         result)))
+
+  (doc module-with "specializes the reachable program plus `extra-requests`
+(e.g. ownership delete demands), sharing one worklist so introduced calls use
+the same interface selection and instance deduplication as user calls.")
+  (defn module-with [core inferred extra-requests]
+    (match (module-with-known core
+                              inferred
+                              extra-requests
+                              &(the (Array Specialization) []))
+      (Result.Success incremental)
+        (Result.Success @(IncrementalSpecialization.module &incremental))
+      (Result.Error error) (Result.Error error)))
 
   (doc module "specializes the reachable program from its roots.")
   (defn module [core inferred]

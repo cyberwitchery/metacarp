@@ -31,7 +31,7 @@
 ;; emission under the reference compiler, at top level it is reliable.
 
 (load "../carp-backend/carp-backend.carp")
-(load "../../llvm/llvm.carp")
+(load "git@github.com:carpentry-org/llvm@0.1.0")
 (LLVM.setup)
 
 ;; emission errors collected across one emit-module run.
@@ -83,6 +83,10 @@
 ;; the module's Function-declaration symbols: only these may be forced into
 ;; the impl treatment when wrapped as values.
 (def *llvm-function-symbols* (the (Array String) []))
+
+; Symbols already published by earlier modules in a persistent JIT. They are
+; declarations in the current cell module, never definitions.
+(def *llvm-predefined-symbols* (the (Array String) []))
 
 ;; every symbol the module itself declares or defines, for spotting calls to
 ;; preprocessor-provided C functions (register-type accessors ride the
@@ -163,6 +167,17 @@
 ;; (handles have no default value to give a bare def).
 (def *llvm-target-data* (the (Array LLVMTargetData) []))
 
+; Per-emission DWARF state. The source map itself is owned by BackendModule;
+; these arrays only cache the DI nodes belonging to the module being emitted.
+(def *llvm-line-map* (BackendLineMap.empty))
+(def *llvm-di-builders* (the (Array LLVMDIBuilder) []))
+(def *llvm-di-file-names* (the (Array String) []))
+(def *llvm-di-files* (the (Array LLVMMetadata) []))
+(def *llvm-di-units* (the (Array LLVMMetadata) []))
+(def *llvm-di-scopes* (the (Array LLVMMetadata) []))
+(def *llvm-di-lexical-file-names* (the (Array String) []))
+(def *llvm-di-lexical-scopes* (the (Array LLVMMetadata) []))
+
 ;; entry-block spill slots for by-value match scrutinees, keyed by the match
 ;; expression's id: the pre-scan requests them, emit-slots! allocates them.
 (def *llvm-matchspill-pending-ids* (the (Array Int) []))
@@ -172,6 +187,159 @@
 
 (hidden llvm-cstr)
 (defn llvm-cstr [s] (String.cstr s))
+
+(hidden llvm-debug-enabled?)
+(defn llvm-debug-enabled? []
+  (Int.> (Array.length (BackendLineMap.lines &*llvm-line-map*)) 0))
+
+(hidden llvm-debug-line)
+(defn llvm-debug-line [id]
+  (if (and (Int.>= id 0)
+           (Int.< id (Array.length (BackendLineMap.lines &*llvm-line-map*))))
+    @(Array.unsafe-nth (BackendLineMap.lines &*llvm-line-map*) id)
+    -1))
+
+(hidden llvm-debug-column)
+(defn llvm-debug-column [id]
+  (if (and (Int.>= id 0)
+           (Int.< id (Array.length (BackendLineMap.columns &*llvm-line-map*))))
+    @(Array.unsafe-nth (BackendLineMap.columns &*llvm-line-map*) id)
+    0))
+
+(hidden llvm-debug-file-name)
+(defn llvm-debug-file-name [id]
+  (if (and (Int.>= id 0)
+           (Int.< id (Array.length (BackendLineMap.files &*llvm-line-map*))))
+    (String.copy (Array.unsafe-nth (BackendLineMap.files &*llvm-line-map*) id))
+    @""))
+
+(hidden llvm-debug-file-index)
+(defn llvm-debug-file-index [name]
+  (let-do [found -1]
+    (for [i 0 (Array.length &*llvm-di-file-names*)]
+      (when (String.= (Array.unsafe-nth &*llvm-di-file-names* i) name)
+        (set! found i)))
+    found))
+
+(hidden llvm-debug-file!)
+(defn llvm-debug-file! [name]
+  (let-do [known (llvm-debug-file-index name)]
+    (if (Int.>= known 0)
+      known
+      (let-do [dib (LLVM.dup (Array.unsafe-nth &*llvm-di-builders* 0))
+               file (LLVM.di-file dib (llvm-cstr name) (llvm-cstr &@"."))
+               unit (LLVM.di-compile-unit dib file (llvm-cstr &@"metacarp"))]
+        (Array.push-back! &*llvm-di-file-names* (String.copy name))
+        (Array.push-back! &*llvm-di-files* file)
+        (Array.push-back! &*llvm-di-units* unit)
+        (Int.dec (Array.length &*llvm-di-file-names*))))))
+
+(hidden llvm-debug-location)
+(defn llvm-debug-location [ctx id]
+  (let-do [line (llvm-debug-line id)
+           name (llvm-debug-file-name id)]
+    (if (and (Int.> line 0) (not (String.empty? &name)))
+      (let-do [_file-index (llvm-debug-file! &name)
+               lexical-index -1]
+        (for [i 0 (Array.length &*llvm-di-lexical-file-names*)]
+          (when (String.= (Array.unsafe-nth &*llvm-di-lexical-file-names* i)
+                          &name)
+            (set! lexical-index i)))
+        (let [scope (if (Int.> (Array.length &*llvm-di-scopes*) 0)
+                      (if (Int.>= lexical-index 0)
+                        (LLVM.dup
+                          (Array.unsafe-nth &*llvm-di-lexical-scopes*
+                                            lexical-index))
+                        (let-do [dib (LLVM.dup
+                                       (Array.unsafe-nth &*llvm-di-builders* 0))
+                                 lexical
+                                  (LLVM.di-lexical-block-file
+                                    dib
+                                    (LLVM.dup
+                                      (Array.unsafe-nth &*llvm-di-scopes* 0))
+                                    (LLVM.dup
+                                      (Array.unsafe-nth &*llvm-di-files*
+                                                        _file-index))
+                                    0)]
+                          (Array.push-back! &*llvm-di-lexical-file-names*
+                                            (String.copy &name))
+                          (Array.push-back! &*llvm-di-lexical-scopes* lexical)
+                          (LLVM.dup &lexical)))
+                      (LLVM.dup (Array.unsafe-nth &*llvm-di-units* _file-index)))]
+        (Maybe.Just
+          (LLVM.debug-location ctx line (llvm-debug-column id) scope))))
+      (the (Maybe LLVMMetadata) (Maybe.Nothing)))))
+
+(hidden llvm-debug-enter-function!)
+(defn llvm-debug-enter-function! [ctx func symbol body]
+  (do
+    (set! *llvm-di-scopes* [])
+    (set! *llvm-di-lexical-file-names* [])
+    (set! *llvm-di-lexical-scopes* [])
+    (when-do (llvm-debug-enabled?)
+      (let-do [id (Specialize.expression-id body)
+               line (llvm-debug-line id)
+               name (llvm-debug-file-name id)]
+        (when-do (and (Int.> line 0) (not (String.empty? &name)))
+          (let-do [index (llvm-debug-file! &name)
+                   dib (LLVM.dup (Array.unsafe-nth &*llvm-di-builders* 0))
+                   file (LLVM.dup (Array.unsafe-nth &*llvm-di-files* index))
+                   unit (LLVM.dup (Array.unsafe-nth &*llvm-di-units* index))
+                   subty (LLVM.di-subroutine-type dib file
+                           &(the (Array LLVMMetadata) []))
+                   scope (LLVM.di-function dib unit (llvm-cstr symbol) file line subty)]
+            (LLVM.set-subprogram func scope)
+            (set! *llvm-di-scopes* [scope])))))))
+
+(hidden llvm-debug-set-builder!)
+(defn llvm-debug-set-builder! [ctx builder expression]
+  (if (llvm-debug-enabled?)
+    (match (llvm-debug-location ctx (Specialize.expression-id expression))
+      (Maybe.Just location) (LLVM.set-debug-location builder location)
+      (Maybe.Nothing) (LLVM.clear-debug-location builder))
+    (LLVM.clear-debug-location builder)))
+
+(hidden llvm-debug-attach!)
+(defn llvm-debug-attach! [ctx value expression]
+  (when-do (and (llvm-debug-enabled?) (LLVM.instruction? value))
+    (match (llvm-debug-location ctx (Specialize.expression-id expression))
+      (Maybe.Just location) (LLVM.set-instruction-debug-location value location)
+      (Maybe.Nothing) ())))
+
+(hidden llvm-debug-begin!)
+(defn llvm-debug-begin! [ctx mod line-map]
+  (do
+    (set! *llvm-line-map* (BackendLineMap.copy line-map))
+    (set! *llvm-di-builders* [])
+    (set! *llvm-di-file-names* [])
+    (set! *llvm-di-files* [])
+    (set! *llvm-di-units* [])
+    (set! *llvm-di-scopes* [])
+    (set! *llvm-di-lexical-file-names* [])
+    (set! *llvm-di-lexical-scopes* [])
+    (when-do (llvm-debug-enabled?)
+      (let-do [dib (LLVM.di-builder-create mod)
+               version (LLVM.value-as-metadata
+                         (LLVM.const-int (LLVM.int32-type ctx) 3l 0))]
+        (set! *llvm-di-builders* [dib])
+        (LLVM.add-module-flag mod LLVM.behavior-warning
+                              (llvm-cstr &@"Debug Info Version") version)))))
+
+(hidden llvm-debug-finish!)
+(defn llvm-debug-finish! []
+  (when-do (Int.> (Array.length &*llvm-di-builders*) 0)
+    (let-do [dib (LLVM.dup (Array.unsafe-nth &*llvm-di-builders* 0))]
+      (LLVM.di-finalize dib)
+      (LLVM.di-builder-dispose dib)
+      (set! *llvm-di-builders* []))))
+
+(hidden llvm-predefined?)
+(defn llvm-predefined? [symbol]
+  (let-do [found false]
+    (for [i 0 (Array.length &*llvm-predefined-symbols*)]
+      (when (String.= (Array.unsafe-nth &*llvm-predefined-symbols* i) symbol)
+        (set! found true)))
+    found))
 
 (hidden llvm-emit-error!)
 (defn llvm-emit-error! [message]
@@ -1801,7 +1969,7 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
 
 ;; llvm-emit-expr and the construct emitters below are mutually recursive.
 (defn llvm-emit-expr [ctx builder mod func expression]
-  (match-ref expression
+  (let-do [_debug (llvm-debug-set-builder! ctx builder expression) value (match-ref expression
     (SpecializedExpr.IntLit _ _ value)
       (LLVM.const-int (LLVM.int32-type ctx) (Long.from-int @value) 0)
     (SpecializedExpr.LongLit _ _ value)
@@ -2094,7 +2262,7 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
     _ (do
         (llvm-emit-error! (fmt "unsupported %s in llvm backend"
                                &(llvm-unsupported-name expression)))
-        (llvm-dummy-value ctx))))
+        (llvm-dummy-value ctx)))] (llvm-debug-attach! ctx value expression) value))
 
 (doc llvm-emit-wrapper-call "calls a C-native function whose signature moves
 aggregates: every argument is spilled to an entry-block slot and passed by
@@ -2541,11 +2709,13 @@ backend's abort() when nothing matched.")
         _ (when (match-ref external (Maybe.Just _) true (Maybe.Nothing) false)
             (Array.push-back! &*llvm-value-intrinsics* (String.copy symbol))))
     (BackendDeclaration.Global symbol signature _)
-      ;; a unit-typed global has no storage
+      ; A predefined global is storage owned by an earlier JIT module.
       (unless (unit-type? (Box.peek signature))
         (let [ty (llvm-lower-type ctx (Box.peek signature))]
-          (LLVM.set-initializer (LLVM.add-global mod ty (llvm-cstr symbol))
-                                (LLVM.const-null ty))))
+          (if (llvm-predefined? symbol)
+            (ignore (LLVM.add-global mod ty (llvm-cstr symbol)))
+            (LLVM.set-initializer (LLVM.add-global mod ty (llvm-cstr symbol))
+                                  (LLVM.const-null ty)))))
     ;; templates are C-native: declared here, defined by the C shim
     (BackendDeclaration.Template symbol signature _ _)
       (match-ref (Box.peek signature)
@@ -2639,9 +2809,9 @@ trailing out-pointer.")
 
 (hidden llvm-define-function!)
 (defn llvm-define-function! [ctx builder mod symbol signature parameters body]
-  (if (llvm-cimpl? symbol)
+  (do (llvm-debug-enter-function! ctx (LLVM.get-named-function mod (llvm-cstr symbol)) symbol (Box.peek body)) (if (llvm-cimpl? symbol)
     (llvm-define-impl-function! ctx builder mod symbol signature parameters body)
-    (llvm-define-plain-function! ctx builder mod symbol signature parameters body)))
+    (llvm-define-plain-function! ctx builder mod symbol signature parameters body))))
 
 (hidden llvm-define-plain-function!)
 (defn llvm-define-plain-function! [ctx builder mod symbol signature parameters body]
@@ -2767,9 +2937,9 @@ parameter is the environment pointer, captures load from it (into slots when
 set!), and the declared parameters follow shifted by one.")
 (hidden llvm-define-closure!)
 (defn llvm-define-closure! [ctx builder mod closure]
-  (if (llvm-needs-wrapper? (Box.peek (ClosureFunction.signature closure)))
+  (let-do [symbol (ClosureFunction.symbol closure) _debug (llvm-debug-enter-function! ctx (LLVM.get-named-function mod (llvm-cstr symbol)) symbol (Box.peek (ClosureFunction.body closure))) value (if (llvm-needs-wrapper? (Box.peek (ClosureFunction.signature closure)))
     (llvm-define-impl-closure! ctx builder mod closure)
-    (llvm-define-plain-closure! ctx builder mod closure)))
+    (llvm-define-plain-closure! ctx builder mod closure))] value))
 
 (doc llvm-define-impl-closure! "defines an aggregate-moving closure impl-style:
 environment pointer first, arguments behind pointers, a non-unit result
@@ -3002,28 +3172,44 @@ order — the LLVM backend's carp_init_globals."
   (let-do [fnty (llvm-void-fn-type ctx)
            func (LLVM.add-function mod (llvm-cstr symbol) fnty)
            entry (LLVM.append-block ctx func (llvm-cstr &@"entry"))
-           n (Array.length declarations)]
+           n (Array.length declarations)
+           debug-entered false]
     (LLVM.position-at-end builder entry)
+    (set! *llvm-di-scopes* [])
+    (LLVM.clear-debug-location builder)
+    (for [i 0 n]
+      (match-ref (Array.unsafe-nth declarations i)
+        (BackendDeclaration.Global global-symbol _ initializer)
+          (when-do (and (not debug-entered)
+                        (not (llvm-predefined? global-symbol))
+                        (Int.> (llvm-debug-line
+                                 (Specialize.expression-id (Box.peek initializer)))
+                               0))
+            (llvm-debug-enter-function! ctx func symbol (Box.peek initializer))
+            (set! debug-entered true))
+        _ ()))
     (llvm-env-reset!)
     (llvm-slot-reset!)
     (llvm-pending-reset!)
     (for [i 0 n]
       (match-ref (Array.unsafe-nth declarations i)
-        (BackendDeclaration.Global _ _ initializer)
-          (llvm-collect-set-targets! (Box.peek initializer))
+        (BackendDeclaration.Global global-symbol _ initializer)
+          (unless (llvm-predefined? global-symbol)
+            (llvm-collect-set-targets! (Box.peek initializer)))
         _ ()))
     (llvm-emit-slots! ctx builder)
     (for [i 0 n]
       (match-ref (Array.unsafe-nth declarations i)
         (BackendDeclaration.Global global-symbol signature initializer)
-          (let [value (llvm-emit-expr ctx builder mod func (Box.peek initializer))]
-            (if (unit-type? (Box.peek signature))
-              ()
-              (let [g (LLVM.get-named-global mod (llvm-cstr global-symbol))]
-                (if (LLVM.value-null? g)
-                  (llvm-emit-error! (fmt "undeclared global %s in llvm backend"
-                                         global-symbol))
-                  (ignore (LLVM.build-store builder value g))))))
+          (unless (llvm-predefined? global-symbol)
+            (let [value (llvm-emit-expr ctx builder mod func (Box.peek initializer))]
+              (if (unit-type? (Box.peek signature))
+                ()
+                (let [g (LLVM.get-named-global mod (llvm-cstr global-symbol))]
+                  (if (LLVM.value-null? g)
+                    (llvm-emit-error! (fmt "undeclared global %s in llvm backend"
+                                           global-symbol))
+                    (ignore (LLVM.build-store builder value g)))))))
         _ ()))
     (ignore (LLVM.build-ret-void builder))))
 
@@ -3033,8 +3219,20 @@ order — the LLVM backend's carp_init_globals."
                                     &(the (Array LLVMType) []) false)
            func (LLVM.add-function mod (llvm-cstr symbol) fnty)
            entry (LLVM.append-block ctx func (llvm-cstr &@"entry"))
-           n (Array.length roots)]
+           n (Array.length roots)
+           debug-entered false]
     (LLVM.position-at-end builder entry)
+    (set! *llvm-di-scopes* [])
+    (LLVM.clear-debug-location builder)
+    (for [i 0 n]
+      (let [root (Array.unsafe-nth roots i)]
+        (when-do (and (not debug-entered)
+                      (Int.> (llvm-debug-line
+                               (Specialize.expression-id (Box.peek root)))
+                             0))
+          (llvm-debug-enter-function! ctx func symbol (Box.peek root))
+          (llvm-debug-set-builder! ctx builder (Box.peek root))
+          (set! debug-entered true))))
     (llvm-env-reset!)
     (llvm-slot-reset!)
     (llvm-pending-reset!)
@@ -3425,7 +3623,8 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
                                     (Array.copy (BackendModule.system-includes backend))
                                     (the (Array ClosureFunction) [])
                                     (Array.copy (BackendModule.delete-symbols backend))
-                                    (Array.copy (BackendModule.copy-symbols backend))))
+                                    (Array.copy (BackendModule.copy-symbols backend))
+                                    (BackendLineMap.empty)))
         (Result.Success unit-c)
           (let-do [buffer (StringBuf.create)
                    emitted-getters (the (Array String) [])]
@@ -3500,6 +3699,29 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
             (Result.Success (StringBuf.to-string &buffer)))
         (Result.Error error) (Result.Error error))))
 
+  (doc defined-symbols "returns every symbol this backend module publishes:
+functions, constructors, globals, closures, and closure environment helpers.")
+  (defn defined-symbols [backend]
+    (let-do [symbols (the (Array String) [])
+             declarations (BackendModule.declarations backend)]
+      (for [i 0 (Array.length declarations)]
+        (match-ref (Array.unsafe-nth declarations i)
+          (BackendDeclaration.Function symbol _ _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          (BackendDeclaration.Constructor symbol _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          (BackendDeclaration.Global symbol _ _)
+            (Array.push-back! &symbols (String.copy symbol))
+          _ ()))
+      (let [closures (BackendModule.closure-functions backend)]
+        (for [i 0 (Array.length closures)]
+          (let-do [symbol (ClosureFunction.symbol
+                            (Array.unsafe-nth closures i))]
+            (Array.push-back! &symbols (String.copy symbol))
+            (Array.push-back! &symbols (fmt "%s_env_delete" symbol))
+            (Array.push-back! &symbols (fmt "%s_env_copy" symbol)))))
+      symbols))
+
   (doc use-carp-allocator! "routes IR-side heap operations through the shim's
 carp_llvm_malloc/free helpers (CARP_MALLOC/CARP_FREE, honoring LOG_MEMORY).
 Call once before emitting; builds that link no shim must not use it.")
@@ -3514,9 +3736,13 @@ bodies, and collects the top-level expressions into one function named by
 `roots-symbol`. Returns () or the collected emission errors. The scope is the
 simple and nominal example tiers; constructs beyond it are reported, never
 mis-lowered.")
-  (defn emit-module [ctx builder mod td backend]
+  (private emit-module-with)
+  (hidden emit-module-with)
+  (defn emit-module-with [ctx builder mod td backend predefined roots-name init-name]
     (do
       (set! *llvm-backend-errors* [])
+      (set! *llvm-predefined-symbols* (Array.copy predefined))
+      (llvm-debug-begin! ctx mod (BackendModule.line-map backend))
       (set! *llvm-backend-constructors*
             (Array.copy (BackendModule.constructors backend)))
       (set! *llvm-sum-names* [])
@@ -3629,18 +3855,36 @@ mis-lowered.")
         (for [i 0 n]
           (match-ref (Array.unsafe-nth declarations i)
             (BackendDeclaration.Function symbol signature parameters body)
-              (llvm-define-function! ctx builder mod symbol signature parameters body)
+              (unless (llvm-predefined? symbol)
+                (llvm-define-function! ctx builder mod symbol signature parameters body))
             (BackendDeclaration.Constructor symbol signature decl)
-              (llvm-define-constructor! ctx builder mod symbol signature decl)
+              (unless (llvm-predefined? symbol)
+                (llvm-define-constructor! ctx builder mod symbol signature decl))
             _ ()))
         (for [i 0 (Array.length &*llvm-closures*)]
-          (do
+          (unless-do (llvm-predefined?
+                       (ClosureFunction.symbol (Array.unsafe-nth &*llvm-closures* i)))
             (llvm-define-closure! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))
-            (llvm-define-closure-env-fns! ctx builder mod (Array.unsafe-nth &*llvm-closures* i))))
-        (llvm-define-global-inits! ctx builder mod declarations &(init-symbol))
+            (llvm-define-closure-env-fns! ctx builder mod
+                                          (Array.unsafe-nth &*llvm-closures* i))))
+        (llvm-define-global-inits! ctx builder mod declarations init-name)
         (llvm-define-roots! ctx builder mod (BackendModule.roots backend)
-                            &(roots-symbol) &(init-symbol))
-        (if (Int.= 0 (Array.length &*llvm-backend-errors*))
-          (Result.Success ())
-          (Result.Error (String.join "; " &*llvm-backend-errors*))))))
+                            roots-name init-name)
+        (let-do [result (if (Int.= 0 (Array.length &*llvm-backend-errors*))
+                          (Result.Success ())
+                          (Result.Error (String.join "; " &*llvm-backend-errors*)))]
+          (llvm-debug-finish!)
+          result))))
+
+  (doc emit-module-incremental "emits one module for a persistent JIT. Symbols
+already present in `predefined` remain external declarations, their globals
+retain storage and values, and the cell receives unique initializer and roots
+symbols.")
+  (defn emit-module-incremental
+    [ctx builder mod td backend predefined roots-name init-name]
+    (emit-module-with ctx builder mod td backend predefined roots-name init-name))
+
+  (defn emit-module [ctx builder mod td backend]
+    (emit-module-with ctx builder mod td backend
+                      &(the (Array String) []) &(roots-symbol) &(init-symbol)))
 )

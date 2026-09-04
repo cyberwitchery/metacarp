@@ -27,15 +27,69 @@
           (IO.println &(diagnostic-line &diagnostic))
           -1))))
 
+(defn compile-process [js session id body]
+  (let [source (String.concat
+                 &[@"(sig process (Fn [Float] Float))\n(defn process [x] "
+                   (String.copy body)
+                   @")\n(process 0.0f)"])
+        cell (SourceInput.init (String.copy id) source)]
+    (SessionJit.compile-f32-function js session &cell "process")))
+
+(defn dsp-scenario! []
+  (let-do [dir (core-dir)
+           _mk (ignore (System.system "mkdir -p out"))
+           js (SessionJit.create &dir "out")
+           results (the (Array Float) [])]
+    (match (Session.create &dir)
+      (Result.Error diagnostic)
+        (IO.println &(diagnostic-line &diagnostic))
+      (Result.Success session)
+        (match (compile-process &js &session "dsp:identity" "x")
+          (Result.Error diagnostic)
+            (IO.println &(diagnostic-line &diagnostic))
+          (Result.Success identity)
+            (do
+              (Array.push-back! &results (LLVM.call-f32-f32 identity 0.8f))
+              (match (compile-process &js &session
+                                      "dsp:gain"
+                                      "(Float.* x 0.5f)")
+                (Result.Error diagnostic)
+                  (IO.println &(diagnostic-line &diagnostic))
+                (Result.Success gain)
+                  (do
+                    (Array.push-back! &results (LLVM.call-f32-f32 gain 0.8f))
+                    ;; Publishing the replacement cannot retire code that an
+                    ;; audio block may still hold.
+                    (Array.push-back! &results
+                                      (LLVM.call-f32-f32 identity 0.8f))
+                    (match (compile-process &js &session
+                                            "dsp:bad"
+                                            "(no-such-function x)")
+                      (Result.Success _) (Array.push-back! &results -1.0f)
+                      (Result.Error _)
+                        ;; A failed compile leaves the last valid address live.
+                        (Array.push-back! &results
+                                          (LLVM.call-f32-f32 gain 0.8f))))))))
+    (SessionJit.dispose &js)
+    results))
+
 ;; results of the one shared scenario, in order:
 ;;   0 (Int.+ 1 2)                             expected 3
 ;;   1 (Int.* 6 7)                             expected 42
 ;;   2 new templates between cells 1 and 2     expected 0
-;;   3 string cell                             expected 4
-;;   4 committed definition cell               expected 42
-;;   5 unknown-symbol cell failed              expected 1
-;;   6 cell after the failed one               expected 5
+;;   3 cached Int.* specialization declarations expected 0
+;;   4 first transient lambda                   expected 11
+;;   5 same-ID different transient lambda       expected 20
+;;   6 string cell                              expected 4
+;;   7 committed definition cell                expected 42
+;;   8 unknown-symbol cell failed               expected 1
+;;   9 cell after the failed one                expected 5
+;;  10 echoed cell                              expected 1
+;;  11 first call into persistent compiled code expected 1
+;;  12 second call preserves compiled state     expected 2
+;;  13 committed edit resets compiled state     expected 1
 (def *jit-results* (the (Array Int) []))
+(def *dsp-results* (the (Array Float) []))
 
 (defn jit-scenario! []
   (let-do [dir (core-dir)
@@ -53,6 +107,20 @@
                    after-second (Array.length (JitSession.materialized &js))]
             (Array.push-back! &results second)
             (Array.push-back! &results (Int.- after-second after-first)))
+          (let [repeat (run-int &js &session "cell:mul-again" "(Int.* 8 9)")]
+            (if (Int.= repeat 72)
+              (Array.push-back! &results @(JitSession.last-declarations &js))
+              (Array.push-back! &results -1)))
+          (Array.push-back!
+            &results
+            (run-int &js &session
+                     "cell:lambda-add"
+                     "(let [f (fn [x] (Int.+ x 1))] (f 10))"))
+          (Array.push-back!
+            &results
+            (run-int &js &session
+                     "cell:lambda-mul"
+                     "(let [f (fn [x] (Int.* x 2))] (f 10))"))
           (Array.push-back!
             &results
             (run-int &js &session "cell:string"
@@ -82,17 +150,44 @@
                 (do
                   (IO.println &(diagnostic-line &diagnostic))
                   (Array.push-back! &results 0))))
+          (let [stateful
+                (SourceInput.init
+                  (String.copy "definition:counter")
+                  (String.copy
+                    "(def counter 0) (defn next-counter [] (do (set! counter (Int.inc counter)) counter))"))]
+            (match (SessionJit.upsert &js &session &stateful)
+              (Result.Error diagnostic)
+                (do
+                  (IO.println &(diagnostic-line &diagnostic))
+                  (Array.push-back! &results -1)
+                  (Array.push-back! &results -1))
+              (Result.Success _)
+                (do
+                  (Array.push-back! &results
+                                    (run-int &js &session "cell:counter-1" "(next-counter)"))
+                  (Array.push-back! &results
+                                    (run-int &js &session "cell:counter-2" "(next-counter)")))))
+          (let [edit (SourceInput.init (String.copy "definition:unrelated")
+                                       (String.copy "(defn unrelated [] 42)"))]
+            (match (SessionJit.upsert &js &session &edit)
+              (Result.Error diagnostic)
+                (do
+                  (IO.println &(diagnostic-line &diagnostic))
+                  (Array.push-back! &results -1))
+              (Result.Success _)
+                (Array.push-back! &results
+                                  (run-int &js &session "cell:counter-after-edit"
+                                           "(next-counter)"))))
           (SessionJit.dispose &js)))
     results))
 
 (deftest test
   (let-do [results (jit-scenario!)]
-    (do
-      (set! *jit-results* results)
-      (assert-equal test
-                    8
-                    (Array.length &*jit-results*)
-                    "the jit scenario ran every step")))
+    (set! *jit-results* results)
+    (assert-equal test
+                  14
+                  (Array.length &*jit-results*)
+                  "the jit scenario ran every step"))
   (assert-equal test
                 3
                 @(Array.unsafe-nth &*jit-results* 0)
@@ -106,22 +201,58 @@
                 @(Array.unsafe-nth &*jit-results* 2)
                 "a same-shape cell reuses the shim (no new templates)")
   (assert-equal test
-                4
+                0
                 @(Array.unsafe-nth &*jit-results* 3)
+                "a cached specialization lowers no declaration a second time")
+  (assert-equal test
+                11
+                @(Array.unsafe-nth &*jit-results* 4)
+                "a transient lambda runs")
+  (assert-equal test
+                20
+                @(Array.unsafe-nth &*jit-results* 5)
+                "a different transient lambda is not mistaken for the first")
+  (assert-equal test
+                4
+                @(Array.unsafe-nth &*jit-results* 6)
                 "jit runs a string cell across the shim")
   (assert-equal test
                 42
-                @(Array.unsafe-nth &*jit-results* 4)
+                @(Array.unsafe-nth &*jit-results* 7)
                 "jit runs a cell against a committed definition")
   (assert-equal test
                 1
-                @(Array.unsafe-nth &*jit-results* 5)
+                @(Array.unsafe-nth &*jit-results* 8)
                 "an unknown symbol is refused before the jit")
   (assert-equal test
                 5
-                @(Array.unsafe-nth &*jit-results* 6)
+                @(Array.unsafe-nth &*jit-results* 9)
                 "a failed cell leaves the jit session usable")
   (assert-equal test
                 1
-                @(Array.unsafe-nth &*jit-results* 7)
-                "an echoed cell runs and prints its value"))
+                @(Array.unsafe-nth &*jit-results* 10)
+                "an echoed cell runs and prints its value")
+  (assert-equal test
+                1
+                @(Array.unsafe-nth &*jit-results* 11)
+                "the first cell initializes persistent compiled state")
+  (assert-equal test
+                2
+                @(Array.unsafe-nth &*jit-results* 12)
+                "the next cell observes persistent compiled state")
+  (assert-equal test
+                1
+                @(Array.unsafe-nth &*jit-results* 13)
+                "a committed edit invalidates compiled state")
+  (let-do [results (dsp-scenario!)]
+    (set! *dsp-results* results)
+    (assert-equal test 4 (Array.length &*dsp-results*)
+                  "the live DSP scenario ran every step"))
+  (assert-true test (Float.approx @(Array.unsafe-nth &*dsp-results* 0) 0.8f)
+               "identity DSP returns its input")
+  (assert-true test (Float.approx @(Array.unsafe-nth &*dsp-results* 1) 0.4f)
+               "replacement DSP applies gain")
+  (assert-true test (Float.approx @(Array.unsafe-nth &*dsp-results* 2) 0.8f)
+               "an old compiled generation remains callable")
+  (assert-true test (Float.approx @(Array.unsafe-nth &*dsp-results* 3) 0.4f)
+               "a failed replacement leaves the last valid DSP callable"))
