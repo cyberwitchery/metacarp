@@ -63,8 +63,9 @@ Lowering decisions worth knowing:
   globals and filled by the init function in declaration order.
 - A string literal mirrors the C backend's `({ static String v = "..."; &v; })`:
   a private global pointer variable initialized with the interned literal
-  data, yielding a `String*` borrow of static storage. Owned strings (copy,
-  delete, `String.append`, ...) are the not-yet-started managed tier.
+  data, yielding a `String*` borrow of static storage. Owned strings cross the
+  generated C shim for copy, delete, and other runtime operations, with their
+  lifetimes governed by the shared ownership plan.
 - The helpers live at top level like the C backend's renderers: mutual
   recursion between defns inside a `defmodule` loses definitions during
   emission under the reference compiler. An ignored recursive call also needs
@@ -121,7 +122,7 @@ target machine, linked by clang against the C shim plus a generated `main`).
 DWARF line and byte-column locations to LLVM IR, and emits a `.dSYM` beside a
 Darwin `-b` executable before its temporary object is removed. ELF targets
 retain the object DWARF in the linked executable.
-every runnable example — `hello.carp`, `nominal.carp`, `nested-pattern.carp`,
+Every runnable example — `hello.carp`, `nominal.carp`, `nested-pattern.carp`,
 `signature-nominal.carp`, `polymorphic-nominal.carp`, and `squares.carp` (the
 full standard library: lambdas, `copy-map`, string formatting) — runs end to
 end and prints what the C driver's build prints. A Carp `(defn main ...)`

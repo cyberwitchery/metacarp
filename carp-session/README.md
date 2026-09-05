@@ -12,9 +12,9 @@ ownership plans, macro expansion, completion, and structured documentation.
 mutating the session; `Session.lower-cell`/`Session.lower-cell-plain` stop the
 same transactional pipeline at the lowered `BackendModule` for alternative
 backends (the LLVM session JIT in `carp-llvm-backend/carp-session-jit.carp` —
-carp-session itself stays free of libLLVM). `Session.create` loads and checks Core once; subsequent
-cells and definition rebuilds reuse the warm Core expansion, resolution, and
-inference snapshots.
+carp-session itself stays free of libLLVM). `Session.create` loads and checks
+Core once; subsequent cells and definition rebuilds reuse the warm Core
+expansion, resolution, and inference snapshots.
 
 The LLVM host adds a second persistent layer: one ORC LLJIT and thread-safe
 LLVM context per compiler session. Each cell contributes an incremental module
@@ -23,6 +23,12 @@ mutable storage survive later cells. `SessionJit.upsert` and
 `SessionJit.remove` conservatively invalidate published native code after a
 committed source change while retaining the context, target state, and C
 template shim.
+
+`SessionJit.compile-f32-function` is the deliberately narrow native-function
+entry point used by the audio experiment. It accepts a named Carp function of
+type `(Fn [Float] Float)`, publishes an immutable generation, and returns its
+callable address. A failed compilation leaves all earlier generations alive
+and callable; the host owns the policy for atomically selecting one.
 
 The immutable base expansion snapshot is shared with the current overlay via
 `Rc`; it is copied only when expansion actually commits a user definition.

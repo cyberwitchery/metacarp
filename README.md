@@ -1,7 +1,8 @@
-# carp-compiler
+# Metacarp
 
-A self-hosting compiler for [Carp](https://github.com/carp-lang/Carp), written
-in Carp. It reads Carp source and emits a C translation unit, driving the whole
+Metacarp is a self-hosting compiler for
+[Carp](https://github.com/carp-lang/Carp), written in Carp. It reads Carp source
+and emits a C translation unit, driving the whole
 pipeline — module loading, macro expansion, name resolution, type inference,
 interface specialization, ownership and borrow checking, and C code generation —
 in Carp itself.
@@ -23,6 +24,16 @@ carp -b --optimize main.carp
 ```
 
 This produces `./out/carp-compiler`.
+
+The optional LLVM driver additionally requires a linkable `libLLVM`:
+
+```sh
+carp -b --optimize main-llvm.carp
+```
+
+This produces `./out/carp-compiler-llvm`. The LLVM bindings use
+`brew --prefix llvm` on macOS and `llvm-config --prefix` elsewhere. Embedders
+can pass an explicit installation prefix to `LLVM.setup`.
 
 ## Usage
 
@@ -70,6 +81,22 @@ Compile and run a program that uses the standard library:
 ./out/carp-compiler -x -c "$CARP_DIR/core" examples/squares.carp
 # sum of squares of the even numbers in 1..10 = 220
 ```
+
+### LLVM backend
+
+`carp-compiler-llvm` shares the complete compiler front end with the C driver.
+It writes LLVM IR by default, or emits and links a native object under `-b` and
+`-x`:
+
+```sh
+./out/carp-compiler-llvm -c "$CARP_DIR/core" -o /tmp/squares.ll examples/squares.carp
+./out/carp-compiler-llvm -x -c "$CARP_DIR/core" examples/squares.carp
+```
+
+Pass `-g` or `--debug` to preserve source texts and attach DWARF locations from
+the backend-neutral line map. See
+[`carp-llvm-backend`](carp-llvm-backend/README.md) for supported lowering,
+native linking, the persistent ORC session JIT, and its test commands.
 
 ## Self-hosting
 
@@ -144,8 +171,8 @@ standard library:
 
 ## How it works
 
-Source flows through fifteen phase libraries, each with its own directory,
-data model, and tests:
+Source flows through the major phases below. Each has its own directory, data
+model, and tests:
 
 ```
 source registry
@@ -160,12 +187,13 @@ source registry
   -> one C translation unit
 ```
 
-Two further libraries are **experimental and opt-in**, and are not part of
-that pipeline: `carp-ct-types` (a tag lattice for the compile-time language)
-and `carp-ct-infer` (a shape check over `defmacro` and `defndynamic` bodies,
-invoked through `CtCheck.modules`). Nothing calls them. They are a checking
-phase rather than a transforming one, so a build that ignores them loses only
-their diagnostics. See
+Two research libraries are **experimental and opt-in**. They are published in
+this repository but are not part of the compiler pipeline: `carp-ct-types` (a
+tag lattice for the compile-time language) and `carp-ct-infer` (a shape check
+over `defmacro` and `defndynamic` bodies, invoked through `CtCheck.modules`).
+Nothing in Metacarp calls them. They are a checking phase rather than a
+transforming one, so a build that ignores them loses only their diagnostics.
+See
 [`carp-ct-infer/README.md`](carp-ct-infer/README.md) for what they do and do
 not cover yet.
 
@@ -193,7 +221,9 @@ registry.
 notebook and editor clients, then provides transactional definition updates,
 cell-relative typed reports, ownership queries, completion, and incremental
 code generation. The design deliberately leaves transport and value hosting to
-clients such as Lepiter and GT. [`docs/carp-session.md`](docs/carp-session.md)
+clients such as Lepiter and GT. `carp-llvm-backend/carp-session-jit.carp` adds a
+persistent ORC JIT whose modules reuse that semantic session. Failed cells do
+not replace the last published implementation. [`docs/carp-session.md`](docs/carp-session.md)
 records the original design and implementation history.
 
 ## Limitations
@@ -210,11 +240,18 @@ records the original design and implementation history.
 
 ## Dependencies
 
-Two pinned Carpentry packages, loaded as git references:
+The default compiler uses two pinned Carpentry packages, loaded as git
+references:
 
 ```clojure
 (load "git@github.com:carpentry-org/carp-reader@0.3.8")
 (load "git@github.com:carpentry-org/strbuf@0.2.0")
+```
+
+The optional LLVM backend additionally loads:
+
+```clojure
+(load "git@github.com:carpentry-org/llvm@0.1.0")
 ```
 
 ## License
