@@ -169,6 +169,12 @@ standard library:
 | `signature-nominal.carp`   | layout discovery from a signature, no reachable constructor  |
 | `squares.carp`             | the full standard library (needs `--core`)                   |
 
+An intentionally small integration experiment lives in
+[`experiments/metacarp-clap`](experiments/metacarp-clap): a macOS CLAP audio
+effect whose interface is a Carp function compiled through the warm session
+and LLVM JIT. It executes unsandboxed native code inside the plugin host and is
+not a release artifact.
+
 ## How it works
 
 Source flows through the major phases below. Each has its own directory, data

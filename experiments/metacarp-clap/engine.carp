@@ -1,0 +1,95 @@
+(load "../../carp-llvm-backend/carp-session-jit.carp")
+(LLVM.setup)
+(Project.no-echo)
+(Project.config "title" "Metacarp")
+(Project.config "output-directory" "experiments/metacarp-clap/out")
+(Project.config "cmod" "experiments/metacarp-clap/shell.m")
+(Project.append-cflag "-Iexperiments/metacarp-clap/.deps/clap/include")
+(Project.append-cflag "-framework Cocoa")
+(Project.append-cflag "-pthread")
+
+(deftype DspEngine
+  [session CompilerSession
+   jit JitSession
+   serial Int
+   error String
+   milliseconds Double])
+
+(defn dsp_engine_new [core-dir scratch]
+  (let [session (Result.expect (Session.create core-dir)
+                               "Metacarp could not load its compiler session")]
+    (DspEngine.init session
+                    (SessionJit.create core-dir scratch)
+                    0
+                    (String.copy "identity fallback")
+                    0.0)))
+
+(defn dsp_diagnostic [diagnostic]
+  (String.concat
+    &[(String.copy (Diagnostic.phase diagnostic))
+      @": "
+      (String.copy (Diagnostic.message diagnostic))]))
+
+(defn dsp_engine_compile [engine source]
+  (let-do [serial @(DspEngine.serial engine)
+           input (SourceInput.init (fmt "plugin:process:%d" serial)
+                                   (String.concat &[(String.copy source) @"
+(process 0.0f)"]))
+           started (System.nanotime)
+           result (SessionJit.compile-f32-function (DspEngine.jit engine)
+                                                   (DspEngine.session engine)
+                                                   &input
+                                                   "process")
+           elapsed (Double./
+             (Double.from-long
+               (Uint64.to-long (Uint64.- (System.nanotime) started)))
+             1000000.0)]
+    (DspEngine.set-serial! engine (Int.inc serial))
+    (DspEngine.set-milliseconds! engine elapsed)
+    (match result
+      (Result.Success address)
+        (do (DspEngine.set-error! engine (String.copy "")) address)
+      (Result.Error diagnostic)
+        (do (DspEngine.set-error! engine (dsp_diagnostic &diagnostic)) 0l))))
+
+(defn dsp_engine_error [engine] (String.copy (DspEngine.error engine)))
+
+(defn dsp_engine_milliseconds [engine] @(DspEngine.milliseconds engine))
+
+(defn dsp_engine_dispose [engine] (SessionJit.dispose (DspEngine.jit engine)))
+
+;; These templates are the deliberately tiny C ABI boundary used by the CLAP
+;; and Cocoa bridge. The compiler/session and its diagnostics remain Carp.
+(deftemplate metacarp_engine_create
+             (Fn [(Ptr CChar) (Ptr CChar)] Long)
+             "Long metacarp_engine_create(char* core_dir, char* scratch)"
+             "$DECL { String core = String_copy(&core_dir); String tmp = String_copy(&scratch); DspEngine* e = CARP_MALLOC(sizeof(DspEngine)); *e = dsp_engine_new(&core, &tmp); String_delete(core); String_delete(tmp); return (Long)(intptr_t)e; }")
+
+(deftemplate metacarp_engine_compile
+             (Fn [Long (Ptr CChar)] Long)
+             "Long metacarp_engine_compile(Long engine, char* source)"
+             "$DECL { String text = String_copy(&source); Long result = dsp_engine_compile((DspEngine*)(intptr_t)engine, &text); String_delete(text); return result; }")
+
+(deftemplate metacarp_engine_error
+             (Fn [Long] (Ptr CChar))
+             "char* metacarp_engine_error(Long engine)"
+             "$DECL { return dsp_engine_error((DspEngine*)(intptr_t)engine); }")
+
+(deftemplate metacarp_engine_milliseconds
+             (Fn [Long] Double)
+             "double metacarp_engine_milliseconds(Long engine)"
+             "$DECL { return dsp_engine_milliseconds((DspEngine*)(intptr_t)engine); }")
+
+(deftemplate metacarp_engine_destroy
+             (Fn [Long] ())
+             "void metacarp_engine_destroy(Long engine)"
+             "$DECL { DspEngine* e = (DspEngine*)(intptr_t)engine; dsp_engine_dispose(e); DspEngine_delete(*e); CARP_FREE(e); }")
+
+;; Concrete calls retain the ABI templates in a library build without a main.
+(defn retain_plugin_abi []
+  (let-do [empty (String.copy "")]
+    (ignore (metacarp_engine_create (String.cstr &empty) (String.cstr &empty)))
+    (ignore (metacarp_engine_compile 0l (String.cstr &empty)))
+    (ignore (metacarp_engine_error 0l))
+    (ignore (metacarp_engine_milliseconds 0l))
+    (metacarp_engine_destroy 0l)))
