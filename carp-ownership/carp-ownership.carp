@@ -19,13 +19,36 @@ source ID space; specialization may leave holes in it.")
   (Temporary [Int])
   (Result []))
 
+(doc OwnershipBorrowMode "distinguishes an aliasing read-only borrow from an
+exclusive borrow which permits mutation. It is explicit in the ownership IR
+even while source-level syntax and inference continue to evolve.")
+(deftype OwnershipBorrowMode
+  (Shared [])
+  (Unique []))
+
+(doc OwnershipProjection "is one backend-neutral step from an ownership root
+to a sub-place. Unknown array indices and slice bounds are represented by
+`Nothing`, which conservatively overlaps every concrete value.")
+(deftype OwnershipProjection
+  (Deref [])
+  (Field [String])
+  (Index [(Maybe Int)])
+  (Slice [(Maybe Int) (Maybe Int)]))
+
+(doc OwnershipPlace "names memory as a root resource followed by zero or more
+projections. A root-only place preserves the meaning of the former bare
+resource representation while allowing later field-sensitive loan checking.")
+(deftype OwnershipPlace
+  [root OwnershipResource
+   projections (Array OwnershipProjection)])
+
 (doc OwnershipAction "is the backend-neutral output vocabulary for the future
 linear ownership planner. Copy is intentionally absent: Carp copies are
 explicit calls which create a new temporary. The planner inserts moves,
 borrows, and deletes.")
 (deftype OwnershipAction
   (Move [OwnershipSite OwnershipResource OwnershipResource (Box MonoType)])
-  (Borrow [OwnershipSite OwnershipResource])
+  (Borrow [OwnershipSite OwnershipBorrowMode OwnershipPlace])
   (Delete [OwnershipSite OwnershipResource (Box MonoType)]))
 
 (doc OwnershipRequirement "records concrete interface work introduced by
@@ -237,6 +260,107 @@ deleters are polymorphic over each arity.")
       (OwnershipTypeFacts.init owned []))))
 
 (defmodule Ownership
+  (private same-resource?)
+  (hidden same-resource?)
+  (defn same-resource? [left right]
+    (match-ref left
+      (OwnershipResource.Binding l)
+        (match-ref right
+          (OwnershipResource.Binding r) (CoreIR.same-ref? l r)
+          _ false)
+      (OwnershipResource.Temporary l)
+        (match-ref right (OwnershipResource.Temporary r) (Int.= @l @r) _ false)
+      (OwnershipResource.Result)
+        (match-ref right (OwnershipResource.Result) true _ false)))
+
+  (private index-outside-slice?)
+  (hidden index-outside-slice?)
+  (defn index-outside-slice? [index start end]
+    (match-ref index
+      (Maybe.Just i)
+        (match-ref start
+          (Maybe.Just s)
+            (if (Int.< @i @s)
+              true
+              (match-ref end (Maybe.Just e) (Int.>= @i @e) (Maybe.Nothing) false))
+          (Maybe.Nothing)
+            (match-ref end (Maybe.Just e) (Int.>= @i @e) (Maybe.Nothing) false))
+      (Maybe.Nothing) false))
+
+  (private projections-disjoint?)
+  (hidden projections-disjoint?)
+  (defn projections-disjoint? [left right]
+    (match-ref left
+      (OwnershipProjection.Field l)
+        (match-ref right
+          (OwnershipProjection.Field r) (not (String.= l r))
+          _ false)
+      (OwnershipProjection.Index l)
+        (match-ref right
+          (OwnershipProjection.Index r)
+            (match-ref l
+              (Maybe.Just li)
+                (match-ref r
+                  (Maybe.Just ri) (Int./= @li @ri)
+                  (Maybe.Nothing) false)
+              (Maybe.Nothing) false)
+          (OwnershipProjection.Slice start end)
+            (index-outside-slice? l start end)
+          _ false)
+      (OwnershipProjection.Slice lstart lend)
+        (match-ref right
+          (OwnershipProjection.Index index)
+            (index-outside-slice? index lstart lend)
+          (OwnershipProjection.Slice rstart rend)
+            (match-ref lend
+              (Maybe.Just le)
+                (match-ref rstart
+                  (Maybe.Just rs)
+                    (if (Int.<= @le @rs)
+                      true
+                      (match-ref rend
+                        (Maybe.Just re)
+                          (match-ref lstart
+                            (Maybe.Just ls) (Int.<= @re @ls)
+                            (Maybe.Nothing) false)
+                        (Maybe.Nothing) false))
+                  (Maybe.Nothing)
+                    (match-ref rend
+                      (Maybe.Just re)
+                        (match-ref lstart
+                          (Maybe.Just ls) (Int.<= @re @ls)
+                          (Maybe.Nothing) false)
+                      (Maybe.Nothing) false))
+              (Maybe.Nothing)
+                (match-ref rend
+                  (Maybe.Just re)
+                    (match-ref lstart
+                      (Maybe.Just ls) (Int.<= @re @ls)
+                      (Maybe.Nothing) false)
+                  (Maybe.Nothing) false))
+          _ false)
+      _ false))
+
+  (doc places-overlap? "conservatively decides whether two structured memory
+places can denote common bytes. Different known fields, indices, and disjoint
+half-open slices are proven separate; unknown indices/bounds and mismatched
+projection kinds remain overlapping. A whole-place prefix overlaps every one
+of its subplaces.")
+  (defn places-overlap? [left right]
+    (if (not
+        (same-resource? (OwnershipPlace.root left) (OwnershipPlace.root right)))
+      false
+      (let-do [overlap true
+               left-projections (OwnershipPlace.projections left)
+               right-projections (OwnershipPlace.projections right)
+               n (Int.min (Array.length left-projections)
+                          (Array.length right-projections))]
+        (for [i 0 n]
+          (when (projections-disjoint? (Array.unsafe-nth left-projections i)
+                                       (Array.unsafe-nth right-projections i))
+            (set! overlap false)))
+        overlap)))
+
   (private invalid-id)
   (hidden invalid-id)
   (private mark-id!)
@@ -278,7 +402,8 @@ expression site without dropping compiler-generated actions.")
               id (match-ref action
                 (OwnershipAction.Move site _ _ _)
                   @(OwnershipSite.expression site)
-                (OwnershipAction.Borrow site _) @(OwnershipSite.expression site)
+                (OwnershipAction.Borrow site _ _)
+                  @(OwnershipSite.expression site)
                 (OwnershipAction.Delete site _ _)
                   @(OwnershipSite.expression site))]
           (Array.push-back! &result
