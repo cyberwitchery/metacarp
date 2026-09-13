@@ -1,5 +1,6 @@
 (load "../carp-surface/carp-surface.carp")
-(load "../carp-ct-types/carp-ct-types.carp")
+(load "../carp-ct-sub/carp-ct-shape.carp")
+(load "../carp-graph/carp-graph.carp")
 
 (doc CtShapeError "one rejection, in the shape the other phase libraries use:
 a message and the span it belongs to. `definition` names the compile-time
@@ -28,6 +29,21 @@ syntax while a dynamic function's bind evaluated values.")
                        rest? Bool
                        macro? Bool])
 
+(doc CtSummary "what the pass knows about calling one compile-time function.
+
+`domain` holds one shape per fixed parameter: a shape the argument must meet
+or the call definitely goes wrong. It is derived only from uses the body is
+certain to reach, because a use inside a branch says nothing about a call that
+does not take it. `result` is the shape the body answers with, over every
+path.
+
+⊤ in either position is the absence of a claim. That is where every summary
+starts, and where a macro’s stays: a macro’s parameters bind unevaluated
+syntax and its result is evaluated again, so neither position would mean for a
+macro what it means here.")
+(deftype CtSummary [domain (Array Int)
+                    result Int])
+
 (doc CtObservation "one place the pass had something to say: an argument
 position with a domain, or a binding a predicate refined. Recording these is
 what lets a clean run be inspected rather than merely believed.")
@@ -47,6 +63,38 @@ what lets a clean run be inspected rather than merely believed.")
 (def *ct-current-definition* @"")
 (def *ct-current-file* @"")
 (def *ct-current-module* @"")
+
+;; one summary per entry in *ct-definitions*, at the same index. The bodies and
+;; the module prefixes are kept beside them because the summary pass runs
+;; between `collect` and `check-module`, when there is no module tree to walk.
+(def *ct-summaries* (the (Array CtSummary) []))
+(def *ct-bodies* (the (Array (Box SurfaceNode)) []))
+(def *ct-definition-modules* (the (Array String) []))
+
+;; whether summaries are consulted. Off is the pass as it was before they
+;; existed: every call to a compile-time function is ⊤ in and ⊤ out. The
+;; measurement is the difference, so it is a switch.
+(def *ct-summaries-enabled* true)
+
+;; suppresses findings and coverage counters while summaries are being derived.
+;; The fixpoint walks every body several times, and neither a finding nor a
+;; count means anything until the walk reporting it is the one that checks.
+(def *ct-quiet* false)
+
+;; summary coverage. Same argument as the position counters below: a summary
+;; layer that decides nothing is indistinguishable from no summary layer unless
+;; it says how much it knew.
+(def *ct-summary-rounds* 0)
+(def *ct-summary-functions* 0)
+;; functions a summary was derived for at all
+(def *ct-summary-results* 0)
+;; of those, ones whose result is not ⊤
+(def *ct-summary-domains* 0)
+;; parameters with a domain
+(def *ct-summary-assists* 0)
+;; call sites where a summary supplied what the builtin table could not
+(def *ct-summary-contradictory* 0)
+;; parameters whose spine uses require two disjoint things at once
 
 ;; whether a macro's parameters start at Syntax rather than at ⊤. Precision
 ;; against false positives is exactly the tradeoff being measured, so it is a
@@ -73,6 +121,7 @@ what lets a clean run be inspected rather than merely believed.")
   (doc reset! "clears findings and known definitions for a fresh run.")
   (defn reset! []
     (do
+      (CtShape.init!)
       (set! *ct-findings* [])
       (set! *ct-definitions* [])
       (set! *ct-current-definition* @"")
@@ -84,6 +133,16 @@ what lets a clean run be inspected rather than merely believed.")
       (set! *ct-argument-positions* 0)
       (set! *ct-definitions-constrained* 0)
       (set! *ct-definitions-decided* 0)
+      (set! *ct-summaries* [])
+      (set! *ct-bodies* [])
+      (set! *ct-definition-modules* [])
+      (set! *ct-quiet* false)
+      (set! *ct-summary-rounds* 0)
+      (set! *ct-summary-functions* 0)
+      (set! *ct-summary-results* 0)
+      (set! *ct-summary-domains* 0)
+      (set! *ct-summary-assists* 0)
+      (set! *ct-summary-contradictory* 0)
       (set! *ct-observations* [])))
 
   (defn observations [] &*ct-observations*)
@@ -98,14 +157,29 @@ what lets a clean run be inspected rather than merely believed.")
   (defn findings [] &*ct-findings*)
   (defn definitions [] &*ct-definitions*)
 
+  (doc summaries-enabled! "turns the summary layer on or off. Off is the pass
+as it was before summaries existed, which is what a measurement compares
+against.")
+  (defn summaries-enabled! [on?] (set! *ct-summaries-enabled* on?))
+
+  (defn summary-rounds [] *ct-summary-rounds*)
+  (defn summary-functions [] *ct-summary-functions*)
+  (defn summary-results [] *ct-summary-results*)
+  (defn summary-domains [] *ct-summary-domains*)
+  (defn summary-assists [] *ct-summary-assists*)
+  (defn summary-contradictory [] *ct-summary-contradictory*)
+
   (private record!)
   (hidden record!)
   (defn record! [node kind message]
-    (Array.push-back! &*ct-findings*
-                      (CtShapeError.init @&*ct-current-definition*
-                                         kind
-                                         message
-                                         @(SurfaceNode.span node))))
+    ;; a finding from a summary-derivation walk is not a finding: the same body
+    ;; is walked again by the pass that reports, under shapes that are final
+    (unless *ct-quiet*
+      (Array.push-back! &*ct-findings*
+                        (CtShapeError.init @&*ct-current-definition*
+                                           kind
+                                           message
+                                           @(SurfaceNode.span node)))))
 
   ;; ---------------------------------------------------------------- syntax
 
@@ -164,10 +238,9 @@ comment as the default branch and never looks at `e`.")
       (Maybe.Nothing)
       (symbol-key (Box.peek (Array.unsafe-nth items 0)))))
 
-  (doc data-shape "the shape of a node taken as data rather than as code.
-This is where quotation gets its precision: a quoted form's tag is decided by
-the reader, not by evaluation.")
-  (defn data-shape [node]
+  (doc node-kind "the tag of a node, for dispatch: which of the reader's forms
+this is, and nothing about what is inside it.")
+  (defn node-kind [node]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.IntLit _) (CtShape.leaf (CtShape.i-int-lit))
       (SurfaceForm.ByteLit _) (CtShape.leaf (CtShape.i-byte-lit))
@@ -186,6 +259,51 @@ the reader, not by evaluation.")
       (SurfaceForm.Comment _) (CtShape.leaf (CtShape.i-comment))))
 
   ;; ----------------------------------------------------------- environment
+
+  (private container-index)
+  (hidden container-index)
+  ;; the tag index of a container node, for building a shape that holds its
+  ;; elements
+  (defn container-index [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Array _) (CtShape.i-array)
+      (SurfaceForm.StaticArray _) (CtShape.i-static-array)
+      (SurfaceForm.Dictionary _) (CtShape.i-dictionary)
+      _ (CtShape.i-list)))
+
+  (sig data-shape (Fn [(Ref SurfaceNode)] Int))
+
+  (doc data-shape "the shape of a node taken as data rather than as code.
+
+This is where quotation gets its precision: a quoted form's tag is decided by the
+reader and not by evaluation, and so are the tags of everything inside it. On a
+backend that can hold an element type, `(quote (a b))` is a list of two symbols
+rather than merely a list; on one that cannot, the elements are dropped and it is
+merely a list.")
+  (defn data-shape [node]
+    (let [kind (node-kind node)]
+      (if (CtShape.equal? kind (CtShape.leaf (CtShape.i-symbol)))
+        ;; which symbol it is, not merely that it is one: the head of an emitted
+        ;; form is how a macro's output is recognised at all
+        (match (symbol-key node)
+          (Maybe.Just spelling) (CtShape.symbol-literal &spelling)
+          (Maybe.Nothing) kind)
+        (if (or
+            (CtShape.equal? kind (CtShape.leaf (CtShape.i-list)))
+            (or
+              (CtShape.equal? kind (CtShape.leaf (CtShape.i-array)))
+              (or
+                (CtShape.equal? kind (CtShape.leaf (CtShape.i-static-array)))
+                (CtShape.equal? kind (CtShape.leaf (CtShape.i-dictionary))))))
+          (let-do [items (items-of node)
+                   elements (the (Array Int) [])]
+            (for [i 0 (Array.length &items)]
+              (set! elements
+                    (Array.push-back elements
+                                     (data-shape (Box.peek (Array.unsafe-nth &items
+                                                                             i))))))
+            (CtShape.container-of (container-index node) &elements))
+          kind))))
 
   (private lookup)
   (hidden lookup)
@@ -320,9 +438,13 @@ surface of the pass: everything it does not mention is accepted.")
       (if (Int.= index 0) (CtShape.leaf (CtShape.i-string-lit)) (CtShape.top))
       (= name "String.append")
       (if (Int.< index 2) (CtShape.leaf (CtShape.i-string-lit)) (CtShape.top))
-      ;; concat takes one argument, an array of strings, not a pair of them
+      ;; concat takes one argument, a container of strings, not a pair of them.
+      ;; The elements are part of the domain, which a tag alone cannot say: on a
+      ;; backend without products `every-listy` is just `listy` again
       (= name "String.concat")
-      (if (Int.= index 0) (CtShape.listy) (CtShape.top))
+      (if (Int.= index 0)
+        (CtShape.every-listy (CtShape.leaf (CtShape.i-string-lit)))
+        (CtShape.top))
       (one-of? name
                &[@"String.slice"
                  @"String.char-at"
@@ -340,8 +462,12 @@ surface of the pass: everything it does not mention is accepted.")
         (CtShape.union (CtShape.leaf (CtShape.i-string-lit))
                        (CtShape.leaf (CtShape.i-int-lit)))
         (CtShape.top))
+      ;; every element has to be a symbol, which is the constraint this pass
+      ;; could not state until the algebra could hold an element type
       (= name "Symbol.concat")
-      (if (Int.= index 0) (CtShape.listy) (CtShape.top))
+      (if (Int.= index 0)
+        (CtShape.every-listy (CtShape.leaf (CtShape.i-symbol)))
+        (CtShape.top))
       (string-builtin? name)
       (CtShape.top)
       (match (dynamic-key name)
@@ -396,9 +522,9 @@ Unknown names constrain nothing, which is what keeps the pass from inventing
 findings about the parts of the dynamic language it does not model.")
   (defn constrained? [name]
     (not
-      (Int.= (CtShape.top)
-             (CtShape.intersection (builtin-domain name 0)
-                                   (builtin-domain name 1)))))
+      (CtShape.equal? (CtShape.top)
+                      (CtShape.intersection (builtin-domain name 0)
+                                            (builtin-domain name 1)))))
 
   ;; --------------------------------------------------------------- special
 
@@ -512,7 +638,8 @@ checker does not understand refines nothing.")
                                refined (if positive?
                                  (CtShape.intersection current tag)
                                  (CtShape.difference current tag))]
-                        (when-do (Int./= refined current)
+                        (when-do (and (not *ct-quiet*)
+                                      (not (CtShape.equal? refined current)))
                           (set! *ct-narrowings* (Int.inc *ct-narrowings*))
                           (when *ct-explain*
                             (Array.push-back! &*ct-observations*
@@ -540,6 +667,10 @@ checker does not understand refines nothing.")
   (hidden check-quoted)
   (private quote-each)
   (hidden quote-each)
+  (private quoted-container)
+  (hidden quoted-container)
+  (private prefix-before-splice)
+  (hidden prefix-before-splice)
   (private check-list)
   (hidden check-list)
   (private check-call)
@@ -558,6 +689,19 @@ checker does not understand refines nothing.")
   (hidden check-arguments)
   (private check-arity)
   (hidden check-arity)
+  (private check-lambda)
+  (hidden check-lambda)
+  (private check-local-call)
+  (hidden check-local-call)
+  (private check-argument!)
+  (hidden check-argument!)
+  (private check-construction)
+  (hidden check-construction)
+  (private construction-index)
+  (hidden construction-index)
+  (sig construction-index (Fn [(Ref String)] Int))
+  (private local-function?)
+  (hidden local-function?)
 
   (sig known-definition (Fn [(Ref String)] (Maybe CtDefinition)))
   (sig builtin? (Fn [(Ref String)] Bool))
@@ -569,7 +713,14 @@ checker does not understand refines nothing.")
   (sig quote-each
        (Fn
          [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding)) Int Int]
-         ()))
+         (Array Int)))
+  (sig quoted-container
+       (Fn
+         [(Ref SurfaceNode)
+          (Ref (Array (Box SurfaceNode)))
+          (Ref (Array CtShapeBinding))
+          Int]
+         Int))
   (sig check-list
        (Fn
          [(Ref SurfaceNode)
@@ -611,6 +762,146 @@ checker does not understand refines nothing.")
          ()))
   (sig check-arity
        (Fn [(Ref SurfaceNode) (Ref (Array (Box SurfaceNode))) (Ref String)] ()))
+  (sig check-lambda
+       (Fn [(Ref (Array (Box SurfaceNode))) (Ref (Array CtShapeBinding))] Int))
+  (sig check-local-call
+       (Fn
+         [(Ref (Array (Box SurfaceNode)))
+          (Ref (Array CtShapeBinding))
+          (Ref String)]
+         Int))
+  (sig check-argument! (Fn [(Ref SurfaceNode) Int Int (Ref String) Int] ()))
+  (sig check-construction
+       (Fn
+         [(Ref (Array (Box SurfaceNode)))
+          (Ref (Array CtShapeBinding))
+          (Ref String)]
+         Int))
+  (sig local-function? (Fn [(Ref (Array CtShapeBinding)) (Ref String)] Bool))
+
+  ;; ------------------------------------------------------- summary lookup
+
+  (private exact-definition-index)
+  (hidden exact-definition-index)
+  (defn exact-definition-index [name]
+    (let-do [found (Maybe.Nothing)
+             n (Array.length &*ct-definitions*)]
+      (for [i 0 n]
+        (let [entry (Array.unsafe-nth &*ct-definitions* i)]
+          (when (and (Maybe.nothing? &found) (= (CtDefinition.name entry) name))
+            (set! found (Maybe.Just i)))))
+      found))
+
+  (doc known-definition-index "where the definition a name resolves to is
+stored, resolved the way the evaluator resolves it: by the name as written.")
+  (defn known-definition-index [name] (exact-definition-index name))
+
+  (private summary-result-at)
+  (hidden summary-result-at)
+  (defn summary-result-at [index]
+    @(CtSummary.result (Array.unsafe-nth &*ct-summaries* index)))
+
+  (private summary-domain-at)
+  (hidden summary-domain-at)
+  (defn summary-domain-at [index position]
+    (let [domain (CtSummary.domain (Array.unsafe-nth &*ct-summaries* index))]
+      (if (Int.< position (Array.length domain))
+        @(Array.unsafe-nth domain position)
+        (CtShape.top))))
+
+  (private summary-domain-array)
+  (hidden summary-domain-array)
+  (defn summary-domain-array [index]
+    @(CtSummary.domain (Array.unsafe-nth &*ct-summaries* index)))
+
+  (doc summary-usable? "whether the summary at `index` may be believed. A
+macro’s may not: its parameters bind unevaluated syntax and its result is
+evaluated again, so a summary derived as though it were a function would be a
+claim about the wrong program.")
+  (defn summary-usable? [index]
+    (and *ct-summaries-enabled*
+         (and
+           (Int.< index (Array.length &*ct-summaries*))
+           (not
+             @(CtDefinition.macro? (Array.unsafe-nth &*ct-definitions* index))))))
+
+  (private note-assist!)
+  (hidden note-assist!)
+  (defn note-assist! [shape]
+    (when (and (not *ct-quiet*) (not (CtShape.equal? shape (CtShape.top))))
+      (set! *ct-summary-assists* (Int.inc *ct-summary-assists*))))
+
+  (doc call-range "the shape a call answers with: the builtin table first,
+because the evaluator tries a builtin before it looks a name up, and otherwise
+the summary of the function the name resolves to.")
+  (defn call-range [name]
+    (let [builtin (builtin-range name)]
+      (if (or (not (CtShape.equal? builtin (CtShape.top))) (builtin? name))
+        builtin
+        (match (known-definition-index name)
+          (Maybe.Nothing) builtin
+          (Maybe.Just index)
+            (if (summary-usable? index)
+              (let-do [answer (summary-result-at index)]
+                (note-assist! answer)
+                answer)
+              builtin)))))
+
+  (doc call-domain "the shape an argument must meet: the builtin table first,
+for the same reason, and otherwise the domain the callee’s body forces on that
+parameter.")
+  (defn call-domain [name index]
+    (let [builtin (builtin-domain name index)]
+      (if (or (not (CtShape.equal? builtin (CtShape.top))) (builtin? name))
+        builtin
+        (match (known-definition-index name)
+          (Maybe.Nothing) builtin
+          (Maybe.Just found)
+            (if (summary-usable? found)
+              (let-do [answer (summary-domain-at found index)]
+                (note-assist! answer)
+                answer)
+              builtin)))))
+
+  ;; the spine scanner is one mutually recursive group, like the walker. It
+  ;; visits only what the body is certain to evaluate, which is what a domain
+  ;; may be derived from: a constraint read off a branch would reject a call
+  ;; that never takes it.
+  (private scan-spine)
+  (hidden scan-spine)
+  (private scan-spine-each)
+  (hidden scan-spine-each)
+  (private scan-spine-let)
+  (hidden scan-spine-let)
+  (private scan-spine-for)
+  (hidden scan-spine-for)
+  (private scan-spine-call)
+  (hidden scan-spine-call)
+
+  (sig scan-spine
+       (Fn [(Ref SurfaceNode) (Ref (Array String)) (Ref (Array Int))] Bool))
+  (sig scan-spine-each
+       (Fn
+         [(Ref (Array (Box SurfaceNode)))
+          Int
+          (Ref (Array String))
+          (Ref (Array Int))]
+         Bool))
+  (sig scan-spine-let
+       (Fn
+         [(Ref (Array (Box SurfaceNode))) (Ref (Array String)) (Ref (Array Int))]
+         Bool))
+  (sig scan-spine-for
+       (Fn
+         [(Ref (Array (Box SurfaceNode))) (Ref (Array String)) (Ref (Array Int))]
+         Bool))
+  (sig scan-spine-call
+       (Fn
+         [(Ref (Array (Box SurfaceNode)))
+          (Ref (Array String))
+          (Ref (Array Int))
+          (Ref String)]
+         Bool))
 
   (private parameter-names)
   (hidden parameter-names)
@@ -630,28 +921,36 @@ at depth zero a form is code, above zero it is data and only `unquote` and
   (defn check [node env quasi]
     (if (Int.> quasi 0)
       (check-quoted node env quasi)
-      ;; `data-shape` already classifies every variant, so the walk dispatches
-      ;; on the shape rather than re-matching the form. Container children are
-      ;; copied out before recursing: branches of one `match-ref` share a
-      ;; lifetime, and passing a borrow from one branch into a call does not
-      ;; survive that.
-      (let [kind (data-shape node)]
+      ;; `node-kind` already classifies every variant, so the walk dispatches on
+      ;; the tag rather than re-matching the form. Container children are copied
+      ;; out before recursing: branches of one `match-ref` share a lifetime, and
+      ;; passing a borrow from one branch into a call does not survive that.
+      (let [kind (node-kind node)]
         (cond
-          (Int.= kind (CtShape.leaf (CtShape.i-symbol)))
+          (CtShape.equal? kind (CtShape.leaf (CtShape.i-symbol)))
             (match (symbol-key node)
               (Maybe.Just name)
                 (match (lookup env &name)
                   (Maybe.Just shape) shape
                   (Maybe.Nothing) (CtShape.top))
               (Maybe.Nothing) (CtShape.top))
-          (Int.= kind (CtShape.leaf (CtShape.i-list)))
+          (CtShape.equal? kind (CtShape.leaf (CtShape.i-list)))
             (let [items (items-of node)] (check-list node &items env))
           (or
-            (Int.= kind (CtShape.leaf (CtShape.i-array)))
+            (CtShape.equal? kind (CtShape.leaf (CtShape.i-array)))
             (or
-              (Int.= kind (CtShape.leaf (CtShape.i-static-array)))
-              (Int.= kind (CtShape.leaf (CtShape.i-dictionary)))))
-            (let-do [items (items-of node)] (check-each &items env 0) kind)
+              (CtShape.equal? kind (CtShape.leaf (CtShape.i-static-array)))
+              (CtShape.equal? kind (CtShape.leaf (CtShape.i-dictionary)))))
+            (let-do [items (items-of node)
+                     elements (the (Array Int) [])]
+              (for [i 0 (Array.length &items)]
+                (set! elements
+                      (Array.push-back elements
+                                       (check (Box.peek (Array.unsafe-nth &items
+                                                                          i))
+                                              env
+                                              0))))
+              (CtShape.container-of (container-index node) &elements))
           kind))))
 
   (defn check-each [items env from]
@@ -659,9 +958,9 @@ at depth zero a form is code, above zero it is data and only `unquote` and
       (ignore (check (Box.peek (Array.unsafe-nth items i)) env 0))))
 
   (defn check-quoted [node env quasi]
-    (let [kind (data-shape node)]
+    (let [kind (node-kind node)]
       (cond
-        (Int.= kind (CtShape.leaf (CtShape.i-list)))
+        (CtShape.equal? kind (CtShape.leaf (CtShape.i-list)))
           (let [items (items-of node)
                 n (Array.length &items)]
             (if (Int.= 0 n)
@@ -678,20 +977,77 @@ at depth zero a form is code, above zero it is data and only `unquote` and
                            (Int.dec quasi))
                     ;; a nested quasiquote needs one more unquote to escape
                     (= &name "quasiquote")
-                    (do (quote-each &items env (Int.inc quasi) 1) kind)
-                    (do (quote-each &items env quasi 0) kind))
-                (Maybe.Nothing) (do (quote-each &items env quasi 0) kind))))
+                    ;; annotated for the reference compiler; see scan-spine's
+                    ;; macro-error arm
+                    (let-do [inner (the (Array Int)
+                                        (quote-each &items env (Int.inc quasi) 1))]
+                      (ignore inner)
+                      kind)
+                    (quoted-container node &items env quasi))
+                (Maybe.Nothing) (quoted-container node &items env quasi))))
         (or
-          (Int.= kind (CtShape.leaf (CtShape.i-array)))
+          (CtShape.equal? kind (CtShape.leaf (CtShape.i-array)))
           (or
-            (Int.= kind (CtShape.leaf (CtShape.i-static-array)))
-            (Int.= kind (CtShape.leaf (CtShape.i-dictionary)))))
-          (let-do [items (items-of node)] (quote-each &items env quasi 0) kind)
+            (CtShape.equal? kind (CtShape.leaf (CtShape.i-static-array)))
+            (CtShape.equal? kind (CtShape.leaf (CtShape.i-dictionary)))))
+          (let [items (items-of node)] (quoted-container node &items env quasi))
         kind)))
 
+  (doc quoted-container "the shape of a quoted container: its tag, holding what
+its children are.
+
+A splice is the one case this cannot do. `unquote-splicing` inserts elements
+rather than one element, so the length and the order of what follows are not
+known here, and the container falls back to saying only what kind it is.")
+  (defn quoted-container [node items env quasi]
+    (let-do [elements (quote-each items env quasi 0)
+             spliced false]
+      (for [i 0 (Array.length items)]
+        (let [child (Box.peek (Array.unsafe-nth items i))]
+          (when (CtShape.equal? (node-kind child)
+                                (CtShape.leaf (CtShape.i-list)))
+            (let [inner (items-of child)]
+              (match (head-key &inner)
+                (Maybe.Just head)
+                  (when (= &head "unquote-splicing") (set! spliced true))
+                (Maybe.Nothing) ())))))
+      (if spliced
+        ;; what is written before the splice is there whatever the splice turns
+        ;; out to be, so the prefix is kept and the rest is any number of forms
+        (CtShape.chain-of (container-index node)
+                          &(prefix-before-splice items &elements)
+                          (CtShape.every-of (container-index node) (CtShape.top)))
+        (CtShape.container-of (container-index node) &elements))))
+
+  (private prefix-before-splice)
+  (hidden prefix-before-splice)
+  (defn prefix-before-splice [items elements]
+    (let-do [out (the (Array Int) [])
+             stop false]
+      (for [i 0 (Array.length items)]
+        (let [child (Box.peek (Array.unsafe-nth items i))]
+          (unless-do stop
+            (when (CtShape.equal? (node-kind child)
+                                  (CtShape.leaf (CtShape.i-list)))
+              (let [inner (items-of child)]
+                (match (head-key &inner)
+                  (Maybe.Just head)
+                    (when (= &head "unquote-splicing") (set! stop true))
+                  (Maybe.Nothing) ())))
+            (unless stop
+              (when (Int.< i (Array.length elements))
+                (set! out (Array.push-back out @(Array.unsafe-nth elements i))))))))
+      out))
+
   (defn quote-each [items env quasi from]
-    (for [i from (Array.length items)]
-      (ignore (check-quoted (Box.peek (Array.unsafe-nth items i)) env quasi))))
+    (let-do [elements (the (Array Int) [])]
+      (for [i from (Array.length items)]
+        (set! elements
+              (Array.push-back elements
+                               (check-quoted (Box.peek (Array.unsafe-nth items i))
+                                             env
+                                             quasi))))
+      elements))
 
   (defn check-list [node items env]
     (let [n (Array.length items)]
@@ -742,14 +1098,7 @@ at depth zero a form is code, above zero it is data and only `unquote` and
         (or (= name "let") (= name "let-do"))
         (check-let items env)
         (or (= name "fn") (= name "λ"))
-        (let-do [inner @env]
-          (when (Int.> n 1)
-            (let [names (parameter-names (Box.peek (Array.unsafe-nth items 1)))]
-              (for [i 0 (Array.length &names)]
-                (set! inner
-                      (bind &inner (Array.unsafe-nth &names i) (CtShape.top))))))
-          (check-each items &inner 2)
-          (CtShape.leaf (CtShape.i-closure)))
+        (check-lambda items env)
         (= name "cond")
         (check-cond items env)
         (= name "case")
@@ -781,11 +1130,22 @@ at depth zero a form is code, above zero it is data and only `unquote` and
         ;; pass models; its subforms are still walked so findings inside are
         ;; not lost
         (do (check-each items env 1) (CtShape.top))
+        ;; `list` and `array` build a container out of their arguments, so what
+        ;; the container holds is what the arguments are. Without this a
+        ;; constraint on the elements has nothing to bite on: every constructed
+        ;; list would be merely a list
+        (Int.>= (construction-index name) 0)
+        (check-construction items env name)
+        ;; a local holding a function: what it takes and answers is in its own
+        ;; shape, so the call is checked against that rather than against a table
+        ;; that has nothing to say about a binding
+        (local-function? env name)
+        (check-local-call items env name)
         ;; an ordinary call
         (do
           (check-arguments items env name)
           (check-arity node items name)
-          (builtin-range name)))))
+          (call-range name)))))
 
   (defn check-short-circuit [items env name]
     (let-do [result (CtShape.bottom)
@@ -894,6 +1254,119 @@ the walker handles itself rather than through the builtin table.")
               (set! b (Int.+ b 2))))))
       (check-do items &inner 2)))
 
+  (doc check-argument!
+    "records what one argument position means: the coverage it
+adds, and the contradiction if there is one. Both kinds of callee come through
+here, so a call to a local function reads the same as a call to a builtin.")
+  (defn check-argument! [argument actual index name required]
+    (do
+      (unless *ct-quiet*
+        (set! *ct-argument-positions* (Int.inc *ct-argument-positions*)))
+      (when-do (and (not *ct-quiet*)
+                    (not (CtShape.equal? required (CtShape.top))))
+        (set! *ct-constrained-positions* (Int.inc *ct-constrained-positions*))
+        (unless (CtShape.equal? actual (CtShape.top))
+          (set! *ct-decided-positions* (Int.inc *ct-decided-positions*)))
+        (when *ct-explain*
+          (Array.push-back! &*ct-observations*
+                            (CtObservation.init @&*ct-current-definition*
+                                                (node-line argument)
+                                                @name
+                                                (fmt "argument %d" index)
+                                                actual
+                                                required))))
+      ;; ⊥ on the left is Lemma 4.12 case (a): unreachable code relates to
+      ;; anything, so it is never a contradiction
+      (when (and (not (CtShape.bottom? actual))
+                 (CtShape.bottom? (CtShape.intersection actual required)))
+        (record! argument
+                 @"shape"
+                 (fmt
+                   "%s argument %d is %s, which can never be %s"
+                   name
+                   index
+                   &(CtShape.render actual)
+                   &(CtShape.render required))))))
+
+  (doc construction-index "the container tag a builtin builds, or -1 when it
+builds nothing.")
+  (defn construction-index [name]
+    (match (dynamic-key name)
+      (Maybe.Nothing) -1
+      (Maybe.Just n)
+        (cond (= &n "list") (CtShape.i-list) (= &n "array") (CtShape.i-array) -1)))
+
+  (doc check-construction "checks the arguments of a container constructor and
+answers with the container holding them.")
+  (defn check-construction [items env name]
+    (let-do [n (Array.length items)
+             elements (the (Array Int) [])]
+      (for [i 1 n]
+        (let-do [argument (Box.peek (Array.unsafe-nth items i))
+                 actual (check argument env 0)
+                 at (Int.dec i)]
+          (check-argument! argument actual at name (call-domain name at))
+          (set! elements (Array.push-back elements actual))))
+      (CtShape.container-of (construction-index name) &elements)))
+
+  (doc check-lambda "the shape of a lambda: a function from the shapes its body
+forces on its parameters to the shape its body answers with.
+
+The domains are read off the spine, the same rule a definition's are: a use the
+body might not reach says nothing about the argument. On a backend without arrows
+this is `Closure` and everything below it is dropped.")
+  (defn check-lambda [items env]
+    (let-do [n (Array.length items)
+             names (if (Int.> n 1)
+               (parameter-names (Box.peek (Array.unsafe-nth items 1)))
+               (the (Array String) []))
+             unconstrained (CtShape.top)
+             domains (Array.replicate (Array.length &names) &unconstrained)
+             inner @env]
+      (let-do [reached (the Bool (scan-spine-each items 2 &names &domains))]
+        (ignore reached))
+      ;; a parameter required to be two disjoint things at once makes the lambda
+      ;; uncallable, which is a claim about the lambda and not about a call to it
+      (for [i 0 (Array.length &domains)]
+        (when-do (CtShape.bottom? @(Array.unsafe-nth &domains i))
+          (set! *ct-summary-contradictory* (Int.inc *ct-summary-contradictory*))
+          (Array.aset! &domains i (CtShape.top))))
+      (for [i 0 (Array.length &names)]
+        (set! inner
+              (bind &inner
+                    (Array.unsafe-nth &names i)
+                    @(Array.unsafe-nth &domains i))))
+      (CtShape.closure-of &domains (check-do items &inner 2))))
+
+  (doc local-function?
+    "whether a name is a local binding whose shape says what it
+takes. A builtin wins over a binding, so one of those is never this.")
+  (defn local-function? [env name]
+    (if (builtin? name)
+      false
+      (match (lookup env name)
+        (Maybe.Nothing) false
+        (Maybe.Just shape) (CtShape.closure? shape))))
+
+  (doc check-local-call
+    "checks a call to a local function against its own domain,
+and answers with its codomain.")
+  (defn check-local-call [items env name]
+    (let-do [callee (match (lookup env name)
+               (Maybe.Just shape) shape
+               (Maybe.Nothing) (CtShape.top))
+             n (Array.length items)]
+      (for [i 1 n]
+        (let-do [argument (Box.peek (Array.unsafe-nth items i))
+                 actual (check argument env 0)
+                 index (Int.dec i)]
+          (check-argument! argument
+                           actual
+                           index
+                           name
+                           (CtShape.closure-domain callee index))))
+      (CtShape.closure-result callee)))
+
   (defn check-arguments [items env name]
     ;; a compile-time definition the program wrote wins over a builtin of the
     ;; same spelling, because that is what the name resolves to when the body
@@ -903,34 +1376,8 @@ the walker handles itself rather than through the builtin table.")
       (for [i 1 n]
         (let-do [argument (Box.peek (Array.unsafe-nth items i))
                  actual (check argument env 0)
-                 index (Int.dec i)
-                 required (builtin-domain name index)]
-          (set! *ct-argument-positions* (Int.inc *ct-argument-positions*))
-          (when-do (Int./= required (CtShape.top))
-            (set! *ct-constrained-positions*
-                  (Int.inc *ct-constrained-positions*))
-            (when (Int./= actual (CtShape.top))
-              (set! *ct-decided-positions* (Int.inc *ct-decided-positions*)))
-            (when *ct-explain*
-              (Array.push-back! &*ct-observations*
-                                (CtObservation.init @&*ct-current-definition*
-                                                    (node-line argument)
-                                                    @name
-                                                    (fmt "argument %d" index)
-                                                    actual
-                                                    required))))
-          ;; ⊥ on the left is Lemma 4.12 case (a): unreachable code relates to
-          ;; anything, so it is never a contradiction
-          (when (and (not (CtShape.bottom? actual))
-                     (CtShape.bottom? (CtShape.intersection actual required)))
-            (record! argument
-                     @"shape"
-                     (fmt
-                       "%s argument %d is %s, which can never be %s"
-                       name
-                       index
-                       &(CtShape.render actual)
-                       &(CtShape.render required))))))))
+                 index (Int.dec i)]
+          (check-argument! argument actual index name (call-domain name index))))))
 
   (private exact-definition)
   (hidden exact-definition)
@@ -943,18 +1390,22 @@ the walker handles itself rather than through the builtin table.")
             (set! found (Maybe.Just @entry)))))
       found))
 
-  (doc known-definition "resolves a name the way the expander would: a short
-name written inside a module means that module's definition when it has one,
-and only otherwise the top-level one. Registering module-scoped definitions
-under their short name as well would let `Map.str` shadow the builtin `str`
-for the whole program.")
-  (defn known-definition [name]
-    (if (String.empty? &*ct-current-module*)
-      (exact-definition name)
-      (let [qualified (String.concat &[@&*ct-current-module* @"." @name])]
-        (match (exact-definition &qualified)
-          (Maybe.Just found) (Maybe.Just found)
-          (Maybe.Nothing) (exact-definition name)))))
+  (doc known-definition "resolves a name the way the evaluator resolves it: by
+the name as written, against the definitions registered under that exact path.
+
+A bare name inside a module does NOT mean that module's definition. The body of
+a `defndynamic` is evaluated in the lexical environment it was written in plus
+the global one, and the module's own bindings live under their qualified paths,
+so an unqualified call reaches the top-level definition and the module's is
+reachable only qualified. That is why library code writes its own recursion out
+in full: `OrderedTree.put` calls `(OrderedTree.put …)`, and `(length (car t))`
+beside it means the builtin.
+
+Verified against the reference evaluator on 2026-09-12: with a global `pick` of
+two arguments and an `M.pick` of one, `(M.pick 7)` answers 7, which is the global
+one. Assuming the other precedence made this pass reject a correct call in
+`carpentry-org/match-utils`, which is the defect this note replaces.")
+  (defn known-definition [name] (exact-definition name))
 
   (doc builtin? "whether the compile-time evaluator answers to this name
 itself.
@@ -1173,6 +1624,47 @@ arity-checked against a definition that cannot receive the call.")
   (hidden rest-marker?)
   (defn rest-marker? [name] (String.starts-with? name ":"))
 
+  (doc special-form-minimum "how many forms a special form has to hold at the
+least, or 0 where this makes no claim.
+
+A minimum is the part of a form's grammar that cannot drift: a form with too few
+children is malformed in any version of the expander, while what may follow the
+ones required is where the variadic subtleties live. So this says only that, and
+`carp-expand` stays the one place that knows the rest.")
+  (defn special-form-minimum [name]
+    (cond
+      (= name "if") 3
+      (= name "set!") 3
+      (= name "def") 3
+      (= name "defn") 4
+      (= name "let") 3
+      (= name "while") 3
+      0))
+
+  (doc check-emitted! "checks the syntax a macro answers with.
+
+This is a claim about the macro's output rather than about the macro as a
+program, and it is deliberately the narrowest one available: the form has to
+start with a known special form, its length has to be fixed — a splice makes it
+unknown and nothing is claimed — and it has to be shorter than that form can ever
+be.")
+  (defn check-emitted! [node shape]
+    (match (CtShape.head-spelling shape)
+      (Maybe.Nothing) ()
+      (Maybe.Just head)
+        (let [minimum (special-form-minimum &head)
+              length (CtShape.form-length shape)]
+          (when (and (Int.> minimum 0)
+                     (and (Int.>= length 0) (Int.< length minimum)))
+            (record! node
+                     @"syntax"
+                     (fmt
+                       "emits (%s …) holding %d form(s), and %s is never well formed with fewer than %d"
+                       &head
+                       length
+                       &head
+                       minimum))))))
+
   (doc check-definition "checks one `defmacro` or `defndynamic` body under an
 environment holding its parameters.")
   (defn check-definition [items macro?]
@@ -1193,8 +1685,12 @@ environment holding its parameters.")
                             name
                             (if seen-rest (CtShape.listy) parameter-shape))))))))
       (let-do [constrained-before *ct-constrained-positions*
-               decided-before *ct-decided-positions*]
-        (check-each items &env 3)
+               decided-before *ct-decided-positions*
+               answered (check-do items &env 3)]
+        ;; a macro's body answers with the syntax it emits, and that syntax has to
+        ;; be something the expander can take
+        (when macro?
+          (check-emitted! (Box.peek (Array.unsafe-nth items 0)) answered))
         (when (Int.> *ct-constrained-positions* constrained-before)
           (set! *ct-definitions-constrained*
                 (Int.inc *ct-definitions-constrained*)))
@@ -1215,6 +1711,429 @@ environment holding its parameters.")
             (set! rest? true)
             (unless rest? (set! fixed (Int.inc fixed))))))
       (CtDefinition.init @"" fixed rest? macro?)))
+
+  ;; ---------------------------------------------------------- summaries
+
+  (private position-of)
+  (hidden position-of)
+  (defn position-of [names name]
+    (let-do [found (Maybe.Nothing)
+             n (Array.length names)]
+      (for [i 0 n]
+        (when (and (Maybe.nothing? &found) (= (Array.unsafe-nth names i) name))
+          (set! found (Maybe.Just i))))
+      found))
+
+  (private hide)
+  (hidden hide)
+  (doc hide "a parameter list with one name struck out. A local binding that
+shadows a parameter hides it: a use below the binding is a use of the local and
+says nothing about the argument.")
+  (defn hide [name names]
+    (let-do [kept (the (Array String) [])
+             n (Array.length names)]
+      (for [i 0 n]
+        (let [candidate (Array.unsafe-nth names i)]
+          (set! kept
+                (Array.push-back kept (if (= candidate name) @"" @candidate)))))
+      kept))
+
+  (private stored-items)
+  (hidden stored-items)
+  (defn stored-items [index]
+    (items-of (Box.peek (Array.unsafe-nth &*ct-bodies* index))))
+
+  (private stored-head)
+  (hidden stored-head)
+  (defn stored-head [index]
+    (let [items (stored-items index)]
+      (match (head-key &items) (Maybe.Just name) name (Maybe.Nothing) @"")))
+
+  (private fixed-parameters)
+  (hidden fixed-parameters)
+  (doc fixed-parameters "the names bound positionally, in order. The rest
+parameter and anything after it is left out: an argument’s position in a rest
+list is not its position in the call.")
+  (defn fixed-parameters [items]
+    (let-do [names (if (Int.> (Array.length items) 2)
+               (parameter-names (Box.peek (Array.unsafe-nth items 2)))
+               (the (Array String) []))
+             kept (the (Array String) [])
+             stop false]
+      (for [i 0 (Array.length &names)]
+        (let [name (Array.unsafe-nth &names i)]
+          (if (rest-marker? name)
+            (set! stop true)
+            (unless stop (set! kept (Array.push-back kept @name))))))
+      kept))
+
+  (private defers-arguments?)
+  (hidden defers-arguments?)
+  (doc defers-arguments? "whether a builtin takes its arguments unevaluated. A
+use inside one is not a use: the syntax may never run.")
+  (defn defers-arguments? [name]
+    (match (dynamic-key name)
+      (Maybe.Nothing) false
+      (Maybe.Just n) (one-of? &n &[@"with-test-internal"])))
+
+  (private macro-call?)
+  (hidden macro-call?)
+  (defn macro-call? [name]
+    (if (builtin? name)
+      false
+      (match (known-definition-index name)
+        (Maybe.Nothing) false
+        (Maybe.Just index)
+          @(CtDefinition.macro? (Array.unsafe-nth &*ct-definitions* index)))))
+
+  (private constrain-argument!)
+  (hidden constrain-argument!)
+  (doc constrain-argument! "records what a call forces on a parameter passed
+to it bare. Only a bare symbol is recorded: `(car (f x))` constrains what `f`
+answers with, not `x`.")
+  (defn constrain-argument! [argument name index params domains]
+    (match (symbol-key argument)
+      (Maybe.Nothing) ()
+      (Maybe.Just spelling)
+        (match (position-of params &spelling)
+          (Maybe.Nothing) ()
+          (Maybe.Just position)
+            (let [required (call-domain name index)]
+              (unless (CtShape.equal? required (CtShape.top))
+                (let-do [current @(Array.unsafe-nth domains position)
+                         refined (CtShape.intersection current required)]
+                  (Array.aset! domains position refined)))))))
+
+  (doc scan-spine "walks the part of a form that is certain to be evaluated,
+intersecting into `domains` what each call forces on a parameter it receives
+bare. Answers whether evaluation can reach past this form: a form that can
+only answer ⊥ ends the sequence it sits in, and a use after it says nothing,
+because it is never reached.")
+  (defn scan-spine [node params domains]
+    (if (not (CtShape.equal? (node-kind node) (CtShape.leaf (CtShape.i-list))))
+      true
+      (let [items (items-of node)]
+        (if (Int.= 0 (Array.length &items))
+          true
+          (match (head-key &items)
+            ;; a computed head: the head and every argument are evaluated
+            (Maybe.Nothing)
+            (scan-spine-each &items 0 params domains)
+            (Maybe.Just name)
+            (cond
+              ;; quoted syntax is data, and an unquote inside it is code the
+              ;; expansion runs, not code this body runs
+              (or (= &name "quote") (= &name "quasiquote"))
+              true
+              ;; only the test of a conditional is certain to run. `cond`
+              ;; always runs its first test; `case` always evaluates its
+              ;; subject
+              (or (= &name "if")
+                  (or (= &name "when")
+                      (or (= &name "unless")
+                          (or (= &name "cond")
+                              (or (= &name "case") (= &name "while"))))))
+              (if (Int.> (Array.length &items) 1)
+                (scan-spine (Box.peek (Array.unsafe-nth &items 1))
+                            params
+                            domains)
+                true)
+              ;; a short circuit runs its first operand and decides the rest
+              (or (= &name "and") (= &name "or"))
+              (if (Int.> (Array.length &items) 1)
+                (scan-spine (Box.peek (Array.unsafe-nth &items 1))
+                            params
+                            domains)
+                true)
+              (= &name "do")
+              (scan-spine-each &items 1 params domains)
+              (or (= &name "let") (= &name "let-do"))
+              (scan-spine-let &items params domains)
+              ;; a lambda body runs when the lambda is called, which may be
+              ;; never and is in any case not here
+              (or (= &name "fn") (= &name "λ"))
+              true
+              (= &name "for")
+              (scan-spine-for &items params domains)
+              (= &name "set!")
+              (if (Int.> (Array.length &items) 2)
+                (scan-spine (Box.peek (Array.unsafe-nth &items 2))
+                            params
+                            domains)
+                true)
+              (= &name "macro-error")
+              ;; the annotation is for the reference compiler, which cannot
+              ;; infer `ignore`'s binding type for this call and fails emit with
+              ;; an unresolved generic in Macros.carp; metacarp types it fine
+              (let-do [reached (the Bool
+                                    (scan-spine-each &items 1 params domains))]
+                (ignore reached)
+                false)
+              ;; a definition is not an expression this body evaluates
+              (definition-form? &name)
+              true
+              ;; a special form the scanner does not model says nothing,
+              ;; rather than being read as a call whose arguments all run
+              (special-form? &name)
+              true
+              (scan-spine-call &items params domains &name)))))))
+
+  (defn scan-spine-each [items from params domains]
+    (let-do [n (Array.length items)
+             continues true
+             i from]
+      (while-do (and continues (Int.< i n))
+        (set! continues
+              (scan-spine (Box.peek (Array.unsafe-nth items i)) params domains))
+        (set! i (Int.inc i)))
+      continues))
+
+  (defn scan-spine-let [items params domains]
+    (let-do [n (Array.length items)
+             visible @params
+             continues true]
+      (when (Int.> n 1)
+        (let-do [bindings (items-of (Box.peek (Array.unsafe-nth items 1)))
+                 bn (Array.length &bindings)
+                 b 0]
+          (while-do (and continues (Int.< (Int.inc b) bn))
+            (set! continues
+                  (scan-spine
+                    (Box.peek (Array.unsafe-nth &bindings (Int.inc b)))
+                    &visible
+                    domains))
+            (match (symbol-key (Box.peek (Array.unsafe-nth &bindings b)))
+              (Maybe.Just bound) (set! visible (hide &bound &visible))
+              (Maybe.Nothing) ())
+            (set! b (Int.+ b 2)))))
+      (if continues (scan-spine-each items 2 &visible domains) false)))
+
+  (defn scan-spine-for [items params domains]
+    ;; the bounds are evaluated once before the loop; the body may run zero
+    ;; times
+    (if (Int.> (Array.length items) 1)
+      (let [bindings (items-of (Box.peek (Array.unsafe-nth items 1)))]
+        (scan-spine-each &bindings 1 params domains))
+      true))
+
+  (defn scan-spine-call [items params domains name]
+    (if (or (defers-arguments? name) (macro-call? name))
+      true
+      (let-do [n (Array.length items)
+               continues true]
+        ;; applicative order: every argument is evaluated before the call
+        (for [i 1 n]
+          (let-do [argument (Box.peek (Array.unsafe-nth items i))]
+            (constrain-argument! argument name (Int.dec i) params domains)
+            (unless (scan-spine argument params domains) (set! continues false))))
+        (and continues (not (CtShape.bottom? (call-range name)))))))
+
+  (private collect-callees)
+  (hidden collect-callees)
+  (doc collect-callees "every compile-time definition a body mentions in head
+position, conditional or not. The graph is only used to find the cycles, so it
+over-approximates on purpose.")
+  (defn collect-callees [node out]
+    (let-do [items (items-of node)]
+      (when (CtShape.equal? (node-kind node) (CtShape.leaf (CtShape.i-list)))
+        (match (head-key &items)
+          (Maybe.Nothing) ()
+          (Maybe.Just name)
+            (unless (builtin? &name)
+              (match (known-definition-index &name)
+                (Maybe.Just callee) (Array.push-back! out callee)
+                (Maybe.Nothing) ()))))
+      (for [i 0 (Array.length &items)]
+        (collect-callees (Box.peek (Array.unsafe-nth &items i)) out))))
+
+  (private dependency-order)
+  (hidden dependency-order)
+  (doc dependency-order "the definitions ordered callees first, cycles kept
+together. Summaries derived in this order reach a fixed point in one pass
+wherever the call graph is acyclic.")
+  (defn dependency-order []
+    (let-do [n (Array.length &*ct-definitions*)
+             edges (the (Array (Array Int)) [])
+             order (the (Array Int) [])]
+      (for [i 0 n]
+        (let-do [row (the (Array Int) [])]
+          (set! *ct-current-module*
+                @(Array.unsafe-nth &*ct-definition-modules* i))
+          (collect-callees (Box.peek (Array.unsafe-nth &*ct-bodies* i)) &row)
+          (set! edges (Array.push-back edges row))))
+      (let [components (IntGraph.strong-components &(IntGraph.init edges))]
+        (for [c 0 (Array.length &components)]
+          (let [component (Array.unsafe-nth &components c)]
+            (for [k 0 (Array.length component)]
+              (set! order
+                    (Array.push-back order @(Array.unsafe-nth component k)))))))
+      order))
+
+  (private summarizable?)
+  (hidden summarizable?)
+  (doc summarizable? "whether a stored definition is a compile-time function.
+A macro is not, for the reason `CtSummary` gives; a `defdynamic` is a value
+rather than something callable.")
+  (defn summarizable? [index]
+    (and
+      (not @(CtDefinition.macro? (Array.unsafe-nth &*ct-definitions* index)))
+      (/= &(stored-head index) "defdynamic")))
+
+  (private compute-domain)
+  (hidden compute-domain)
+  (doc compute-domain "the shapes the body forces on its parameters, read off
+the uses it is certain to reach.")
+  (defn compute-domain [index]
+    (let-do [items (stored-items index)
+             params (fixed-parameters &items)
+             count (Array.length &params)
+             top (CtShape.top)
+             domains (Array.replicate count &top)]
+      (set! *ct-current-module*
+            @(Array.unsafe-nth &*ct-definition-modules* index))
+      (set! *ct-current-definition*
+            @(CtDefinition.name (Array.unsafe-nth &*ct-definitions* index)))
+      ;; annotated for the reference compiler; see scan-spine's macro-error arm
+      (let-do [reached (the Bool (scan-spine-each &items 3 &params &domains))]
+        (ignore reached))
+      ;; a parameter required to be two disjoint things at once makes the
+      ;; function uncallable. That is a claim about the callee, not about any
+      ;; call site, and propagating ⊥ would reject every call it has. The pass
+      ;; does not report it yet, so the domain is dropped and counted.
+      (for [i 0 count]
+        (when-do (CtShape.bottom? @(Array.unsafe-nth &domains i))
+          (set! *ct-summary-contradictory* (Int.inc *ct-summary-contradictory*))
+          (Array.aset! &domains i (CtShape.top))))
+      domains))
+
+  (private compute-result)
+  (hidden compute-result)
+  (doc compute-result "the shape the body answers with, under parameters typed
+by the domain its call sites are checked against.
+
+Typing the parameters by the domain is the refinement step: a call passing
+something outside it is rejected at the call site, so the body only has to
+answer for the arguments that survive.")
+  (defn compute-result [index domains]
+    (let-do [items (stored-items index)
+             params (fixed-parameters &items)
+             env (the (Array CtShapeBinding) [])
+             names (if (Int.> (Array.length &items) 2)
+               (parameter-names (Box.peek (Array.unsafe-nth &items 2)))
+               (the (Array String) []))
+             seen-rest false]
+      (set! *ct-current-module*
+            @(Array.unsafe-nth &*ct-definition-modules* index))
+      (for [i 0 (Array.length &params)]
+        (set! env
+              (bind &env
+                    (Array.unsafe-nth &params i)
+                    @(Array.unsafe-nth domains i))))
+      ;; a rest parameter is a sequence, as it is when the body is checked
+      (for [i 0 (Array.length &names)]
+        (let [name (Array.unsafe-nth &names i)]
+          (if (rest-marker? name)
+            (set! seen-rest true)
+            (when seen-rest (set! env (bind &env name (CtShape.listy)))))))
+      (check-do &items &env 3)))
+
+  (private domains-differ?)
+  (hidden domains-differ?)
+  (doc domains-differ? "whether two domain vectors describe different shapes.
+Element-wise, because a shape is not an identity: on the algebra backend two ids
+can mean the same thing, and a vector compared by identity would report a change
+every round and never converge.")
+  (defn domains-differ? [a b]
+    (if (Int./= (Array.length a) (Array.length b))
+      true
+      (let-do [answer false]
+        (for [i 0 (Array.length a)]
+          (unless (CtShape.equal? @(Array.unsafe-nth a i)
+                                  @(Array.unsafe-nth b i))
+            (set! answer true)))
+        answer)))
+
+  (doc summary-depth "how much structure a summary keeps. A fixed point over
+summaries is not guaranteed to converge — a function that wraps its result grows
+a level a round — so what it carries is cut off here.")
+  (defn summary-depth [] 3)
+
+  (private widened-domain)
+  (hidden widened-domain)
+  (defn widened-domain [domain]
+    (let-do [out (the (Array Int) [])]
+      (for [i 0 (Array.length domain)]
+        (set! out
+              (Array.push-back out
+                               (CtShape.widen @(Array.unsafe-nth domain i)
+                                              (summary-depth)))))
+      out))
+
+  (private refine!)
+  (hidden refine!)
+  (doc refine! "recomputes one summary, answering whether it moved.")
+  (defn refine! [index]
+    (let-do [changed false]
+      (when (summarizable? index)
+        (let-do [before-result (summary-result-at index)
+                 before-domain (summary-domain-array index)
+                 raw-domain (compute-domain index)
+                 domain (widened-domain &raw-domain)
+                 result (CtShape.widen (compute-result index &domain)
+                                       (summary-depth))]
+          (when (or
+              (not (CtShape.equal? result before-result))
+              (domains-differ? &domain &before-domain))
+            (set! changed true))
+          (Array.aset! &*ct-summaries* index (CtSummary.init domain result))))
+      changed))
+
+  (private tally-summaries!)
+  (hidden tally-summaries!)
+  (defn tally-summaries! []
+    (let-do [n (Array.length &*ct-summaries*)]
+      (for [i 0 n]
+        (when-do (summarizable? i)
+          (set! *ct-summary-functions* (Int.inc *ct-summary-functions*))
+          (unless (CtShape.equal? (summary-result-at i) (CtShape.top))
+            (set! *ct-summary-results* (Int.inc *ct-summary-results*)))
+          (let [domain (summary-domain-array i)]
+            (for [k 0 (Array.length &domain)]
+              (unless (CtShape.equal? @(Array.unsafe-nth &domain k)
+                                      (CtShape.top))
+                (set! *ct-summary-domains* (Int.inc *ct-summary-domains*)))))))))
+
+  (doc compute-summaries! "derives a summary for every compile-time function,
+callees first, and iterates until nothing moves.
+
+Every summary starts at ⊤, which claims nothing, and every step derives a
+summary from summaries that are already sound, so every intermediate state is
+sound as well. That is what lets the iteration stop on a round count rather
+than on a proof of convergence: stopping early loses precision and nothing
+else. Cycles need no special case for the same reason.
+
+Must run after `collect` has seen every module and before anything is
+checked.")
+  (defn compute-summaries! []
+    (let-do [n (Array.length &*ct-definitions*)
+             empty-domain (the (Array Int) [])]
+      (set! *ct-summaries*
+            (Array.replicate n &(CtSummary.init @&empty-domain (CtShape.top))))
+      (when (and *ct-summaries-enabled* (Int.> n 0))
+        (let-do [order (dependency-order)
+                 changed true
+                 round 0]
+          (set! *ct-quiet* true)
+          (while-do (and changed (Int.< round 6))
+            (set! changed false)
+            (for [k 0 (Array.length &order)]
+              (when (refine! @(Array.unsafe-nth &order k)) (set! changed true)))
+            (set! round (Int.inc round)))
+          (set! *ct-quiet* false)
+          (set! *ct-summary-rounds* round)
+          (set! *ct-current-module* @"")
+          (set! *ct-current-definition* @"")
+          (tally-summaries!)))))
 
   (doc collect "records every compile-time definition in a module, descending
 into `defmodule`. A definition is registered under its full path; only a
@@ -1241,15 +2160,20 @@ top-level one is also reachable unqualified.")
                 (when (Int.> (Array.length &items) 1)
                   (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
                     (Maybe.Just short)
-                      (let [template (definition-of &items (= &head "defmacro"))
-                            path (if (String.empty? prefix)
-                              @&short
-                              (String.concat &[@prefix @"." @&short]))]
+                      (let-do [template (definition-of &items
+                                                       (= &head "defmacro"))
+                               path (if (String.empty? prefix)
+                                 @&short
+                                 (String.concat &[@prefix @"." @&short]))]
                         (Array.push-back! &*ct-definitions*
                                           (CtDefinition.init path
                                                              @(CtDefinition.arity &template)
                                                              @(CtDefinition.rest? &template)
-                                                             @(CtDefinition.macro? &template))))
+                                                             @(CtDefinition.macro? &template)))
+                        ;; the body and the module it was written in, so the
+                        ;; summary pass can walk it without the module tree
+                        (Array.push-back! &*ct-bodies* (Box.init @node))
+                        (Array.push-back! &*ct-definition-modules* @prefix))
                     (Maybe.Nothing) ()))
               ())))))
 
@@ -1295,6 +2219,7 @@ between files resolve.")
     (let-do [forms (SurfaceModule.forms module)]
       (for [i 0 (Array.length forms)]
         (collect (Box.peek (Array.unsafe-nth forms i)) ""))
+      (compute-summaries!)
       (for [i 0 (Array.length forms)]
         (check-module (Box.peek (Array.unsafe-nth forms i)) ""))))
 
@@ -1314,6 +2239,7 @@ resolves. Modules are checked in the order given.")
         (let [forms (SurfaceModule.forms (Array.unsafe-nth modules i))]
           (for [f 0 (Array.length forms)]
             (collect (Box.peek (Array.unsafe-nth forms f)) ""))))
+      (compute-summaries!)
       (for [i 0 (Array.length modules)]
         (let [forms (SurfaceModule.forms (Array.unsafe-nth modules i))]
           (for [f 0 (Array.length forms)]
