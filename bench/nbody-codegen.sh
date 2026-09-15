@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guard generated-code quality for the array-access regression in n-body.
+# Check n-body output parity, array-data access, and executable runtime.
 # Correctness and stable data-pointer materialization gate the script; runtime
 # is reported rather than thresholded because shared CI machines are noisy.
 set -euo pipefail

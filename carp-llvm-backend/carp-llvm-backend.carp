@@ -1,34 +1,17 @@
-;; carp-llvm-backend — spike backend: lowers a BackendModule to LLVM IR
-;; through the carpentry-org/llvm bindings, leaving verification, JIT
-;; execution, and object emission to the caller.
-;;
-;; Scope (the examples/simple.carp and nominal tiers): concrete functions over
-;; Int, Bool, Long, Double, and Unit; if, let, do, set!, while, and break;
-;; direct global calls; concrete sum types with constructors and by-value
-;; match (nested patterns included); registered intrinsics (declared only —
-;; the JIT resolves them from the process, a linked build from an object).
-;; Every construct beyond that records an emission error naming itself rather
-;; than mis-lowering.
-;;
-;; Bool lowers to i8 to match the C backend's `bool`, so a mixed C/LLVM link
-;; agrees on scalar signatures; conditions compare against zero at branch
-;; sites.
-;;
-;; Sum types mirror the C backend's layout under the module's target data
-;; layout: `{ union-rep, i32 tag }` where union-rep is the strictest-aligned
-;; variant struct padded with bytes to the union's ABI size, and a nullary
-;; variant is `{ i8 }` like the C backend's `unsigned char unused`. Variant
-;; access goes through memory — opaque-pointer typed GEPs overlay the active
-;; variant struct on the union area — so constructors spill to an alloca and
-;; matches read a pre-allocated entry-block spill slot. Layout parity with the
-;; host C compiler is asserted by the test against offsetof/sizeof probes.
-;;
-;; set!-targeted binders get entry-block alloca slots (found by a pre-scan of
-;; the body), so mem2reg can promote them; every other binder stays SSA.
-;;
-;; The helpers live at top level like the C backend's renderers: mutual
-;; recursion between defns inside a defmodule loses definitions during
-;; emission under the reference compiler, at top level it is reliable.
+; LLVM emission for the shared BackendModule through carpentry-org/llvm.
+; The caller owns verification, execution, and object emission.
+;
+; Lowering covers scalar and aggregate values, arrays, globals, closures,
+; control flow, nominal constructors, and pattern matches. C template calls
+; cross generated ABI wrappers. Unsupported constructs return emission errors.
+;
+; Bool uses i8 for C bool compatibility. Sum layouts use a padded variant union
+; followed by an i32 tag, with field access through typed pointers. Layout tests
+; compare sizes and offsets against the host C compiler.
+;
+; Mutated binders and match scrutinees use entry-block allocation slots;
+; other binders remain SSA values. Mutually recursive emission helpers are
+; defined at top level.
 
 (load "../carp-backend/carp-backend.carp")
 (load "git@github.com:carpentry-org/llvm@0.1.0")
@@ -744,9 +727,10 @@ wrapper.")
         (set! found true)))
     found))
 
-(doc llvm-preproc? "whether `symbol` rode the preprocessor channel — no
-declaration covers it, so only the C compiler can resolve it (it may be a
-function-like macro), and every call must go through a shim wrapper.")
+(doc llvm-preproc?
+  "checks whether a symbol is supplied by preprocessor text rather than a
+declaration. Such calls use C shim wrappers so the C compiler resolves
+macros.")
 (hidden llvm-preproc?)
 (defn llvm-preproc? [symbol]
   (let-do [found false]
@@ -964,9 +948,9 @@ copy }` — every function value shares it.")
           (set! result (Maybe.Just (String.copy (Pair.b entry)))))))
     result))
 
-(doc llvm-named-fn "get-named-function with the name String kept alive
-across the call — `(llvm-cstr &(fmt ...))` hands LLVM a pointer into a
-temporary that can be freed first.")
+(doc llvm-named-fn
+  "looks up a named LLVM function while retaining the name string for the
+duration of the C API call.")
 (hidden llvm-named-fn)
 (defn llvm-named-fn [mod name] (LLVM.get-named-function mod (String.cstr name)))
 
@@ -1839,10 +1823,10 @@ returned value is the address of that variable.")
         (set! found true)))
     found))
 
-(doc llvm-capture-self? "whether a capture argument references a local with no
-binding yet — the only legal case is a letrec-style closure capturing the very
-binding under construction, which gets a weak self-reference stored after
-assembly (the C backend's `_carp_self` two-phase init).")
+(doc llvm-capture-self?
+  "checks whether a capture refers to the closure binding under
+construction. Recursive closure assembly stores this as a weak
+self-reference after initializing the environment.")
 (hidden llvm-capture-self?)
 (defn llvm-capture-self? [argument]
   (match-ref argument
@@ -4441,12 +4425,11 @@ layout under `td`, for parity checks against the C backend's struct.")
           (Long.to-int (LLVM.abi-size-of-type td ty))
           (Long.to-int (LLVM.offset-of-element td ty 1))))))
 
-  (doc shim-translation-unit "renders the C-native declarations — deftemplate
-sources and primitive templates — plus whatever typedefs their signatures
-need into a C translation unit with no entry point: the shim a build compiles
-with a C compiler and links (or dlopens for the JIT) beside the emitted LLVM
-module. Only scalars may cross the LLVM/C call boundary until the ABI-wrapper
-work lands; aggregate parameters and returns need the C compiler's coercions.")
+  (doc shim-translation-unit
+    "renders C template sources, primitive templates, required typedefs, and ABI
+wrappers as a translation unit without an entry point. The compiled shim is
+linked or loaded beside emitted LLVM code; aggregate calls cross the
+boundary through pointer-only wrappers.")
   (defn shim-translation-unit [backend]
     (let-do [filtered (the (Array BackendDeclaration) [])
              template-symbols (the (Array String) [])
@@ -4462,7 +4445,7 @@ work lands; aggregate parameters and returns need the C compiler's coercions.")
               (Array.push-back! &template-symbols (String.copy symbol))
               (Array.push-back! &filtered @(Array.unsafe-nth declarations i)))
           _ ()))
-      ;; a header-backed intrinsic must NOT get our prototype (const-qualifier
+      ; Header-backed intrinsics use their header prototypes (const-qualifier
       ;; conflicts with the header's own declaration)
       (for [i 0 (Array.length declarations)]
         (match-ref (Array.unsafe-nth declarations i)
@@ -4670,12 +4653,11 @@ Call once before emitting; builds that link no shim must not use it.")
       (set! *llvm-malloc-symbol* @"carp_llvm_malloc")
       (set! *llvm-free-symbol* @"carp_llvm_free")))
 
-  (doc emit-module "lowers `backend` into the LLVM module `mod`: declares every
-function, constructor, and intrinsic, defines the function and constructor
-bodies, and collects the top-level expressions into one function named by
-`roots-symbol`. Returns () or the collected emission errors. The scope is the
-simple and nominal example tiers; constructs beyond it are reported, never
-mis-lowered.")
+  (doc emit-module
+    "emits a lowered `BackendModule` into the caller-owned LLVM module:
+declarations, functions, constructors, globals, closures, and top-level
+roots. Returns unit on success or collected emission errors; unsupported
+constructs produce errors.")
   (private emit-module-with)
   (hidden emit-module-with)
   (defn emit-module-with [ctx

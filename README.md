@@ -1,266 +1,155 @@
 # Metacarp
 
-Metacarp is a self-hosting compiler for
-[Carp](https://github.com/carp-lang/Carp), written in Carp. It reads Carp source
-and emits a C translation unit, driving the whole
-pipeline — module loading, macro expansion, name resolution, type inference,
-interface specialization, ownership and borrow checking, and C code generation —
-in Carp itself.
+Metacarp is a self-hosting compiler for [Carp](https://github.com/carp-lang/Carp),
+written in Carp. It compiles Carp programs to C or, with the optional LLVM
+backend, LLVM IR and native executables. Its libraries also support warm
+compiler sessions for editors and notebooks.
 
-> **Status: self-hosting.** The compiler compiles itself, and the result
-> compiles the compiler again to byte-identical C — a fixed point. Both
-> generations pass the reference compiler's test suite (154 entries: examples,
-> output tests, error-rejection tests, benches). It is still not a drop-in
-> replacement for the reference compiler (see [Limitations](#limitations)).
+The C compiler reaches a self-hosted fixed point: successive generations emit
+byte-identical C for the compiler itself. The assurance scripts check this,
+reference-suite behavior, and macro-expansion parity. Metacarp is still not a
+drop-in replacement for reference Carp; see [limitations](#limitations).
 
-## Build
+## Start here
 
-Requires the reference [Carp](https://github.com/carp-lang/Carp) compiler and a
-C compiler (`clang`). Building bootstraps the roughly 42,000 lines of compiler
-source through reference Carp:
+| Task | Documentation |
+| --- | --- |
+| Build and run a program | [Quick start](#quick-start) |
+| Choose compiler flags | [Command line](#command-line) |
+| Embed a notebook or editor session | [Session guide](docs/carp-session.md) |
+| Understand the compiler pipeline | [Architecture](docs/architecture.md) |
+| Run tests, check self-hosting, or benchmark | [Development](docs/development.md) |
+| Use LLVM or its persistent session JIT | [LLVM backend](carp-llvm-backend/README.md) |
+| Browse the libraries | [Documentation index](docs/README.md) |
+
+## Quick start
+
+You need the reference Carp compiler on `PATH`, a checkout of its source
+repository, and `clang`. Run these commands from the Metacarp repository root.
+Set `CARP_DIR` to your reference Carp checkout, not its `core/` directory:
 
 ```sh
+export CARP_DIR=/path/to/Carp
 carp -b --optimize main.carp
+./out/carp-compiler -x -c "$CARP_DIR/core" examples/squares.carp
 ```
 
-This produces `./out/carp-compiler`.
+The build produces `out/carp-compiler`. The example prints:
 
-The optional LLVM driver additionally requires a linkable `libLLVM`:
+```text
+sum of squares of the even numbers in 1..10 = 220
+```
+
+The build loads pinned Carpentry dependencies into Carp's shared package cache.
+The first build needs network access and Git access to those repositories.
+
+To keep an executable instead of running it immediately:
+
+```sh
+./out/carp-compiler -b -c "$CARP_DIR/core" -o /tmp/squares examples/squares.carp
+/tmp/squares
+```
+
+To inspect generated C:
+
+```sh
+./out/carp-compiler -c "$CARP_DIR/core" -o /tmp/squares.c examples/squares.carp
+```
+
+Without `--core`, the C driver can compile programs that do not need the
+standard library. Generated C still needs Carp's runtime headers when linked:
+
+```sh
+./out/carp-compiler -o /tmp/hello.c examples/hello.carp
+clang -I "$CARP_DIR/core" -o /tmp/hello /tmp/hello.c -lm
+/tmp/hello
+```
+
+This example prints `OK`.
+
+## Command line
+
+```text
+carp-compiler [options] <source.carp>
+```
+
+The driver accepts one input file. It emits C to standard output unless you
+choose `-o`, `-b`, `-x`, `--annotate`, or `--ownership`. Diagnostics go to
+standard error.
+
+| Option | Behavior |
+| --- | --- |
+| `-c`, `--core <dir>` | Load the standard library; supply runtime headers for linking. |
+| `-b`, `--build` | Build an executable, defaulting to `a.out`. Requires `--core`. |
+| `-x`, `--execute` | Build and run a temporary executable. Requires `--core`. |
+| `-o`, `--output <file>` | Choose the generated C file or, under `-b`, executable path. |
+| `--optimize` | Use `clang -O3 -D NDEBUG` for `-b`/`-x`. |
+| `-g`, `--debug` | Preserve source mapping; under `-b`, retain generated C beside the executable. |
+| `--annotate` | Emit inferred global-definition types as JSON. Requires `--core`. |
+| `--ownership` | Emit the move, borrow, and delete plan as JSON. Requires `--core`. |
+| `--log-memory` | Enable runtime allocation logging in built executables. |
+| `--no-core` | Skip the implicit Core load; explicit loads can still resolve through `--core`. |
+| `-h`, `--help` | Show help. |
+| `-v`, `--version` | Show the compiler version. |
+
+Choose one action (`-b`, `-x`, `--annotate`, or `--ownership`) per invocation.
+`-o` does not select the executable path for `-x`.
+
+The driver resolves `(load ...)` relative to the loading file, then through
+the Core directory. Git references use the shared `~/.cache/carp/libs/` cache:
+
+```clojure
+(load "git@github.com:carpentry-org/strbuf@0.2.1")
+```
+
+### LLVM driver
+
+The optional driver needs a linkable `libLLVM`. The bindings discover its
+prefix with `brew --prefix llvm` on macOS and `llvm-config --prefix` elsewhere.
+Library hosts can pass an explicit prefix to `LLVM.setup`.
 
 ```sh
 carp -b --optimize main-llvm.carp
-```
-
-This produces `./out/carp-compiler-llvm`. The LLVM bindings use
-`brew --prefix llvm` on macOS and `llvm-config --prefix` elsewhere. Embedders
-can pass an explicit installation prefix to `LLVM.setup`.
-
-## Usage
-
-```
-carp-compiler [options] <source.carp>
-
-  -b, --build           compile to an executable instead of C (needs --core)
-  -x, --execute         compile to an executable and run it (needs --core)
-  -c, --core <dir>      compile against the Carp standard library in <dir>
-  -o, --output <file>   output path — the C file, or the executable under -b
-  --optimize            build -b/-x executables with clang -O3 -D NDEBUG
-  --no-core             skip the implicit Core load; the source's own
-                        (load "X.carp") directives still resolve in --core
-  -h, --help            show this help and exit
-  -v, --version         show version and exit
-```
-
-With no `-b`/`-x`, the C translation unit is written to standard output (or
-`-o`). Diagnostics go to standard error and name the rejecting compiler phase.
-`-b`/`-x` require `--core`, because linking needs the runtime headers the
-standard library ships with.
-
-`(load ...)` resolves like the reference compiler's: relative to the loading
-file, then the Core directory — and git references install into the shared
-cache (`~/.cache/carp/libs/...`) on first use:
-
-```clojure
-(load "git@github.com:carpentry-org/strbuf@0.2.0")
-```
-
-The examples below assume `CARP_DIR` points at a checkout of the reference
-Carp repository (its `core/` is the standard library and runtime headers).
-
-Compile a standalone program (no standard library) to C:
-
-```sh
-./out/carp-compiler examples/hello.carp \
-  | clang -x c -I "$CARP_DIR/core" -o /tmp/carp-hello -
-/tmp/carp-hello        # prints: OK
-```
-
-Compile and run a program that uses the standard library:
-
-```sh
-./out/carp-compiler -x -c "$CARP_DIR/core" examples/squares.carp
-# sum of squares of the even numbers in 1..10 = 220
-```
-
-### LLVM backend
-
-`carp-compiler-llvm` shares the complete compiler front end with the C driver.
-It writes LLVM IR by default, or emits and links a native object under `-b` and
-`-x`:
-
-```sh
 ./out/carp-compiler-llvm -c "$CARP_DIR/core" -o /tmp/squares.ll examples/squares.carp
 ./out/carp-compiler-llvm -x -c "$CARP_DIR/core" examples/squares.carp
 ```
 
-Pass `-g` or `--debug` to preserve source texts and attach DWARF locations from
-the backend-neutral line map. See
-[`carp-llvm-backend`](carp-llvm-backend/README.md) for supported lowering,
-native linking, the persistent ORC session JIT, and its test commands.
-
-## Self-hosting
-
-The bootstrap chain, from the repository root:
-
-```sh
-carp -b --optimize main.carp                                    # gen 1
-./out/carp-compiler -c "$CARP_DIR/core" -o self.c main.carp     # gen 1 emits itself
-clang -O3 -D NDEBUG -o self-cc self.c -I "$CARP_DIR/core"      # link gen 2
-./self-cc -c "$CARP_DIR/core" -o self2.c main.carp              # gen 2 emits itself
-cmp self.c self2.c                                              # fixed point
-```
-
-The canonical generation benchmark compares reference Carp, gen 1, and gen 2
-on the same workload (generating C for `main.carp`):
-
-```sh
-CARP_BENCH_RUNS=3 ./bench/compiler-generations.sh
-```
-
-It reports wall time, user time, and maximum resident set size, writes the raw
-measurements as TSV, and checks that the C emitted by gen 1 and gen 2 reaches a
-fixed point. Linking each next-generation compiler is deliberately excluded
-from the timed region.
-
-`bench/nbody-codegen.sh` checks exact output parity with reference Carp and
-requires the generated hot loop to materialize its stable array data pointer.
-It also reports reference/generated executable runtime without imposing a
-noise-sensitive CI timing threshold.
-
-The assurance harness keeps the self-host honest:
-
-- `scripts/run-assurance.sh phase` runs lint and formatting before every
-  phase/session suite. Set `CARP_SKIP_STYLE=1` when the two style tools are
-  unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run independent test groups
-  concurrently; CI runs this architecture-neutral group once on two Linux
-  workers.
-- `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
-  checks the self-hosted fixed point, and compares expansion behavior. Set
-  `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated
-  workers; CI uses all two Linux or three macOS runner cores.
-- `scripts/run-assurance.sh all` runs both groups and is the default. CI calls
-  the same phase and self groups rather than maintaining its own command list.
-  The self-host group executes generated programs on both x86-64 Linux and
-  ARM64 macOS for every commit. CI caches the versioned Carp library checkouts
-  on both architectures and the pinned Ubuntu style-tool binaries; generated
-  compiler and test outputs are deliberately never cached.
-
-- `scripts/run-carp-suite-self.sh` runs the reference repository's own test
-  suite (examples, produces-output diffs, `test/*.carp`, error-rejection
-  tests, bench builds) through this compiler. It finds the reference checkout
-  through `CARP_ROOT` or `CARP_DIR`, and `CARP_COMPILER` can point it at a
-  gen-2 binary.
-- `scripts/diff-expansion.sh` compiles and runs a front-end corpus (macros,
-  quasiquote, gensym, dynamic evaluation) under both the reference compiler
-  and this one and requires identical observable output.
+This driver requires `--core` even for IR output and with `--no-core`. It
+supports `-b`, `-x`, `-c`, `-o`, `--no-core`, `-g`, `--log-memory`, `-h`, and
+`-v`. It does not accept the C driver's `--optimize`, `--annotate`, or
+`--ownership` flags. `-g` attaches DWARF source locations; Darwin builds also
+produce a `.dSYM` beside a `-b` executable.
 
 ## Examples
 
-The programs in `examples/` double as checkpoints. The standalone ones need no
-standard library:
+| File in `examples/` | Demonstrates |
+| --- | --- |
+| `hello.carp` | Inline C through `deftemplate`; prints `OK`. |
+| `nominal.carp` | Sum types and wildcard fields in `match`. |
+| `polymorphic-nominal.carp` | Two concrete instances of a generic type. |
+| `nested-pattern.carp` | Nested constructor patterns. |
+| `signature-nominal.carp` | Type layout discovered from a signature. |
+| `squares.carp` | Arrays, lambdas, and strings from Core. |
+| `simple.carp` | Registered external C primitive; linking needs an implementation of `int_inc`. |
 
-| example                    | shows                                                        |
-| -------------------------- | ------------------------------------------------------------ |
-| `simple.carp`              | functions, `if`, a registered C primitive                    |
-| `hello.carp`               | `deftemplate` inline C; prints `OK`                          |
-| `nominal.carp`             | `deftype` sum type, `match` with a wildcard field            |
-| `polymorphic-nominal.carp` | one polymorphic type specialized at two instances            |
-| `nested-pattern.carp`      | nested constructor patterns                                  |
-| `signature-nominal.carp`   | layout discovery from a signature, no reachable constructor  |
-| `squares.carp`             | the full standard library (needs `--core`)                   |
-
-An intentionally small integration experiment lives in
-[`experiments/metacarp-clap`](experiments/metacarp-clap): a macOS CLAP audio
-effect whose interface is a Carp function compiled through the warm session
-and LLVM JIT. It executes unsandboxed native code inside the plugin host and is
-not a release artifact.
-
-## How it works
-
-Source flows through the major phases below. Each has its own directory, data
-model, and tests:
-
-```
-source registry
-  -> carp-module      module loading, load-order and git-reference resolution
-  -> carp-surface     lossless surface parsing
-  -> carp-expand      macro expansion (with carp-ct-env / carp-ct-eval)
-                      compile-time code is lowered and compiled to bytecode
-  -> carp-resolve     name resolution into the core IR (carp-ir)
-  -> carp-infer       Hindley–Milner type inference (carp-types)
-  -> carp-specialize  interface selection and monomorphization
-  -> carp-ownership   ownership planning and flow-sensitive borrow checking
-  -> carp-backend     lowering and C emission (carp-c-abi for mangling)
-  -> one C translation unit
-```
-
-Two research libraries are **experimental and opt-in**. They are published in
-this repository but are not part of the compiler pipeline: `carp-ct-types` (a
-tag lattice for the compile-time language) and `carp-ct-infer` (a shape check
-over `defmacro` and `defndynamic` bodies, invoked through `CtCheck.modules`).
-Nothing in Metacarp calls them. They are a checking phase rather than a
-transforming one, so a build that ignores them loses only their diagnostics.
-See
-[`carp-ct-infer/README.md`](carp-ct-infer/README.md) for what they do and do
-not cover yet.
-
-Supporting libraries: `carp-primitives` (the declarative primitive registry) and
-`carp-graph` (strongly-connected-component ordering), plus `carp-source`
-(caller-owned source identities and byte spans) and `carp-session` (warm,
-transactional notebook inference). Each phase reports failures tagged with its
-own name.
-
-Ownership is real: the compiler derives `delete`/`copy` for managed `deftype`s
-(concrete and generic), runs a sound flow-sensitive borrow check (escape, move,
-borrow-after-move, branch joins), and emits the corresponding C cleanup. The
-delete plan covers let scopes, unconsumed parameters, discarded intermediates,
-`set!` overwrites, by-value `match` bindings (used or not), and the payloads a
-wildcard pattern drops — with deep deleters and copiers for nested containers.
-Escaping closures heap-allocate their environments.
-
-The reusable entry point is `CarpCompiler.compile-source`, or
-`CarpCompiler.compile-sources` when the caller already holds an in-memory source
-registry.
-
-## Session library
-
-[`carp-session`](carp-session/README.md) keeps an inferred core resident for
-notebook and editor clients, then provides transactional definition updates,
-cell-relative typed reports, ownership queries, completion, and incremental
-code generation. The design deliberately leaves transport and value hosting to
-clients such as Lepiter and GT. `carp-llvm-backend/carp-session-jit.carp` adds a
-persistent ORC JIT whose modules reuse that semantic session. Failed cells do
-not replace the last published implementation. [`docs/carp-session.md`](docs/carp-session.md)
-records the original design and implementation history.
+The [CLAP experiment](experiments/metacarp-clap/README.md) embeds the warm
+session and LLVM JIT in a macOS audio effect. It runs native code in the plugin
+host and is an integration experiment, not a release artifact.
 
 ## Limitations
 
-- The host architecture and OS are stamped for the build machine
-  (`aarch64`/`darwin`) in the `--core` path.
-- Delete placement is scope-based, not liveness-based: values die at scope or
-  branch exit rather than after their last use, so peak memory can exceed the
-  reference compiler's on the same program.
-- A binding consumed on one control-flow path and reassigned later leaks the
-  reassigned value (the plan is any-path conservative; it never double-frees).
-- Error messages are deliberately this compiler's own; only rejection behavior
-  matches the reference, not diagnostic text.
+- Delete placement is scope-based rather than liveness-based, so peak memory
+  can exceed reference Carp's on the same program.
+- The conservative ownership plan can leak a reassigned value when its
+  binding was consumed on another control-flow path.
+- Diagnostics are Metacarp's own. Reference-suite parity checks rejection
+  behavior, not identical error text.
+- The command-line drivers build for the host; they expose no cross-compilation
+  target option.
 
-## Dependencies
+## Dependencies and license
 
-The default compiler uses two pinned Carpentry packages, loaded as git
-references:
-
-```clojure
-(load "git@github.com:carpentry-org/carp-reader@0.3.8")
-(load "git@github.com:carpentry-org/strbuf@0.2.0")
-```
-
-The optional LLVM backend additionally loads:
-
-```clojure
-(load "git@github.com:carpentry-org/llvm@0.1.0")
-```
-
-## License
+The compiler loads `carp-reader@0.4.1` and `strbuf@0.2.1`. The session library
+also loads `rc@0.3.0`; the LLVM backend loads `llvm@0.1.0`.
 
 MIT. See [LICENSE](LICENSE).

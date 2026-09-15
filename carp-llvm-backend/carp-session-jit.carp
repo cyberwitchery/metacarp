@@ -1,25 +1,13 @@
-;; carp-session-jit — the LLVM session JIT: runs a session cell natively
-;; through one persistent ORC LLJIT instead of emitting C for a clang round-trip.
-;;
-;; The split keeps carp-session free of libLLVM: `Session.lower-cell` stops
-;; the transactional cell pipeline at the lowered BackendModule, and this
-;; component (loaded only by hosts that want the JIT) does the LLVM work.
-;;
-;; Per session there is one LLVM context, target machine, and data layout,
-;; plus one C shim dylib holding the template specializations (deftemplate
-;; bodies, primitive templates, wrappers): clang compiles it ONCE, on the
-;; first cell, and again only when a later cell introduces a template
-;; specialization the dylib does not have yet. A cell whose templates are all
-;; materialized pays no clang at all: its BackendModule is emitted into a
-;; new LLVM module containing only symbols not published by earlier cells,
-;; added to one LLJIT (which resolves template symbols from the dlopened shim),
-;; and its uniquely named roots function runs
-;; in-process — echo output prints to the host's stdout, and the returned
-;; Int is the last integer-typed top-level's value, like the driver's.
-;;
-;; Published code and global storage persist across cells. A committed edit
-;; clears published code while retaining the LLJIT and thread-safe context;
-;; the next cell republishes the new dependency world.
+; Persistent LLVM execution for compiler sessions, kept separate from the
+; semantic session library to isolate the libLLVM dependency.
+;
+; Each JIT session owns one LLJIT, thread-safe context, target machine, and
+; data layout. Template specializations are compiled into a C shim dylib;
+; cells reuse it until new specializations require a rebuilt shim.
+;
+; Cells publish incremental modules with unique roots and initializer symbols.
+; Native code and global storage persist across cells. Committed edits clear
+; published code while retaining the JIT context, target state, and shim.
 
 (load "../carp-session/carp-session.carp")
 (load "carp-llvm-backend.carp")
@@ -149,12 +137,11 @@ and target machine.")
   (defn jit-diagnostic [message]
     (Diagnostic.init @"jit" message (the (Maybe SourceSpan) (Maybe.Nothing))))
 
-  (doc ensure-shim! "makes every template specialization `backend` needs
-resolvable in the process: when one is missing from the materialized set, the
-full shim translation unit is rendered, clang-compiled to a dylib (the one
-clang invocation a session pays, repeated only when new specializations
-appear), and dlopened RTLD_GLOBAL so ORC's process resolver finds the
-symbols.")
+  (doc ensure-shim!
+    "ensures required template specializations are available to the process
+resolver. Missing specializations trigger rendering and compilation of the
+shim dylib, which is loaded with `RTLD_GLOBAL`. Cells with no new
+specialization reuse the shim.")
   (defn ensure-shim! [js backend]
     (let-do [needed (template-symbols backend)
              missing false]
@@ -353,13 +340,10 @@ symbols.")
                                                 (JitSession.instances js)
                                                 &salt)))
 
-  (doc run-cell "checks, lowers, JIT-compiles, and RUNS `input` against the
-session: `Session.lower-cell-plain`'s transactional BackendModule is emitted
-into a fresh incremental LLVM module, ORC adds only symbols not already
-published in the shared LLJIT (template symbols resolve from the shim dylib),
-and the roots function executes in-process.
-Returns the cell's value: the last integer-typed top-level's result, 0
-otherwise.")
+  (doc run-cell
+    "checks, lowers, compiles, and executes a transient cell in the persistent
+LLJIT. New symbols are published incrementally; templates resolve through
+the shim. Returns the last integer-typed top-level value, or zero.")
   (defn run-cell [js session input]
     (match (publish-lowered js
                             (lower-cell js session input false)
@@ -367,10 +351,10 @@ otherwise.")
       (Result.Success address) (Result.Success (LLVM.call-i32 address))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
-  (doc run-cell-echoed "as `run-cell`, but with the driver's top-level result
-echo: the cell's value is PRINTED to stdout by the same `str` a driver-built
-binary would pick, and the returned Int is the echoed roots value (0 — the
-echo wrapping consumes the top level).")
+  (doc run-cell-echoed
+    "runs a cell with top-level result echoing through selected `str`
+implementations. Returns zero because echo wrapping consumes the top-level
+result.")
   (defn run-cell-echoed [js session input]
     (match (publish-lowered js
                             (lower-cell js session input true)
@@ -388,9 +372,9 @@ addresses remain valid until the JitSession is disposed.")
                      (lower-cell js session input false)
                      &(Maybe.Just (String.copy name))))
 
-  (doc upsert "commits a definition and invalidates published native code.
-The LLJIT and shared context remain alive; the next cell republishes the new
-definition world.")
+  (doc upsert
+    "commits a definition and invalidates published native code while retaining
+the LLJIT and context. Subsequent cells republish reachable definitions.")
   (defn upsert [js session input]
     (match (Session.upsert session input)
       (Result.Error diagnostic) (Result.Error diagnostic)

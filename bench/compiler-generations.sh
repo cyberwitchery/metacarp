@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compare the reference compiler and two self-hosted generations on the same
 # workload: generating C for this compiler. Linking generations is setup work
-# and is deliberately excluded from the measurements.
+# and is excluded from the measurements.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# The anti-a-priori ratchet: every corpus file is compiled and RUN by both the
-# reference compiler and this one; observable behavior must agree exactly.
-# The corpus exercises the front end (macros, quasiquote, gensym, dynamic
-# evaluation, sugar) so a semantic drift in expansion shows up as an output
-# diff even while the main suite stays green.
+# Compile and run each front-end corpus file with reference Carp and Metacarp.
+# Require identical observable output for macros, quasiquote, gensym, dynamic
+# evaluation, and syntax sugar.
 set -u
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

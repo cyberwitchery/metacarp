@@ -4,20 +4,13 @@
 #   test/*.carp                 -x --log-memory (exit 0 = pass)
 #   test/test-for-errors        compilation must be rejected
 #   bench + compile-only        -b builds
-# Known-gaps POLICY: tests named in known_gaps below exercise reference
-# semantics this compiler does not implement yet. They still run and are
-# reported (as 'gap'), but do not gate — each entry cites the tracking issue.
-# Error-text POLICY: rejection is the gate; error TEXT parity with the
-# reference is reported, never gated. Our diagnostics are deliberately our own
-# (different wording and spans), so byte-matching the reference's messages
-# would freeze us to its phrasing without making the compiler more correct.
-# Set CARP_CHECK_ERRORS=1 to also write a per-file divergence report
-# (our first diagnostic line vs the reference's expected first line) to
-# $out_root/error-text-report.txt — visibility without brittleness.
-# Set CARP_SELF_JOBS=2 or 3 to split the corpus across shadow reference roots.
-# Each worker owns its `out/Untitled`, preserving `-x` argv behavior without
-# sharing build artifacts.
-# Not covered: SDL examples, doc generation.
+# Tests in known_gaps run and are reported as gaps without gating the suite.
+# Rejection gates error tests; diagnostic text parity is reported separately.
+# CARP_CHECK_ERRORS=1 writes first-line diagnostic differences to
+# $out_root/error-text-report.txt.
+# CARP_SELF_JOBS=2 or 3 splits the corpus across isolated reference roots.
+# Each worker owns its out/Untitled and preserves -x argument behavior.
+# Excludes SDL examples and documentation generation.
 set -u
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -50,14 +43,14 @@ passed=0
 failed=0
 gaps=0
 
-# reference tests we knowingly fail, each with its tracking issue:
+# Accepted reference-test gaps and their tracking issues:
 #   expand_qualified_shadow.carp      qualified lookup vs sibling macros (#16)
 #   expand_value_position_macro.carp  value-position macro substitution (#16)
 #   memory_global_ref_in_loop.carp    qualified-member multisym fallback (#8)
 #   nested_module_multisym.carp       nested-module multisym dispatch (#8)
 # The reference memory suite is otherwise gated in full. Its one accepted
 # subtest gap is matched by exact name and 76/1 totals below: managed values in
-# StaticArray literals do not yet have an element-lifetime owner in our IR.
+# StaticArray literals lack element-lifetime ownership in the core IR.
 known_gaps="expand_qualified_shadow expand_value_position_macro memory_global_ref_in_loop nested_module_multisym"
 
 known_gap() {

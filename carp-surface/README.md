@@ -1,82 +1,48 @@
 # carp-surface
 
-`carp-surface` is the lossless syntax boundary for tools built around Carp.
-It converts the concrete, source-located forms returned by
-[`carp-reader`](https://github.com/carpentry-org/carp-reader) into a small,
-standalone AST with a uniform `SurfaceNode` shape:
+Source-located syntax shared by the compiler and Carp tooling. The package
+converts [`carp-reader`](https://github.com/carpentry-org/carp-reader) forms
+into an owned, statically shaped tree. It has no filesystem, package-loading,
+code-generation, name-resolution, or type-checking API.
 
-```clojure
-(load "git@github.com:carpentry-org/carp-surface@0.1.0")
+Load `carp-surface/carp-surface.carp` from the repository root. Each
+`SurfaceNode` pairs a `SurfaceSpan` with a `SurfaceForm`. Forms retain comments,
+container kinds, numeric widths, and the reader's normalized reader macros.
+Rendering produces source-level syntax, not a byte-identical copy of the
+original spelling and whitespace.
 
-(match (Surface.parse "; a note\n(defn id [x] x)")
-  (Result.Success module) module
-  (Result.Error error)    (panic (Parser.format-error &error)))
-```
+## Parse and render
 
-Each `SurfaceNode` has a `SurfaceSpan`; comments, container kinds, number widths, and the
-reader's normalized reader-macro forms are retained. The library has no file,
-subprocess, code-generation, name-resolution, or type-checking API.
+| Operation in `Surface` | Result |
+| --- | --- |
+| `parse` | Parse a source string to `Result SurfaceModule ParseErr`; spans have no source ID. |
+| `parse-in` | Parse with a source ID attached to spans. |
+| `parse-input` | Parse a `SourceInput` to `Result SourcedSurfaceModule ParseErr`, retaining the exact input. |
+| `parse-input-diagnosed` | Same input, returning a structured `Diagnostic` on failure. |
+| `render` | Render one node to a string. |
+| `render-module` | Render a module as newline-separated forms. |
 
-`Surface.render` renders a node back to source-level Carp without its span or
-implementation boxes. It is also installed as `str` for `SurfaceNode`, so an
-expanded form can be inspected directly with `(str &node)`.
+`SurfaceNode.str` and `SurfaceModule.str` use those renderers. The diagnosed
+parser reports a zero-width byte span at the reader's error position.
+`SurfaceSpan.in-source` converts a reader span to a caller-visible `SourceSpan`.
+See [carp-source](../carp-source/README.md) for the byte-range contract.
 
-## Why this is separate from the compiler
+## Compiler boundary
 
-The reader is reusable by formatters and linters. The compiler needs a tree it
-can own without coupling later phases to parser implementation details. This
-package is that boundary: the formatter, linter, language server, and compiler
-can all use it, while each can make its own semantic decisions.
+The module loader parses supplied sources and orders their forms before macro
+expansion. Expansion consumes this surface model; runtime resolution creates
+the separate core IR afterward. The surface model therefore remains useful
+for inspecting macros and building source tools without coupling them to
+inferred or specialized runtime representations.
 
-`Surface.parse` returns the reader's `ParseErr` unchanged. Semantic errors are
-not invented here; a later validation library will define compiler diagnostics.
+See [carp-module](../carp-module/README.md),
+[carp-expand](../carp-expand/README.md), and the
+[architecture guide](../docs/architecture.md) for the current package graph.
 
-## Intended compiler package graph
+## Verification
 
-```
-parsec + strbuf
-       │
-  carp-reader
-       │
-  carp-surface ── carp-module ── carp-expand ── carp-resolve ── carp-infer ── carp-specialize ── carp-c
-       │                 │               │               │
-  formatter/linter   source graph  carp-ct-eval   carp-names      carp-types
-                                                               │
-                                                        carp-compiler (CLI/driver)
-```
+Run from this package directory:
 
-The bottom row contains reusable libraries. `carp-compiler` will only load
-files, select options, compose phases, write generated C, and invoke a C
-compiler. It must not become the home for ASTs, type algorithms, or C lowering.
-
-The existing `ast` package remains useful for macro-time source rewriting, but
-does not replace this package: it uses dynamic maps and quoted values rather
-than a source-located, statically shaped AST.
-
-## Macro expansion
-
-`carp-module` runs after reading and before expansion. It resolves a supplied
-source graph and flattens top-level load directives into deterministic source
-order without performing filesystem, package-cache, or network work.
-
-`carp-expand` runs after loading and before ordinary runtime name resolution
-and type inference.
-It processes top-level forms in source order: a `defmacro` registers a
-compile-time binding; a later macro call receives syntax objects,
-`carp-ct-eval` evaluates its body to syntax, and that result is expanded
-recursively. The resulting module no longer contains macro definitions or
-macro calls.
-
-`carp-ct-eval` is an interpreter/VM for the compile-time subset of Carp. It is
-separate from the generated program and from `carp-c`: no target C executable
-is compiled or run merely to expand a macro. Macro output is deliberately
-unhygienic, matching Carp's default: generated identifiers can capture, and be
-captured by, surrounding names. Runtime resolution then operates only on fully
-expanded forms; it can share basic name types with the expander, but not the
-expander's environment.
-
-## Development
-
-```bash
+```sh
 carp -x test/carp-surface.carp
 ```

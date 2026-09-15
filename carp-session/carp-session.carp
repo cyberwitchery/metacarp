@@ -56,12 +56,11 @@
                           documentation String
                           span SourceSpan])
 
-(doc SessionOverlay "the committed half of a session. `inputs` is the replay
-list -- one slot per committed input, in commit order -- and `references`
-runs parallel to it: the global identity to retain when the input is replaced,
-meaningful only for an input holding exactly one definition. `definitions`
-and `dependencies` hold one slot per definition and are derived by replay,
-never replayed themselves: the inputs are the single source of truth.")
+(doc SessionOverlay
+  "stores committed source inputs in replay order. `references` records
+compatible retained global identities for single-definition inputs.
+Definition reports and dependency arrays are derived by replaying the
+inputs.")
 (deftype SessionOverlay
   [expansion (Rc ExpandSnapshot)
    resolution ResolveSnapshot
@@ -107,11 +106,9 @@ environment.")
   (hidden append-inferred-analysis)
   (private normalized-analysis)
   (hidden normalized-analysis)
-  (doc normalized-analysis "one module's inference traces, each normalized with
-the substitution of the run that produced it. A merged module carries an empty
-substitution, so normalization has to happen before modules are combined: a
-trace that kept its solver variables fails specialization later, when a
-committed definition makes a dormant polymorphic call reachable.")
+  (doc normalized-analysis
+    "normalizes a module's inference traces using its own substitution before
+combining traces from separately inferred modules.")
   (defn normalized-analysis [module]
     (let-do [environment (Array.copy (InferredModule.environment module))
              expression-types (the (Array (Box MonoType)) [])
@@ -389,10 +386,9 @@ traces retained once by `CompilerSession`.")
          (Array SessionDefInfo)))
   (private rendered-type)
   (hidden rendered-type)
-  (doc rendered-type "the type to show for a definition. A signature the
-author wrote is shown as they wrote it, type variables and all; without one
-there is nothing to quote, so what inference generalized is shown in letters
-of its own.")
+  (doc rendered-type
+    "renders a definition's declared signature when available, preserving
+declared variable names. Otherwise renders its inferred scheme.")
   (defn rendered-type [core reference scheme]
     (let-do [result (Type.render-scheme scheme)
              signatures (CoreModule.signatures core)]
@@ -1190,9 +1186,9 @@ resolve to; inputs already after the shadow need no move.")
               (Array.push-back! &out-references @reference)))))
       (Pair.init out-inputs out-references)))
 
-  (doc create-from-module "creates a warm session from an already loaded base
-module. Loading files remains a host concern in this initial library slice;
-the expensive expansion, resolution, and inference happen exactly once here.")
+  (doc create-from-module
+    "creates a warm session from a loaded base module. Expansion, resolution,
+derivation, and inference run once; the host supplies the source module.")
   (defn create-from-module [base config]
     (match (MacroExpand.prepare-module-with (SourcedSurfaceModule.module base)
                                             config)
@@ -1268,8 +1264,9 @@ the expensive expansion, resolution, and inference happen exactly once here.")
           (expand-diagnostic &error
                              (SourceInput.id (SourcedSurfaceModule.input base))))))
 
-  (doc create "loads, expands, derives, resolves, and infers the standard
-library under `core-dir` once, producing a warm compiler session.")
+  (doc create
+    "loads, expands, resolves, derives, and infers the standard library under
+`core-dir` once, producing a warm compiler session.")
   (defn create [core-dir]
     (match (SessionCoreLoader.load-core core-dir)
       (Result.Success module)
@@ -1283,8 +1280,8 @@ library under `core-dir` once, producing a warm compiler session.")
   (private set-overlay!)
   (hidden set-overlay!)
   (doc set-overlay!
-    "replaces the session's overlay — the one place it changes,
-so anything later derived from it has a single place to be invalidated from.")
+    "publishes a replacement overlay and invalidates analysis and lowering caches
+derived from the previous overlay.")
   (defn set-overlay! [session next]
     (do
       (Array.aset! (CompilerSession.overlay session) 0 next)
@@ -1297,12 +1294,9 @@ so anything later derived from it has a single place to be invalidated from.")
 
   (private session-analysis)
   (hidden session-analysis)
-  (doc session-analysis "the base and overlay inference traces as one set.
-Normalizing the base half means walking every trace the base holds and
-applying its substitution: on a project the size of a compiler that is half a
-minute of work, and the base is fixed when the session is created — so it is
-normalized once and kept, and each call only normalizes the overlay, which
-holds what the user has committed since.")
+  (doc session-analysis
+    "combines base and overlay inference traces. Base traces are normalized once
+and cached; overlay traces are normalized for the current operation.")
   (defn session-analysis [session overlay]
     (do
       (when (Int.= (Array.length (CompilerSession.analysis session)) 0)
@@ -1762,13 +1756,10 @@ definition's moves, borrows, and deletes joined to caller source spans.")
         (match-ref right (SessionDefKind.Interface) true _ false)
       _ false))
 
-  (doc upsert "atomically inserts or replaces one runtime definition and
-reports its transitive resolved dependents. A definition that arrived in a
-multi-definition input is owned by that input and cannot be edited by name:
-replace the whole input with `upsert-input`. Inserting a definition whose
-name a base binding carries rebinds that name's committed dependents to the
-new definition, exactly as replacement does -- the latest committed
-definition of a name is the one every committed dependent resolves to.")
+  (doc upsert "atomically inserts or replaces one definition by name and reports
+invalidated dependents. Definitions owned by multi-definition inputs
+require `upsert-input`. Replacements and base shadows rebind committed
+dependents to the latest definition.")
   (defn upsert [session input]
     (let [current (Array.unsafe-nth (CompilerSession.overlay session) 0)
           probe (SessionOverlay.copy current)]
@@ -1909,13 +1900,11 @@ the shadow existed, so convergence needs them replayed after it.")
                     (Array.push-back! &result (String.copy dependent)))))))))
       result))
 
-  (doc upsert-input "upserts a whole input — a file, say — with however many
-definitions it holds, and answers them. Everything that input contributed
-before is replaced in place, so definitions committed later that depend on it
-still resolve; definitions that have vanished from it are dropped, so a
-rename leaves no ghost behind. Use `upsert` for a single definition whose
-identity is its name rather than its file. Definitions that shadow base
-bindings rebind those names' committed dependents, as `upsert` does.")
+  (doc upsert-input "atomically replaces or inserts all definitions owned by
+`SourceInput.id` at its replay position. Omitted definitions are
+removed; remaining dependent inputs must still check. Base-shadowing
+definitions rebind committed dependents. Returns the definitions
+contributed by the input.")
   (sig upsert-input
        (Fn
          [(Ref CompilerSession) (Ref SourceInput)]
@@ -1983,11 +1972,10 @@ file would.")
           (do (set-overlay! session rebuilt) (Result.Success ()))
         (Result.Error diagnostic) (Result.Error diagnostic))))
 
-  (doc remove "removes a definition and its transitive resolved dependents.
-A definition that arrived in a multi-definition input is owned by that input
-and cannot be removed by name: drop the whole input with `remove-input`.
-Removal drops whole inputs -- a dependent's input goes with it -- and the
-report lists every definition that disappeared beyond the named one.")
+  (doc remove
+    "removes a definition and its transitive dependents, dropping whole
+owning inputs. Multi-definition inputs require `remove-input`. Reports
+the other definitions removed.")
   (defn remove [session name]
     (let [current (Array.unsafe-nth (CompilerSession.overlay session) 0)
           index (definition-index (SessionOverlay.definitions current) name)]
@@ -2082,18 +2070,10 @@ snapshot copy and is discarded after the query.")
               (Result.Error (expand-diagnostic &error (SourceInput.id input))))
         (Result.Error diagnostic) (Result.Error diagnostic))))
 
-  (doc trace-expand "expands caller source against the warm environment and
-answers every compile-time step it took, in order, paired with the failure
-that ended it when one did.
-
-Compile-time evaluation is deterministic, so a debugger does not need to stop
-it: this runs it once, recording each form as it is entered, and stepping is
-then walking the recording — backwards as easily as forwards.
-
-A failed expansion is exactly when a trace is worth having: it ran up to the
-failure, and that is where the reader is looking. The failure comes back
-alongside the steps rather than instead of them, because the last step says
-where the evaluation stopped and only the diagnostic says why.")
+  (doc trace-expand
+    "expands transient source while recording compile-time steps. Returns the
+step array paired with an optional diagnostic, preserving recorded steps
+when expansion fails.")
   (defn trace-expand [session input]
     (let-do [_on (CtEval.trace-on!)
              ;; the caller's own forms are written in the caller's source, and
@@ -2136,18 +2116,14 @@ top-level form. Returns `Nothing` when no top-level form is a macro call.")
                                         0
                                         (String.length (SourceInput.source input))))))
 
-  (doc emit-cell "emits a deterministic executable C translation unit for a
-transient cell against the warm committed environment. Expansion, identity
-allocation, inference, and code generation occur on private copies and cannot
-mutate the session. A cell is a top level, so a value it ends on is echoed the
-way the driver echoes one, and a client does not have to guess whether a type's
-`str` takes its argument by reference or by value.")
+  (doc emit-cell
+    "emits a complete C translation unit for a transient cell against the warm
+committed environment. Temporary semantic changes are discarded. Top-level
+values are rendered and printed through their selected `str`
+implementations.")
   (private emit-mark!)
   (hidden emit-mark!)
-  ;; Prints elapsed milliseconds per emit-cell step under CARP_DEBUG_EMIT, the
-  ;; way the compiler's own pipeline reports phases under CARP_DEBUG_PHASES.
-  ;; Emission cost is dominated by whole-program work, so it is worth being
-  ;; able to see which step a session is spending its time in.
+  ; Emit per-stage elapsed milliseconds to stderr when `CARP_DEBUG_EMIT` is set.
   (defn emit-mark! [name since]
     (match (IO.getenv "CARP_DEBUG_EMIT")
       (Maybe.Just _)
@@ -2160,9 +2136,9 @@ way the driver echoes one, and a client does not have to guess whether a type's
                   1000000.0)))
       (Maybe.Nothing) ()))
 
-  (doc prepare-emit "does the session-wide work that emitting a cell needs —
-normalizing the base's inference traces — so the first cell does not pay for
-it. Optional: emit-cell does it on demand.")
+  (doc prepare-emit
+    "normalizes and caches base inference traces needed by emission. Optional:
+`emit-cell` initializes this cache lazily.")
   (defn prepare-emit [session]
     (when (Int.= (Array.length (CompilerSession.analysis session)) 0)
       (Array.push-back! (CompilerSession.analysis session)
@@ -2369,15 +2345,16 @@ native symbol namespace.")
         (Result.Success @(IncrementalLowering.module &incremental))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
-  (doc lower-cell "as `emit-cell`, but stops at the lowered `BackendModule`
-instead of rendering C, for alternative backends (the LLVM session JIT), with
-the driver's top-level result echo. The same transactional guarantee holds:
-everything runs on private copies and cannot mutate the session.")
+  (doc lower-cell
+    "lowers a transient cell to `BackendModule` with top-level result echoing.
+Committed semantic definitions remain unchanged; analysis and lowering
+caches may be populated.")
   (defn lower-cell [session input] (lower-cell-with session input true))
 
-  (doc lower-cell-plain "as `lower-cell` without the echo: the cell's last
-integer-typed top level becomes the roots function's return value, so a JIT
-host reads the result instead of parsing printed output.")
+  (doc lower-cell-plain
+    "lowers a transient cell without top-level result echoing. The last
+integer-typed top-level expression becomes the roots function's return
+value.")
   (defn lower-cell-plain [session input] (lower-cell-with session input false))
 
   (defn infer-cell [session input]
