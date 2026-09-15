@@ -124,6 +124,20 @@ and the complete concrete instance cache after satisfying that cell's roots.")
 ;; Unfilled slots hold a Unit placeholder; *normalized-filled* is the truth.
 (def *normalized-node-types* (the (Array (Box MonoType)) []))
 (def *normalized-filled* (the (Array Bool) []))
+;; an indexed, read-only view of the module substitution, built once per
+;; public entry. Applying a substitution looks a variable up per occurrence,
+;; and the module substitution is module-sized, so the plain association-list
+;; scan is linear in the whole module every time. `Type.solver-*` answers in
+;; constant time from the same bindings.
+;;
+;; This view must belong to the `inferred` that specialization is running
+;; over. It rides the same invariant the normalized-node-type memo above it
+;; already rides: every public entry calls `prime-trace!` before anything
+;; downstream can reach it, and `clear-caches!` drops it afterwards. A stale
+;; view would apply one module's substitution to another module's types.
+(def *module-solver* (Type.solver))
+(def *module-solver-ready* false)
+
 ;; expr-id → trace position for the owner named by *trace-owner-key*;
 ;; expression ids repeat across owners, so the index is per-owner and is
 ;; rebuilt when the owner changes (once per materialized instance).
@@ -631,6 +645,9 @@ trace's length; slots fill on first touch in `expression-type-for`.")
              placeholder (Box.init (MonoType.Unit))]
       (set! *normalized-node-types* (Array.replicate n &placeholder))
       (set! *normalized-filled* (Array.replicate n &false))
+      (set! *module-solver*
+            (Type.solver-from-substitution (InferredModule.substitution inferred)))
+      (set! *module-solver-ready* true)
       (set! *trace-owner-key* -1000000002)))
 
   (private clear-caches!)
@@ -644,6 +661,8 @@ its concrete node types, so none of these memoized values are needed afterward."
       (set! *instance-buckets* [])
       (set! *normalized-node-types* [])
       (set! *normalized-filled* [])
+      (set! *module-solver* (Type.solver))
+      (set! *module-solver-ready* false)
       (set! *trace-positions* [])
       (set! *trace-owner-key* -1000000002)))
 
@@ -1026,12 +1045,21 @@ one.")
 
   (private normalize-call)
   (hidden normalize-call)
+  (private apply-module-substitution)
+  (hidden apply-module-substitution)
+  (doc apply-module-substitution "applies the module substitution, through the
+indexed view when one has been built for this module.")
+  (defn apply-module-substitution [inferred type]
+    (if *module-solver-ready*
+      (Type.solver-apply &*module-solver* type)
+      (Type.apply (InferredModule.substitution inferred) type)))
+
   (defn normalize-call [inferred call]
     (CallSite.init @(CallSite.id call)
                    (CoreRef.copy (CallSite.reference call))
                    (Box.init
-                     (Type.apply (InferredModule.substitution inferred)
-                                 (Box.peek (CallSite.type call))))
+                     (apply-module-substitution inferred
+                                                (Box.peek (CallSite.type call))))
                    (copy-call-owner call)))
 
   (doc entry-request "seeds the `main` function as a specialization demand so it
@@ -1915,8 +1943,8 @@ hardcoded ranges.")
         (let [node-type (Array.unsafe-nth node-types i)]
           (when (Int.= @(InferredNodeType.id node-type) expression-id)
             (when (same-owner? (InferredNodeType.owner node-type) owner)
-              (let [normalized (Type.apply (InferredModule.substitution inferred)
-                                           (Box.peek (InferredNodeType.type node-type)))]
+              (let [normalized (apply-module-substitution inferred
+                                                          (Box.peek (InferredNodeType.type node-type)))]
                 (set! result
                       (Maybe.Just (Type.apply instance-substitution &normalized))))))))
       (match result
@@ -1979,8 +2007,8 @@ per-expression trace scan becomes an array lookup.")
                       (Array.aset! &*normalized-node-types*
                                    at
                                    (Box.init
-                                     (Type.apply (InferredModule.substitution inferred)
-                                                 (Box.peek (InferredNodeType.type node-type)))))
+                                     (apply-module-substitution inferred
+                                                                (Box.peek (InferredNodeType.type node-type)))))
                       (Array.aset! &*normalized-filled* at true))
                     (Result.Success
                       (Type.apply instance-substitution

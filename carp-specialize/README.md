@@ -17,6 +17,16 @@ An interface call is resolved to a matching registered implementation before
 an instance is emitted. Builtins are leaf instances; functions continue to
 contribute body dependencies.
 
+Two module-level caches carry data derived from one inferred module, and both
+are primed by `prime-trace!` at every public entry and dropped by
+`clear-caches!` afterwards: the normalized node types, and an indexed
+`Type.solver-from-substitution` view of the module substitution, which is what
+applies that substitution wherever a concrete type is needed. A public entry
+that does not prime them applies one module's substitution to another's types.
+
+Call and expression ids repeat across owners, so nothing here may be memoized
+by id alone; `*trace-positions*` is rebuilt per owner for that reason.
+
 The module also exports the pattern-slot utilities the ownership and backend
 phases share: `bound-slot-types` and `unbound-slot-types` type a match
 pattern's `Bind` and `Ignore` slots from the constructor declarations and the
