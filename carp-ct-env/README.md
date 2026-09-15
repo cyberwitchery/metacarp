@@ -26,5 +26,10 @@ Two kinds of binding are distinguished, because callers cache resolutions:
 `add-import!` also advances the epoch: an import changes what every name in
 the importing frame can mean.
 
+Epoch stamps come from one process-wide counter rather than a per-store one.
+Stores are copied — a warm session expands transient source against a snapshot
+copy — and two copies that diverge from one base would otherwise reach the
+same per-store stamp while holding different bindings.
+
 The library contains no syntax or evaluator policy. Its value type is generic,
 so other interpreters can reuse it.

@@ -185,6 +185,7 @@ source registry
   -> carp-module      module loading, load-order and git-reference resolution
   -> carp-surface     lossless surface parsing
   -> carp-expand      macro expansion (with carp-ct-env / carp-ct-eval)
+                      compile-time code is lowered and compiled to bytecode
   -> carp-resolve     name resolution into the core IR (carp-ir)
   -> carp-infer       Hindley–Milner type inference (carp-types)
   -> carp-specialize  interface selection and monomorphization

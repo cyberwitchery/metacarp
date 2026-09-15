@@ -2,13 +2,19 @@
 
 `carp-expand` is the macro-expansion phase between `carp-surface` and runtime
 name resolution. It processes forms in source order: `(defmacro ...)` adds a
-compile-time binding, while calls to that binding are evaluated by
-`carp-ct-eval`, then recursively expanded. Macro definitions are omitted from
-the resulting `SurfaceModule`.
+compile-time binding, while calls to that binding run through `carp-ct-eval`
+and are then recursively expanded. Macro definitions are omitted from the
+resulting `SurfaceModule`.
 
-The current vertical slice supports fixed-arity and rest-parameter,
-unhygienic macros, plus top-level and module-scoped `(defndynamic ...)` and
-`(defdynamic ...)` compile-time bindings. Dynamic definitions are evaluated in
+A macro's body is lowered and compiled when the macro is defined, and
+`ExpandMacro` carries the id of that code; a call runs it rather than walking
+the body. Forms that exist only at expansion time — an expansion to evaluate,
+a top-level compile-time call — go through `CtEval.eval-node`, which compiles
+them the same way.
+
+Macros are fixed-arity or rest-parameter and unhygienic, alongside top-level
+and module-scoped `(defndynamic ...)` and `(defdynamic ...)` compile-time
+bindings. Dynamic definitions are evaluated in
 source order and are omitted from the resulting `SurfaceModule`, just like
 macro definitions. Reopened modules share one compile-time frame, and
 `(use Module)` imports that frame without copying its values.

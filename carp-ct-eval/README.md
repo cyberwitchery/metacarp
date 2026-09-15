@@ -21,62 +21,59 @@ operations, small integer arithmetic, string operations (`String.length`,
 Collections convert to array syntax where an evaluated macro expression requires
 syntax.
 
-## Lowering and bytecode
+## How a form runs
 
-Syntax is compiled before it runs, in two stages, and a body that runs more
-than once is compiled once: a macro body when the macro is defined, a `fn`
-body when the lambda is written. There is no second evaluator — no tree
-walker beside the compiler — so the language has one description, in one
-place.
+Syntax is compiled before it runs, in two stages. A body that runs more than
+once is compiled once: a macro body when the macro is defined, a `fn` body
+where the lambda is written. `CtEval.eval-node` compiles and runs a form that
+exists only at run time — a macro expansion, the argument of `eval`, a
+top-level compile-time call.
 
-`CtLower.lower` produces `CtIR`. It decides three things a tree walker would
-decide again on every visit: which special form a list is, whether its head
-names a builtin, and whether a symbol is bound by an enclosing `fn` or `let`.
-A form with its own rule about which arguments are evaluated says so with
-`CtIR.Special`, and a malformed one carries the diagnostic it will raise when
-it runs, because the reference reports those where the form runs rather than
-where it is read.
+`CtLower.lower` produces `CtIR`. It settles, per form, which special form a
+list is, whether its head names a builtin, and whether a symbol is bound by an
+enclosing `fn` or `let`. A form with its own rule about which arguments are
+evaluated carries that rule as `CtIR.Special`; a malformed form becomes
+`CtIR.Fail` holding the diagnostic it raises when reached, because the
+reference reports these where a form runs rather than where it is read.
 
-`CtCompile.compile` turns that into `CtCode` — one instruction array plus the
-tables its operands index. `if`, `when`, `and`, `or`, `cond`, `case`, `while`
-and `let` become jumps and frame instructions within that array, so none of
-them costs an interpreter call; `for` desugars to `let` and `while`, and a
-dictionary literal to the `Map.from-array` call it means. `CtEval.run-code` is
-a loop over a program counter with a value stack and a stack of the frames
-`let` opens. One instruction leaves the loop and comes back, and the
-reference's VM recurses at the same place: a call, which enters a body that is
-not this one.
+`CtCompile.compile` produces `CtCode`: one instruction array plus the tables
+its operands index — constants, symbols, names, spans, call sites, nodes.
+`if`, `when`, `and`, `or`, `cond`, `case`, `while` and `let` are jumps and
+frame instructions inside that array. `for` is lowered as `let` and `while`,
+and a dictionary literal as the `Map.from-array` call it denotes.
 
-Call arguments MOVE off the value stack rather than being copied off it. A
-compile-time value owns a syntax tree, so copying every argument of every call
-is the one thing a stack machine here must not do; doing it cost 6% before it
-was noticed.
+`CtEval.run-code` runs one `CtCode`: a program counter, a value stack, and a
+stack of the frames `let` opens. One instruction re-enters the loop — a call,
+which runs a body that is not this one.
 
-Names are classified where they are written. A parameter or `let` binding is
-found among the handful of bindings in its own frame. Every other name carries
-an inline cache index: what a free name resolves to depends on the frame the
-body was DEFINED in, which is fixed per body, and on the environment's binding
-epoch, so a cache keyed by that pair is sound and hits on every call after the
-first. `CARP_DEBUG_CT` prints the cache counters after expansion.
+## Names
 
-## What the measurements said
+A parameter or `let` binding is found among the handful of bindings in its own
+frame. Every other name carries an inline cache: what a free name resolves to
+depends on the frame its body was defined in, which is fixed per body, and on
+the environment's binding epoch. A cache keyed by that pair is sound only
+while two things hold, and both are load-bearing:
 
-Against the tree walker this replaced, on this box: a Core-only compile went
-from 2.01s to 0.66s and `test/map.carp` from 4.75s to 3.15s, with peak RSS on
-the latter down from 183MB to 152MB (2026-09-15). Most of that is the first
-stage — deciding once what a form means, making a closure a prototype index
-instead of a copied syntax tree, and caching free-name resolution — plus
-`carp-ct-env` indexing the frames that hold hundreds of bindings, which was
-the single largest item and the one a profile had to find.
+- lowering classifies every name an enclosing `fn` or `let` binds, so a free
+  name can never be shadowed by a local;
+- `CtEnv.define-local!` does not advance the binding epoch, while `define!`
+  and `add-import!` do.
 
-The flat instruction array itself is worth about 3% of a Core-only compile
-over running `CtIR` as a tree, and 1-2% of `test/map.carp`.
+`CARP_DEBUG_CT` reports cache hits and misses after expansion.
 
-Two things were tried and dropped because they measured flat. Positional
-slots for locals: a local frame holds two or three bindings, so there was
-nothing in the scan to remove. And lowering `for` for speed: compile-time code
-rarely runs one — it is lowered anyway, because leaving one control form out
-of the compiler was arbitrary.
+## Rules for changing this
+
+- **Call arguments move off the value stack; they are never copied off it.**
+  A compile-time value owns a syntax tree, so copying each argument of each
+  call costs a tree per argument.
+- **The builtin table in `CtLower.builtin-id` and the integer arms of
+  `CtEval.apply-builtin` are one table written twice.** Adding a builtin means
+  adding it in both.
+- **`CtSpecial`'s opcodes and `CtEval.run-special`'s arms are likewise one
+  table written twice.**
+- **`apply`, `expand`, `eval` and `Dynamic.compose` strip comments before
+  counting arity; the other special forms do not.** The asymmetry is the
+  reference's.
 
 This evaluator is explicitly unhygienic: it returns the names that the macro
 body constructs. Hygiene is not part of this checkpoint. It deliberately does
