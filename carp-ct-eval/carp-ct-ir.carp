@@ -1,0 +1,225 @@
+(load "../carp-surface/carp-surface.carp")
+
+(doc CtRef "how lowered code reaches the value a name stands for.
+
+`Name` is a local: a parameter or `let` binding, found among the handful of
+bindings in its own frame. `Free` is everything else — a module member, a
+builtin, a name defined elsewhere — and carries the index of the inline cache
+that answers where it resolved to, so a reference that would otherwise walk
+out to a module frame holding all of Core reads one array slot instead.")
+(deftype CtRef
+  (Name [])
+  (Free [Int]))
+
+(doc CtBind "one `let` binding in lowered compile-time code: the name it
+binds and the code that produces its value.")
+(deftype CtBind [name String
+                 value (Box CtIR)
+                 span SurfaceSpan])
+
+(doc CtIR "is lowered compile-time code: what a form MEANS, settled once per
+body, rather than what it looks like.
+
+Lowering settles three questions a form would otherwise raise on every
+evaluation: which special form a list is, whether its head names a builtin,
+and whether a symbol is bound by an enclosing `fn` or `let`. A local resolves
+in its own frame; every other name carries an inline cache index, keyed by the
+frame its body was defined in and by the environment's binding epoch, so no
+name is compared at run time at all.
+
+Every compile-time form lowers, so this is the only description of what a
+compile-time form means.")
+(deftype CtIR
+  ;; syntax that evaluates to itself: literals, empty lists, opaque forms.
+  (Lit [(Box SurfaceNode)])
+  ;; (quote x)
+  (Quote [(Box SurfaceNode)])
+  ;; a name: how to reach it, and what it is called if that fails.
+  (Sym [String CtRef SurfaceSpan])
+  ;; a call argument in symbol position, which stays as its own syntax when
+  ;; it resolves to nothing.
+  (ArgSym [String CtRef (Box SurfaceNode)])
+  ;; an array literal, which evaluates to a collection.
+  (Coll [(Array (Box CtIR)) SurfaceSpan])
+  (If [(Box CtIR) (Box CtIR) (Box CtIR) SurfaceSpan])
+  (When [(Box CtIR) (Box CtIR) SurfaceSpan])
+  (And [(Array (Box CtIR)) SurfaceSpan])
+  (Or [(Array (Box CtIR)) SurfaceSpan])
+  (Seq [(Array (Box CtIR)) SurfaceSpan])
+  (Let [(Array CtBind) (Box CtIR) SurfaceSpan])
+  (LetDo [(Array CtBind) (Array (Box CtIR)) SurfaceSpan])
+  ;; `cond` keeps its own form: a `cond` that matches no branch answers with
+  ;; the form itself.
+  (Cond [(Array (Box CtIR)) (Box SurfaceNode)])
+  (While [(Box CtIR) (Box CtIR) SurfaceSpan])
+  (SetName [String (Box CtIR) SurfaceSpan])
+  ;; a lambda: the index of its prototype in the global prototype table.
+  (Fn [Int SurfaceSpan])
+  ;; a call whose head is a name: name, how to reach it, builtin id or -1,
+  ;; lowered arguments, raw argument syntax (a macro binds it unevaluated),
+  ;; and the call form itself for diagnostics and syntax construction.
+  (CallSym
+    [String
+     CtRef
+     Int
+     (Array (Box CtIR))
+     (Array (Box SurfaceNode))
+     (Box SurfaceNode)])
+  ;; a call whose head is computed.
+  (CallExpr
+    [(Box CtIR) (Array (Box CtIR)) (Array (Box SurfaceNode)) (Box SurfaceNode)])
+  ;; a form with its own rule about which arguments are evaluated: the
+  ;; opcode says which form, the IR array is the arguments it evaluates, and
+  ;; the node array is the ones it takes as syntax.
+  (Special [Int (Array (Box CtIR)) (Array (Box SurfaceNode)) (Box SurfaceNode)])
+  ;; a form that is malformed. Lowering knows, but the reference reports it
+  ;; where it runs, so the diagnostic is carried to that point.
+  (Fail [String SurfaceSpan])
+  ;; `case`: the value to match, then alternating pattern and branch, and a
+  ;; trailing form when there is an else.
+  (Case [(Box CtIR) (Array (Box CtIR)) (Box SurfaceNode)])
+  ;; an argument that resolves through the recorded-source table, falling
+  ;; back to ordinary evaluation, which is what `Dynamic.curry*` does to its
+  ;; first one.
+  (SexprArg [(Box SurfaceNode) (Box CtIR)]))
+
+(doc CtParameterNames "the names a compile-time parameter array binds.")
+(deftype CtParameterNames [fixed (Array String)
+                           rest (Maybe String)])
+
+(doc CtProto "is the shape of a compile-time lambda, lowered and compiled
+once where it is written. `code` is the id of its bytecode. Closing over a
+frame at run time then costs a prototype index and a frame ID rather than a
+copy of the body.")
+(deftype CtProto
+  [parameters (Array String)
+   rest (Maybe String)
+   code Int
+   body (Box SurfaceNode)])
+
+;; every lowered lambda, indexed by the prototype id a `CtIR.Fn` carries.
+(def *ct-protos* (the (Array (Box CtProto)) []))
+
+;; the inline caches, as three parallel arrays indexed by cache id. `frame`
+;; and `epoch` are the key: a cache line answers only for the frame a body
+;; was defined in, and only while the environment has not been rebound.
+;; `cell` is the answer — a cell index, or one of the negative codes below.
+(def *ct-cache-frame* (the (Array Int) []))
+(def *ct-cache-epoch* (the (Array Int) []))
+(def *ct-cache-cell* (the (Array Int) []))
+
+;; instrumentation for the inline caches, read by `CARP_DEBUG_CT`.
+(def *ct-cache-hits* 0)
+(def *ct-cache-misses* 0)
+(def *ct-name-resolutions* 0)
+
+(doc CtCacheCode "the non-cell answers an inline cache can hold.")
+(defmodule CtCacheCode
+  (defn builtin [] -2)
+  (defn missing [] -3)
+  (defn ambiguous [] -4))
+
+(doc CtSpecial "the forms with their own rule about which arguments are
+evaluated. The opcode is what the lowerer writes and the evaluator matches;
+the two tables must agree, the way the builtin table does.")
+(defmodule CtSpecial
+  (defn apply-op [] 0)
+  (defn expand-op [] 1)
+  (defn eval-op [] 2)
+  (defn members-op [] 3)
+  (defn managed-op [] 4)
+  (defn sexpr-op [] 5)
+  (defn use-op [] 6)
+  (defn concat-op [] 7)
+  (defn with-test-op [] 8)
+  (defn compose-op [] 9))
+
+(defmodule CtIRSpan
+  (doc of "the source span a lowered node came from.")
+  (defn of [code]
+    (match-ref code
+      (CtIR.Lit node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.Quote node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.Sym _ _ span) @span
+      (CtIR.ArgSym _ _ node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.Coll _ span) @span
+      (CtIR.If _ _ _ span) @span
+      (CtIR.When _ _ span) @span
+      (CtIR.And _ span) @span
+      (CtIR.Or _ span) @span
+      (CtIR.Seq _ span) @span
+      (CtIR.Let _ _ span) @span
+      (CtIR.LetDo _ _ span) @span
+      (CtIR.Cond _ node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.While _ _ span) @span
+      (CtIR.SetName _ _ span) @span
+      (CtIR.Fn _ span) @span
+      (CtIR.CallSym _ _ _ _ _ node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.CallExpr _ _ _ node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.Special _ _ _ node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.Fail _ span) @span
+      (CtIR.Case _ _ node) @(SurfaceNode.span (Box.peek node))
+      (CtIR.SexprArg node _) @(SurfaceNode.span (Box.peek node)))))
+
+(defmodule CtIRStore
+  (doc reset! "empties the lowered-code tables. A fresh compile-time session
+starts with no prototypes and no caches; frame IDs and cell indices from a
+previous session would otherwise answer for this one.")
+  (defn reset! []
+    (do
+      (set! *ct-protos* [])
+      (set! *ct-cache-frame* [])
+      (set! *ct-cache-epoch* [])
+      (set! *ct-cache-cell* [])))
+
+  (doc fresh-cache! "allocates an inline cache line and returns its id.")
+  (defn fresh-cache! []
+    (let-do [id (Array.length &*ct-cache-cell*)]
+      (Array.push-back! &*ct-cache-frame* -1)
+      (Array.push-back! &*ct-cache-epoch* -1)
+      (Array.push-back! &*ct-cache-cell* -1)
+      id))
+
+  (doc cache-hit? "whether cache line `id` answers for `frame` at `epoch`.")
+  (defn cache-hit? [id frame epoch]
+    (let-do [hit (and
+               (Int.= @(Array.unsafe-nth &*ct-cache-frame* id) frame)
+               (Int.= @(Array.unsafe-nth &*ct-cache-epoch* id) epoch))]
+      (if hit
+        (set! *ct-cache-hits* (Int.inc *ct-cache-hits*))
+        (set! *ct-cache-misses* (Int.inc *ct-cache-misses*)))
+      hit))
+
+  (doc count-name-resolution! "records one resolution that walked frames.")
+  (defn count-name-resolution! []
+    (set! *ct-name-resolutions* (Int.inc *ct-name-resolutions*)))
+
+  (doc report "the inline-cache counters, as text.")
+  (defn report []
+    (fmt
+      "ct-cache hits=%d misses=%d name-resolutions=%d protos=%d caches=%d"
+      *ct-cache-hits*
+      *ct-cache-misses*
+      *ct-name-resolutions*
+      (Array.length &*ct-protos*)
+      (Array.length &*ct-cache-cell*)))
+
+  (doc cache-value "the answer held in cache line `id`.")
+  (defn cache-value [id] @(Array.unsafe-nth &*ct-cache-cell* id))
+
+  (doc cache-fill! "records `value` as the answer for `frame` at `epoch`.")
+  (defn cache-fill! [id frame epoch value]
+    (do
+      (Array.aset! &*ct-cache-frame* id frame)
+      (Array.aset! &*ct-cache-epoch* id epoch)
+      (Array.aset! &*ct-cache-cell* id value)))
+
+  (doc add-proto! "registers a lowered lambda and returns its index.
+
+Prototypes are boxed so that registering one while another is running cannot
+move the code a live reference points at: the array moves pointers, never
+bodies.")
+  (defn add-proto! [proto]
+    (let-do [id (Array.length &*ct-protos*)]
+      (Array.push-back! &*ct-protos* (Box.init proto))
+      id)))

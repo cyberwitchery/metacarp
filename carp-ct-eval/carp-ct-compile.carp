@@ -1,0 +1,365 @@
+(load "carp-ct-code.carp")
+
+(doc CtBuilder "a code object under construction.")
+(deftype CtBuilder
+  [instructions (Array CtInstr)
+   constants (Array (Box SurfaceNode))
+   symbols (Array CtSymbol)
+   names (Array String)
+   spans (Array SurfaceSpan)
+   sites (Array CtCallSite)
+   nodes (Array (Box SurfaceNode))])
+
+(doc CtCompile "compiles lowered code to compile-time bytecode.
+
+`CtLower` decided what each form means; this decides where control goes. The
+conditional forms — `if`, `when`, `and`, `or`, `cond`, `while` — become jumps
+within one instruction array, and `let` becomes a frame instruction and a run
+of binds, so none of them costs an interpreter call any more. Calls and the
+`Raw` escape still enter a body that is not this one, which is where the
+reference's VM recurses too.
+
+Jump targets are absolute indices into the instruction array. A forward jump
+is emitted with a placeholder target and patched once its destination is
+known.")
+(defmodule CtCompile
+  (private emit!)
+  (hidden emit!)
+  (doc emit! "appends an instruction and answers its index.")
+  (defn emit! [builder instruction]
+    (let-do [index (Array.length (CtBuilder.instructions builder))]
+      (Array.push-back! (CtBuilder.instructions builder) instruction)
+      index))
+
+  (private here)
+  (hidden here)
+  (doc here "the index the next instruction will get.")
+  (defn here [builder] (Array.length (CtBuilder.instructions builder)))
+
+  (private patch!)
+  (hidden patch!)
+  (doc patch! "replaces a placeholder jump with one that has its target.")
+  (defn patch! [builder index instruction]
+    (Array.aset! (CtBuilder.instructions builder) index instruction))
+
+  (private constant!)
+  (hidden constant!)
+  (defn constant! [builder node]
+    (let-do [index (Array.length (CtBuilder.constants builder))]
+      (Array.push-back! (CtBuilder.constants builder)
+                        (Box.init (SurfaceNode.copy node)))
+      index))
+
+  (private symbol!)
+  (hidden symbol!)
+  (defn symbol! [builder name reference span]
+    (let-do [index (Array.length (CtBuilder.symbols builder))]
+      (Array.push-back! (CtBuilder.symbols builder)
+                        (CtSymbol.init @name @reference @span))
+      index))
+
+  (private name!)
+  (hidden name!)
+  (defn name! [builder name]
+    (let-do [index (Array.length (CtBuilder.names builder))]
+      (Array.push-back! (CtBuilder.names builder) @name)
+      index))
+
+  (private span!)
+  (hidden span!)
+  (defn span! [builder span]
+    (let-do [index (Array.length (CtBuilder.spans builder))]
+      (Array.push-back! (CtBuilder.spans builder) @span)
+      index))
+
+  (private site!)
+  (hidden site!)
+  (defn site! [builder site]
+    (let-do [index (Array.length (CtBuilder.sites builder))]
+      (Array.push-back! (CtBuilder.sites builder) site)
+      index))
+
+  (private node!)
+  (hidden node!)
+  (defn node! [builder node]
+    (let-do [index (Array.length (CtBuilder.nodes builder))]
+      (Array.push-back! (CtBuilder.nodes builder)
+                        (Box.init (SurfaceNode.copy node)))
+      index))
+
+  (private copy-nodes)
+  (hidden copy-nodes)
+  (defn copy-nodes [nodes]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length nodes)]
+      (for [i 0 n]
+        (Array.push-back! &result
+                          (Box.init
+                            (SurfaceNode.copy (Box.peek (Array.unsafe-nth nodes
+                                                                          i))))))
+      result))
+
+  (private compile-into!)
+  (hidden compile-into!)
+  (private compile-sequence!)
+  (hidden compile-sequence!)
+  (private compile-cond!)
+  (hidden compile-cond!)
+  (private compile-chain!)
+  (hidden compile-chain!)
+  (private compile-case!)
+  (hidden compile-case!)
+
+  (doc compile-sequence! "compiles forms evaluated for effect but the last,
+which is the value. An empty sequence answers with an empty list.")
+  (defn compile-sequence! [builder items span]
+    (let [n (Array.length items)]
+      (if (Int.= 0 n)
+        (ignore (emit! builder (CtInstr.PushEmpty (span! builder span))))
+        (for [i 0 n]
+          (do
+            (compile-into! builder (Box.peek (Array.unsafe-nth items i)))
+            (when (Int.< i (Int.dec n)) (ignore (emit! builder (CtInstr.Drop)))))))))
+
+  (doc compile-chain! "compiles `and` or `or`: each form but the last decides
+whether to stop, and the value that decided is the answer, so the jump keeps
+it on the stack.")
+  (defn compile-chain! [builder items span stop-when-false]
+    (let [n (Array.length items)]
+      (if (Int.= 0 n)
+        (ignore
+          (emit! builder (CtInstr.PushBool (span! builder span) stop-when-false)))
+        (let-do [ends (the (Array Int) [])]
+          (for [i 0 n]
+            (let-do [item (Box.peek (Array.unsafe-nth items i))]
+              (compile-into! builder item)
+              (when (Int.< i (Int.dec n))
+                (let [blame (span! builder &(CtIRSpan.of item))]
+                  (Array.push-back! &ends
+                                    (emit! builder
+                                           (if stop-when-false
+                                             (CtInstr.JumpUnlessKeep 0 blame)
+                                             (CtInstr.JumpIfKeep 0 blame))))))))
+          (let-do [end (here builder)
+                   pending (Array.length &ends)]
+            (for [i 0 pending]
+              (let [index @(Array.unsafe-nth &ends i)]
+                (match-ref (Array.unsafe-nth (CtBuilder.instructions builder)
+                                             index)
+                  (CtInstr.JumpUnlessKeep _ blame)
+                    (patch! builder index (CtInstr.JumpUnlessKeep end @blame))
+                  (CtInstr.JumpIfKeep _ blame)
+                    (patch! builder index (CtInstr.JumpIfKeep end @blame))
+                  _ ()))))))))
+
+  (doc compile-cond! "compiles `cond`. A `cond` that matches no branch and has
+no trailing form answers with its own syntax.")
+  (defn compile-cond! [builder items node]
+    (let-do [ends (the (Array Int) [])
+             n (Array.length items)
+             i 0]
+      (while-do (Int.< (Int.inc i) n)
+        (let-do [condition (Box.peek (Array.unsafe-nth items i))
+                 blame (span! builder &(CtIRSpan.of condition))]
+          (compile-into! builder condition)
+          (let-do [skip (emit! builder (CtInstr.JumpUnlessBool 0 blame))]
+            (compile-into! builder
+                           (Box.peek (Array.unsafe-nth items (Int.inc i))))
+            (Array.push-back! &ends (emit! builder (CtInstr.Jump 0)))
+            (patch! builder skip (CtInstr.JumpUnlessBool (here builder) blame))))
+        (set! i (Int.+ i 2)))
+      (if (Int.< i n)
+        (compile-into! builder (Box.peek (Array.unsafe-nth items i)))
+        (ignore (emit! builder (CtInstr.Push (constant! builder node)))))
+      (let-do [end (here builder)
+               pending (Array.length &ends)]
+        (for [j 0 pending]
+          (patch! builder @(Array.unsafe-nth &ends j) (CtInstr.Jump end))))))
+
+  (defn compile-into! [builder code]
+    (match-ref code
+      (CtIR.Lit node)
+      (ignore (emit! builder (CtInstr.Push (constant! builder (Box.peek node)))))
+      (CtIR.Quote node)
+      (ignore (emit! builder (CtInstr.Push (constant! builder (Box.peek node)))))
+      (CtIR.Sym name reference span)
+      (ignore
+        (emit! builder (CtInstr.Resolve (symbol! builder name reference span))))
+      (CtIR.ArgSym name reference node)
+      (ignore
+        (emit! builder
+               (CtInstr.ArgResolve
+                 (symbol! builder
+                          name
+                          reference
+                          (SurfaceNode.span (Box.peek node)))
+                 (node! builder (Box.peek node)))))
+      (CtIR.Coll items span)
+      (let-do [n (Array.length items)]
+        (for [i 0 n]
+          (compile-into! builder (Box.peek (Array.unsafe-nth items i))))
+        (ignore (emit! builder (CtInstr.MakeColl n))))
+      (CtIR.If condition then-branch else-branch _)
+      (let-do [blame (span! builder &(CtIRSpan.of (Box.peek condition)))]
+        (compile-into! builder (Box.peek condition))
+        (let-do [skip (emit! builder (CtInstr.JumpUnlessStrict 0 blame))]
+          (compile-into! builder (Box.peek then-branch))
+          (let-do [over (emit! builder (CtInstr.Jump 0))]
+            (patch! builder skip (CtInstr.JumpUnlessStrict (here builder) blame))
+            (compile-into! builder (Box.peek else-branch))
+            (patch! builder over (CtInstr.Jump (here builder))))))
+      (CtIR.When condition then-branch span)
+      (let-do [blame (span! builder &(CtIRSpan.of (Box.peek condition)))
+               empty (span! builder span)]
+        (compile-into! builder (Box.peek condition))
+        (let-do [skip (emit! builder (CtInstr.JumpUnlessBool 0 blame))]
+          (compile-into! builder (Box.peek then-branch))
+          (let-do [over (emit! builder (CtInstr.Jump 0))]
+            (patch! builder skip (CtInstr.JumpUnlessBool (here builder) blame))
+            (ignore (emit! builder (CtInstr.PushEmpty empty)))
+            (patch! builder over (CtInstr.Jump (here builder))))))
+      (CtIR.And items span)
+      (compile-chain! builder items span true)
+      (CtIR.Or items span)
+      (compile-chain! builder items span false)
+      (CtIR.Seq items span)
+      (compile-sequence! builder items span)
+      (CtIR.Cond items node)
+      (compile-cond! builder items (Box.peek node))
+      (CtIR.While condition body span)
+      (let-do [start (here builder)
+               blame (span! builder &(CtIRSpan.of (Box.peek condition)))
+               empty (span! builder span)]
+        (compile-into! builder (Box.peek condition))
+        (let-do [skip (emit! builder (CtInstr.JumpUnlessBool 0 blame))]
+          (compile-into! builder (Box.peek body))
+          (ignore (emit! builder (CtInstr.Drop)))
+          (ignore (emit! builder (CtInstr.Jump start)))
+          (patch! builder skip (CtInstr.JumpUnlessBool (here builder) blame))
+          (ignore (emit! builder (CtInstr.PushEmpty empty)))))
+      (CtIR.Let binds body _)
+      (let-do [n (Array.length binds)]
+        (ignore (emit! builder (CtInstr.EnterFrame)))
+        (for [i 0 n]
+          (let-do [bind (Array.unsafe-nth binds i)]
+            (compile-into! builder (Box.peek (CtBind.value bind)))
+            (ignore
+              (emit! builder (CtInstr.Bind (name! builder (CtBind.name bind)))))))
+        (compile-into! builder (Box.peek body))
+        (ignore (emit! builder (CtInstr.LeaveFrame))))
+      (CtIR.LetDo binds items span)
+      (let-do [n (Array.length binds)]
+        (ignore (emit! builder (CtInstr.EnterFrame)))
+        (for [i 0 n]
+          (let-do [bind (Array.unsafe-nth binds i)]
+            (compile-into! builder (Box.peek (CtBind.value bind)))
+            (ignore
+              (emit! builder (CtInstr.Bind (name! builder (CtBind.name bind)))))))
+        (compile-sequence! builder items span)
+        (ignore (emit! builder (CtInstr.LeaveFrame))))
+      (CtIR.SetName name value span)
+      (let-do [target (name! builder name)
+               blame (span! builder span)]
+        (compile-into! builder (Box.peek value))
+        (ignore (emit! builder (CtInstr.Assign target blame))))
+      (CtIR.Fn proto _)
+      (ignore (emit! builder (CtInstr.MakeClosure @proto)))
+      (CtIR.CallSym name reference builtin args raws call)
+      (let-do [site (site! builder
+                           (CtCallSite.init @name
+                                            @reference
+                                            @builtin
+                                            (copy-nodes raws)
+                                            (Box.init (SurfaceNode.copy (Box.peek call)))))
+               n (Array.length args)
+               test (emit! builder (CtInstr.CallMacroTest site 0))]
+        (for [i 0 n]
+          (compile-into! builder (Box.peek (Array.unsafe-nth args i))))
+        (ignore (emit! builder (CtInstr.CallApply site n)))
+        (patch! builder test (CtInstr.CallMacroTest site (here builder))))
+      ;; arguments before the callee: a compile-time call can log or `set!`,
+      ;; so the order is observable.
+      (CtIR.CallExpr head args _ call)
+      (let-do [n (Array.length args)]
+        (for [i 0 n]
+          (compile-into! builder (Box.peek (Array.unsafe-nth args i))))
+        (compile-into! builder (Box.peek head))
+        (ignore
+          (emit! builder
+                 (CtInstr.CallApplyValue (node! builder (Box.peek call)) n))))
+      (CtIR.Special opcode arguments raws call)
+      (let-do [site (site! builder
+                           (CtCallSite.init @""
+                                            (CtRef.Name)
+                                            -1
+                                            (copy-nodes raws)
+                                            (Box.init (SurfaceNode.copy (Box.peek call)))))
+               n (Array.length arguments)]
+        (for [i 0 n]
+          (compile-into! builder (Box.peek (Array.unsafe-nth arguments i))))
+        (ignore (emit! builder (CtInstr.Special @opcode site n))))
+      (CtIR.Fail message span)
+      (ignore
+        (emit! builder
+               (CtInstr.Fail (name! builder message) (span! builder span))))
+      (CtIR.SexprArg node fallback)
+      (let-do [taken (emit! builder
+                            (CtInstr.SexprResolve (node! builder (Box.peek node))
+                                                  0))]
+        (compile-into! builder (Box.peek fallback))
+        (patch! builder
+                taken
+                (CtInstr.SexprResolve (node! builder (Box.peek node))
+                                      (here builder))))
+      (CtIR.Case target branches node)
+      (compile-case! builder (Box.peek target) branches (Box.peek node))))
+
+  (doc compile-case! "compiles `case`. The value stays on the stack while
+each pattern is evaluated and compared against a copy of it, so a pattern
+after the matching one is never evaluated.")
+  (defn compile-case! [builder target branches node]
+    (let-do [ends (the (Array Int) [])
+             n (Array.length branches)
+             i 0]
+      (compile-into! builder target)
+      (while-do (Int.< (Int.inc i) n)
+        (let-do [pattern (Box.peek (Array.unsafe-nth branches i))
+                 blame (span! builder &(CtIRSpan.of pattern))]
+          (ignore (emit! builder (CtInstr.Dup)))
+          (compile-into! builder pattern)
+          (let-do [skip (emit! builder (CtInstr.JumpUnlessEqual 0 blame))]
+            (ignore (emit! builder (CtInstr.Drop)))
+            (compile-into! builder
+                           (Box.peek (Array.unsafe-nth branches (Int.inc i))))
+            (Array.push-back! &ends (emit! builder (CtInstr.Jump 0)))
+            (patch! builder skip (CtInstr.JumpUnlessEqual (here builder) blame))))
+        (set! i (Int.+ i 2)))
+      ;; the matched value is still under the answer, or still alone when
+      ;; nothing matched
+      (ignore (emit! builder (CtInstr.Drop)))
+      (if (Int.< i n)
+        (compile-into! builder (Box.peek (Array.unsafe-nth branches i)))
+        (ignore
+          (emit! builder
+                 (CtInstr.Fail
+                   (name! builder "compile-time case has no matching branch")
+                   (span! builder (SurfaceNode.span node))))))
+      (let-do [end (here builder)
+               pending (Array.length &ends)]
+        (for [j 0 pending]
+          (patch! builder @(Array.unsafe-nth &ends j) (CtInstr.Jump end))))))
+
+  (doc compile "compiles one lowered body and registers it, answering its
+code id.")
+  (defn compile [code]
+    (let-do [builder (CtBuilder.init [] [] [] [] [] [] [])]
+      (compile-into! &builder code)
+      (ignore (emit! &builder (CtInstr.Halt)))
+      (CtCodeStore.add!
+        (CtCode.init @(CtBuilder.instructions &builder)
+                     @(CtBuilder.constants &builder)
+                     @(CtBuilder.symbols &builder)
+                     @(CtBuilder.names &builder)
+                     @(CtBuilder.spans &builder)
+                     @(CtBuilder.sites &builder)
+                     @(CtBuilder.nodes &builder))))))

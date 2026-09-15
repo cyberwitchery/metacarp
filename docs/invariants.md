@@ -361,7 +361,10 @@ by comments + the session macro-provenance tests
 
 ### 19. ct-eval dispatch order is reference semantics: builtins beat same-named definitions [semantic (fidelity)]
 
-`apply-builtin` runs before environment lookup (carp-ct-eval:2763-2770).
+`apply-builtin` runs before environment lookup, in `run-call-values`, and a
+macro bound to the same name still beats both. There is one call path now,
+which is the point: while the compiler and a tree walker both existed, this
+rule had to hold in two places and drifted between them twice.
 carp-ct-infer's duplicated ~91-name `builtin?` table encodes the same rule by
 hand. Reordering "to respect user definitions" diverges from reference macro
 semantics — and `diff-expansion.sh`'s 6-program corpus will probably not
@@ -583,6 +586,35 @@ byte-identical.
    contiguity is unrepresentable (and `repeats-previous?` disappears).
 5. **#26**: one shared core manifest module consumed by both main.carp and
    carp-core-loader.
+
+### 33. Inline-cache soundness rests on what `define-local!` does NOT bump [semantic, new 2026-09-15]
+
+`CtIR.Sym`/`CallSym` with a `CtRef.Free` cache an environment resolution
+under `(base frame, epoch)`, where `base` is the frame the BODY was defined
+in — a closure's `defining-frame`, a macro's. That key is sound only because
+of two facts that must stay true together:
+
+1. Lowering classifies every name bound by an enclosing `fn` or `let` as
+   `CtRef.Name`, so a free name can never be shadowed by a local; resolving
+   one from the call frame and from the defining frame cannot differ.
+2. `CtEnv.define-local!` (parameters, `let` values) deliberately does not
+   advance the epoch, while `define!` and `add-import!` do.
+3. Epoch stamps come from ONE process-wide counter, not a per-store one.
+   Stores are copied — a warm session expands transient source against a
+   snapshot copy — and two copies diverging from one base would otherwise
+   reach the same per-store number with different bindings.
+
+Break (1) — lower a local as `Free`, or lower a body in a scope that does not
+list its binders — and a cached cell from one call answers in another.
+Break (2) the other way — bump on locals — and the caches simply never hit;
+that fails quietly as lost speed, not as a wrong answer.
+
+Enforced by: `diff-expansion.sh` (byte-identical expansion against the
+reference over the corpus), the reference suite, and the gen-2/gen-3 fixed
+point, all of which a mis-scoped local breaks loudly. `CARP_DEBUG_CT` prints
+hit/miss counters when the question is whether the caches are working
+(76% hits during a Core load, measured 2026-09-15).
+
 
 ## Five things that look fragile but are actually safe
 

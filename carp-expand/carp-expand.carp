@@ -8,6 +8,7 @@ until a call invokes `CtEval.eval-template` with call-site bindings.")
   [name String
    parameters MacroParameters
    body (Box SurfaceNode)
+   code Int
    defining-frame FrameId
    file String])
 
@@ -166,10 +167,16 @@ compile-time snapshot produced while expanding it.")
                       (Result.Success macro-parameters)
                         (Result.Success
                           ;; the file is only knowable now: when the macro is
-                          ;; called, the file being loaded is the caller's
+                          ;; called, the file being loaded is the caller's.
+                          ;; The body is lowered here too, once, so that every
+                          ;; call runs code instead of walking syntax.
                           (ExpandMacro.init name
-                                            macro-parameters
+                                            @&macro-parameters
                                             (Box.init (SurfaceNode.copy body))
+                                            (CtLower.lower-macro-proto
+                                              @(MacroParameters.fixed &macro-parameters)
+                                              @(MacroParameters.rest &macro-parameters)
+                                              (Box.init (SurfaceNode.copy body)))
                                             @frame
                                             (CtEval.definition-file)))
                       (Result.Error error) (Result.Error error))
@@ -225,7 +232,7 @@ compile-time snapshot produced while expanding it.")
               (if (named? head @"defdynamic")
                 (match (symbol-name name-node)
                   (Maybe.Just name)
-                    (match (CtEval.eval-value value-form state frame)
+                    (match (CtEval.eval-node value-form state frame)
                       (Result.Success value)
                         (Result.Success
                           (ExpandDynamic.init name (Box.init value)))
@@ -361,9 +368,11 @@ what asked for the expansion.")
   (defn expand-macro-template [call macro state frame]
     (let-do [_entered (CtEval.enter-call! call state frame)
              _pushed (CtEval.push-step-file! (ExpandMacro.file macro))
-             result (CtEval.eval-template (Box.peek (ExpandMacro.body macro))
-                                          state
-                                          frame)
+             result (CtEval.eval-proto-template @(ExpandMacro.code macro)
+                                                (Box.peek (ExpandMacro.body macro))
+                                                state
+                                                frame
+                                                @(FrameId.index (ExpandMacro.defining-frame macro)))
              _popped (CtEval.pop-step-file!)
              _left (CtEval.leave-call!)]
       result))
@@ -393,23 +402,24 @@ what asked for the expansion.")
                  n fixed-count]
           (for [i 0 n]
             (ignore
-              (CtEval.define! state
-                              &frame
-                              (Array.unsafe-nth fixed i)
-                              (CtValue.Syntax
-                                (Box.init
-                                  (SurfaceNode.copy
-                                    (Box.peek (Array.unsafe-nth arguments i))))))))
+              (CtEval.define-local! state
+                                    &frame
+                                    (Array.unsafe-nth fixed i)
+                                    (CtValue.Syntax
+                                      (Box.init
+                                        (SurfaceNode.copy
+                                          (Box.peek (Array.unsafe-nth arguments
+                                                                      i))))))))
           (match rest
             (Maybe.Just rest-name)
               (ignore
-                (CtEval.define! state
-                                &frame
-                                &rest-name
-                                (CtValue.Syntax
-                                  (Box.init (rest-syntax call
-                                                         arguments
-                                                         fixed-count)))))
+                (CtEval.define-local! state
+                                      &frame
+                                      &rest-name
+                                      (CtValue.Syntax
+                                        (Box.init (rest-syntax call
+                                                               arguments
+                                                               fixed-count)))))
             (Maybe.Nothing) ())
           (Result.Success frame)))))
 
@@ -674,9 +684,9 @@ happens to render identically.")
                 (match (symbol-key head)
                   (Maybe.Just name)
                     (if (or (String.= &name "eval") (String.= &name "set!"))
-                      (match (CtEval.eval-value node
-                                                state
-                                                (ExpandScope.frame scope))
+                      (match (CtEval.eval-node node
+                                               state
+                                               (ExpandScope.frame scope))
                         (Result.Success _) (Result.Success (Maybe.Nothing))
                         (Result.Error error) (Result.Error error))
                       ;; a top-level call to a pure compile-time command with
@@ -687,9 +697,9 @@ happens to render identically.")
                       (cond
                         (and (CtEval.pure-string-command? &name)
                              (literal-arguments? node))
-                        (match (CtEval.eval-value node
-                                                  state
-                                                  (ExpandScope.frame scope))
+                        (match (CtEval.eval-node node
+                                                 state
+                                                 (ExpandScope.frame scope))
                           (Result.Success _) (Result.Success (Maybe.Nothing))
                           (Result.Error error) (Result.Error error))
                         (String.= &name "if")
@@ -702,10 +712,10 @@ happens to render identically.")
                           (SurfaceForm.List raw-items)
                             (let [items (semantic-items raw-items)
                                   folded (if (Int.= (Array.length &items) 4)
-                                    (match (CtEval.eval-value (Box.peek (Array.unsafe-nth &items
-                                                                                          1))
-                                                              state
-                                                              (ExpandScope.frame scope))
+                                    (match (CtEval.eval-node (Box.peek (Array.unsafe-nth &items
+                                                                                         1))
+                                                             state
+                                                             (ExpandScope.frame scope))
                                       (Result.Success value)
                                         (match value
                                           (CtValue.Syntax boxed)
@@ -757,9 +767,9 @@ happens to render identically.")
                               (Maybe.Just value)
                                 (match value
                                   (CtValue.Closure _)
-                                    (match (CtEval.eval-value node
-                                                              state
-                                                              (ExpandScope.frame scope))
+                                    (match (CtEval.eval-node node
+                                                             state
+                                                             (ExpandScope.frame scope))
                                       (Result.Success _)
                                         (Result.Success (Maybe.Nothing))
                                       (Result.Error error) (Result.Error error))
@@ -1535,10 +1545,14 @@ compile-time environment for subsequent transient expansions.")
   (doc expand-module-with "expands source with explicit compiler-driver
 configuration.")
   (defn expand-module-with [module config]
-    (match (prepare-module-with module config)
-      (Result.Success prepared)
-        (Result.Success @(PreparedExpansion.module &prepared))
-      (Result.Error error) (Result.Error error)))
+    (let-do [result (match (prepare-module-with module config)
+               (Result.Success prepared)
+                 (Result.Success @(PreparedExpansion.module &prepared))
+               (Result.Error error) (Result.Error error))]
+      (match (IO.getenv "CARP_DEBUG_CT")
+        (Maybe.Just _) (IO.errorln &(CtIRStore.report))
+        (Maybe.Nothing) ())
+      result))
 
   (doc prepare-module-against "expands a module against a warm snapshot and
 returns the resulting snapshot. Callers may commit that snapshot atomically or
