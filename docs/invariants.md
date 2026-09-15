@@ -616,6 +616,23 @@ hit/miss counters when the question is whether the caches are working
 (76% hits during a Core load, measured 2026-09-15).
 
 
+### 34. Specialization's module-level caches must be primed per entry [implementation, sharpened 2026-09-15]
+
+`*normalized-node-types*` and now `*module-solver*` (an indexed
+`Type.solver-from-substitution` view of `InferredModule.substitution`) are
+process globals holding data derived from ONE inferred module. Every public
+entry — `named-requests`, `echo-request`, `module-with-known` — calls
+`prime-trace!` before anything downstream can reach them, and `clear-caches!`
+drops them afterwards. A new entry that forgets `prime-trace!` applies one
+module's substitution to another module's types, which the suites would show
+as a wrong type rather than a crash.
+
+Do NOT memoize `normalize-call` by `CallSite.id`. Expression and call ids
+repeat across owners — that is why `*trace-positions*` is rebuilt per owner —
+so an id-keyed memo returns one function's type for another's call. The
+specialize suites catch it.
+
+
 ## Five things that look fragile but are actually safe
 
 1. **`-g` vs release divergence**: the debug path allocates ids differently
