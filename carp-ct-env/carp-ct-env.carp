@@ -17,22 +17,63 @@ so callers never depend on import order.")
 
 (doc CtEnvFrame "is one lexical compile-time scope. Parent and import
 relationships use stable IDs, so extending an environment does not copy
-bindings or values.")
+bindings or values.
+
+A frame that grows past `index-threshold` builds a name index and keeps it
+up to date. Call frames and `let` frames hold a handful of bindings and scan
+them; a module frame holding all of Core would otherwise be scanned, name by
+name, by every reference that has to walk out to it. The index is empty until
+the frame outgrows a scan, so the frames created per call cost nothing for
+it.")
 (deftype CtEnvFrame
   [parent (Maybe FrameId)
    imports (Array FrameId)
-   bindings (Array CtEnvBinding)])
+   bindings (Array CtEnvBinding)
+   index (Map String CellId)
+   indexed Bool])
+
+;; the source of binding-epoch stamps. One counter for the process, never
+;; reset: see the note on `CtEnvStore`.
+(def *ct-env-epoch* 0)
 
 (doc CtEnvCell "holds one mutable compile-time value.")
 (deftype (CtEnvCell a) [value (Box a)])
 
-(doc CtEnvStore "owns all frames and cells for one compile-time session.")
-(deftype (CtEnvStore a) [frames (Array CtEnvFrame)
-                         cells (Array (CtEnvCell a))])
+(doc CtEnvStore "owns all frames and cells for one compile-time session.
+
+`epoch` stamps the changes that can alter what a name RESOLVES to: a new
+binding in a frame a body can see out to, or a new import. It does not count
+writes through `set!`, which change a value without moving a name, and it does
+not count local bindings, which a lowered body has already classified and
+never looks up by name. Callers cache resolutions against it.
+
+Stamps come from one process-wide counter rather than from a per-store one,
+because stores are COPIED: a warm session expands transient source against a
+snapshot copy, and two copies that diverge from one base would otherwise
+reach the same number with different bindings, letting a cache filled against
+one answer for the other. A global counter cannot collide. Two copies that
+never diverge share a stamp, which is correct — they hold the same frames and
+the same cells.")
+(deftype (CtEnvStore a)
+  [frames (Array CtEnvFrame)
+   cells (Array (CtEnvCell a))
+   epoch Int])
 
 (defmodule CtEnv
+  (private next-epoch!)
+  (hidden next-epoch!)
+  (defn next-epoch! []
+    (let-do [stamp (Int.inc *ct-env-epoch*)] (set! *ct-env-epoch* stamp) stamp))
+
   (doc empty "creates an environment with no frames or cells.")
-  (defn empty [] (CtEnvStore.init [] []))
+  (defn empty [] (CtEnvStore.init [] [] (next-epoch!)))
+
+  (doc epoch "the environment's current binding epoch.")
+  (defn epoch [store] @(CtEnvStore.epoch store))
+
+  (private bump!)
+  (hidden bump!)
+  (defn bump! [store] (CtEnvStore.set-epoch! store (next-epoch!)))
 
   (private valid-frame?)
   (hidden valid-frame?)
@@ -52,46 +93,91 @@ bindings or values.")
   (defn root! [store]
     (let-do [id (FrameId.init (Array.length (CtEnvStore.frames store)))]
       (Array.push-back! (CtEnvStore.frames store)
-                        (CtEnvFrame.init (Maybe.Nothing) [] []))
+                        (CtEnvFrame.init (Maybe.Nothing)
+                                         []
+                                         []
+                                         (Map.init 0 0 [])
+                                         false))
       id))
 
   (doc child! "allocates a lexical child of `parent`.")
   (defn child! [store parent]
     (let-do [id (FrameId.init (Array.length (CtEnvStore.frames store)))]
       (Array.push-back! (CtEnvStore.frames store)
-                        (CtEnvFrame.init (Maybe.Just @parent) [] []))
+                        (CtEnvFrame.init (Maybe.Just @parent)
+                                         []
+                                         []
+                                         (Map.init 0 0 [])
+                                         false))
       id))
+
+  (doc index-threshold "the number of bindings past which a frame indexes its
+names instead of scanning them.")
+  (defn index-threshold [] 8)
 
   (private local-cell)
   (hidden local-cell)
   (defn local-cell [store frame name]
     (if (valid-frame? store frame)
-      (let-do [result (the (Maybe CellId) (Maybe.Nothing))
-               bindings (CtEnvFrame.bindings
-                 (Array.unsafe-nth (CtEnvStore.frames store)
-                                   @(FrameId.index frame)))
-               i (Int.dec (Array.length bindings))]
-        (while-do (Int.>= i 0)
-          (match-ref &result
-            (Maybe.Nothing)
-              (let [binding (Array.unsafe-nth bindings i)]
-                (when (= (CtEnvBinding.name binding) name)
-                  (set! result (Maybe.Just @(CtEnvBinding.cell binding)))))
-            (Maybe.Just _) ())
-          (set! i (Int.dec i)))
-        result)
+      (let [stored (Array.unsafe-nth (CtEnvStore.frames store)
+                                     @(FrameId.index frame))]
+        (if @(CtEnvFrame.indexed stored)
+          (Map.get-maybe (CtEnvFrame.index stored) name)
+          (let-do [result (the (Maybe CellId) (Maybe.Nothing))
+                   bindings (CtEnvFrame.bindings stored)
+                   i (Int.dec (Array.length bindings))]
+            (while-do (Int.>= i 0)
+              (match-ref &result
+                (Maybe.Nothing)
+                  (let [binding (Array.unsafe-nth bindings i)]
+                    (when (= (CtEnvBinding.name binding) name)
+                      (set! result (Maybe.Just @(CtEnvBinding.cell binding)))))
+                (Maybe.Just _) ())
+              (set! i (Int.dec i)))
+            result)))
       (Maybe.Nothing)))
+
+  (private record-binding!)
+  (hidden record-binding!)
+  (doc record-binding! "appends a binding and keeps the frame's name index in
+step, building it the first time the frame outgrows a scan. A later binding
+of a name shadows an earlier one, which the index reproduces by overwriting
+the entry.")
+  (defn record-binding! [store frame name cell]
+    (let-do [stored (Array.unsafe-nth (CtEnvStore.frames store)
+                                      @(FrameId.index frame))]
+      (Array.push-back! (CtEnvFrame.bindings stored)
+                        (CtEnvBinding.init @name @cell))
+      (if @(CtEnvFrame.indexed stored)
+        (ignore (Map.put! (CtEnvFrame.index stored) name cell))
+        (when (Int.>
+            (Array.length (CtEnvFrame.bindings stored))
+            (index-threshold))
+          (let-do [_fresh (CtEnvFrame.set-index! stored
+                                                 (the (Map String CellId)
+                                                      (Map.create)))
+                   bindings (CtEnvFrame.bindings stored)
+                   n (Array.length bindings)]
+            (for [i 0 n]
+              (let [binding (Array.unsafe-nth bindings i)]
+                (ignore
+                  (Map.put! (CtEnvFrame.index stored)
+                            (CtEnvBinding.name binding)
+                            (CtEnvBinding.cell binding)))))
+            (CtEnvFrame.set-indexed! stored true))))))
 
   (doc bind-cell! "adds a name in `frame` that refers to an existing cell.
 This is the primitive used for aliases and imports.")
   (defn bind-cell! [store frame name cell]
     (if (and (valid-frame? store frame) (valid-cell? store cell))
-      (do
-        (Array.push-back!
-          (CtEnvFrame.bindings
-            (Array.unsafe-nth (CtEnvStore.frames store) @(FrameId.index frame)))
-          (CtEnvBinding.init @name @cell))
-        true)
+      (do (record-binding! store frame name cell) (bump! store) true)
+      false))
+
+  (private bind-cell-local!)
+  (hidden bind-cell-local!)
+  (defn bind-cell-local! [store frame name cell]
+    (if (and (valid-frame? store frame) (valid-cell? store cell))
+      (do (record-binding! store frame name cell) true)
       false))
 
   (doc define! "allocates a cell and binds it in `frame`. A later definition
@@ -103,6 +189,18 @@ of the same local name shadows the earlier binding.")
       (ignore (bind-cell! store frame name &cell))
       cell))
 
+  (doc define-local! "binds a name that no free reference can see: a
+parameter, a `let` binding, a loop variable. Lowering classifies these names
+where they are written, so binding one cannot change what any other name
+resolves to, and the epoch stays where it is. Binding them through `define!`
+instead would invalidate every cached resolution on every call.")
+  (defn define-local! [store frame name value]
+    (let-do [cell (CellId.init (Array.length (CtEnvStore.cells store)))]
+      (Array.push-back! (CtEnvStore.cells store)
+                        (CtEnvCell.init (Box.init value)))
+      (ignore (bind-cell-local! store frame name &cell))
+      cell))
+
   (doc add-import! "adds an imported frame searched after lexical parents.")
   (defn add-import! [store frame imported]
     (if (and (valid-frame? store frame) (valid-frame? store imported))
@@ -111,6 +209,7 @@ of the same local name shadows the earlier binding.")
           (CtEnvFrame.imports
             (Array.unsafe-nth (CtEnvStore.frames store) @(FrameId.index frame)))
           @imported)
+        (bump! store)
         true)
       false))
 
@@ -188,6 +287,20 @@ lexical parents.")
     (match (lookup-status store frame name)
       (CtEnvLookup.Found cell) (Maybe.Just cell)
       _ (Maybe.Nothing)))
+
+  (doc cell-index "the raw index of a cell, for callers that cache it.")
+  (defn cell-index [cell] @(CellId.index cell))
+
+  (doc cell-at "rebuilds a cell id from a cached index.")
+  (defn cell-at [index] (CellId.init index))
+
+  (doc peek-cell "borrows the value in a cell. A caller that only needs to
+LOOK at a binding — to classify it, not to use it — borrows instead of
+copying, which for a compile-time value means not copying a syntax tree.")
+  (defn peek-cell [store cell]
+    (Box.peek
+      (CtEnvCell.value
+        (Array.unsafe-nth (CtEnvStore.cells store) @(CellId.index cell)))))
 
   (doc read-cell "copies the value in a cell.")
   (defn read-cell [store cell]

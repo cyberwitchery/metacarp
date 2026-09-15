@@ -1,0 +1,803 @@
+(load "carp-ct-compile.carp")
+
+(doc CtLower "lowers surface syntax to `CtIR` once, so that evaluation never
+asks what a form is.
+
+Lowering decides three things the tree walker decided on every visit: which
+special form a list is, whether its head names a builtin, and whether a
+symbol is bound by an enclosing `fn` or `let` in the same body. A form this
+form with its own rule about which arguments are evaluated says so with
+`CtIR.Special`, and a malformed one carries the diagnostic it will raise when
+it runs.")
+(defmodule CtLower
+  (private symbol-key)
+  (hidden symbol-key)
+  (defn symbol-key [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (if (Int.> (Array.length segments) 0)
+          (Maybe.Just (String.join "." segments))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private symbol-name)
+  (hidden symbol-name)
+  (defn symbol-name [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (if (Int.= 1 (Array.length segments))
+          (Maybe.Just @(Array.unsafe-nth segments 0))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private semantic-items)
+  (hidden semantic-items)
+  (defn semantic-items [items]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length items)]
+      (for [i 0 n]
+        (let [item (Box.peek (Array.unsafe-nth items i))]
+          (match-ref (SurfaceNode.form item)
+            (SurfaceForm.Comment _) ()
+            _ (Array.push-back! &result (Box.init (SurfaceNode.copy item))))))
+      result))
+
+  (doc builtin-id "the id of the builtin `name` names, or -1. The order is
+the order of the arms in `CtEval.apply-builtin`, which the evaluator's
+dispatch mirrors; adding a builtin means adding it in both places.")
+  (defn builtin-id [name]
+    (cond
+      (String.= name "Unsafe.load-stack") 0
+      (String.= name "list") 1
+      (String.= name "array") 2
+      (String.= name "Symbol.from") 3
+      (String.= name "Symbol.concat") 4
+      (String.= name "Symbol.prefix") 5
+      (String.= name "car") 6
+      (String.= name "Dynamic.car") 7
+      (String.= name "cdr") 8
+      (String.= name "Dynamic.cdr") 9
+      (String.= name "cadr") 10
+      (String.= name "Dynamic.cadr") 11
+      (String.= name "caddr") 12
+      (String.= name "Dynamic.caddr") 13
+      (String.= name "cadddr") 14
+      (String.= name "Dynamic.cadddr") 15
+      (String.= name "cddr") 16
+      (String.= name "Dynamic.cddr") 17
+      (String.= name "caadr") 18
+      (String.= name "Dynamic.caadr") 19
+      (String.= name "cdadr") 20
+      (String.= name "Dynamic.cdadr") 21
+      (String.= name "last") 22
+      (String.= name "Dynamic.last") 23
+      (String.= name "all-but-last") 24
+      (String.= name "Dynamic.all-but-last") 25
+      (String.= name "cons") 26
+      (String.= name "Dynamic.cons") 27
+      (String.= name "cons-last") 28
+      (String.= name "Dynamic.cons-last") 29
+      (String.= name "append") 30
+      (String.= name "Dynamic.append") 31
+      (String.= name "length") 32
+      (String.= name "Dynamic.length") 33
+      (String.= name "empty?") 34
+      (String.= name "Dynamic.empty?") 35
+      (String.= name "list?") 36
+      (String.= name "Dynamic.list?") 37
+      (String.= name "array?") 38
+      (String.= name "Dynamic.array?") 39
+      (String.= name "not") 40
+      (String.= name "dynamic-type") 41
+      (String.= name "=") 42
+      (String.= name "Dynamic.=") 43
+      (String.= name "+") 44
+      (String.= name "-") 45
+      (String.= name "*") 46
+      (String.= name "/") 47
+      (String.= name "round") 48
+      (String.= name ">") 49
+      (String.= name "<") 50
+      (String.= name "String.length") 51
+      (String.= name "String.index-of") 52
+      (String.= name "String.char-at") 53
+      (String.= name "String.slice") 54
+      (String.= name "String.prefix") 55
+      (String.= name "String.suffix") 56
+      (String.= name "String.head") 57
+      (String.= name "String.tail") 58
+      (String.= name "String.empty?") 59
+      (String.= name "String.to-list") 60
+      (String.= name "Dynamic.String.to-list") 61
+      (String.= name "String.to-array") 62
+      (String.= name "Dynamic.String.to-array") 63
+      (String.= name "String.append") 64
+      (String.= name "Dynamic.String.concat") 65
+      (String.= name "String.concat") 66
+      (String.= name "parse") 67
+      (String.= name "Dynamic.Path.directory") 68
+      (String.= name "read-file") 69
+      (String.= name "line") 70
+      (String.= name "column") 71
+      (String.= name "file") 72
+      (String.= name "macro-log") 73
+      (String.= name "system-include") 74
+      (String.= name "add-cflag") 75
+      (String.= name "add-lib") 76
+      (String.= name "add-pkg") 77
+      (String.= name "str") 78
+      (String.= name "hash") 79
+      (String.= name "macro-error") 80
+      -1))
+
+  (doc empty-scope "the scope of code with no enclosing local frames.")
+  (defn empty-scope [] (the (Array (Array String)) []))
+
+  (private local?)
+  (hidden local?)
+  (doc local? "whether `name` is bound by an enclosing `fn` or `let`.")
+  (defn local? [scope name]
+    (let-do [found false
+             frame-index (Int.dec (Array.length scope))]
+      (while-do (and (Int.>= frame-index 0) (not found))
+        (let-do [names (Array.unsafe-nth scope frame-index)
+                 i (Int.dec (Array.length names))]
+          (while-do (and (Int.>= i 0) (not found))
+            (when (String.= (Array.unsafe-nth names i) name) (set! found true))
+            (set! i (Int.dec i))))
+        (set! frame-index (Int.dec frame-index)))
+      found))
+
+  (private ref-for)
+  (hidden ref-for)
+  (doc ref-for "how to reach `name` from `scope`.")
+  (defn ref-for [scope name]
+    (if (local? scope name) (CtRef.Name) (CtRef.Free (CtIRStore.fresh-cache!))))
+
+  (private with-frame)
+  (hidden with-frame)
+  (doc with-frame "the scope inside a new local frame binding `names`.")
+  (defn with-frame [scope names] (Array.push-back @scope names))
+
+  (private lower-items)
+  (hidden lower-items)
+  (private lower-bindings)
+  (hidden lower-bindings)
+  (private lower-call)
+  (hidden lower-call)
+  (private lower-list)
+  (hidden lower-list)
+  (private fail)
+  (hidden fail)
+  (private special)
+  (hidden special)
+  (private node-list)
+  (hidden node-list)
+  (private ir-list)
+  (hidden ir-list)
+  (private symbol-node)
+  (hidden symbol-node)
+  (defn symbol-node [span name]
+    (SurfaceNode.init @span (SurfaceForm.Symbol [@name])))
+
+  (private call-node)
+  (hidden call-node)
+  (defn call-node [span head arguments]
+    (let-do [items (the (Array (Box SurfaceNode))
+                        [(Box.init (SurfaceNode.copy head))])
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (Array.push-back! &items
+                          (Box.init
+                            (SurfaceNode.copy
+                              (Box.peek (Array.unsafe-nth arguments i))))))
+      (SurfaceNode.init @span (SurfaceForm.List items))))
+
+  (private copy-nodes)
+  (hidden copy-nodes)
+  (defn copy-nodes [nodes]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length nodes)]
+      (for [i 0 n]
+        (Array.push-back! &result
+                          (Box.init
+                            (SurfaceNode.copy (Box.peek (Array.unsafe-nth nodes
+                                                                          i))))))
+      result))
+
+  (private lowered-call)
+  (hidden lowered-call)
+  (doc lowered-call "builds a lowered call to `head-name` over already
+lowered arguments, with the call form the arguments came from so that a
+macro in that position still sees syntax.")
+  (defn lowered-call [span head-name arguments raws]
+    (CtIR.CallSym @head-name
+                  (CtRef.Free (CtIRStore.fresh-cache!))
+                  (builtin-id head-name)
+                  arguments
+                  (copy-nodes raws)
+                  (Box.init (call-node span &(symbol-node span head-name) raws))))
+
+  (private lower-for)
+  (hidden lower-for)
+  (doc fail "lowers a malformed form to the diagnostic it deserves. The
+reference reports these where the form runs, not where it is read, so the
+message travels to that point rather than being raised here.")
+  (defn fail [node message] (CtIR.Fail @message @(SurfaceNode.span node)))
+
+  (private special)
+  (hidden special)
+  (doc special "lowers a form with its own argument rule: `evaluated` are
+lowered as code, `raw` are carried as syntax.")
+  (defn special [opcode node evaluated raw]
+    (CtIR.Special opcode evaluated raw (Box.init (SurfaceNode.copy node))))
+
+  (private node-list)
+  (hidden node-list)
+  (defn node-list [items indices]
+    (let-do [result (the (Array (Box SurfaceNode)) [])
+             n (Array.length indices)]
+      (for [i 0 n]
+        (Array.push-back! &result
+                          (Box.init
+                            (SurfaceNode.copy
+                              (Box.peek
+                                (Array.unsafe-nth items
+                                                  @(Array.unsafe-nth indices i)))))))
+      result))
+
+  (private ir-list)
+  (hidden ir-list)
+  (private lower-case)
+  (hidden lower-case)
+  (private dictionary-node)
+  (hidden dictionary-node)
+  (private lower-dictionary)
+  (hidden lower-dictionary)
+  (doc dictionary-node "rewrites `{k v ...}` into the call it means, exactly
+as the reference parser does: `(Map.from-array [(Pair.init k v) ...])`.")
+  (defn dictionary-node [node entries]
+    (let-do [pairs (semantic-items entries)
+             span @(SurfaceNode.span node)
+             elements (the (Array (Box SurfaceNode)) [])
+             n (Array.length &pairs)
+             i 0]
+      (while-do (Int.< i n)
+        (Array.push-back! &elements
+                          (Box.init
+                            (SurfaceNode.init @&span
+                                              (SurfaceForm.List
+                                                [(Box.init
+                                                   (SurfaceNode.init @&span
+                                                                     (SurfaceForm.Symbol [@"Pair"
+                                                                                          @"init"])))
+                                                 (Box.init
+                                                   (SurfaceNode.copy (Box.peek (Array.unsafe-nth &pairs
+                                                                                                 i))))
+                                                 (Box.init
+                                                   (SurfaceNode.copy
+                                                     (Box.peek (Array.unsafe-nth &pairs
+                                                                                 (Int.inc i)))))]))))
+        (set! i (Int.+ i 2)))
+      (SurfaceNode.init @&span
+                        (SurfaceForm.List
+                          [(Box.init
+                             (SurfaceNode.init @&span
+                                               (SurfaceForm.Symbol [@"Map"
+                                                                    @"from-array"])))
+                           (Box.init
+                             (SurfaceNode.init @&span
+                                               (SurfaceForm.Array elements)))]))))
+
+  (doc lower "lowers one form in a scope whose local names are `locals`.")
+  (defn lower [node locals]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (let [name (String.join "." segments)]
+          (CtIR.Sym @&name (ref-for locals &name) @(SurfaceNode.span node)))
+      (SurfaceForm.Array items)
+        (CtIR.Coll (lower-items items locals) @(SurfaceNode.span node))
+      (SurfaceForm.List items)
+        (if (Int.= 0 (Array.length items))
+          (CtIR.Lit (Box.init (SurfaceNode.copy node)))
+          (lower-list node items locals))
+      (SurfaceForm.Dictionary entries) (lower-dictionary node entries locals)
+      _ (CtIR.Lit (Box.init (SurfaceNode.copy node)))))
+
+  (defn ir-list [items indices locals]
+    (let-do [result (the (Array (Box CtIR)) [])
+             n (Array.length indices)]
+      (for [i 0 n]
+        (Array.push-back! &result
+                          (Box.init
+                            (lower
+                              (Box.peek
+                                (Array.unsafe-nth items
+                                                  @(Array.unsafe-nth indices i)))
+                              locals))))
+      result))
+
+  (doc lower-case "lowers `case`: the target, then the patterns and branches
+in source order. Patterns are evaluated one at a time until one matches, so
+they stay code rather than becoming a table.")
+  (defn lower-case [node items locals]
+    (if (Int.<= (Array.length items) 2)
+      (fail node "case expects a value and branches")
+      (CtIR.Case
+        (Box.init (lower (Box.peek (Array.unsafe-nth items 1)) locals))
+        (lower-items &(Array.suffix items 2) locals)
+        (Box.init (SurfaceNode.copy node)))))
+
+  (doc lower-dictionary "lowers `{k v ...}` by way of the call it means.")
+  (defn lower-dictionary [node entries locals]
+    (let [pairs (semantic-items entries)]
+      (if (Int.= 0 (Int.mod (Array.length &pairs) 2))
+        (let [rewritten (dictionary-node node entries)]
+          (lower &rewritten locals))
+        (fail node "dictionary literal needs an even number of forms"))))
+  (doc lower-for "lowers `for` into the loop it means: a `let` that binds the
+variable, a `while` over the comparison, and a `set!` that steps it.
+
+The tree walker rebuilt those three call forms as syntax on every iteration
+and then walked them. They are the same forms every time, so lowering builds
+them once.")
+  (defn lower-for [node items locals]
+    (let [count (Array.length items)
+          span @(SurfaceNode.span node)]
+      (if (or (Int.< count 2) (Int.> count 3))
+        (fail node "for expects settings and at most one body form")
+        (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 1)))
+          (SurfaceForm.Array raw-settings)
+            (let [settings (semantic-items raw-settings)
+                  setting-count (Array.length &settings)]
+              (if (or (Int.< setting-count 3) (Int.> setting-count 5))
+                (fail node "for expects settings and at most one body form")
+                (let [variable-form (Box.peek (Array.unsafe-nth &settings 0))
+                      from-form (Box.peek (Array.unsafe-nth &settings 1))
+                      to-form (Box.peek (Array.unsafe-nth &settings 2))
+                      step-form (if (Int.> setting-count 3)
+                        (SurfaceNode.copy
+                          (Box.peek (Array.unsafe-nth &settings 3)))
+                        (SurfaceNode.init @&span (SurfaceForm.IntLit 1)))
+                      comparison (if (Int.> setting-count 4)
+                        (symbol-key (Box.peek (Array.unsafe-nth &settings 4)))
+                        (Maybe.Just
+                          (match-ref (SurfaceNode.form &step-form)
+                            (SurfaceForm.IntLit step)
+                              (if (Int.< @step 0) @">" @"<")
+                            _ @"<")))]
+                  (match comparison
+                    (Maybe.Nothing)
+                      (fail node
+                            "for expects settings and at most one body form")
+                    (Maybe.Just compare)
+                      (match (symbol-name variable-form)
+                        (Maybe.Nothing)
+                          (fail node
+                                "for expects settings and at most one body form")
+                        (Maybe.Just variable)
+                          (let [scope (with-frame locals [@&variable])
+                                variable-ref (CtIR.Sym @&variable
+                                                       (CtRef.Name)
+                                                       @(SurfaceNode.span variable-form))
+                                stepped (lowered-call &span
+                                                      "+"
+                                                      [(Box.init
+                                                         (CtIR.Sym @&variable
+                                                                   (CtRef.Name)
+                                                                   @(SurfaceNode.span variable-form)))
+                                                       (Box.init (CtIR.Lit (Box.init @&step-form)))]
+                                                      &[(Box.init (SurfaceNode.copy variable-form))
+                                                        (Box.init @&step-form)])
+                                condition (lowered-call &span
+                                                        &compare
+                                                        [(Box.init variable-ref)
+                                                         (Box.init (lower to-form
+                                                                          &scope))]
+                                                        &[(Box.init (SurfaceNode.copy variable-form))
+                                                          (Box.init (SurfaceNode.copy to-form))])
+                                loop-body (if (Int.= count 3)
+                                  (CtIR.Seq
+                                    [(Box.init
+                                       (lower (Box.peek (Array.unsafe-nth items
+                                                                          2))
+                                              &scope))
+                                     (Box.init
+                                       (CtIR.SetName @&variable
+                                                     (Box.init stepped)
+                                                     @&span))]
+                                    @&span)
+                                  (CtIR.SetName @&variable
+                                                (Box.init stepped)
+                                                @&span))]
+                            (CtIR.Let
+                              [(CtBind.init @&variable
+                                            (Box.init (lower from-form locals))
+                                            @(SurfaceNode.span variable-form))]
+                              (Box.init
+                                (CtIR.While (Box.init condition)
+                                            (Box.init loop-body)
+                                            @&span))
+                              @&span)))))))
+          _ (fail node "for expects settings and at most one body form")))))
+
+  (private lower-case)
+  (hidden lower-case)
+  (private dictionary-node)
+  (hidden dictionary-node)
+  (private lower-dictionary)
+  (hidden lower-dictionary)
+  (private lower-for)
+  (hidden lower-for)
+  (private symbol-node)
+  (hidden symbol-node)
+  (private call-node)
+  (hidden call-node)
+  (private lowered-call)
+  (hidden lowered-call)
+  (private copy-nodes)
+  (hidden copy-nodes)
+
+  (private fail)
+  (hidden fail)
+
+  (defn lower-items [items locals]
+    (let-do [result (the (Array (Box CtIR)) [])
+             n (Array.length items)]
+      (for [i 0 n]
+        (Array.push-back! &result
+                          (Box.init
+                            (lower (Box.peek (Array.unsafe-nth items i)) locals))))
+      result))
+
+  (doc lower-bindings "lowers a `let` binding array. Bindings are sequential:
+each value sees the names bound before it, so `locals` grows as the pairs are
+lowered and the caller receives the scope the body runs in.")
+  (defn lower-bindings [pairs locals]
+    (let-do [binds (the (Array CtBind) [])
+             names (the (Array String) [])
+             scope (with-frame locals [])
+             n (Array.length pairs)
+             i 0]
+      (while-do (Int.< i n)
+        (let [name-form (Box.peek (Array.unsafe-nth pairs i))
+              value-form (Box.peek (Array.unsafe-nth pairs (Int.inc i)))]
+          (match (symbol-name name-form)
+            (Maybe.Just name)
+              (let-do [value (lower value-form &scope)]
+                (Array.push-back! &binds
+                                  (CtBind.init @&name
+                                               (Box.init value)
+                                               @(SurfaceNode.span name-form)))
+                (Array.push-back! &names name)
+                (set! scope (with-frame locals @&names)))
+            (Maybe.Nothing) ()))
+        (set! i (Int.+ i 2)))
+      (Pair.init binds scope)))
+
+  (private parameter-names)
+  (hidden parameter-names)
+  (doc parameter-names "the names a parameter array binds, rest included.
+`Nothing` when the array is not a well-formed parameter list, which leaves
+the form to the tree walker and its diagnostics.")
+  (defn parameter-names [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Array raw-forms)
+        (let-do [forms (semantic-items raw-forms)
+                 fixed (the (Array String) [])
+                 rest (the (Maybe String) (Maybe.Nothing))
+                 ok true
+                 n (Array.length &forms)
+                 i 0]
+          (while-do (and (Int.< i n) ok)
+            (match (symbol-name (Box.peek (Array.unsafe-nth &forms i)))
+              (Maybe.Just name)
+                (cond
+                  (String.= &name ":rest")
+                    (if (Int.= (Int.inc i) (Int.dec n))
+                      (match (symbol-name
+                          (Box.peek (Array.unsafe-nth &forms (Int.inc i))))
+                        (Maybe.Just rest-name)
+                          (do
+                            (set! rest (Maybe.Just rest-name))
+                            (set! i (Int.inc i)))
+                        (Maybe.Nothing) (set! ok false))
+                      (set! ok false))
+                  (Maybe.just? &rest) (set! ok false)
+                  (set! fixed (Array.push-back fixed name)))
+              (Maybe.Nothing) (set! ok false))
+            (set! i (Int.inc i)))
+          (if ok
+            (Maybe.Just (CtParameterNames.init fixed rest))
+            (the (Maybe CtParameterNames) (Maybe.Nothing))))
+      _ (the (Maybe CtParameterNames) (Maybe.Nothing))))
+
+  (doc lower-proto "lowers a lambda body in the scope its parameters open and
+registers the result, answering the prototype's index.")
+  (defn lower-proto [parameters body locals]
+    (match (parameter-names parameters)
+      (Maybe.Just names)
+        (let-do [parameters @(CtParameterNames.fixed &names)
+                 fixed @(CtParameterNames.fixed &names)]
+          (match-ref (CtParameterNames.rest &names)
+            (Maybe.Just rest-name) (Array.push-back! &parameters @rest-name)
+            (Maybe.Nothing) ())
+          (let [scope (with-frame locals parameters)]
+            (Maybe.Just
+              (CtIRStore.add-proto!
+                (CtProto.init fixed
+                              @(CtParameterNames.rest &names)
+                              (CtCompile.compile &(lower body &scope))
+                              (Box.init (SurfaceNode.copy body)))))))
+      (Maybe.Nothing) (the (Maybe Int) (Maybe.Nothing))))
+
+  (doc lower-macro-proto "lowers a macro body in the scope its parameters
+open and registers the prototype, answering its index.")
+  (defn lower-macro-proto [fixed rest body]
+    (let-do [parameters (Array.copy &fixed)]
+      (match-ref &rest
+        (Maybe.Just rest-name) (Array.push-back! &parameters @rest-name)
+        (Maybe.Nothing) ())
+      (let [code (CtCompile.compile
+              &(lower (Box.peek &body) &(with-frame &(empty-scope) parameters)))]
+        (CtIRStore.add-proto! (CtProto.init fixed rest code body)))))
+
+  (private lower-argument)
+  (hidden lower-argument)
+  (doc lower-argument "lowers one argument of a call. An argument that names
+nothing stays as its own syntax, which is how unbound symbols reach macros
+and builtins, so a bare symbol lowers to a node that can answer either way.")
+  (defn lower-argument [node locals]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Symbol segments)
+        (let [name (String.join "." segments)]
+          (if (local? locals &name)
+            (CtIR.Sym @&name (ref-for locals &name) @(SurfaceNode.span node))
+            (CtIR.ArgSym @&name
+                         (ref-for locals &name)
+                         (Box.init (SurfaceNode.copy node)))))
+      _ (lower node locals)))
+
+  (private sexpr-argument?)
+  (hidden sexpr-argument?)
+  (doc sexpr-argument? "whether this argument of this call resolves through
+the recorded-source table instead of by evaluation. `Dynamic.curry*` does
+that to its first argument, so that currying a named function can see the
+function's source.")
+  (defn sexpr-argument? [head-name index]
+    (match-ref head-name
+      (Maybe.Just name) (and (String.= name "Dynamic.curry*") (Int.= index 1))
+      (Maybe.Nothing) false))
+
+  (defn lower-call [node items head-name locals]
+    (let-do [args (the (Array (Box CtIR)) [])
+             raws (the (Array (Box SurfaceNode)) [])
+             n (Array.length items)]
+      (for [i 1 n]
+        (let-do [argument (Box.peek (Array.unsafe-nth items i))]
+          (Array.push-back! &args
+                            (Box.init
+                              (if (sexpr-argument? &head-name i)
+                                (CtIR.SexprArg (Box.init (SurfaceNode.copy argument))
+                                               (Box.init (lower-argument argument
+                                                                         locals)))
+                                (lower-argument argument locals))))
+          (Array.push-back! &raws (Box.init (SurfaceNode.copy argument)))))
+      (match head-name
+        (Maybe.Just name)
+          (CtIR.CallSym @&name
+                        (ref-for locals &name)
+                        (builtin-id &name)
+                        args
+                        raws
+                        (Box.init (SurfaceNode.copy node)))
+        (Maybe.Nothing)
+          (CtIR.CallExpr
+            (Box.init (lower (Box.peek (Array.unsafe-nth items 0)) locals))
+            args
+            raws
+            (Box.init (SurfaceNode.copy node))))))
+
+  (private lower-binding-form)
+  (hidden lower-binding-form)
+  (doc lower-binding-form "lowers a `let`/`let-do` binding array, or answers
+`Nothing` when it is not a well-formed one and the tree walker should raise
+the diagnostic.")
+  (defn lower-binding-form [node locals]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Array raw-pairs)
+        (let [pairs (semantic-items raw-pairs)]
+          (if (Int.= 0 (Int.mod (Array.length &pairs) 2))
+            (let-do [named true
+                     n (Array.length &pairs)
+                     i 0]
+              (while-do (Int.< i n)
+                (when (Maybe.nothing?
+                    &(symbol-name (Box.peek (Array.unsafe-nth &pairs i))))
+                  (set! named false))
+                (set! i (Int.+ i 2)))
+              (if named
+                (Maybe.Just (lower-bindings &pairs locals))
+                (the
+                  (Maybe (Pair (Array CtBind) (Array (Array String))))
+                  (Maybe.Nothing))))
+            (the
+              (Maybe (Pair (Array CtBind) (Array (Array String))))
+              (Maybe.Nothing))))
+      _
+        (the
+          (Maybe (Pair (Array CtBind) (Array (Array String))))
+          (Maybe.Nothing))))
+
+  (defn lower-list [node items locals]
+    (let [head (Box.peek (Array.unsafe-nth items 0))
+          span @(SurfaceNode.span node)
+          count (Array.length items)]
+      (match (symbol-key head)
+        (Maybe.Nothing) (lower-call node items (Maybe.Nothing) locals)
+        (Maybe.Just name)
+          (cond
+            (String.= &name "quote")
+            (if (Int.= 2 count)
+              (CtIR.Quote
+                (Box.init
+                  (SurfaceNode.copy (Box.peek (Array.unsafe-nth items 1)))))
+              (fail node "quote expects one argument"))
+            (String.= &name "do")
+            (if (Int.= 1 count)
+              (CtIR.Lit (Box.init (SurfaceNode.copy node)))
+              (CtIR.Seq (lower-items &(Array.suffix items 1) locals) span))
+            (String.= &name "if")
+            (let [semantic (semantic-items items)]
+              (if (Int.= 4 (Array.length &semantic))
+                (CtIR.If
+                  (Box.init
+                    (lower (Box.peek (Array.unsafe-nth &semantic 1)) locals))
+                  (Box.init
+                    (lower (Box.peek (Array.unsafe-nth &semantic 2)) locals))
+                  (Box.init
+                    (lower (Box.peek (Array.unsafe-nth &semantic 3)) locals))
+                  span)
+                (fail node "if expects condition, then, and else forms")))
+            (String.= &name "when")
+            (if (Int.= 3 count)
+              (CtIR.When
+                (Box.init (lower (Box.peek (Array.unsafe-nth items 1)) locals))
+                (Box.init (lower (Box.peek (Array.unsafe-nth items 2)) locals))
+                span)
+              (fail node "when expects a condition and a body"))
+            (String.= &name "and")
+            (CtIR.And (lower-items &(Array.suffix items 1) locals) span)
+            (String.= &name "or")
+            (CtIR.Or (lower-items &(Array.suffix items 1) locals) span)
+            (String.= &name "cond")
+            (if (Int.= 1 count)
+              (CtIR.Lit (Box.init (SurfaceNode.copy node)))
+              (CtIR.Cond
+                (lower-items &(Array.suffix items 1) locals)
+                (Box.init (SurfaceNode.copy node))))
+            (String.= &name "while")
+            (if (Int.= 3 count)
+              (CtIR.While
+                (Box.init (lower (Box.peek (Array.unsafe-nth items 1)) locals))
+                (Box.init (lower (Box.peek (Array.unsafe-nth items 2)) locals))
+                span)
+              (fail node "while expects a condition and a body"))
+            (String.= &name "set!")
+            (if (Int.= 3 count)
+              (match (symbol-key (Box.peek (Array.unsafe-nth items 1)))
+                (Maybe.Just target)
+                  (CtIR.SetName target
+                                (Box.init
+                                  (lower (Box.peek (Array.unsafe-nth items 2))
+                                         locals))
+                                span)
+                (Maybe.Nothing) (fail node "set! target must be a symbol"))
+              (fail node "set! expects a name and a value"))
+            (String.= &name "fn")
+            (let [semantic (semantic-items items)]
+              (if (Int.= 3 (Array.length &semantic))
+                (match (lower-proto
+                    (Box.peek (Array.unsafe-nth &semantic 1))
+                    (Box.peek (Array.unsafe-nth &semantic 2))
+                    locals)
+                  (Maybe.Just proto) (CtIR.Fn proto span)
+                  (Maybe.Nothing)
+                    (fail node "compile-time fn parameters must be symbols"))
+                (fail node "fn expects parameters and a body")))
+            (String.= &name "let")
+            (if (Int.= 3 count)
+              (match (lower-binding-form (Box.peek (Array.unsafe-nth items 1))
+                                         locals)
+                (Maybe.Just lowered)
+                  (CtIR.Let @(Pair.a &lowered)
+                            (Box.init
+                              (lower (Box.peek (Array.unsafe-nth items 2))
+                                     (Pair.b &lowered)))
+                            span)
+                (Maybe.Nothing)
+                  (fail node
+                        "compile-time let bindings must contain name/value pairs"))
+              (fail node "let expects bindings and a body"))
+            (String.= &name "let-do")
+            (if (Int.> count 2)
+              (match (lower-binding-form (Box.peek (Array.unsafe-nth items 1))
+                                         locals)
+                (Maybe.Just lowered)
+                  (CtIR.LetDo @(Pair.a &lowered)
+                              (lower-items &(Array.suffix items 2)
+                                           (Pair.b &lowered))
+                              span)
+                (Maybe.Nothing)
+                  (fail node
+                        "compile-time let-do bindings must contain name/value pairs"))
+              (fail node "let-do expects bindings and a body"))
+            ;; the forms below each have their own rule about which of their
+            ;; arguments are evaluated and which stay syntax.
+            (String.= &name "apply")
+            (let [semantic (semantic-items items)]
+              (if (Int.= 3 (Array.length &semantic))
+                (special (CtSpecial.apply-op)
+                         node
+                         (ir-list &semantic &[2] locals)
+                         (node-list &semantic &[1]))
+                (fail node "apply expects a function and arguments")))
+            (String.= &name "expand")
+            (let [semantic (semantic-items items)]
+              (if (Int.= 2 (Array.length &semantic))
+                (special (CtSpecial.expand-op)
+                         node
+                         (ir-list &semantic &[1] locals)
+                         [])
+                (fail node "expand expects one argument")))
+            (String.= &name "eval")
+            (let [semantic (semantic-items items)]
+              (if (Int.= 2 (Array.length &semantic))
+                (special (CtSpecial.eval-op)
+                         node
+                         (ir-list &semantic &[1] locals)
+                         [])
+                (fail node "eval expects one argument")))
+            (String.= &name "members")
+            (if (Int.= 2 count)
+              (special (CtSpecial.members-op) node [] (node-list items &[1]))
+              (fail node "members expects one argument"))
+            (String.= &name "managed?")
+            (if (Int.= 2 count)
+              (special (CtSpecial.managed-op) node [] (node-list items &[1]))
+              (fail node "managed? expects one argument"))
+            (String.= &name "s-expr")
+            (if (Int.= 2 count)
+              (special (CtSpecial.sexpr-op) node [] (node-list items &[1]))
+              (fail node "s-expr expects one argument"))
+            (String.= &name "use")
+            (if (Int.= 2 count)
+              (special (CtSpecial.use-op) node [] (node-list items &[1]))
+              (fail node "use expects one module"))
+            (String.= &name "concat")
+            (if (Int.= 3 count)
+              (special (CtSpecial.concat-op)
+                       node
+                       (ir-list items &[1 2] locals)
+                       [])
+              (fail node "concat expects two collections"))
+            (String.= &name "with-test-internal")
+            (if (Int.= 3 count)
+              (special (CtSpecial.with-test-op)
+                       node
+                       (ir-list items &[1 2] locals)
+                       [])
+              (fail node "with-test-internal expects a name and forms"))
+            (String.= &name "Dynamic.compose")
+            (let [semantic (semantic-items items)]
+              (if (Int.= 3 (Array.length &semantic))
+                (special (CtSpecial.compose-op)
+                         node
+                         []
+                         (node-list &semantic &[1 2]))
+                (fail node "Dynamic.compose expects two functions")))
+            (String.= &name "for")
+            (lower-for node items locals)
+            (String.= &name "case")
+            (lower-case node items locals)
+            (lower-call node items (Maybe.Just name) locals))))))
