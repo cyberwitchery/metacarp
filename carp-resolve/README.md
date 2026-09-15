@@ -12,10 +12,13 @@ Literals: `Int`, `Long`, `Float`, `Double`, `Byte`, `Char`, `String`,
 `Pattern`, `Bool`, and array / static-array literals.
 
 Expressions and control flow: symbol references (local, global, imported),
-calls, `do`, `if`, `set!`, `while`/`while-do`, `break`, `when`/`when-do`,
-`unless`/`unless-do`, `cond`, `for`, `and`, `or`, `case`, `fmt`/`str*`,
-multi-binding `let`/`let-do`, `fn`, `match`/`match-ref`, and `(the TYPE EXPR)`.
-The higher-level forms are desugared here into core `if`/`let`/`while`/`set!`.
+calls, `do`, `if`, `set!`, `while`, `break`, multi-binding `let`, `fn`,
+`match`/`match-ref`, and `(the TYPE EXPR)`.
+
+That is the whole list. `when`, `unless`, `cond`, `for`, `and`, `or`, `case`,
+`fmt`/`str*` and the `-do` variants are Core macros: they are gone by the time
+resolution runs, and this phase never sees them. There is no sugar table
+here.
 
 Top-level declarations: `defn`/`defn-`, `def`/`def-`, `defmodule` (nested and
 scoped), `with`, spliced top-level `do`, `sig`, `definterface`, `register`,

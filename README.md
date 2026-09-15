@@ -61,7 +61,7 @@ file, then the Core directory — and git references install into the shared
 cache (`~/.cache/carp/libs/...`) on first use:
 
 ```clojure
-(load "git@github.com:carpentry-org/strbuf@0.2.0")
+(load "git@github.com:carpentry-org/strbuf@0.2.1")
 ```
 
 The examples below assume `CARP_DIR` points at a checkout of the reference
@@ -247,11 +247,18 @@ records the original design and implementation history.
 ## Dependencies
 
 The default compiler uses two pinned Carpentry packages, loaded as git
-references:
+references — `carp-reader` by `carp-surface`, `strbuf` by `carp-backend` and
+`carp-c-abi`:
 
 ```clojure
-(load "git@github.com:carpentry-org/carp-reader@0.3.8")
-(load "git@github.com:carpentry-org/strbuf@0.2.0")
+(load "git@github.com:carpentry-org/carp-reader@0.4.1")
+(load "git@github.com:carpentry-org/strbuf@0.2.1")
+```
+
+`carp-session` adds one, for the shared expansion snapshot:
+
+```clojure
+(load "git@github.com:carpentry-org/rc@0.3.0")
 ```
 
 The optional LLVM backend additionally loads:
