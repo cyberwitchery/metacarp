@@ -31,6 +31,12 @@ backend lowering copies the node's id. Nodes synthesized after resolution use
 carp-backend.carp:26-31; `*hoist-serial*` is raised above every specialized
 global id, :1964).
 
+`-1` is for a genuinely new node, never for a **wrapper**. A wrapper stands in
+the position of the expression it encloses, so it must carry that
+expression's id: downstream lookups read the id of whatever node now occupies
+the position (`Specialize.expression-id`), not of the node that used to.
+`wrap-hoisted` binds `inner-id` for exactly this reason.
+
 **Participants.** carp-ir (`IndexedCoreExpr`, `CoreIR.index-call-sites`,
 `identify-generated`), carp-infer (node-types keyed by (owner, id)),
 carp-specialize (calls resolved by id), carp-ownership (`OwnershipAction`
@@ -42,7 +48,10 @@ carp-compiler.carp:3670, keyed by id), carp-session provenance
 **Why.** Ids are the only cross-phase join key. Types, spans, ownership
 actions, and line directives all attach by id; the IR carries none of them.
 
-**Failure mode.** A pass that clones a subtree without renumbering: ownership
+**Failure mode.** A wrapper that takes `-1` hides the expression it wraps from
+every id-keyed lookup: ownership plans a delete against the real id,
+`cleanup-for` reads the wrapper's `-1`, matches nothing, and the delete is
+dropped with no diagnostic. A pass that clones a subtree without renumbering: ownership
 rejects duplicates within a context (loud), but the source map and session
 span lookups silently return the first match — the debugger points at the
 wrong line, session reports mis-span, no gate fires. A pass that renumbers
@@ -50,7 +59,12 @@ real nodes: session identity reuse and `#line` mapping silently detach.
 
 **Enforced by.** Validation for globals only (`CoreIR.duplicate-global-id`,
 driver :3834-3840, per category); ownership's per-context uniqueness check;
-otherwise convention.
+`scripts/check-leaks.sh` for the dropped-delete consequence; otherwise
+convention.
+
+**Corollary.** Only one pass runs between ownership planning and cleanup
+insertion — `hoist-array-literals`. Anything added there must preserve ids, or
+the plan stops resolving.
 
 **Strongest evidence.** The `ScopeDelete.site` field exists because set!-site
 deletes were confused with let-scope deletes on the same binder during the
@@ -281,6 +295,37 @@ deletes stop resolving. Enforced by code + the closure-capture and copier
 integration tests. Inspect both functions together, always.
 
 ---
+
+### 36. Cleanup insertion must place a scheduled delete, never discard it [implementation, historically fatal]
+
+**Invariant.** Once `Ownership.prepare` schedules a delete,
+`BackendLower.insert-path-cleanup` must place it on every exit that still owns
+the binder. When a subexpression evaluated before the tail moves the binder on
+only some paths, the cleanup belongs on **that subexpression's** exits — the
+`If` condition, the `Let` value, the `Match` scrutinee, the first consuming
+element of a `Do`. Returning the expression unchanged is never correct: the
+plan has no other consumer, so the delete is simply lost.
+
+**Why it is safe to descend.** A later position cannot use the binder after a
+conditional move: `check-borrows` rejects both the use-after-move (flag 1) and
+the second move (flag 3). So rewriting the consuming subexpression's exits is
+complete, and the body needs nothing at scope exit.
+
+**Failure mode.** Silent leak, proportional to how often the shape occurs.
+The trigger needs two owned bindings in one scope, not one: `cleanup-after`
+wraps the rest of the body in `Let path-cleanup = <body>` to sequence the
+second binding's delete, and that wrapper is what demotes a conditional
+consumer out of tail position. A single-binding test cannot reach it.
+
+**Enforced by.** `scripts/check-leaks.sh` (macOS self-host job), a byte budget
+on the generation-2 compiler. Generation 1 is built by the reference compiler
+and inherits its cleanup, so it cannot show the bug — measure gen-2 or measure
+nothing.
+
+**Before changing, inspect.** `insert-nested-path-cleanup`'s arm list (a
+missing arm silently degrades to `SpecializedExpr.copy`); `Ownership.consumed?`
+versus `consumed-on-all-paths?` — the any-path query selects the arm, the
+all-paths query decides whether a delete is scheduled at all.
 
 ## Primitive lowering
 
