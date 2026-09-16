@@ -587,7 +587,7 @@ byte-identical.
 5. **#26**: one shared core manifest module consumed by both main.carp and
    carp-core-loader.
 
-### 33. Inline-cache soundness rests on what `define-local!` does NOT bump [semantic, new 2026-09-15]
+### 33. Inline-cache soundness rests on what `define-local!` does NOT bump [semantic]
 
 `CtIR.Sym`/`CallSym` with a `CtRef.Free` cache an environment resolution
 under `(base frame, epoch)`, where `base` is the frame the BODY was defined
@@ -609,14 +609,13 @@ list its binders — and a cached cell from one call answers in another.
 Break (2) the other way — bump on locals — and the caches simply never hit;
 that fails quietly as lost speed, not as a wrong answer.
 
-Enforced by: `diff-expansion.sh` (byte-identical expansion against the
-reference over the corpus), the reference suite, and the gen-2/gen-3 fixed
-point, all of which a mis-scoped local breaks loudly. `CARP_DEBUG_CT` prints
-hit/miss counters when the question is whether the caches are working
-(76% hits during a Core load, measured 2026-09-15).
+Enforced by `diff-expansion.sh`, the reference suite and the gen-2/gen-3 fixed
+point, all of which a mis-scoped local breaks loudly. `CARP_DEBUG_CT` reports
+hit and miss counts when the question is whether the caches are working at
+all.
 
 
-### 34. Specialization's module-level caches must be primed per entry [implementation, sharpened 2026-09-15]
+### 34. Specialization's module-level caches must be primed per entry [implementation]
 
 `*normalized-node-types*` and now `*module-solver*` (an indexed
 `Type.solver-from-substitution` view of `InferredModule.substitution`) are
@@ -632,6 +631,22 @@ repeat across owners — that is why `*trace-positions*` is rebuilt per owner �
 so an id-keyed memo returns one function's type for another's call. The
 specialize suites catch it.
 
+
+### 35. Resolve's per-resolution state resets in `module-inner`, not at the entries [implementation]
+
+`*private-names*`, `*type-decl-stamp*`, `*type-decl-events*`,
+`*resolve-stamp*`, `*local-binder-serial*` (see 30) and the global-name index
+all belong to ONE resolution. They reset in `module-inner`'s preamble, which
+is the funnel all five public entries pass through: `module`,
+`module-with-provenance`, `module-with-provenance-against`,
+`-against-reusing`, `-seeded`. Resetting at the entries instead leaves
+whichever one is added or overlooked next reading the previous resolution's
+state.
+
+Enforcement is narrow, and worth knowing before adding per-resolution state: a
+cold process resolves exactly once, so the self-host fixed point and the
+reference suite cannot see stale state at all. The session tests in the phase
+suites are the only gate that resolves twice in one process.
 
 ## Five things that look fragile but are actually safe
 
