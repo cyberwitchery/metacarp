@@ -327,6 +327,69 @@ missing arm silently degrades to `SpecializedExpr.copy`); `Ownership.consumed?`
 versus `consumed-on-all-paths?` — the any-path query selects the arm, the
 all-paths query decides whether a delete is scheduled at all.
 
+### 37. A mutating field write frees the value it displaces [implementation, historically fatal]
+
+**Invariant.** `field-set!` (primitive 49, what Derive's `set-<field>!`
+accessors lower to) overwrites a struct member. If the member's type has a
+deleter, the previous value is dropped by that write and must be freed there,
+after the new value is evaluated into a temporary — a new value derived from
+the old one must still be valid when the delete runs. Ownership planning does
+not cover this: no binding goes out of scope, so no scope delete is scheduled.
+
+**Failure mode.** Silent leak of one value per write, unbounded in a loop.
+`Surface.reanchor!` re-spans every node of every macro expansion, so this leaks
+proportionally to expansion volume.
+
+**Enforced by.** `scripts/check-leaks.sh`. The renderer needs the module's
+type-key→deleter table, which is why `*field-set-deleters*` is primed once per
+translation unit; a renderer reached without priming silently degrades to a
+bare assignment.
+
+**Before changing, inspect.** `field-set-deleter`; `prime-field-set-deleters!`
+and its call in `translation-unit`; the LLVM backend, which renders
+`field-set!` on its own path.
+
+### 38. A lifted closure is matched only against the context it came from [implementation]
+
+**Invariant.** `rewrite-closures` pairs each `ClosureFunction` with the
+ownership deletes planned for the body it was lifted out of, using the context
+stamped on it at lifting time (`*lift-context*`). Matching against the whole
+module's delete set is unsound: one generic body instantiated twice yields two
+lifted closures whose locals share binder ids AND site ids but have different
+types, so a context-blind match picks an arbitrary instance's delete.
+
+**Failure mode.** A value freed through another instantiation's deleter. This
+surfaces as a C type error when the two instantiations' types are
+incompatible, and as a wrong-deleter call when they are not — the second is
+silent and is the dangerous one.
+
+**Enforced by.** The self-host build (mismatched instantiations fail to
+compile); `scripts/check-leaks.sh` for the silent half.
+
+**Before changing, inspect.** `ScopeDelete.context` and where
+`deletes-for-context` fills it; `*lift-context*` in `lift-lambdas`; the `-1`
+context, which still means "match any" and is used for roots.
+
+### 39. Every managed classifier agrees that a function type owns memory [implementation]
+
+**Invariant.** A function value may carry a heap-allocated closure
+environment, so all three classifiers must call it managed:
+`OwnershipClassify.classify` (`MonoType.Function` → `Owned`),
+`managed-mono?` (the per-instance path generic deftypes take), and
+`field-managed?` (the declaration path concrete ones take). A deftype whose
+only managed content is a closure — `(deftype (Parser a) [run (Fn …)])` — is
+classified through `managed-mono?`.
+
+**Failure mode.** A classifier that disagrees silently withholds the derived
+deleter: the type is never freed, and because no deleter is demanded there is
+no missing-symbol error either. Concrete types can pass while their generic
+counterparts leak, so a test must use a generic deftype to reach it.
+
+**Enforced by.** `scripts/check-leaks.sh`.
+
+**Before changing, inspect.** All three classifiers together; `managed-keys`'s
+fixpoint; `derive-target-keys`, which only sees types `managed-keys` admitted.
+
 ## Primitive lowering
 
 ### 14. One lowering authority per primitive; a renderer arm must be semantically identical to the definition it bypasses [implementation, historically fatal]
