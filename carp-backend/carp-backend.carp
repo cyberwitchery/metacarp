@@ -26,6 +26,11 @@ offsets could, once a program grew large enough.")
 ; Batch lowering uses a private counter because historical owner-local node IDs
 ; may collide. A provenanced session can opt into deterministic lambda symbols
 ; derived from its globally unique expression IDs and concrete signatures.
+(doc *lift-context* "the ownership context id of the body currently being
+lambda-lifted, stamped onto each `ClosureFunction` so its planned deletes can
+be matched back to the context they were planned in. -1 while lifting roots.")
+(def *lift-context* -1)
+
 (def *stable-lambda-symbols* false)
 (def *lambda-symbol-salt* (String.copy ""))
 
@@ -63,7 +68,8 @@ an environment struct of the captured values.")
    signature (Box MonoType)
    captures (Array (Pair CoreRef (Box MonoType)))
    parameters (Array CoreRef)
-   body (Box SpecializedExpr)])
+   body (Box SpecializedExpr)
+   context Int])
 
 (doc BackendLineMap "is the backend-neutral source location table. Its arrays
 are indexed by expression identity; an empty file or a non-positive line means
@@ -96,10 +102,12 @@ type deleted, and the site (expression id) the plan anchored it to. Local
 function's exit, set! overwrites at the set site, and by-value match bindings
 at their branch's exit — the site disambiguates which node consumes each
 delete.")
-(deftype ScopeDelete [binder CoreRef
-                      symbol String
-                      type (Box MonoType)
-                      site Int])
+(deftype ScopeDelete
+  [binder CoreRef
+   symbol String
+   type (Box MonoType)
+   site Int
+   context Int])
 
 (doc EchoStr "how one concrete type renders for top-level result echo: the
 specialized str C symbol and whether it takes its argument by reference.")
@@ -490,7 +498,13 @@ frees run before the result is returned.")
   (defn wrap-hoisted [cell inner counter]
     (if (Int.= 0 (Array.length cell))
       (SpecializedExpr.copy &inner)
+      ;; Ownership planning ran before hoisting and keys every scheduled
+      ;; delete on the id of the expression it belongs to. A wrapper that
+      ;; introduced a fresh id would hide that expression from the lookup and
+      ;; the delete would be dropped without a diagnostic, so each wrapper
+      ;; carries the id of what it wraps.
       (let-do [inner-type (Specialize.expression-type &inner)
+               inner-id (Specialize.expression-id &inner)
                is-unit (match-ref &inner-type (MonoType.Unit) true _ false)
                sentinel (the String (String.copy "__carp_array_free"))
                core (the SpecializedExpr
@@ -508,7 +522,8 @@ frees run before the result is returned.")
                                       (make-delete-node (Pair.a binding)
                                                         &array-type
                                                         &sentinel))))))
-            (set! core (SpecializedExpr.Do -1 (Box.init (Type.unit)) elems)))
+            (set! core
+                  (SpecializedExpr.Do inner-id (Box.init (Type.unit)) elems)))
           (let-do [result-id (next-hoist counter)
                    result-ref (CoreRef.init result-id
                                             (String.concat &[@"_hoistr"
@@ -531,7 +546,7 @@ frees run before the result is returned.")
                                                            (Box.init (MonoType.copy &inner-type))
                                                            (CoreRef.copy &result-ref))))
             (set! core
-                  (SpecializedExpr.Let -1
+                  (SpecializedExpr.Let inner-id
                                        (Box.init (MonoType.copy &inner-type))
                                        (CoreRef.copy &result-ref)
                                        (Box.init (SpecializedExpr.copy &inner))
@@ -547,7 +562,7 @@ frees run before the result is returned.")
               ;; array's: a statement-position wrapper must stay unit-typed or
               ;; root cleanup mistakes it for a leaked managed value.
               (set! result
-                    (SpecializedExpr.Let -1
+                    (SpecializedExpr.Let inner-id
                                          (Box.init
                                            (if is-unit
                                              (Type.unit)
@@ -913,20 +928,39 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
                            (Box.peek type)))
                        (String.concat &[@"_carp_closure_" (Int.str fresh-id)]))
                      capture-exprs (the (Array (Box SpecializedExpr)) [])]
+              ;; A capture is COPIED into the environment, so the construction
+              ;; only READS the captured binder — the enclosing scope keeps
+              ;; ownership and still has to free it. Passing a bare `Reference`
+              ;; would read as a move to `Ownership.consumed?`, which would then
+              ;; suppress that scope's delete and orphan the original.
               (for [i 0 (Array.length &captures)]
-                (let [capture (Array.unsafe-nth &captures i)]
+                (let [capture (Array.unsafe-nth &captures i)
+                      capture-type (Box.peek (Pair.b capture))]
                   (Array.push-back! &capture-exprs
                                     (Box.init
-                                      (SpecializedExpr.Reference -1
-                                                                 (Box.init
-                                                                   (MonoType.copy (Box.peek (Pair.b capture))))
-                                                                 (CoreRef.copy (Pair.a capture)))))))
+                                      (SpecializedExpr.GlobalCall -1
+                                                                  (Box.init
+                                                                    (MonoType.Reference (Box.init (MonoType.copy capture-type))
+                                                                                        (MonoLifetime.Static)))
+                                                                  (PrimitiveRegistry.ref-reference)
+                                                                  (Box.init
+                                                                    (MonoType.Function
+                                                                      [(Box.init (MonoType.copy capture-type))]
+                                                                      (Box.init
+                                                                        (MonoType.Reference (Box.init (MonoType.copy capture-type))
+                                                                                            (MonoLifetime.Static)))))
+                                                                  (String.copy "ref")
+                                                                  [(Box.init
+                                                                     (SpecializedExpr.Reference -1
+                                                                                                (Box.init (MonoType.copy capture-type))
+                                                                                                (CoreRef.copy (Pair.a capture))))])))))
               (Array.push-back! closures
                                 (ClosureFunction.init (String.copy &lambda-symbol)
                                                       (Box.init (MonoType.copy (Box.peek type)))
                                                       @&captures
                                                       (Array.copy parameters)
-                                                      (Box.init lifted-body)))
+                                                      (Box.init lifted-body)
+                                                      *lift-context*))
               (SpecializedExpr.GlobalCall @id
                                           (Box.init (MonoType.copy (Box.peek type)))
                                           (CoreRef.init fresh-id
@@ -1057,7 +1091,10 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
              new-bodies (the (Array SpecializedBody) [])
              new-roots (the (Array (Box SpecializedExpr)) [])]
       (for [i 0 (Array.length bodies)]
-        (let [body (Array.unsafe-nth bodies i)]
+        (let-do [body (Array.unsafe-nth bodies i)]
+          ;; body `i` is ownership context `i` (see `rewrite-bodies`); a lambda
+          ;; lifted out of it keeps that context so its deletes stay matchable.
+          (set! *lift-context* i)
           (Array.push-back! &new-bodies
                             (SpecializedBody.init @(SpecializedBody.specialization body)
                                                   @(SpecializedBody.parameters body)
@@ -1067,6 +1104,7 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
                                                                   &lifted
                                                                   &closures))
                                                   @(SpecializedBody.value body)))))
+      (set! *lift-context* -1)
       (for [i 0 (Array.length roots)]
         (Array.push-back! &new-roots
                           (Box.init
@@ -1153,51 +1191,61 @@ builtin with no runtime deleter function; the backend inlines this sentinel to a
   (defn insert-nested-path-cleanup [expr binder value-type symbol]
     (match-ref expr
       (SpecializedExpr.Match _ _ _ _ _)
-        (insert-path-cleanup expr binder value-type symbol)
+      (insert-path-cleanup expr binder value-type symbol)
+      ;; these carry their own path structure: `insert-path-cleanup` splits
+      ;; them branch by branch rather than wrapping the whole expression,
+      ;; which is what a nested position needs too.
+      (SpecializedExpr.If _ _ _ _ _)
+      (insert-path-cleanup expr binder value-type symbol)
+      (SpecializedExpr.Let _ _ _ _ _)
+      (insert-path-cleanup expr binder value-type symbol)
+      (SpecializedExpr.Do _ _ _)
+      (insert-path-cleanup expr binder value-type symbol)
       (SpecializedExpr.GlobalCall id type reference signature call-symbol args)
-        (let-do [new-args (the (Array (Box SpecializedExpr)) [])]
-          (for [i 0 (Array.length args)]
-            (let [argument (Box.peek (Array.unsafe-nth args i))]
-              (Array.push-back! &new-args
-                                (Box.init
-                                  (if (Ownership.consumed? binder argument)
-                                    (insert-nested-path-cleanup argument
-                                                                binder
-                                                                value-type
-                                                                symbol)
-                                    (SpecializedExpr.copy argument))))))
-          (SpecializedExpr.GlobalCall @id
-                                      (Box.init (MonoType.copy (Box.peek type)))
-                                      (CoreRef.copy reference)
-                                      (Box.init (MonoType.copy (Box.peek signature)))
-                                      (String.copy call-symbol)
-                                      new-args))
-      (SpecializedExpr.Call id type callee args)
-        (let-do [new-args (the (Array (Box SpecializedExpr)) [])]
-          (for [i 0 (Array.length args)]
-            (let [argument (Box.peek (Array.unsafe-nth args i))]
-              (Array.push-back! &new-args
-                                (Box.init
-                                  (if (Ownership.consumed? binder argument)
-                                    (insert-nested-path-cleanup argument
-                                                                binder
-                                                                value-type
-                                                                symbol)
-                                    (SpecializedExpr.copy argument))))))
-          (SpecializedExpr.Call @id
-                                (Box.init (MonoType.copy (Box.peek type)))
-                                (Box.init (SpecializedExpr.copy (Box.peek callee)))
-                                new-args))
-      (SpecializedExpr.Annotation id type inner core-type)
-        (SpecializedExpr.Annotation @id
+      (let-do [new-args (the (Array (Box SpecializedExpr)) [])]
+        (for [i 0 (Array.length args)]
+          (let [argument (Box.peek (Array.unsafe-nth args i))]
+            (Array.push-back! &new-args
+                              (Box.init
+                                (if (Ownership.consumed? binder argument)
+                                  (insert-nested-path-cleanup argument
+                                                              binder
+                                                              value-type
+                                                              symbol)
+                                  (SpecializedExpr.copy argument))))))
+        (SpecializedExpr.GlobalCall @id
                                     (Box.init (MonoType.copy (Box.peek type)))
-                                    (Box.init
-                                      (insert-nested-path-cleanup (Box.peek inner)
-                                                                  binder
-                                                                  value-type
-                                                                  symbol))
-                                    (Box.init (CoreType.copy (Box.peek core-type))))
-      _ (SpecializedExpr.copy expr)))
+                                    (CoreRef.copy reference)
+                                    (Box.init (MonoType.copy (Box.peek signature)))
+                                    (String.copy call-symbol)
+                                    new-args))
+      (SpecializedExpr.Call id type callee args)
+      (let-do [new-args (the (Array (Box SpecializedExpr)) [])]
+        (for [i 0 (Array.length args)]
+          (let [argument (Box.peek (Array.unsafe-nth args i))]
+            (Array.push-back! &new-args
+                              (Box.init
+                                (if (Ownership.consumed? binder argument)
+                                  (insert-nested-path-cleanup argument
+                                                              binder
+                                                              value-type
+                                                              symbol)
+                                  (SpecializedExpr.copy argument))))))
+        (SpecializedExpr.Call @id
+                              (Box.init (MonoType.copy (Box.peek type)))
+                              (Box.init (SpecializedExpr.copy (Box.peek callee)))
+                              new-args))
+      (SpecializedExpr.Annotation id type inner core-type)
+      (SpecializedExpr.Annotation @id
+                                  (Box.init (MonoType.copy (Box.peek type)))
+                                  (Box.init
+                                    (insert-nested-path-cleanup (Box.peek inner)
+                                                                binder
+                                                                value-type
+                                                                symbol))
+                                  (Box.init (CoreType.copy (Box.peek core-type))))
+      _
+      (SpecializedExpr.copy expr)))
 
   (doc cleanup-after "evaluates an expression, deletes one still-owned
 binding, then yields the expression's result.")
@@ -1256,7 +1304,17 @@ ordinary scope-exit cleanup.")
                                                      symbol))))
         (SpecializedExpr.Match id type by-reference scrutinee branches)
         (if (Ownership.consumed? binder (Box.peek scrutinee))
-          (SpecializedExpr.copy expr)
+          ;; The scrutinee runs before any branch and may move the binder on only
+          ;; some paths; the cleanup belongs on its exits, not on the branches.
+          (SpecializedExpr.Match @id
+                                 (Box.init (MonoType.copy (Box.peek type)))
+                                 @by-reference
+                                 (Box.init
+                                   (insert-nested-path-cleanup (Box.peek scrutinee)
+                                                               binder
+                                                               value-type
+                                                               symbol))
+                                 @branches)
           (let-do [new-branches (the (Array SpecializedMatchBranch) [])
                    n (Array.length branches)]
             (for [i 0 n]
@@ -1276,9 +1334,22 @@ ordinary scope-exit cleanup.")
                                    (Box.init
                                      (SpecializedExpr.copy (Box.peek scrutinee)))
                                    new-branches)))
+
         (SpecializedExpr.Let id type inner-binder value body)
         (if (Ownership.consumed? binder (Box.peek value))
-          (SpecializedExpr.copy expr)
+          ;; The declaration moves the binder on only some paths. Push the cleanup
+          ;; into the value, where the paths that keep ownership are still
+          ;; distinguishable; the body cannot mention the binder after a conditional
+          ;; move, so nothing is owed at scope exit.
+          (SpecializedExpr.Let @id
+                               (Box.init (MonoType.copy (Box.peek type)))
+                               (CoreRef.copy inner-binder)
+                               (Box.init
+                                 (insert-nested-path-cleanup (Box.peek value)
+                                                             binder
+                                                             value-type
+                                                             symbol))
+                               (Box.init (SpecializedExpr.copy (Box.peek body))))
           (SpecializedExpr.Let @id
                                (Box.init (MonoType.copy (Box.peek type)))
                                (CoreRef.copy inner-binder)
@@ -1288,31 +1359,43 @@ ordinary scope-exit cleanup.")
                                                       binder
                                                       value-type
                                                       symbol))))
+
         (SpecializedExpr.Do id type es)
         (let-do [n (Array.length es)
-                 prefix-consumes false]
+                 moving -1]
+          ;; An element before the tail can move the binder on only some paths. The
+          ;; cleanup then belongs on that element's own exits: appending it to the
+          ;; `Do` would free a value the moving paths already gave away.
           (when (Int.> n 1)
             (for [i 0 (Int.dec n)]
-              (when (Ownership.consumed? binder
-                                         (Box.peek (Array.unsafe-nth es i)))
-                (set! prefix-consumes true))))
-          (if (or prefix-consumes (Int.= n 0))
+              (when (and (Int.< moving 0)
+                         (Ownership.consumed? binder
+                                              (Box.peek (Array.unsafe-nth es i))))
+                (set! moving i))))
+          (if (Int.= n 0)
             (SpecializedExpr.copy expr)
             (let-do [new-es (the (Array (Box SpecializedExpr)) [])]
               (for [i 0 n]
-                (Array.push-back! &new-es
-                                  (Box.init
-                                    (if (Int.= i (Int.dec n))
-                                      (insert-path-cleanup (Box.peek (Array.unsafe-nth es
-                                                                                       i))
-                                                           binder
-                                                           value-type
-                                                           symbol)
-                                      (SpecializedExpr.copy (Box.peek (Array.unsafe-nth es
-                                                                                        i)))))))
+                (let [element (Box.peek (Array.unsafe-nth es i))]
+                  (Array.push-back! &new-es
+                                    (Box.init
+                                      (cond
+                                        (Int.= i moving)
+                                          (insert-nested-path-cleanup element
+                                                                      binder
+                                                                      value-type
+                                                                      symbol)
+                                        (and (Int.< moving 0)
+                                             (Int.= i (Int.dec n)))
+                                          (insert-path-cleanup element
+                                                               binder
+                                                               value-type
+                                                               symbol)
+                                        (SpecializedExpr.copy element))))))
               (SpecializedExpr.Do @id
                                   (Box.init (MonoType.copy (Box.peek type)))
                                   new-es))))
+
         ;; A match can move an outer owner on only some branches even when it
         ;; appears directly as a call argument. Push the path cleanup into that
         ;; match; wrapping the whole call cannot distinguish which branch moved
@@ -1680,7 +1763,8 @@ arguments and array literals whose values are consumed, not dropped).")
                                            (ScopeDelete.init (CoreRef.copy binder)
                                                              symbol
                                                              (Box.init (MonoType.copy (Box.peek type)))
-                                                             @(OwnershipSite.expression site))))
+                                                             @(OwnershipSite.expression site)
+                                                             @(OwnershipSite.context site))))
                     (Maybe.Nothing)
                     ;; arrays whose deleter instance was not demanded fall back
                     ;; to the shallow data free.
@@ -1690,7 +1774,8 @@ arguments and array literals whose values are consumed, not dropped).")
                                              (ScopeDelete.init (CoreRef.copy binder)
                                                                (array-free-symbol)
                                                                (Box.init (MonoType.copy (Box.peek type)))
-                                                               @(OwnershipSite.expression site))))
+                                                               @(OwnershipSite.expression site)
+                                                               @(OwnershipSite.context site))))
                       (set! failed true)))
                 _ ()))
           _ ()))
@@ -1958,8 +2043,11 @@ function exit on exactly the paths that do not consume them.")
   (hidden rewrite-closures)
   (doc rewrite-closures "applies ownership actions planned for nested lambda
 bodies after lambda lifting has moved capturing callbacks outside the ordinary
-specialized-body list. Local binder ids are module-unique, so the complete
-delete set can be matched without retaining the source context id.")
+specialized-body list. Each closure is matched only against the context it was
+lifted out of: one generic body instantiated twice yields two closures whose
+locals share binder ids and sites but not types, so a context-blind match picks
+an arbitrary instance's delete and frees a value through the wrong type's
+deleter.")
   (defn rewrite-closures [closures ownership delete-symbols constructors]
     (match (deletes-for-context (OwnershipPlan.actions ownership)
                                 -1
@@ -1972,15 +2060,18 @@ delete set can be matched without retaining the source context id.")
                      parameters (ClosureFunction.parameters closure-fn)
                      original-body (Box.peek (ClosureFunction.body closure-fn))
                      root-id (Specialize.expression-id original-body)
+                     context @(ClosureFunction.context closure-fn)
                      param-deletes (the (Array ScopeDelete) [])
                      local-deletes (the (Array ScopeDelete) [])]
               (for [j 0 (Array.length &deletes)]
                 (let [sd (Array.unsafe-nth &deletes j)]
-                  (if (and
-                      (binder-in? parameters (ScopeDelete.binder sd))
-                      (Int.= @(ScopeDelete.site sd) root-id))
-                    (Array.push-back! &param-deletes @sd)
-                    (Array.push-back! &local-deletes @sd))))
+                  (when (or (Int.< context 0)
+                            (Int.= @(ScopeDelete.context sd) context))
+                    (if (and
+                        (binder-in? parameters (ScopeDelete.binder sd))
+                        (Int.= @(ScopeDelete.site sd) root-id))
+                      (Array.push-back! &param-deletes @sd)
+                      (Array.push-back! &local-deletes @sd)))))
               (set! result
                     (Array.push-back result
                                      (ClosureFunction.init
@@ -1996,7 +2087,8 @@ delete set can be matched without retaining the source context id.")
                                                            &local-deletes
                                                            delete-symbols
                                                            constructors)
-                                           &param-deletes)))))))
+                                           &param-deletes))
+                                       context)))))
           (Result.Success result))))
 
   (doc module-with-ownership-echoed "like module-with-ownership, additionally
