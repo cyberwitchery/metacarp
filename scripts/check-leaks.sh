@@ -16,7 +16,7 @@ compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
 carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 fixture=${CARP_LEAK_FIXTURE:-"$carp_root/test/map.carp"}
-budget=${CARP_LEAK_BUDGET:-200000}
+budget=${CARP_LEAK_BUDGET:-0}
 work_dir=${CARP_FIXED_POINT_OUT:-}
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
