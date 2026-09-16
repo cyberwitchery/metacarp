@@ -810,14 +810,23 @@ A managed capture is deep-copied: the environment's deleter frees its fields,
 so storing the capturing scope's own value would free it twice and read it
 after that scope ended. Captures are always plain variable references, so the
 address taken here is always an lvalue.")
-(defn render-env-field-value [value expression]
+(doc capture-inner "the value a capture argument reads. Lifting wraps each
+capture in `ref` so the construction does not read as a move; the environment
+still stores the value, copied.")
+(defn capture-inner [expression]
   (match-ref expression
+    (SpecializedExpr.GlobalCall _ _ reference _ _ arguments)
+      (if (and (Int.= @(CoreRef.id reference) 5)
+               (Int.= 1 (Array.length arguments)))
+        (Box.peek (Array.unsafe-nth arguments 0))
+        expression)
+    _ expression))
+
+(defn capture-copier-for [expression]
+  (match-ref (capture-inner expression)
     (SpecializedExpr.Reference _ type _)
-      (match (closure-capture-copier (Box.peek type))
-        (Maybe.Just copier)
-          (String.concat &[(sanitize &copier) @"(&" (String.copy value) @")"])
-        (Maybe.Nothing) (String.copy value))
-    _ (String.copy value)))
+      (closure-capture-copier (Box.peek type))
+    _ (the (Maybe String) (Maybe.Nothing))))
 
 (defn render-env-fields [constructors arguments]
   (let-do [rendered (the String (String.copy ""))
@@ -826,22 +835,36 @@ address taken here is always an lvalue.")
     (for [i 0 n]
       (match-ref &failure
         (Maybe.Nothing)
-          (match (render-value-expression constructors
-                                          (Box.peek (Array.unsafe-nth arguments
-                                                                      i)))
-            (Result.Success value)
-              (do
-                (when (Int.> i 0) (set! rendered (String.append &rendered ", ")))
-                (set! rendered
-                      (String.append &rendered
-                                     &(String.concat
-                                       &[@".f"
-                                         (Int.str i)
-                                         @" = "
-                                         (render-env-field-value &value
-                                                                 (Box.peek (Array.unsafe-nth arguments
-                                                                                             i)))]))))
-            (Result.Error error) (set! failure (Maybe.Just error)))
+          (let [argument (Box.peek (Array.unsafe-nth arguments i))
+                copier (capture-copier-for argument)
+                copies (Maybe.just? &copier)]
+            ;; with a copier the environment stores a deep copy, rendered from
+            ;; the `ref`; without one the capture is unmanaged and the value
+            ;; itself goes in, so the `ref` wrapper is rendered away.
+            (match (render-value-expression constructors
+                                            (if copies
+                                              argument
+                                              (capture-inner argument)))
+              (Result.Success value)
+                (do
+                  (when (Int.> i 0)
+                    (set! rendered (String.append &rendered ", ")))
+                  (set! rendered
+                        (String.append &rendered
+                                       &(String.concat
+                                         &[@".f"
+                                           (Int.str i)
+                                           @" = "
+                                           (match copier
+                                             (Maybe.Just symbol)
+                                               (String.concat
+                                                 &[(sanitize &symbol)
+                                                   @"("
+                                                   (String.copy &value)
+                                                   @")"])
+                                             (Maybe.Nothing)
+                                               (String.copy &value))]))))
+              (Result.Error error) (set! failure (Maybe.Just error))))
         (Maybe.Just _) ()))
     (match-ref &failure
       (Maybe.Just error) (Result.Error @error)
@@ -859,7 +882,7 @@ address taken here is always an lvalue.")
                    field-name (String.concat &[@"f" (Int.str i)])
                    field (String.concat &[@"." (String.copy &field-name)])]
             (when (Int.> i 0) (set! fields (String.append &fields ", ")))
-            (if (match-ref argument
+            (if (match-ref (capture-inner argument)
                 (SpecializedExpr.Reference _ _ reference)
                   (CoreIR.same-ref? reference self)
                 _ false)
@@ -873,15 +896,27 @@ address taken here is always an lvalue.")
                           @" _carp_env->"
                           field-name
                           @" = ((Lambda){ .callback = _carp_self.callback, .env = _carp_self.env, .delete = NULL, .copy = NULL });"])))
-              (match (render-value-expression constructors argument)
-                (Result.Success value)
-                  (set! fields
-                        (String.concat
-                          &[(String.copy &fields)
-                            field
-                            @" = "
-                            (String.copy &value)]))
-                (Result.Error error) (set! failure (Maybe.Just error)))))
+              (let [copier (capture-copier-for argument)
+                    copies (Maybe.just? &copier)]
+                (match (render-value-expression constructors
+                                                (if copies
+                                                  argument
+                                                  (capture-inner argument)))
+                  (Result.Success value)
+                    (set! fields
+                          (String.concat
+                            &[(String.copy &fields)
+                              field
+                              @" = "
+                              (match copier
+                                (Maybe.Just symbol)
+                                  (String.concat
+                                    &[(sanitize &symbol)
+                                      @"("
+                                      (String.copy &value)
+                                      @")"])
+                                (Maybe.Nothing) (String.copy &value))]))
+                  (Result.Error error) (set! failure (Maybe.Just error))))))
         (Maybe.Just _) ()))
     (match-ref &failure
       (Maybe.Just error) (Result.Error @error)
