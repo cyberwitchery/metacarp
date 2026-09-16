@@ -14,6 +14,12 @@
 # Set CARP_CHECK_ERRORS=1 to also write a per-file divergence report
 # (our first diagnostic line vs the reference's expected first line) to
 # $out_root/error-text-report.txt — visibility without brittleness.
+# Set CARP_SELF_SANITIZE=1 to build every generated program with
+# AddressSanitizer. Ownership bugs in the code we emit — a delete placed before
+# a last use, a capture freed twice — produce a use-after-free or double-free
+# that is invisible to every compile-time gate and to the program's own
+# assertions; the only way they surface is by running the compiled program with
+# a sanitizer watching. Costs about 1.5x the run time of the corpus.
 # Set CARP_SELF_JOBS=2 or 3 to split the corpus across shadow reference roots.
 # Each worker owns its `out/Untitled`, preserving `-x` argv behavior without
 # sharing build artifacts.
@@ -29,6 +35,21 @@ core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 out_root=${CARP_SELF_SUITE_OUT:-"${TMPDIR:-/tmp}/carp-self-suite"}
 jobs=${CARP_SELF_JOBS:-1}
 lane=${CARP_SELF_LANE:-all}
+
+if [ "${CARP_SELF_SANITIZE:-0}" = "1" ]; then
+  # the compiler passes CARP_EXTRA_CFLAGS through to clang for -b/-x builds.
+  # -O1 keeps frame pointers and symbol names useful without the -O0 slowdown.
+  export CARP_EXTRA_CFLAGS="${CARP_EXTRA_CFLAGS:-} -fsanitize=address -fno-omit-frame-pointer -O1"
+  # a sanitizer report has to fail the test, not just print
+  # leaks are gated separately by check-leaks.sh, and LeakSanitizer is not
+  # available on macOS anyway; this pass is about use-after-free/double-free.
+  asan_defaults="abort_on_error=1:detect_leaks=0"
+  if [ -n "${ASAN_OPTIONS:-}" ]; then
+    export ASAN_OPTIONS="$ASAN_OPTIONS:$asan_defaults"
+  else
+    export ASAN_OPTIONS="$asan_defaults"
+  fi
+fi
 
 mkdir -p "$out_root/c" "$out_root/bin" "$out_root/log"
 
