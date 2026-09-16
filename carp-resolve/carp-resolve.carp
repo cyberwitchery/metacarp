@@ -143,6 +143,14 @@ references can resolve to all globals and imports visible in the base.")
 (def *resolve-seed-globals* (PrimitiveRegistry.globals))
 (def *resolve-seed-imports* (the (Array ScopedImport) []))
 (def *resolve-reuse-globals* (the (Array CoreRef) []))
+
+;; name -> position of the LAST global with that name, and how many entries of
+;; the global table the index already covers. The table only ever grows during
+;; collection (`add-global!` appends), so the index catches up lazily from
+;; `*global-index-count*` rather than being rebuilt; a table shorter than the
+;; count means a new resolution started, and the index is rebuilt from zero.
+(def *global-name-index* (the (Map String Int) (Map.create)))
+(def *global-index-count* 0)
 (def *last-resolve-snapshot* (ResolveSnapshot.init [] []))
 
 (defmodule Resolve
@@ -844,6 +852,12 @@ same-named events.")
 
   (private global-by-name)
   (hidden global-by-name)
+  (private global-by-name-scanned)
+  (hidden global-by-name-scanned)
+  (private catch-up-global-index!)
+  (hidden catch-up-global-index!)
+  (private reset-global-index!)
+  (hidden reset-global-index!)
   (private first-global-by-name)
   (hidden first-global-by-name)
   (private duplicate-definition-message)
@@ -908,19 +922,53 @@ same-named events.")
   (hidden append-core-builtins)
   (private append-core-implementations)
   (hidden append-core-implementations)
+  (doc reset-global-index! "drops the global-name index, so the next lookup
+rebuilds it. Called where a resolution begins.")
+  (defn reset-global-index! []
+    (do
+      (set! *global-name-index* (the (Map String Int) (Map.create)))
+      (set! *global-index-count* 0)))
+
   (doc global-by-name "the LAST global whose name matches; the single funnel
 where a candidate name meets the global table, so the type-generation rewrite
 happens here (a dotted name prefixed by a redefined type binds the generation
 live at the current resolve stamp).")
-  (defn global-by-name [globals name]
-    (let-do [rewritten (generation-qualify name *resolve-stamp*)
-             result (the (Maybe CoreRef) (Maybe.Nothing))
+  (private global-by-name-scanned)
+  (hidden global-by-name-scanned)
+  (doc global-by-name-scanned "the LAST global with this exact name, by scan.
+Used for the reuse table, which an ordinary compile leaves empty.")
+  (defn global-by-name-scanned [globals name]
+    (let-do [result (the (Maybe CoreRef) (Maybe.Nothing))
              n (Array.length globals)]
       (for [i 0 n]
         (let [candidate (Array.unsafe-nth globals i)]
-          (when (= (CoreRef.name candidate) &rewritten)
+          (when (= (CoreRef.name candidate) name)
             (set! result (Maybe.Just @candidate)))))
       result))
+
+  (private catch-up-global-index!)
+  (hidden catch-up-global-index!)
+  (doc catch-up-global-index! "indexes the entries appended since the last
+call. Indexing in order and overwriting leaves the LAST entry of a name in the
+index, which is what `global-by-name` answers with.")
+  (defn catch-up-global-index! [globals]
+    (let-do [n (Array.length globals)]
+      (when-do (Int.< n *global-index-count*)
+        (set! *global-name-index* (the (Map String Int) (Map.create)))
+        (set! *global-index-count* 0))
+      (for [i *global-index-count* n]
+        (ignore
+          (Map.put! &*global-name-index*
+                    (CoreRef.name (Array.unsafe-nth globals i))
+                    &i)))
+      (set! *global-index-count* n)))
+
+  (defn global-by-name [globals name]
+    (let-do [rewritten (generation-qualify name *resolve-stamp*)
+             _caught-up (catch-up-global-index! globals)]
+      (match (Map.get-maybe &*global-name-index* &rewritten)
+        (Maybe.Just at) (Maybe.Just @(Array.unsafe-nth globals at))
+        (Maybe.Nothing) (the (Maybe CoreRef) (Maybe.Nothing)))))
 
   (defn first-global-by-name [globals name]
     (let-do [result (the (Maybe CoreRef) (Maybe.Nothing))
@@ -1550,7 +1598,7 @@ then reuse a reserved id.")
 
   (defn add-global! [collected name]
     (let [globals (CollectedForms.globals collected)]
-      (match (global-by-name &*resolve-reuse-globals* name)
+      (match (global-by-name-scanned &*resolve-reuse-globals* name)
         (Maybe.Just reusable)
           (do (Array.push-back! globals (CoreRef.copy &reusable)) reusable)
         (Maybe.Nothing)
@@ -4746,7 +4794,13 @@ guessed at.")
              ;; identically-driven sessions in one process used to emit
              ;; different bytes). Uniqueness only ever mattered within one
              ;; resolution: locals are body-scoped everywhere downstream.
-             _ignored-serial (set! *local-binder-serial* 0)]
+             _ignored-serial (set! *local-binder-serial* 0)
+             ;; the global-name index belongs to one resolution's global
+             ;; table. Resetting here rather than at each public entry is the
+             ;; point: `module-inner` is the funnel all five of them go
+             ;; through, and a warm session enters through the ones that are
+             ;; easiest to forget.
+             _ignored-index (reset-global-index!)]
       (match (collect-with-generations (SurfaceModule.forms surface))
         (Result.Success collected)
         ;; the constructor passes resolve plain (= last-generation) names, so

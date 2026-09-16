@@ -138,6 +138,16 @@ and the complete concrete instance cache after satisfying that cell's roots.")
 (def *module-solver* (Type.solver))
 (def *module-solver-ready* false)
 
+;; node-type positions grouped by owner, as a flat array plus per-owner
+;; start offsets (`*owner-bucket-items*` indexed by `*owner-bucket-start*`),
+;; with `*owner-slot-of-key*` mapping an owner's trace key to its slot. Built
+;; in one pass per entry, because `prime-trace-owner!` otherwise scans every
+;; node type in the module twice on every owner switch, and materialization
+;; switches owners once per instance.
+(def *owner-slot-of-key* (the (Map Int Int) (Map.create)))
+(def *owner-bucket-start* (the (Array Int) []))
+(def *owner-bucket-items* (the (Array Int) []))
+
 ;; expr-id → trace position for the owner named by *trace-owner-key*;
 ;; expression ids repeat across owners, so the index is per-owner and is
 ;; rebuilt when the owner changes (once per materialized instance).
@@ -640,6 +650,52 @@ mismatch.")
   (hidden prime-trace!)
   (doc prime-trace! "resets the lazy normalized-node-type memo to match the
 trace's length; slots fill on first touch in `expression-type-for`.")
+  (private build-owner-buckets!)
+  (hidden build-owner-buckets!)
+  (private owner-trace-key)
+  (hidden owner-trace-key)
+  (doc build-owner-buckets! "groups node-type positions by owner trace key in
+one linear pass: count per slot, prefix-sum into starts, then place.")
+  (defn build-owner-buckets! [inferred]
+    (let-do [node-types (InferredModule.node-types inferred)
+             n (Array.length node-types)
+             slot-of (the (Map Int Int) (Map.create))
+             slots (Array.allocate n)
+             counts (the (Array Int) [])]
+      (for [i 0 n]
+        (let [key (owner-trace-key
+                (InferredNodeType.owner (Array.unsafe-nth node-types i)))]
+          (match (Map.get-maybe &slot-of &key)
+            (Maybe.Just slot)
+              (do
+                (Array.aset-uninitialized! &slots i slot)
+                (Array.aset! &counts
+                             slot
+                             (Int.inc @(Array.unsafe-nth &counts slot))))
+            (Maybe.Nothing)
+              (let-do [slot (Array.length &counts)]
+                (ignore (Map.put! &slot-of &key &slot))
+                (Array.push-back! &counts 1)
+                (Array.aset-uninitialized! &slots i slot)))))
+      (let-do [slot-count (Array.length &counts)
+               starts (Array.replicate (Int.inc slot-count) &0)
+               running 0]
+        (for [k 0 slot-count]
+          (do
+            (Array.aset! &starts k running)
+            (set! running (Int.+ running @(Array.unsafe-nth &counts k)))))
+        (Array.aset! &starts slot-count running)
+        (let-do [items (Array.replicate running &0)
+                 cursor @&starts]
+          (for [i 0 n]
+            (let-do [slot @(Array.unsafe-nth &slots i)
+                     at @(Array.unsafe-nth &cursor slot)]
+              (Array.aset! &items at i)
+              (Array.aset! &cursor slot (Int.inc at))))
+          (set! *owner-slot-of-key* slot-of)
+          (set! *owner-bucket-start* starts)
+          (set! *owner-bucket-items* items)))))
+
   (defn prime-trace! [inferred]
     (let-do [n (Array.length (InferredModule.node-types inferred))
              placeholder (Box.init (MonoType.Unit))]
@@ -648,6 +704,7 @@ trace's length; slots fill on first touch in `expression-type-for`.")
       (set! *module-solver*
             (Type.solver-from-substitution (InferredModule.substitution inferred)))
       (set! *module-solver-ready* true)
+      (build-owner-buckets! inferred)
       (set! *trace-owner-key* -1000000002)))
 
   (private clear-caches!)
@@ -663,6 +720,9 @@ its concrete node types, so none of these memoized values are needed afterward."
       (set! *normalized-filled* [])
       (set! *module-solver* (Type.solver))
       (set! *module-solver-ready* false)
+      (set! *owner-slot-of-key* (the (Map Int Int) (Map.create)))
+      (set! *owner-bucket-start* [])
+      (set! *owner-bucket-items* [])
       (set! *trace-positions* [])
       (set! *trace-owner-key* -1000000002)))
 
@@ -1965,21 +2025,36 @@ owner; runs when materialization switches owners (once per instance), so the
 per-expression trace scan becomes an array lookup.")
   (defn prime-trace-owner! [inferred owner]
     (let-do [node-types (InferredModule.node-types inferred)
-             n (Array.length node-types)
-             max-id 0]
-      (for [i 0 n]
-        (let [node-type (Array.unsafe-nth node-types i)]
-          (when (same-owner? (InferredNodeType.owner node-type) owner)
-            (when (Int.> @(InferredNodeType.id node-type) max-id)
-              (set! max-id @(InferredNodeType.id node-type))))))
-      (let-do [positions (Array.replicate (Int.inc max-id) &-1)]
-        (for [i 0 n]
-          (let [node-type (Array.unsafe-nth node-types i)]
+             key (owner-trace-key owner)
+             from 0
+             to 0]
+      (match (Map.get-maybe &*owner-slot-of-key* &key)
+        (Maybe.Just slot)
+          (do
+            (set! from @(Array.unsafe-nth &*owner-bucket-start* slot))
+            (set! to @(Array.unsafe-nth &*owner-bucket-start* (Int.inc slot))))
+        (Maybe.Nothing) ())
+      ;; the bucket is keyed by the owner's reference id, which `same-owner?`
+      ;; also compares its name and globalness for, so the strict test still
+      ;; runs — over the handful of entries this owner has, rather than over
+      ;; every node type in the module.
+      (let-do [max-id 0]
+        (for [b from to]
+          (let [node-type (Array.unsafe-nth node-types
+                                            @(Array.unsafe-nth &*owner-bucket-items*
+                                                               b))]
             (when (same-owner? (InferredNodeType.owner node-type) owner)
-              (let [id @(InferredNodeType.id node-type)]
-                (when (Int.>= id 0) (Array.aset! &positions id i))))))
-        (set! *trace-positions* positions)
-        (set! *trace-owner-key* (owner-trace-key owner)))))
+              (when (Int.> @(InferredNodeType.id node-type) max-id)
+                (set! max-id @(InferredNodeType.id node-type))))))
+        (let-do [positions (Array.replicate (Int.inc max-id) &-1)]
+          (for [b from to]
+            (let-do [i @(Array.unsafe-nth &*owner-bucket-items* b)
+                     node-type (Array.unsafe-nth node-types i)]
+              (when (same-owner? (InferredNodeType.owner node-type) owner)
+                (let [id @(InferredNodeType.id node-type)]
+                  (when (Int.>= id 0) (Array.aset! &positions id i))))))
+          (set! *trace-positions* positions)
+          (set! *trace-owner-key* (owner-trace-key owner))))))
 
   (defn expression-type-for [inferred owner expression-id instance-substitution]
     (if (Int.= 0 (Array.length &*normalized-node-types*))
