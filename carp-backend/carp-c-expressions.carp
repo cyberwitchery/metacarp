@@ -1,6 +1,25 @@
 ;; Expression, control-flow, closure-construction, and pattern rendering.
 ;; Loaded by carp-c-backend.carp after the shared CBackend API is declared.
 
+(doc *field-set-deleters* "the module's type-key→deleter-symbol table, primed
+once per translation unit. `field-set!` needs it: overwriting a managed field
+drops its previous value, which has to be freed at the write site the way the
+reference compiler's mutating setters do.")
+(def *field-set-deleters* (the (Array (Pair String String)) []))
+
+(defn prime-field-set-deleters! [delete-symbols]
+  (set! *field-set-deleters* (Array.copy delete-symbols)))
+
+(defn field-set-deleter [type]
+  (let-do [key (CAbi.type-key type)
+           result (the (Maybe String) (Maybe.Nothing))
+           n (Array.length &*field-set-deleters*)]
+    (for [i 0 n]
+      (let [entry (Array.unsafe-nth &*field-set-deleters* i)]
+        (when (String.= (Pair.a entry) &key)
+          (set! result (Maybe.Just (String.copy (Pair.b entry)))))))
+    result))
+
 (defn unmanaged-type? [constructors type]
   (if (CAbi.unmanaged-scalar? type)
     true
@@ -451,19 +470,43 @@ managed forms still require dedicated lowering.")
                                               (Box.peek (Array.unsafe-nth arguments
                                                                           3)))
                 (Result.Success value-c)
-                  (Result.Success
-                    (String.concat
-                      &[@"((*"
-                        self-c
-                        @").data.variant_"
-                        (Int.str
-                          (literal-int (Box.peek (Array.unsafe-nth arguments 1))))
-                        @".member_"
-                        (Int.str
-                          (literal-int (Box.peek (Array.unsafe-nth arguments 2))))
-                        @" = "
-                        value-c
-                        @")"]))
+                  (let [place (String.concat
+                          &[@"(*"
+                            self-c
+                            @").data.variant_"
+                            (Int.str
+                              (literal-int
+                                (Box.peek (Array.unsafe-nth arguments 1))))
+                            @".member_"
+                            (Int.str
+                              (literal-int
+                                (Box.peek (Array.unsafe-nth arguments 2))))])
+                        value-type (specialized-type
+                          (Box.peek (Array.unsafe-nth arguments 3)))]
+                    ;; the write drops whatever the field held: free it first,
+                    ;; after the new value is evaluated into a temporary so a
+                    ;; value derived from the old one is still valid.
+                    (match (field-set-deleter &value-type)
+                      (Maybe.Just deleter)
+                        (match (render-type &value-type)
+                          (Result.Success type-c)
+                            (Result.Success
+                              (String.concat
+                                &[@"({ "
+                                  type-c
+                                  @" _carp_fs = "
+                                  value-c
+                                  @"; "
+                                  deleter
+                                  @"("
+                                  (String.copy &place)
+                                  @"); "
+                                  place
+                                  @" = _carp_fs; })"]))
+                          (Result.Error error) (Result.Error error))
+                      (Maybe.Nothing)
+                        (Result.Success
+                          (String.concat &[@"(" place @" = " value-c @")"]))))
                 (Result.Error error) (Result.Error error))
             (Result.Error error) (Result.Error error))
           ;; `allocate`/`Array.allocate` (ids 14/15) build an uninitialized heap
