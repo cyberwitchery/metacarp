@@ -2,7 +2,8 @@
 # The canonical local and CI assurance entry point.
 #
 #   run-assurance.sh phase  phase suites plus lint and formatting
-#   run-assurance.sh self   bootstrap, reference suite, fixed point, expansion
+#   run-assurance.sh self   bootstrap, reference suite, fixed point, leaks,
+#                           expansion
 #   run-assurance.sh all    both groups (the default)
 set -euo pipefail
 
@@ -59,7 +60,14 @@ run_self() {
   cd "$repo_root"
   "$reference" -b --optimize main.carp
   "$script_dir/run-carp-suite-self.sh"
-  "$script_dir/check-fixed-point.sh"
+  # Both checks want a generation-2 compiler; share one work directory so it
+  # is built once.
+  self_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-self.XXXXXX")
+  trap 'rm -rf "$self_work"' EXIT
+  CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-fixed-point.sh"
+  CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-leaks.sh"
+  rm -rf "$self_work"
+  trap - EXIT
   "$script_dir/diff-expansion.sh"
 }
 
