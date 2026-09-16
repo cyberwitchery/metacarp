@@ -26,6 +26,11 @@ offsets could, once a program grew large enough.")
 ; Batch lowering uses a private counter because historical owner-local node IDs
 ; may collide. A provenanced session can opt into deterministic lambda symbols
 ; derived from its globally unique expression IDs and concrete signatures.
+(doc *lift-context* "the ownership context id of the body currently being
+lambda-lifted, stamped onto each `ClosureFunction` so its planned deletes can
+be matched back to the context they were planned in. -1 while lifting roots.")
+(def *lift-context* -1)
+
 (def *stable-lambda-symbols* false)
 (def *lambda-symbol-salt* (String.copy ""))
 
@@ -63,7 +68,8 @@ an environment struct of the captured values.")
    signature (Box MonoType)
    captures (Array (Pair CoreRef (Box MonoType)))
    parameters (Array CoreRef)
-   body (Box SpecializedExpr)])
+   body (Box SpecializedExpr)
+   context Int])
 
 (doc BackendLineMap "is the backend-neutral source location table. Its arrays
 are indexed by expression identity; an empty file or a non-positive line means
@@ -96,10 +102,12 @@ type deleted, and the site (expression id) the plan anchored it to. Local
 function's exit, set! overwrites at the set site, and by-value match bindings
 at their branch's exit — the site disambiguates which node consumes each
 delete.")
-(deftype ScopeDelete [binder CoreRef
-                      symbol String
-                      type (Box MonoType)
-                      site Int])
+(deftype ScopeDelete
+  [binder CoreRef
+   symbol String
+   type (Box MonoType)
+   site Int
+   context Int])
 
 (doc EchoStr "how one concrete type renders for top-level result echo: the
 specialized str C symbol and whether it takes its argument by reference.")
@@ -933,7 +941,8 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
                                                       (Box.init (MonoType.copy (Box.peek type)))
                                                       @&captures
                                                       (Array.copy parameters)
-                                                      (Box.init lifted-body)))
+                                                      (Box.init lifted-body)
+                                                      *lift-context*))
               (SpecializedExpr.GlobalCall @id
                                           (Box.init (MonoType.copy (Box.peek type)))
                                           (CoreRef.init fresh-id
@@ -1064,7 +1073,10 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
              new-bodies (the (Array SpecializedBody) [])
              new-roots (the (Array (Box SpecializedExpr)) [])]
       (for [i 0 (Array.length bodies)]
-        (let [body (Array.unsafe-nth bodies i)]
+        (let-do [body (Array.unsafe-nth bodies i)]
+          ;; body `i` is ownership context `i` (see `rewrite-bodies`); a lambda
+          ;; lifted out of it keeps that context so its deletes stay matchable.
+          (set! *lift-context* i)
           (Array.push-back! &new-bodies
                             (SpecializedBody.init @(SpecializedBody.specialization body)
                                                   @(SpecializedBody.parameters body)
@@ -1074,6 +1086,7 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
                                                                   &lifted
                                                                   &closures))
                                                   @(SpecializedBody.value body)))))
+      (set! *lift-context* -1)
       (for [i 0 (Array.length roots)]
         (Array.push-back! &new-roots
                           (Box.init
@@ -1732,7 +1745,8 @@ arguments and array literals whose values are consumed, not dropped).")
                                            (ScopeDelete.init (CoreRef.copy binder)
                                                              symbol
                                                              (Box.init (MonoType.copy (Box.peek type)))
-                                                             @(OwnershipSite.expression site))))
+                                                             @(OwnershipSite.expression site)
+                                                             @(OwnershipSite.context site))))
                     (Maybe.Nothing)
                     ;; arrays whose deleter instance was not demanded fall back
                     ;; to the shallow data free.
@@ -1742,7 +1756,8 @@ arguments and array literals whose values are consumed, not dropped).")
                                              (ScopeDelete.init (CoreRef.copy binder)
                                                                (array-free-symbol)
                                                                (Box.init (MonoType.copy (Box.peek type)))
-                                                               @(OwnershipSite.expression site))))
+                                                               @(OwnershipSite.expression site)
+                                                               @(OwnershipSite.context site))))
                       (set! failed true)))
                 _ ()))
           _ ()))
@@ -2010,8 +2025,11 @@ function exit on exactly the paths that do not consume them.")
   (hidden rewrite-closures)
   (doc rewrite-closures "applies ownership actions planned for nested lambda
 bodies after lambda lifting has moved capturing callbacks outside the ordinary
-specialized-body list. Local binder ids are module-unique, so the complete
-delete set can be matched without retaining the source context id.")
+specialized-body list. Each closure is matched only against the context it was
+lifted out of: one generic body instantiated twice yields two closures whose
+locals share binder ids and sites but not types, so a context-blind match picks
+an arbitrary instance's delete and frees a value through the wrong type's
+deleter.")
   (defn rewrite-closures [closures ownership delete-symbols constructors]
     (match (deletes-for-context (OwnershipPlan.actions ownership)
                                 -1
@@ -2024,15 +2042,18 @@ delete set can be matched without retaining the source context id.")
                      parameters (ClosureFunction.parameters closure-fn)
                      original-body (Box.peek (ClosureFunction.body closure-fn))
                      root-id (Specialize.expression-id original-body)
+                     context @(ClosureFunction.context closure-fn)
                      param-deletes (the (Array ScopeDelete) [])
                      local-deletes (the (Array ScopeDelete) [])]
               (for [j 0 (Array.length &deletes)]
                 (let [sd (Array.unsafe-nth &deletes j)]
-                  (if (and
-                      (binder-in? parameters (ScopeDelete.binder sd))
-                      (Int.= @(ScopeDelete.site sd) root-id))
-                    (Array.push-back! &param-deletes @sd)
-                    (Array.push-back! &local-deletes @sd))))
+                  (when (or (Int.< context 0)
+                            (Int.= @(ScopeDelete.context sd) context))
+                    (if (and
+                        (binder-in? parameters (ScopeDelete.binder sd))
+                        (Int.= @(ScopeDelete.site sd) root-id))
+                      (Array.push-back! &param-deletes @sd)
+                      (Array.push-back! &local-deletes @sd)))))
               (set! result
                     (Array.push-back result
                                      (ClosureFunction.init
@@ -2048,7 +2069,8 @@ delete set can be matched without retaining the source context id.")
                                                            &local-deletes
                                                            delete-symbols
                                                            constructors)
-                                           &param-deletes)))))))
+                                           &param-deletes))
+                                       context)))))
           (Result.Success result))))
 
   (doc module-with-ownership-echoed "like module-with-ownership, additionally
