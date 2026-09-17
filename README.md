@@ -57,8 +57,10 @@ With no `-b`/`-x`, the C translation unit is written to standard output (or
 standard library ships with.
 
 `(load ...)` resolves like the reference compiler's: relative to the loading
-file, then the Core directory — and git references install into the shared
-cache (`~/.cache/carp/libs/...`) on first use:
+file, then relative to the compiler's working directory, then the Core
+directory — so a local file shadows the Core file it is named after. Git
+references install into the shared cache (`~/.cache/carp/libs/...`) on first
+use:
 
 ```clojure
 (load "git@github.com:carpentry-org/strbuf@0.3.0")
