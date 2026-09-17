@@ -1270,6 +1270,48 @@ binding, then yields the expression's result.")
                                                                                    (Box.init (MonoType.copy &body-type))
                                                                                    (CoreRef.copy &temp)))])))))))
 
+  (doc insert-delete-at-last-use "puts a scheduled delete directly after the
+declaration the binder is last needed by, instead of at scope exit. Only for
+binders `Ownership.delete-movable?` accepts: never a RefLift temporary, never
+conditionally moved, and nothing past the insertion point still refers to it.")
+  (private insert-delete-at-last-use)
+  (hidden insert-delete-at-last-use)
+  (sig insert-delete-at-last-use
+       (Fn
+         [(Ref SpecializedExpr) (Ref CoreRef) (Ref MonoType) (Ref String)]
+         SpecializedExpr))
+  (defn insert-delete-at-last-use [expr binder value-type symbol]
+    (match-ref expr
+      (SpecializedExpr.Let id type inner-binder value body)
+      (if (Ownership.live-past-here? binder (Box.peek body))
+        ;; still needed deeper in the chain: keep descending
+        (SpecializedExpr.Let @id
+                             (Box.init (MonoType.copy (Box.peek type)))
+                             (CoreRef.copy inner-binder)
+                             (Box.init (SpecializedExpr.copy (Box.peek value)))
+                             (Box.init
+                               (insert-delete-at-last-use (Box.peek body)
+                                                          binder
+                                                          value-type
+                                                          symbol)))
+        ;; dead from here on: free it between this declaration and the rest
+        (let [rest-type (Specialize.expression-type (Box.peek body))]
+          (SpecializedExpr.Let @id
+                               (Box.init (MonoType.copy (Box.peek type)))
+                               (CoreRef.copy inner-binder)
+                               (Box.init (SpecializedExpr.copy (Box.peek value)))
+                               (Box.init
+                                 (SpecializedExpr.Do -1
+                                                     (Box.init (MonoType.copy &rest-type))
+                                                     [(Box.init
+                                                        (make-delete-node binder
+                                                                          value-type
+                                                                          symbol))
+                                                      (Box.init (SpecializedExpr.copy (Box.peek body)))])))))
+      ;; no declaration chain to splice into: scope exit is already last use
+      _
+      (cleanup-after (SpecializedExpr.copy expr) binder value-type symbol)))
+
   (doc insert-path-cleanup "inserts a delete on exactly the exits where
 `binder` has not been moved. Conditional tail expressions are rewritten
 branch-by-branch; an expression that never consumes the binder gets one
@@ -1464,10 +1506,15 @@ arguments and array literals whose values are consumed, not dropped).")
           (match (cleanup-for binder @id body-deletes)
             (Maybe.Just sd)
               (let [value-type (Specialize.expression-type (Box.peek value))
-                    path-cleaned (insert-path-cleanup &new-body
-                                                      binder
-                                                      &value-type
-                                                      (ScopeDelete.symbol &sd))]
+                    path-cleaned (if (Ownership.delete-movable? binder &new-body)
+                      (insert-delete-at-last-use &new-body
+                                                 binder
+                                                 &value-type
+                                                 (ScopeDelete.symbol &sd))
+                      (insert-path-cleanup &new-body
+                                           binder
+                                           &value-type
+                                           (ScopeDelete.symbol &sd)))]
                 (SpecializedExpr.Let @id
                                      (Box.init (MonoType.copy &body-type))
                                      (CoreRef.copy binder)
@@ -1552,10 +1599,15 @@ arguments and array literals whose values are consumed, not dropped).")
                   (match (cleanup-for b body-id body-deletes)
                     (Maybe.Just sd)
                       (set! path-cleaned
-                            (insert-path-cleanup &path-cleaned
-                                                 b
-                                                 (Box.peek (ScopeDelete.type &sd))
-                                                 (ScopeDelete.symbol &sd)))
+                            (if (Ownership.delete-movable? b &path-cleaned)
+                              (insert-delete-at-last-use &path-cleaned
+                                                         b
+                                                         (Box.peek (ScopeDelete.type &sd))
+                                                         (ScopeDelete.symbol &sd))
+                              (insert-path-cleanup &path-cleaned
+                                                   b
+                                                   (Box.peek (ScopeDelete.type &sd))
+                                                   (ScopeDelete.symbol &sd))))
                     (Maybe.Nothing) ())))
               ;; unbound (`_`) slots of a by-value match drop owned payloads:
               ;; bind each slot with a deleter to a fresh local and free it
