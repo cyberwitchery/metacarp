@@ -1539,6 +1539,174 @@ across joined branches, or carried around a loop).")
                           (OwnershipResource.Binding to)
                           (Box.init type)))
 
+  (doc mentions? "whether `binder` occurs anywhere in `expr`, borrowed or not.
+The liveness question is about occurrence, not about ownership transfer.")
+  (private mentions?)
+  (hidden mentions?)
+  (sig mentions? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (sig mentions-in-any?
+       (Fn [(Ref CoreRef) (Ref (Array (Box SpecializedExpr)))] Bool))
+  (sig mentions-in-branches?
+       (Fn [(Ref CoreRef) (Ref (Array SpecializedMatchBranch))] Bool))
+  (private mentions-in-any?)
+  (hidden mentions-in-any?)
+  (private mentions-in-branches?)
+  (hidden mentions-in-branches?)
+  (defn mentions-in-any? [binder es]
+    (let-do [found false]
+      (for [i 0 (Array.length es)]
+        (when (mentions? binder (Box.peek (Array.unsafe-nth es i)))
+          (set! found true)))
+      found))
+  (defn mentions-in-branches? [binder branches]
+    (let-do [found false]
+      (for [i 0 (Array.length branches)]
+        (when (mentions? binder
+                         (Box.peek
+                           (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                          i))))
+          (set! found true)))
+      found))
+  (defn mentions? [binder expr]
+    (match-ref expr
+      (SpecializedExpr.Reference _ _ r) (CoreIR.same-ref? r binder)
+      (SpecializedExpr.Set _ _ target value)
+        (or (CoreIR.same-ref? target binder) (mentions? binder (Box.peek value)))
+      (SpecializedExpr.Call _ _ callee args)
+        (or (mentions? binder (Box.peek callee)) (mentions-in-any? binder args))
+      (SpecializedExpr.GlobalCall _ _ _ _ _ args) (mentions-in-any? binder args)
+      (SpecializedExpr.Let _ _ _ value body)
+        (or (mentions? binder (Box.peek value))
+            (mentions? binder (Box.peek body)))
+      (SpecializedExpr.Do _ _ es) (mentions-in-any? binder es)
+      (SpecializedExpr.If _ _ c t e)
+        (or (mentions? binder (Box.peek c))
+            (or (mentions? binder (Box.peek t)) (mentions? binder (Box.peek e))))
+      (SpecializedExpr.While _ _ c b)
+        (or (mentions? binder (Box.peek c)) (mentions? binder (Box.peek b)))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (or (mentions? binder (Box.peek scrutinee))
+            (mentions-in-branches? binder branches))
+      (SpecializedExpr.Annotation _ _ inner _)
+        (mentions? binder (Box.peek inner))
+      (SpecializedExpr.ArrayLit _ _ es) (mentions-in-any? binder es)
+      (SpecializedExpr.StaticArrayLit _ _ es) (mentions-in-any? binder es)
+      (SpecializedExpr.Lambda _ _ _ b) (mentions? binder (Box.peek b))
+      _ false))
+
+  (doc type-can-alias? "whether a value of this type could retain a reference
+to something else: a reference anywhere in its structure, or a function, whose
+closure environment can hold one.")
+  (private type-can-alias?)
+  (hidden type-can-alias?)
+  (sig type-can-alias? (Fn [(Ref MonoType)] Bool))
+  (defn type-can-alias? [type]
+    (match-ref type
+      (MonoType.Reference _ _) true
+      (MonoType.Function _ _) true
+      (MonoType.Named _ arguments)
+        (let-do [found false]
+          (for [i 0 (Array.length arguments)]
+            (when (type-can-alias? (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)
+      _ false))
+
+  (doc reflift? "RefLift temporaries exist so `&expr` has something with scope
+lifetime to point at. The borrow taken from one outlives every mention of the
+binding itself, so its delete can never move off scope exit.")
+  (private reflift?)
+  (hidden reflift?)
+  (defn reflift? [binder] (String.starts-with? (CoreRef.name binder) "_reflift"))
+
+  (doc live-past-here? "whether `binder` is still needed anywhere in what is
+left of the scope. Any occurrence counts, borrowed or not — reading through a
+borrow is a use, even when the value bound from it cannot outlive the read.")
+  (sig live-past-here? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (defn live-past-here? [binder expr] (mentions? binder expr))
+
+  (doc alias-binding? "whether binding this value could capture a reference to
+`binder`: it names the binder, and its own type can carry one.")
+  (private alias-binding?)
+  (hidden alias-binding?)
+  (sig alias-binding? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (defn alias-binding? [binder value]
+    (and (mentions? binder value)
+         (type-can-alias? &(Specialize.expression-type value))))
+
+  (doc aliased-in-scope? "whether anything in this scope could have retained a
+reference to `binder`. Such an alias outlives the mention that created it, so
+the binder has to survive to scope exit even once nothing names it directly.
+Every binding form counts, not just the declaration chain: a `set!` into an
+outer binding, or a declaration inside a branch, hides an alias just as well.")
+  (private aliased-in-scope?)
+  (hidden aliased-in-scope?)
+  (sig aliased-in-scope? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (sig aliased-in-any?
+       (Fn [(Ref CoreRef) (Ref (Array (Box SpecializedExpr)))] Bool))
+  (sig aliased-in-branches?
+       (Fn [(Ref CoreRef) (Ref (Array SpecializedMatchBranch))] Bool))
+  (private aliased-in-any?)
+  (hidden aliased-in-any?)
+  (private aliased-in-branches?)
+  (hidden aliased-in-branches?)
+  (defn aliased-in-any? [binder es]
+    (let-do [found false]
+      (for [i 0 (Array.length es)]
+        (when (aliased-in-scope? binder (Box.peek (Array.unsafe-nth es i)))
+          (set! found true)))
+      found))
+  (defn aliased-in-branches? [binder branches]
+    (let-do [found false]
+      (for [i 0 (Array.length branches)]
+        (when (aliased-in-scope? binder
+                                 (Box.peek
+                                   (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                                  i))))
+          (set! found true)))
+      found))
+  (defn aliased-in-scope? [binder expr]
+    (match-ref expr
+      (SpecializedExpr.Let _ _ _ value inner)
+      (or (alias-binding? binder (Box.peek value))
+          (aliased-in-scope? binder (Box.peek inner)))
+      ;; a set! can put an alias into a binding that outlives this scope
+      (SpecializedExpr.Set _ _ _ value)
+      (alias-binding? binder (Box.peek value))
+      (SpecializedExpr.Do _ _ es)
+      (aliased-in-any? binder es)
+      (SpecializedExpr.If _ _ c t e)
+      (or (aliased-in-scope? binder (Box.peek c))
+          (or (aliased-in-scope? binder (Box.peek t))
+              (aliased-in-scope? binder (Box.peek e))))
+      (SpecializedExpr.While _ _ c b)
+      (or (aliased-in-scope? binder (Box.peek c))
+          (aliased-in-scope? binder (Box.peek b)))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+      (or
+        (aliased-in-scope? binder (Box.peek scrutinee))
+        (aliased-in-branches? binder branches))
+      (SpecializedExpr.Annotation _ _ inner _)
+      (aliased-in-scope? binder (Box.peek inner))
+      _
+      false))
+
+  (doc delete-movable? "whether a scheduled delete may leave scope exit for
+the point just after its binder's last use. The backend asks this before
+choosing where to put one.")
+  (sig delete-movable? (Fn [(Ref CoreRef) (Ref SpecializedExpr)] Bool))
+  (defn delete-movable? [binder body]
+    (cond
+      (reflift? binder)
+      false
+      ;; a conditional move needs path-sensitive placement instead: the paths
+      ;; that gave the value away must not also free it.
+      (consumed? binder body)
+      false
+      (aliased-in-scope? binder body)
+      false
+      true))
+
   (private collect-into!)
   (hidden collect-into!)
   (defn collect-into! [expr facts context constructors acc]
