@@ -4,7 +4,10 @@
 #   run-assurance.sh phase  phase suites plus lint and formatting
 #   run-assurance.sh self   bootstrap, reference suite, fixed point, leaks,
 #                           expansion
-#   run-assurance.sh all    both groups (the default)
+#   run-assurance.sh sanitize  the reference suite again, every generated
+#                           program built with AddressSanitizer
+#   run-assurance.sh all    phase and self (not sanitize, which CI runs as its
+#                           own job)
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -71,15 +74,22 @@ run_self() {
   "$script_dir/diff-expansion.sh"
 }
 
+run_sanitize() {
+  cd "$repo_root"
+  "$reference" -b --optimize main.carp
+  CARP_SELF_SANITIZE=1 "$script_dir/run-carp-suite-self.sh"
+}
+
 case "$group" in
   phase) run_phase ;;
   self) run_self ;;
+  sanitize) run_sanitize ;;
   all)
     run_phase
     run_self
     ;;
   *)
-    printf 'usage: %s [phase|self|all]\n' "$0" >&2
+    printf 'usage: %s [phase|self|sanitize|all]\n' "$0" >&2
     exit 2
     ;;
 esac
