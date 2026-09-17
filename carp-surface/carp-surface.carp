@@ -7,13 +7,58 @@ reuses carp-reader's `Info` values, so diagnostics can be reported without
 depending on a compiler driver or file system API.")
 (deftype SurfaceSpan [start Info
                       end Info
-                      source String])
+                      source Int])
 
 ;; which file the reader is currently reading, so a span knows where it came
 ;; from. Positions alone cannot say: every file starts at offset zero, and a
 ;; module loader concatenates many files into one module. Empty when the caller
 ;; parsed a string with no identity of its own.
+;; Every node carries a span, so a span that owned its file name would put one
+;; heap copy of the same path on every node in the program. Spans store an
+;; index into this table instead; `no-source` is the id for syntax with no file.
+(def *surface-sources* (the (Array String) []))
+
 (def *surface-source-id* @"")
+
+(def *surface-source-index* -1)
+
+(defn no-source [] -1)
+
+(doc intern-source! "the id of `name` in the source table, adding it if new.")
+(defn intern-source! [name]
+  (let-do [found -1
+           n (Array.length &*surface-sources*)]
+    (for [i 0 n]
+      (when (and (Int.< found 0)
+                 (String.= (Array.unsafe-nth &*surface-sources* i) name))
+        (set! found i)))
+    (when-do (Int.< found 0)
+      (Array.push-back! &*surface-sources* (String.copy name))
+      (set! found (Int.dec (Array.length &*surface-sources*))))
+    found))
+
+(doc source-name "the file name a span's id refers to, empty when it has none.")
+(defn source-name [id]
+  (if (or (Int.< id 0) (Int.>= id (Array.length &*surface-sources*)))
+    (String.copy "")
+    (String.copy (Array.unsafe-nth &*surface-sources* id))))
+
+(doc source-watermark "how many sources are interned right now. A long-lived
+caller takes one at the point its own base syntax stops changing and hands it
+back to `release-sources!` when it drops everything parsed since.")
+(defn source-watermark [] (Array.length &*surface-sources*))
+
+(doc release-sources! "drops every source interned after `watermark`. Spans
+built since then become sourceless, so only a caller that is discarding those
+spans may call this.")
+(defn release-sources! [watermark]
+  (when (and (Int.>= watermark 0)
+             (Int.< watermark (Array.length &*surface-sources*)))
+    (let-do [kept (the (Array String) [])]
+      (for [i 0 watermark]
+        (Array.push-back! &kept
+                          (String.copy (Array.unsafe-nth &*surface-sources* i))))
+      (set! *surface-sources* kept))))
 
 (defmodule SurfaceSpan
   (doc from-located "creates a span from a `Reader.Located` node, in whichever
@@ -21,14 +66,15 @@ file is being read.")
   (defn from-located [located]
     (SurfaceSpan.init @(Located.info located)
                       @(Located.end located)
-                      @&*surface-source-id*))
+                      *surface-source-index*))
 
   (doc anywhere "a span with no position and no file, for syntax a phase made
 up rather than read.")
-  (defn anywhere [] (SurfaceSpan.init (Info.init 0 0 0) (Info.init 0 0 0) @""))
+  (defn anywhere []
+    (SurfaceSpan.init (Info.init 0 0 0) (Info.init 0 0 0) (no-source)))
 
   (doc at "a span with positions but no file, for syntax built from parts.")
-  (defn at [start end] (SurfaceSpan.init start end @""))
+  (defn at [start end] (SurfaceSpan.init start end (no-source)))
 
   (doc byte-start "returns the UTF-8 byte offset at the start of a surface
 span.")
@@ -44,9 +90,8 @@ what it handed over, and a span read from a file knows better than the caller
 which file that was.")
   (defn in-source [span source-id]
     (SourceSpan.init
-      (if (String.empty? (SurfaceSpan.source span))
-        (String.copy source-id)
-        (String.copy (SurfaceSpan.source span)))
+      (let [own (source-name @(SurfaceSpan.source span))]
+        (if (String.empty? &own) (String.copy source-id) own))
       (byte-start span)
       (byte-end span))))
 
@@ -399,9 +444,12 @@ a string handed over on its own came from nowhere in particular.")
 produces says so. A module loader reads many files into one module, and
 afterwards only the spans can say which file a form was written in.")
   (defn parse-in [source-id source]
-    (let-do [_ignored-enter (set! *surface-source-id* (String.copy source-id))
+    (let-do [_ignored-enter (set! *surface-source-index*
+                                  (intern-source! source-id))
+             _ignored-enter2 (set! *surface-source-id* (String.copy source-id))
              parsed (parse source)
-             _ignored-leave (set! *surface-source-id* @"")]
+             _ignored-leave (set! *surface-source-index* (no-source))
+             _ignored-leave2 (set! *surface-source-id* @"")]
       parsed))
 
   (doc parse-input "parses a caller-identified source buffer without losing its
