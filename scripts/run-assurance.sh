@@ -84,13 +84,22 @@ run_self() {
   "$reference" -b --optimize main.carp
   "$script_dir/run-carp-suite-self.sh"
   # Both checks want a generation-2 compiler; share one work directory so it
-  # is built once.
-  self_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-self.XXXXXX")
-  trap 'rm -rf "$self_work"' EXIT
+  # is built once. A caller that needs the compiler afterwards (the CI lane
+  # that runs the phase suites through generation 2) names that directory in
+  # CARP_FIXED_POINT_OUT and owns it; otherwise this is a temporary.
+  self_work=${CARP_FIXED_POINT_OUT:-}
+  self_work_owned=false
+  if [[ -z "$self_work" ]]; then
+    self_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-self.XXXXXX")
+    self_work_owned=true
+    trap 'rm -rf "$self_work"' EXIT
+  fi
   CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-fixed-point.sh"
   CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-leaks.sh"
-  rm -rf "$self_work"
-  trap - EXIT
+  if $self_work_owned; then
+    rm -rf "$self_work"
+    trap - EXIT
+  fi
   "$script_dir/diff-expansion.sh"
 }
 
