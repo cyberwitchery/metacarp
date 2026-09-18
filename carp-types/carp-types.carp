@@ -122,17 +122,20 @@ lowercase convention as ordinary type variables.")
 This answers with a POSITION rather than the value so that a caller about to
 walk the bound type walks it where it lies. Copying it first would cost a
 second tree per variable occurrence.")
+  ;; Newest binding wins. A solver indexes its bindings by overwriting the
+  ;; slot for a variable on every bind, so the last entry is the one it
+  ;; resolved through; `solver-snapshot` hands that same array over here.
+  ;; Scanning forward would answer with an edge the solver had superseded.
   (defn binding-index [substitution variable]
     (let-do [result -1
              bindings (TypeSubstitution.bindings substitution)
-             n (Array.length bindings)
-             i 0]
-      (while-do (and (Int.< i n) (Int.< result 0))
+             i (Int.dec (Array.length bindings))]
+      (while-do (and (Int.>= i 0) (Int.< result 0))
         (when (Int.=
             @(TypeBinding.variable (Array.unsafe-nth bindings i))
             variable)
           (set! result i))
-        (set! i (Int.inc i)))
+        (set! i (Int.dec i)))
       result))
 
   (defn binding-for [substitution variable]
@@ -147,18 +150,21 @@ second tree per variable occurrence.")
 
   (private lifetime-binding-for)
   (hidden lifetime-binding-for)
+  ;; Newest binding wins, for the reason given on `binding-index`. Lifetimes
+  ;; have no occurs check, so a superseded edge here does not merely answer
+  ;; with a stale lifetime: paired with the newer one it closes a cycle, and
+  ;; `apply-lifetime` chases it until the stack runs out.
   (defn lifetime-binding-for [substitution variable]
     (let-do [result (the (Maybe MonoLifetime) (Maybe.Nothing))
              bindings (TypeSubstitution.lifetime-bindings substitution)
-             n (Array.length bindings)
-             i 0]
-      (while-do (and (Int.< i n) (Maybe.nothing? &result))
+             i (Int.dec (Array.length bindings))]
+      (while-do (and (Int.>= i 0) (Maybe.nothing? &result))
         (let [binding (Array.unsafe-nth bindings i)]
           (when (Int.= @(LifetimeBinding.variable binding) variable)
             (set! result
                   (Maybe.Just
                     (MonoLifetime.copy (LifetimeBinding.value binding))))))
-        (set! i (Int.inc i)))
+        (set! i (Int.dec i)))
       result))
 
   (private apply-lifetime)
@@ -344,15 +350,35 @@ the fresh-name serial.")
       @(TypeSubstitution.lifetime-bindings substitution)
       @(TypeSubstitution.constructor-bindings substitution)))
 
+  (private binds-itself?)
+  (hidden binds-itself?)
+  (doc binds-itself? "whether `lifetime` is `variable` itself. `solver-bind!`
+refuses the same shape for types; the lifetime path had no guard at all, and
+resolution follows lifetime bindings transitively, so a self-binding does not
+surface later as a wrong answer — resolution simply stops terminating.
+
+This is the direct case only, which is what the type path checks too. A
+longer cycle needs a binding whose target already resolves back to the
+variable, and neither unifier can produce one: both resolve each side to the
+end of its chain before binding, so the target is always unbound or `Static`.
+Detecting the longer case here would mean resolving on every bind, and
+instantiation freshens a whole signature's lifetimes one at a time.")
+  (defn binds-itself? [variable lifetime]
+    (match-ref lifetime
+      (MonoLifetime.Variable other) (Int.= @other variable)
+      (MonoLifetime.Static) false))
+
   (private add-lifetime-binding)
   (hidden add-lifetime-binding)
   (defn add-lifetime-binding [substitution variable lifetime]
-    (TypeSubstitution.init
-      (Array.copy (TypeSubstitution.bindings substitution))
-      (Array.push-back
-        @(TypeSubstitution.lifetime-bindings substitution)
-        (LifetimeBinding.init variable (MonoLifetime.copy lifetime)))
-      @(TypeSubstitution.constructor-bindings substitution)))
+    (if (binds-itself? variable lifetime)
+      (TypeSubstitution.copy substitution)
+      (TypeSubstitution.init
+        (Array.copy (TypeSubstitution.bindings substitution))
+        (Array.push-back
+          @(TypeSubstitution.lifetime-bindings substitution)
+          (LifetimeBinding.init variable (MonoLifetime.copy lifetime)))
+        @(TypeSubstitution.constructor-bindings substitution))))
 
   (doc extend-lifetime-substitution "adds one lifetime-variable mapping.")
   (defn extend-lifetime-substitution [substitution variable lifetime]
@@ -964,28 +990,31 @@ normalization can then look up inference variables in constant time.")
   (private solver-bind-lifetime!)
   (hidden solver-bind-lifetime!)
   (defn solver-bind-lifetime! [solver variable lifetime]
-    (let-do [binding-index (Array.length (TypeSolver.lifetime-bindings solver))
-             non-negative (Int.>= variable 0)
-             offset (if non-negative variable (Int.- -1 variable))]
-      (Array.push-back! (TypeSolver.lifetime-bindings solver)
-                        (LifetimeBinding.init variable
-                                              (MonoLifetime.copy lifetime)))
-      (if non-negative
-        (do
-          (while-do (Int.<=
-              (Array.length (TypeSolver.lifetime-indexes solver))
-              offset)
-            (Array.push-back! (TypeSolver.lifetime-indexes solver) -1))
-          (Array.aset! (TypeSolver.lifetime-indexes solver) offset binding-index))
-        (do
-          (while-do (Int.<=
-              (Array.length (TypeSolver.negative-lifetime-indexes solver))
-              offset)
-            (Array.push-back! (TypeSolver.negative-lifetime-indexes solver) -1))
-          (Array.aset!
-            (TypeSolver.negative-lifetime-indexes solver)
-            offset
-            binding-index)))))
+    (unless-do (binds-itself? variable lifetime)
+      (let-do [binding-index (Array.length (TypeSolver.lifetime-bindings solver))
+               non-negative (Int.>= variable 0)
+               offset (if non-negative variable (Int.- -1 variable))]
+        (Array.push-back! (TypeSolver.lifetime-bindings solver)
+                          (LifetimeBinding.init variable
+                                                (MonoLifetime.copy lifetime)))
+        (if non-negative
+          (do
+            (while-do (Int.<=
+                (Array.length (TypeSolver.lifetime-indexes solver))
+                offset)
+              (Array.push-back! (TypeSolver.lifetime-indexes solver) -1))
+            (Array.aset! (TypeSolver.lifetime-indexes solver)
+                         offset
+                         binding-index))
+          (do
+            (while-do (Int.<=
+                (Array.length (TypeSolver.negative-lifetime-indexes solver))
+                offset)
+              (Array.push-back! (TypeSolver.negative-lifetime-indexes solver) -1))
+            (Array.aset!
+              (TypeSolver.negative-lifetime-indexes solver)
+              offset
+              binding-index))))))
 
   (private solver-unify-lifetimes!)
   (hidden solver-unify-lifetimes!)
