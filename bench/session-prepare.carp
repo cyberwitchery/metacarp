@@ -1,0 +1,81 @@
+;; Times the two session-wide costs a warm editor session pays before it can
+;; run its first cell: building the session over a whole project, and
+;; normalizing the base analysis.
+;;
+;; `Session.prepare-emit` is the second one. It applies the base substitution
+;; to every inference trace the project produced, so it grows with the project
+;; rather than with the cell, and on a compiler-sized base it dominates. An
+;; editor fires it once after loading a project, which is why it is worth
+;; measuring on its own rather than through a cell.
+;;
+;; This deliberately does not go through an editor or a server: the session
+;; API is the thing under test, and a harness that owns the process can be
+;; profiled and compared across builds.
+;;
+;;   carp --optimize -x bench/session-prepare.carp
+;;
+;; CARP_SESSION_ROOT  root file of the project to load (default main.carp,
+;;                    i.e. this compiler, which is the large case)
+;; CARP_SESSION_CORE  standard library directory (default $CARP_DIR/core)
+
+(load "../carp-session/carp-session.carp")
+(load "../driver-load.carp")
+
+(private env-or)
+(hidden env-or)
+(defn env-or [name fallback]
+  (match (IO.getenv name)
+    (Maybe.Just value) value
+    (Maybe.Nothing) (String.copy fallback)))
+
+(private millis)
+(hidden millis)
+(defn millis [from to]
+  (Double./ (Double.from-long (Uint64.to-long (Uint64.- to from))) 1000000.0))
+
+(private default-core)
+(hidden default-core)
+(defn default-core []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Just dir) (String.concat &[dir @"/core"])
+    (Maybe.Nothing) (String.copy "../../Carp/core")))
+
+(defn main []
+  (let-do [root (env-or "CARP_SESSION_ROOT" "main.carp")
+           core-dir (env-or "CARP_SESSION_CORE" &(default-core))]
+    (IO.println &(fmt "root %s" &root))
+    (IO.println &(fmt "core %s" &core-dir))
+    (match (load-with-core &root &core-dir false)
+      (Maybe.Nothing)
+        (IO.errorln &(fmt "session-prepare: cannot load %s" &root))
+      (Maybe.Just loaded)
+        (let-do [module @(Pair.a &loaded)
+                 sourced (SourcedSurfaceModule.init
+                   (SourceInput.init @"session:project" @"")
+                   module)
+                 config (ExpandConfig.init [@"Dynamic"])
+                 started (System.nanotime)]
+          (match (Session.create-from-module &sourced &config)
+            (Result.Error diagnostic)
+              (IO.errorln
+                &(fmt "session-prepare: session failed: %s"
+                      (Diagnostic.message &diagnostic)))
+            (Result.Success session)
+              (let-do [created (System.nanotime)
+                       ;; a session whose base inferred nothing would make
+                       ;; prepare-emit look free, so state the population the
+                       ;; measurement is over
+                       base (CompilerSession.base-inferred &session)]
+                (IO.println
+                  &(fmt
+                    "base traces  nodes=%d bindings=%d calls=%d env=%d"
+                    (Array.length (InferredModule.node-types base))
+                    (Array.length (InferredModule.binding-types base))
+                    (Array.length (InferredModule.calls base))
+                    (Array.length (InferredModule.environment base))))
+                (Session.prepare-emit &session)
+                (let-do [prepared (System.nanotime)]
+                  (IO.println
+                    &(fmt "create-session %.1fms" (millis started created)))
+                  (IO.println
+                    &(fmt "prepare-emit   %.1fms" (millis created prepared))))))))))
