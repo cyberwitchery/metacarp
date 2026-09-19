@@ -57,8 +57,10 @@ With no `-b`/`-x`, the C translation unit is written to standard output (or
 standard library ships with.
 
 `(load ...)` resolves like the reference compiler's: relative to the loading
-file, then the Core directory — and git references install into the shared
-cache (`~/.cache/carp/libs/...`) on first use:
+file, then relative to the compiler's working directory, then the Core
+directory — so a local file shadows the Core file it is named after. Git
+references install into the shared cache (`~/.cache/carp/libs/...`) on first
+use:
 
 ```clojure
 (load "git@github.com:carpentry-org/strbuf@0.3.0")
@@ -66,6 +68,9 @@ cache (`~/.cache/carp/libs/...`) on first use:
 
 The examples below assume `CARP_DIR` points at a checkout of the reference
 Carp repository (its `core/` is the standard library and runtime headers).
+
+That checkout must include Carp's recursive value-type `Box`
+(carp-lang/Carp#1571); CI pins `d718653fb82a62f667bf2117f30222267c5fbb27`.
 
 Compile a standalone program (no standard library) to C:
 
@@ -100,15 +105,15 @@ native linking, the persistent ORC session JIT, and its test commands.
 
 ## Self-hosting
 
-The bootstrap chain, from the repository root:
+The bootstrap chain, from the repository root, is automated by the assurance
+harness:
 
 ```sh
-carp -b --optimize main.carp                                    # gen 1
-./out/carp-compiler -c "$CARP_DIR/core" -o self.c main.carp     # gen 1 emits itself
-clang -O3 -D NDEBUG -o self-cc self.c -I "$CARP_DIR/core"      # link gen 2
-./self-cc -c "$CARP_DIR/core" -o self2.c main.carp              # gen 2 emits itself
-cmp self.c self2.c                                              # fixed point
+./scripts/run-assurance.sh self
 ```
+
+It freshly builds generation 1 with reference Carp before running the
+reference suite, fixed-point/provenance/smoke checks, and expansion parity.
 
 The canonical generation benchmark compares reference Carp, gen 1, and gen 2
 on the same workload (generating C for `main.carp`):
@@ -134,6 +139,9 @@ The assurance harness keeps the self-host honest:
   unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run independent test groups
   concurrently; CI runs this architecture-neutral group once on two Linux
   workers.
+- `scripts/run-assurance.sh phase-self` runs the same compiler-phase and
+  session suites through `CARP_PHASE_COMPILER` (default
+  `out/carp-compiler`); CI points it at the fixed-point generation-2 compiler.
 - `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
   checks the self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated

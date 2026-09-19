@@ -7,7 +7,19 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 reference=${CARP_REFERENCE:-carp}
+core_dir=${CARP_PHASE_CORE:-}
 jobs=${CARP_PHASE_JOBS:-1}
+log_memory=${CARP_PHASE_LOG_MEMORY:-1}
+# The leak test measures allocations with Debug.memory-balance, which reference
+# Carp only accounts for under --log-memory. The self-hosted CLI implements
+# neither, so the generation-2 lane runs every other suite and leaves this one
+# to the reference lane.
+memory_tests=${CARP_PHASE_MEMORY_TESTS:-1}
+
+compiler_args=()
+if [[ -n "$core_dir" ]]; then
+  compiler_args=(-c "$core_dir")
+fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   ulimit -s 524288
@@ -33,10 +45,10 @@ run_phase_test() {
       cd "$work_dir/$test_dir"
     fi
     printf '== %s/%s\n' "$test_dir" "$test_file"
-    if [[ "$mode" == memory ]]; then
-      "$reference" -x --log-memory "$test_file"
+    if [[ "$mode" == memory && "$log_memory" == 1 ]]; then
+      "$reference" "${compiler_args[@]}" -x --log-memory "$test_file"
     else
-      "$reference" -x "$test_file"
+      "$reference" "${compiler_args[@]}" -x "$test_file"
     fi
   )
 }
@@ -63,7 +75,10 @@ phase_tasks() {
   emit_task . test/carp-compiler.carp normal
   emit_task . carp-session/test/carp-session.carp normal
   emit_task . carp-session/test/core.carp normal
-  emit_task . carp-session/test/memory.carp memory
+  if [[ "$memory_tests" == 1 ]]; then
+    # see CARP_PHASE_MEMORY_TESTS above: reference-compiler lanes only
+    emit_task . carp-session/test/memory.carp memory
+  fi
 
   for directory in \
     carp-graph carp-c-abi carp-primitives carp-module carp-ct-env \
