@@ -1,0 +1,588 @@
+(load "../carp-ct-sub.carp")
+(Project.no-echo)
+(load "Test.carp")
+
+(use-all Test)
+
+;; The two emptiness rules are easy to write down slightly wrong, and a checker
+;; built on a slightly wrong rule is worse than no checker. So the algebra is not
+;; trusted here: a finite universe of values is enumerated, every generated type
+;; is interpreted by direct membership, and the algebra's answer has to agree.
+;; `uninhabited?` is checked against "no value is a member" and `subtype?`
+;; against set inclusion.
+;;
+;; Two universes, because the kinds are disjoint and each rule has its own. The
+;; container universe holds lists of up to two elements, so a generated product
+;; type keeps its nesting shallow enough that a witness, if one exists, fits
+;; inside it. The function universe is complete rather than bounded: with two
+;; argument values there are four argument-result pairs and therefore exactly
+;; sixteen function graphs, and every one of them is enumerated.
+
+(deftype V
+  (Atom [Int])
+  (Empty [Int])
+  (Pair [Int (Box V) (Box V)])
+  (Fun [Int]))
+
+(doc value-count "how many values a function graph in the model may relate.
+
+Three, not two, and the third one carries the argument. Every component type a
+generated arrow is built from is a subset of Int ⊔ Bool, so a witness the algebra
+finds outside those components has to exist in the model too, or the model calls
+vacuous what the algebra does not: with only Int and Bool around, every graph
+satisfies (Int ⊔ Bool) → (Int ⊔ Bool), while the algebra knows a function may
+answer with a String. One value outside the components is all it takes, because
+every value outside them satisfies exactly the same component memberships.")
+(defn value-count [] 3)
+
+(defn arg-value [index]
+  (cond
+    (Int.= 0 index) (V.Atom (CtSub.i-int))
+    (Int.= 1 index) (V.Atom (CtSub.i-bool))
+    (V.Atom (CtSub.i-string))))
+
+(defn pair-bit [x y] (Int.bit-shift-left 1 (Int.+ (Int.* x (value-count)) y)))
+
+(doc graph-count "every subset of the argument-result pairs.")
+(defn graph-count [] (Int.bit-shift-left 1 (Int.* (value-count) (value-count))))
+
+(defn universe []
+  (let-do [out (the (Array V) [])
+           atoms (the (Array V) [(arg-value 0) (arg-value 1)])]
+    (for [i 0 (Array.length &atoms)]
+      (set! out (Array.push-back out @(Array.unsafe-nth &atoms i))))
+    (set! out (Array.push-back out (V.Empty (CtSub.k-list))))
+    (set! out (Array.push-back out (V.Empty (CtSub.k-array))))
+    (for [i 0 (Array.length &atoms)]
+      (set! out
+            (Array.push-back out
+                             (V.Pair (CtSub.k-list)
+                                     (Box.init @(Array.unsafe-nth &atoms i))
+                                     (Box.init (V.Empty (CtSub.k-list)))))))
+    (for [i 0 (Array.length &atoms)]
+      (for [j 0 (Array.length &atoms)]
+        (set! out
+              (Array.push-back out
+                               (V.Pair (CtSub.k-list)
+                                       (Box.init @(Array.unsafe-nth &atoms i))
+                                       (Box.init
+                                         (V.Pair (CtSub.k-list)
+                                                 (Box.init @(Array.unsafe-nth &atoms
+                                                                              j))
+                                                 (Box.init (V.Empty (CtSub.k-list))))))))))
+    (set! out
+          (Array.push-back out
+                           (V.Pair (CtSub.k-array)
+                                   (Box.init (arg-value 0))
+                                   (Box.init (V.Empty (CtSub.k-array))))))
+    out))
+
+(doc fun-universe "every function graph over the model's values: every subset of
+the argument-result pairs, the empty one included, which is the function that
+meets every arrow at once.")
+(defn fun-universe []
+  (let-do [out (the (Array V) [])]
+    (for [graph 0 (graph-count)] (set! out (Array.push-back out (V.Fun graph))))
+    out))
+
+(sig member? (Fn [(Ref V) Int] Bool))
+(sig member-clause? (Fn [(Ref V) (Ref CtClause)] Bool))
+(sig accepts? (Fn [Int Int Int] Bool))
+
+(doc accepts? "whether a function graph is in `dom → cod`: no pair of it takes
+an argument in the domain to a result outside the codomain.")
+(defn accepts? [graph dom cod]
+  (let-do [ok true]
+    (for [x 0 (value-count)]
+      (for [y 0 (value-count)]
+        (when (Int./= 0 (Int.bit-and graph (pair-bit x y)))
+          (when (member? &(arg-value x) dom)
+            (unless (member? &(arg-value y) cod) (set! ok false))))))
+    ok))
+
+(defn member-clause? [v clause]
+  (let [mask @(CtClause.tags clause)
+        pos @(CtClause.pos clause)
+        neg @(CtClause.neg clause)]
+    (match-ref v
+      (V.Atom index)
+        (and (Int.= 0 (Array.length &pos))
+             (Int./= 0 (Int.bit-and mask (CtSub.leaf @index))))
+      (V.Empty kind)
+        (and (Int.= 0 (Array.length &pos))
+             (Int./= 0 (Int.bit-and mask (CtSub.leaf (CtSub.i-empty @kind)))))
+      (V.Pair kind car cdr)
+        (if (Int.= 0 (Int.bit-and mask (CtSub.leaf (CtSub.i-product @kind))))
+          false
+          (let-do [ok true]
+            (for [i 0 (Array.length &pos)]
+              (let [atom (CtSub.atom @(Array.unsafe-nth &pos i))]
+                (unless (and
+                    (Int.= (CtSub.shape-product) @(CtAtom.shape &atom))
+                    (and (Int.= @kind @(CtAtom.kind &atom))
+                         (and
+                           (member? (Box.peek car) @(CtAtom.left &atom))
+                           (member? (Box.peek cdr) @(CtAtom.right &atom)))))
+                  (set! ok false))))
+            (for [i 0 (Array.length &neg)]
+              (let [atom (CtSub.atom @(Array.unsafe-nth &neg i))]
+                (when (and
+                    (Int.= (CtSub.shape-product) @(CtAtom.shape &atom))
+                    (and (Int.= @kind @(CtAtom.kind &atom))
+                         (and
+                           (member? (Box.peek car) @(CtAtom.left &atom))
+                           (member? (Box.peek cdr) @(CtAtom.right &atom)))))
+                  (set! ok false))))
+            ok))
+      (V.Fun graph)
+        (if (Int.= 0
+                   (Int.bit-and mask
+                                (CtSub.leaf (CtSub.i-arrow (CtSub.s-closure)))))
+          false
+          (let-do [ok true]
+            (for [i 0 (Array.length &pos)]
+              (let [atom (CtSub.atom @(Array.unsafe-nth &pos i))]
+                (unless (and
+                    (Int.= (CtSub.shape-arrow) @(CtAtom.shape &atom))
+                    (and
+                      (Int.= (CtSub.s-closure) @(CtAtom.kind &atom))
+                      (accepts? @graph
+                                @(CtAtom.left &atom)
+                                @(CtAtom.right &atom))))
+                  (set! ok false))))
+            (for [i 0 (Array.length &neg)]
+              (let [atom (CtSub.atom @(Array.unsafe-nth &neg i))]
+                (when (and
+                    (Int.= (CtSub.shape-arrow) @(CtAtom.shape &atom))
+                    (and
+                      (Int.= (CtSub.s-closure) @(CtAtom.kind &atom))
+                      (accepts? @graph
+                                @(CtAtom.left &atom)
+                                @(CtAtom.right &atom))))
+                  (set! ok false))))
+            ok)))))
+
+(defn member? [v t]
+  (let-do [cs (CtSub.clauses t)
+           found false]
+    (for [i 0 (Array.length &cs)]
+      (unless found
+        (when (member-clause? v (Array.unsafe-nth &cs i)) (set! found true))))
+    found))
+
+(defn model-empty? [vs t]
+  (let-do [answer true]
+    (for [i 0 (Array.length vs)]
+      (when answer
+        (when (member? (Array.unsafe-nth vs i) t) (set! answer false))))
+    answer))
+
+(defn model-subtype? [vs a b]
+  (let-do [answer true]
+    (for [i 0 (Array.length vs)]
+      (when answer
+        (let [v (Array.unsafe-nth vs i)]
+          (when (and (member? v a) (not (member? v b))) (set! answer false)))))
+    answer))
+
+(def *ready* false)
+
+(doc ensure! "resets the arena once. Each check below builds the types it needs
+itself, because `deftest` threads its state through the assertions and leaves no
+room for a shared binding around them.")
+(defn ensure! [] (unless-do *ready* (CtSub.reset!) (set! *ready* true)))
+
+(defn int-t [] (do (ensure!) (CtSub.tags (CtSub.leaf (CtSub.i-int)))))
+(defn bool-t [] (do (ensure!) (CtSub.tags (CtSub.leaf (CtSub.i-bool)))))
+(defn either-t [] (CtSub.union (int-t) (bool-t)))
+(defn nil-t []
+  (do (ensure!) (CtSub.tags (CtSub.leaf (CtSub.i-empty (CtSub.k-list))))))
+(defn lists [] (do (ensure!) (CtSub.container (CtSub.k-list))))
+(defn arrays [] (do (ensure!) (CtSub.container (CtSub.k-array))))
+(defn int-list [] (CtSub.product (CtSub.k-list) (int-t) (lists)))
+(defn bool-list [] (CtSub.product (CtSub.k-list) (bool-t) (lists)))
+(defn either-list [] (CtSub.product (CtSub.k-list) (either-t) (lists)))
+(defn any-pair [] (CtSub.product (CtSub.k-list) (CtSub.top) (lists)))
+
+(defn closures [] (do (ensure!) (CtSub.callable (CtSub.s-closure))))
+(defn fn-t [dom cod] (do (ensure!) (CtSub.arrow (CtSub.s-closure) dom cod)))
+
+(doc world "the container universe, written as a type.
+
+A finite universe cannot witness every inhabited type: `⊤ ⊓ ¬Int` is inhabited
+by a String, and no String is enumerated here. So the comparison is made inside
+the world rather than against it — every type is met with `world` first, and the
+two sides then range over exactly the same values. The unfolding mirrors
+`universe` exactly: lists of up to two elements drawn from Int and Bool, the two
+empty containers, and one array pair.")
+(defn world []
+  (let [i (int-t)
+        b (bool-t)
+        nl (nil-t)
+        na (CtSub.tags (CtSub.leaf (CtSub.i-empty (CtSub.k-array))))
+        heads (either-t)]
+    (let [one (CtSub.product (CtSub.k-list) heads nl)]
+      (let [two (CtSub.product (CtSub.k-list) heads one)
+            arr (CtSub.product (CtSub.k-array) i na)]
+        (CtSub.union
+          (CtSub.union (CtSub.union i b) (CtSub.union nl na))
+          (CtSub.union (CtSub.union one two) arr))))))
+
+(doc fun-world "the function part, which is simply every closure. The graphs
+cannot be carved out of the algebra by a type — an arrow says nothing about
+arguments outside its domain, so `functions that only relate these values` is
+not expressible — but it does not need to be: every component in `fun-bases` is
+a subset of Int ⊔ Bool, so an inhabited type always has a witness among these
+graphs.")
+(defn fun-world [] (closures))
+
+(defn in-world [t] (CtSub.intersection t (world)))
+(defn in-fun-world [t] (CtSub.intersection t (fun-world)))
+
+(defn bases []
+  (the (Array Int)
+       [(int-t)
+        (bool-t)
+        (nil-t)
+        (lists)
+        (arrays)
+        (CtSub.tags (CtSub.leaf (CtSub.i-empty (CtSub.k-array))))
+        (int-list)
+        (bool-list)
+        (any-pair)
+        (either-list)
+        (CtSub.product (CtSub.k-array)
+                       (int-t)
+                       (CtSub.tags (CtSub.leaf (CtSub.i-empty (CtSub.k-array)))))
+        (either-t)
+        (CtSub.every-of (CtSub.k-list) (int-t))
+        (CtSub.every-of (CtSub.k-list) (either-t))
+        (CtSub.top)
+        (CtSub.bottom)]))
+
+(doc fun-bases "arrows over every component the model can tell apart, plus the
+opaque closure type and the two constants. Negations and intersections of these
+are where a wrong arrow rule shows itself.")
+(defn fun-bases []
+  (the (Array Int)
+       [(closures)
+        (fn-t (int-t) (int-t))
+        (fn-t (int-t) (bool-t))
+        (fn-t (bool-t) (int-t))
+        (fn-t (either-t) (int-t))
+        (fn-t (either-t) (either-t))
+        (fn-t (CtSub.bottom) (int-t))
+        (fn-t (int-t) (CtSub.bottom))
+        (CtSub.intersection (fn-t (int-t) (int-t)) (fn-t (bool-t) (bool-t)))
+        (CtSub.top)
+        (CtSub.bottom)]))
+
+(defn combos [bs]
+  (let-do [out (the (Array Int) [])
+           n (Array.length bs)]
+    (for [i 0 n]
+      (let-do [a @(Array.unsafe-nth bs i)]
+        (set! out (Array.push-back out a))
+        (set! out (Array.push-back out (CtSub.negation a)))
+        (for [j 0 n]
+          (let-do [b @(Array.unsafe-nth bs j)]
+            (set! out (Array.push-back out (CtSub.union a b)))
+            (set! out (Array.push-back out (CtSub.intersection a b)))
+            (set! out (Array.push-back out (CtSub.difference a b)))))))
+    out))
+
+(defn emptiness-disagreements [vs ts]
+  (let-do [bad 0]
+    (for [i 0 (Array.length ts)]
+      (let [t @(Array.unsafe-nth ts i)]
+        (unless-do (= (CtSub.uninhabited? t) (model-empty? vs t))
+          (IO.println
+            &(fmt
+              "EMPTY DISAGREES  algebra=%s model=%s  %s"
+              (if (CtSub.uninhabited? t) "empty" "inhabited")
+              (if (model-empty? vs t) "empty" "inhabited")
+              &(CtSub.render t)))
+          (set! bad (Int.inc bad)))))
+    bad))
+
+(defn subtype-disagreements [vs ts]
+  (let-do [bad 0
+           n (Array.length ts)]
+    (for [i 0 n]
+      (for [j 0 n]
+        (let [a @(Array.unsafe-nth ts i)
+              b @(Array.unsafe-nth ts j)]
+          (unless-do (= (CtSub.subtype? a b) (model-subtype? vs a b))
+            (IO.println
+              &(fmt "SUB DISAGREES    %s  vs  %s"
+                    &(CtSub.render a)
+                    &(CtSub.render b)))
+            (set! bad (Int.inc bad))))))
+    bad))
+
+(defn in-worlds [ts world-fn]
+  (let-do [out (the (Array Int) [])]
+    (for [i 0 (Array.length ts)]
+      (set! out (Array.push-back out (~world-fn @(Array.unsafe-nth ts i)))))
+    out))
+
+(defn bottom-uninhabited? [] (do (ensure!) (CtSub.uninhabited? (CtSub.bottom))))
+(defn top-inhabited? [] (do (ensure!) (CtSub.inhabited? (CtSub.top))))
+
+(defn leaves-disjoint? []
+  (CtSub.uninhabited? (CtSub.intersection (int-t) (bool-t))))
+(defn kinds-disjoint? []
+  (CtSub.uninhabited? (CtSub.intersection (lists) (arrays))))
+(defn functions-are-not-lists? []
+  (CtSub.uninhabited? (CtSub.intersection (closures) (lists))))
+(defn negated-bottom-is-top? []
+  (CtSub.equivalent? (CtSub.top) (CtSub.negation (CtSub.bottom))))
+(defn double-negation? []
+  (CtSub.equivalent? (int-t) (CtSub.negation (CtSub.negation (int-t)))))
+(defn complement-disjoint? []
+  (CtSub.uninhabited? (CtSub.intersection (lists) (CtSub.negation (lists)))))
+(defn int-list-is-a-list? [] (CtSub.subtype? (int-list) (lists)))
+(defn list-is-an-int-list? [] (CtSub.subtype? (lists) (int-list)))
+(defn head-can-be-both? []
+  (CtSub.inhabited? (CtSub.intersection (int-list) (bool-list))))
+(defn wider-element-is-super? [] (CtSub.subtype? (int-list) (either-list)))
+(defn narrower-element-is-super? [] (CtSub.subtype? (either-list) (int-list)))
+(defn sequence-decomposes? []
+  (CtSub.uninhabited?
+    (CtSub.difference (lists) (CtSub.union (nil-t) (any-pair)))))
+
+;; the arrow identities. Each of these is false under a subset rule that drops
+;; either side of the split, which is what makes them worth asserting separately
+;; from the model check.
+(defn union-domain-distributes? []
+  (CtSub.equivalent? (fn-t (either-t) (int-t))
+                     (CtSub.intersection (fn-t (int-t) (int-t))
+                                         (fn-t (bool-t) (int-t)))))
+(defn intersection-codomain-distributes? []
+  (CtSub.equivalent?
+    (fn-t (int-t) (CtSub.intersection (int-t) (bool-t)))
+    (CtSub.intersection (fn-t (int-t) (int-t)) (fn-t (int-t) (bool-t)))))
+(defn contravariant-domain? []
+  (CtSub.subtype? (fn-t (either-t) (int-t)) (fn-t (int-t) (int-t))))
+(defn contravariant-domain-backwards? []
+  (CtSub.subtype? (fn-t (int-t) (int-t)) (fn-t (either-t) (int-t))))
+(defn covariant-codomain? []
+  (CtSub.subtype? (fn-t (int-t) (int-t)) (fn-t (int-t) (either-t))))
+(defn covariant-codomain-backwards? []
+  (CtSub.subtype? (fn-t (int-t) (either-t)) (fn-t (int-t) (int-t))))
+(defn intersection-meets-componentwise? []
+  (CtSub.subtype?
+    (CtSub.intersection (fn-t (int-t) (int-t)) (fn-t (bool-t) (bool-t)))
+    (fn-t (either-t) (either-t))))
+(defn empty-function-meets-everything? []
+  (CtSub.inhabited?
+    (CtSub.intersection (fn-t (int-t) (bool-t)) (fn-t (int-t) (int-t)))))
+(defn empty-domain-constrains-nothing? []
+  (CtSub.equivalent? (closures) (fn-t (CtSub.bottom) (int-t))))
+(defn arrow-complement-disjoint? []
+  (CtSub.uninhabited?
+    (CtSub.intersection (fn-t (int-t) (int-t))
+                        (CtSub.negation (fn-t (int-t) (int-t))))))
+
+(defn ints-all-the-way [] (CtSub.every-of (CtSub.k-list) (int-t)))
+(defn eithers-all-the-way [] (CtSub.every-of (CtSub.k-list) (either-t)))
+
+(defn recursive-type-holds-the-empty-list? []
+  (do (ensure!) (CtSub.inhabited? (ints-all-the-way))))
+(defn list-of-ints-is-ints-all-the-way? []
+  (CtSub.subtype?
+    (CtSub.list-of &(the (Array Int) [(int-t) (int-t)]))
+    (ints-all-the-way)))
+(defn mixed-list-is-ints-all-the-way? []
+  (CtSub.subtype?
+    (CtSub.list-of &(the (Array Int) [(int-t) (bool-t)]))
+    (ints-all-the-way)))
+(defn ints-all-the-way-is-a-list? [] (CtSub.subtype? (ints-all-the-way) (lists)))
+(defn recursive-types-share-the-empty-list? []
+  (CtSub.inhabited?
+    (CtSub.intersection (ints-all-the-way)
+                        (CtSub.every-of (CtSub.k-list) (bool-t)))))
+(defn ints-all-the-way-is-eithers-all-the-way? []
+  (CtSub.subtype? (ints-all-the-way) (eithers-all-the-way)))
+(defn eithers-all-the-way-is-ints-all-the-way? []
+  (CtSub.subtype? (eithers-all-the-way) (ints-all-the-way)))
+
+(defn if-symbol [] (do (ensure!) (CtSub.literal (CtSub.i-symbol) "if")))
+(defn then-symbol [] (do (ensure!) (CtSub.literal (CtSub.i-symbol) "then")))
+(defn symbols [] (do (ensure!) (CtSub.tags (CtSub.leaf (CtSub.i-symbol)))))
+
+(defn one-symbol-is-a-symbol? [] (CtSub.subtype? (if-symbol) (symbols)))
+(defn symbols-are-one-symbol? [] (CtSub.subtype? (symbols) (if-symbol)))
+(defn two-symbols-overlap? []
+  (CtSub.inhabited? (CtSub.intersection (if-symbol) (then-symbol))))
+(defn other-symbols-exist? []
+  (CtSub.inhabited? (CtSub.difference (symbols) (if-symbol))))
+(defn one-symbol-minus-itself? []
+  (CtSub.uninhabited? (CtSub.difference (if-symbol) (if-symbol))))
+
+(defn spliced-form []
+  ;; (if <test> <body> …), the shape a quasiquote with a splice produces
+  (CtSub.chain-of (CtSub.k-list)
+                  &(the (Array Int) [(if-symbol) (CtSub.top)])
+                  (CtSub.every-of (CtSub.k-list) (CtSub.top))))
+
+(defn spliced-form-head []
+  (match (CtSub.head-spelling (spliced-form))
+    (Maybe.Just written) written
+    (Maybe.Nothing) @"?"))
+(defn spliced-form-minimum [] (CtSub.chain-minimum (spliced-form)))
+(defn fixed-form-minimum []
+  (CtSub.chain-minimum
+    (CtSub.list-of &(the (Array Int) [(if-symbol) (CtSub.top) (CtSub.top)]))))
+
+(defn emptiness-bad []
+  (do
+    (ensure!)
+    (let [vs (universe)
+          bs (bases)]
+      (emptiness-disagreements &vs &(in-worlds &(combos &bs) &in-world)))))
+
+(defn subtype-bad []
+  (do
+    (ensure!)
+    (let [vs (universe)]
+      (subtype-disagreements &vs &(in-worlds &(bases) &in-world)))))
+
+(defn fun-emptiness-bad []
+  (do
+    (ensure!)
+    (let [vs (fun-universe)
+          bs (fun-bases)]
+      (emptiness-disagreements &vs &(in-worlds &(combos &bs) &in-fun-world)))))
+
+(defn fun-subtype-bad []
+  (do
+    (ensure!)
+    (let [vs (fun-universe)]
+      (subtype-disagreements &vs &(in-worlds &(fun-bases) &in-fun-world)))))
+
+(deftest t
+  (assert-true t (bottom-uninhabited?) "⊥ holds nothing")
+  (assert-true t (top-inhabited?) "⊤ holds something")
+  (assert-true t
+    (leaves-disjoint?)
+    "S-TagBot: two unrelated leaves do not overlap")
+  (assert-true t
+    (kinds-disjoint?)
+    "a list and an array are different kinds, so they are disjoint")
+  (assert-true t
+    (functions-are-not-lists?)
+    "a function is its own kind, disjoint from the containers")
+  (assert-true t (negated-bottom-is-top?) "¬⊥ is ⊤")
+  (assert-true t (double-negation?) "double negation is the identity")
+  (assert-true t
+    (complement-disjoint?)
+    "S-Compl: a type and its complement do not overlap")
+  (assert-true t (int-list-is-a-list?) "a non-empty list of ints is a list")
+  (assert-false t
+    (list-is-an-int-list?)
+    "a list is not necessarily a non-empty one")
+  (assert-false t
+    (head-can-be-both?)
+    "a first element cannot be both an Int and a Bool")
+  (assert-true t
+    (wider-element-is-super?)
+    "a wider element type is a supertype, which the tag fragment could not say")
+  (assert-false t
+    (narrower-element-is-super?)
+    "and the other direction does not hold")
+  (assert-true t
+    (sequence-decomposes?)
+    "a list is empty or a pair, which is the sequence decomposition")
+  (assert-true t
+    (union-domain-distributes?)
+    "(A ⊔ B) → C is (A → C) ⊓ (B → C)")
+  (assert-true t
+    (intersection-codomain-distributes?)
+    "A → (B ⊓ C) is (A → B) ⊓ (A → C)")
+  (assert-true t
+    (contravariant-domain?)
+    "a function taking more is a function taking less")
+  (assert-false t
+    (contravariant-domain-backwards?)
+    "and not the other way round: the domain is contravariant")
+  (assert-true t
+    (covariant-codomain?)
+    "a function answering more narrowly answers within the wider type")
+  (assert-false t
+    (covariant-codomain-backwards?)
+    "and not the other way round: the codomain is covariant")
+  (assert-true t
+    (intersection-meets-componentwise?)
+    "an intersection of arrows handles the union of their domains")
+  (assert-true t
+    (empty-function-meets-everything?)
+    "a conjunction of arrows is never empty: the function with no pairs meets it")
+  (assert-true t
+    (empty-domain-constrains-nothing?)
+    "⊥ → A is every function, because no argument is in ⊥")
+  (assert-true t
+    (arrow-complement-disjoint?)
+    "an arrow and its complement do not overlap")
+  (assert-true t
+    (recursive-type-holds-the-empty-list?)
+    "a list of ints at any length holds the empty list, so it is inhabited")
+  (assert-true t
+    (list-of-ints-is-ints-all-the-way?)
+    "a list of two ints is a list of ints at any length")
+  (assert-false t
+    (mixed-list-is-ints-all-the-way?)
+    "and a list with a Bool in it is not")
+  (assert-true t
+    (ints-all-the-way-is-a-list?)
+    "a list of ints at any length is a list")
+  (assert-true t
+    (recursive-types-share-the-empty-list?)
+    "two element constraints still share the empty list, which closes the loop the other way")
+  (assert-true t
+    (ints-all-the-way-is-eithers-all-the-way?)
+    "widening the element type widens the recursive type with it")
+  (assert-false t
+    (eithers-all-the-way-is-ints-all-the-way?)
+    "and not the other way round")
+  (assert-true t (one-symbol-is-a-symbol?) "one symbol is a symbol")
+  (assert-false t
+    (symbols-are-one-symbol?)
+    "and a symbol is not that one symbol")
+  (assert-false t
+    (two-symbols-overlap?)
+    "two different symbols are two different values")
+  (assert-true t
+    (other-symbols-exist?)
+    "a symbol that is not `if` is still a symbol, because there are others")
+  (assert-true t
+    (one-symbol-minus-itself?)
+    "and one symbol minus itself is nothing")
+  (assert-equal t
+    "if"
+    &(spliced-form-head)
+    "a form written around a splice still starts with the symbol it was written with")
+  (assert-equal t
+    2
+    (spliced-form-minimum)
+    "and holds at least what was written before the splice")
+  (assert-equal t
+    3
+    (fixed-form-minimum)
+    "a fixed-length form holds exactly what it was written with")
+  (assert-equal t
+    0
+    (emptiness-bad)
+    "every generated container type agrees with the enumerated model on emptiness")
+  (assert-equal t
+    0
+    (subtype-bad)
+    "every pair of container bases agrees with the model on inclusion")
+  (assert-equal t
+    0
+    (fun-emptiness-bad)
+    "every generated function type agrees with the enumerated graphs on emptiness")
+  (assert-equal t
+    0
+    (fun-subtype-bad)
+    "every pair of function bases agrees with the graphs on inclusion"))
