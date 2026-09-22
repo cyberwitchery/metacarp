@@ -184,6 +184,20 @@ characters. Underscores and punctuation are escaped by Unicode code point.")
   (doc type-key "returns the structural, identifier-safe ABI key for a type.")
   (defn type-key [type] (type-key-internal type))
 
+  (doc generic-key "the key a nominal application has with its arguments
+generalized away: `(Box Int)` and `(Box String)` both key as `(Box a)` does.
+A declaration written once for every instance of a type — core's
+`(sig delete (Fn [(Box a)] ()))` — is recorded under this key, and an instance
+finds it here. Anything else keys as itself.")
+  (defn generic-key [type]
+    (match-ref type
+      (MonoType.Named name arguments)
+        (let-do [generalized (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &generalized (Box.init (MonoType.Variable 0))))
+          (type-key-internal &(MonoType.Named (String.copy name) generalized)))
+      _ (type-key-internal type)))
+
   (doc mangle "returns a collision-resistant generated C symbol.")
   (defn mangle [name signature]
     (let [encoded-name (component name)
@@ -191,21 +205,75 @@ characters. Underscores and punctuation are escaped by Unicode code point.")
       (String.concat &[@"C" (framed &encoded-name) @"__" encoded-type])))
 
   (doc nominal-name "returns the concrete C name for a nominal type
-application. Unparameterized names remain readable; applications use
-structural argument keys.")
+application, spelled the way the reference does (TypesToC): the mangled type
+name, `__`, then its arguments joined by `_`. `(Box Int)` is `Box__int`,
+`(Pair Int String)` is `Pair__int_String`. This spelling is ABI rather than
+an internal choice — core's own C templates name instances directly
+(`Box__$a` in `Box.from-ptr`), so an instance the reference calls `Box__int`
+has to carry that name here too.")
   (doc nominal-symbol "renders a nominal type's C name the way the reference
-does (TypesToC): module dots removed and segments concatenated, so
-`Pattern.MatchResult` becomes `PatternMatchResult` — the name the runtime
-headers use for externally registered module types.")
+does (TypesToC): module dots removed and segments concatenated, then mangled
+by SymPath's rules, so `Pattern.MatchResult` becomes `PatternMatchResult` —
+the name the runtime headers use for externally registered module types.")
   (defn nominal-symbol [name]
-    (component &(String.join "" &(String.split-by name &[\.]))))
+    (runtime-component &(String.join "" &(String.split-by name &[\.]))))
 
+  (private render-arguments)
+  (hidden render-arguments)
+  (private function-name)
+  (hidden function-name)
+  (private render-type-internal)
+  (hidden render-type-internal)
+
+  (sig nominal-name
+       (Fn [(Ref String) (Ref (Array (Box MonoType)))] (Result String CAbiError)))
   (defn nominal-name [name arguments]
-    (let [encoded-name (nominal-symbol name)]
-      (if (Int.= 0 (Array.length arguments))
-        encoded-name
-        (String.concat
-          &[@"T" (framed &encoded-name) @"__" (arguments-key arguments)]))))
+    (if (Int.= 0 (Array.length arguments))
+      (Result.Success (nominal-symbol name))
+      (match (render-arguments arguments)
+        (Result.Success rendered)
+          (Result.Success
+            (String.concat &[(nominal-symbol name) @"__" rendered]))
+        (Result.Error error) (Result.Error error))))
+
+  (doc render-arguments "renders type arguments in name position, joined by
+`_`, the way the reference joins them in `tyToCManglePtr`.")
+  (sig render-arguments
+       (Fn [(Ref (Array (Box MonoType)))] (Result String CAbiError)))
+  (defn render-arguments [arguments]
+    (let-do [failure (the (Maybe CAbiError) (Maybe.Nothing))
+             buffer (StringBuf.create)
+             n (Array.length arguments)]
+      (for [i 0 n]
+        (when (Maybe.nothing? &failure)
+          (match (render-type-internal
+              (Box.peek (Array.unsafe-nth arguments i))
+              true)
+            (Result.Success rendered)
+              (do
+                (when (Int.> i 0) (StringBuf.append-char &buffer \_))
+                (StringBuf.append-str &buffer &rendered))
+            (Result.Error error) (set! failure (Maybe.Just error)))))
+      (match failure
+        (Maybe.Nothing) (Result.Success (StringBuf.into-string buffer))
+        (Maybe.Just error) (Result.Error error))))
+
+  (doc function-name "spells a function type in name position. A C type
+position renders every function as `Lambda`, but a name has to keep the
+signature: the reference writes `Fn__int_bool` there.")
+  (sig function-name
+       (Fn
+         [(Ref (Array (Box MonoType))) (Ref (Box MonoType))]
+         (Result String CAbiError)))
+  (defn function-name [arguments result]
+    (match (render-arguments arguments)
+      (Result.Success rendered-arguments)
+        (match (render-type-internal (Box.peek result) true)
+          (Result.Success rendered-result)
+            (Result.Success
+              (String.concat &[@"Fn__" rendered-arguments @"_" rendered-result]))
+          (Result.Error error) (Result.Error error))
+      (Result.Error error) (Result.Error error)))
 
   (doc unmanaged-scalar? "returns true for scalar values whose C
 representation does not require ownership or lifetime lowering.")
@@ -225,18 +293,35 @@ representation does not require ownership or lifetime lowering.")
 
   (private pointer-like)
   (hidden pointer-like)
-  (private render-type-internal)
-  (hidden render-type-internal)
-  (defn pointer-like [name arguments]
+  (private pointer-suffix)
+  (hidden pointer-suffix)
+  (doc pointer-suffix "a pointer is a star in a type position and `_MUL_` in a
+name, which is SymPath's mangling of the same star.")
+  (defn pointer-suffix [in-name?]
+    (if in-name? (String.copy "_MUL_") (String.copy "*")))
+
+  (sig pointer-like
+       (Fn
+         [(Ref String) (Ref (Array (Box MonoType))) Bool]
+         (Result String CAbiError)))
+  (defn pointer-like [name arguments in-name?]
     (if (Int.= 1 (Array.length arguments))
-      (match (render-type-internal (Box.peek (Array.unsafe-nth arguments 0)))
-        (Result.Success rendered) (Result.Success (String.append &rendered "*"))
+      (match (render-type-internal
+          (Box.peek (Array.unsafe-nth arguments 0))
+          in-name?)
+        (Result.Success rendered)
+          (Result.Success (String.append &rendered &(pointer-suffix in-name?)))
         (Result.Error error) (Result.Error error))
       (Result.Error
         (CAbiError.init
           (String.concat &[(String.copy name) @" expects one type argument"])))))
 
-  (defn render-type-internal [type]
+  (doc render-type-internal "renders a type, in a C type position or — with
+`in-name?` — inside another type's name. The two differ exactly where the
+reference's `tyToCManglePtr` takes its boolean: pointers mangle, functions
+keep their signature, and the runtime container structs keep their element.")
+  (sig render-type-internal (Fn [(Ref MonoType) Bool] (Result String CAbiError)))
+  (defn render-type-internal [type in-name?]
     (match-ref type
       (MonoType.Variable _)
         (Result.Error (CAbiError.init @"cannot render an inference variable"))
@@ -247,12 +332,14 @@ representation does not require ownership or lifetime lowering.")
       (MonoType.Named name arguments)
         (cond
           (= name "Ptr")
-          (pointer-like name arguments)
-          (= name "Array")
-          (Result.Success (String.copy "Array"))
-          ;; static arrays share the runtime `Array` struct; only ownership
-          ;; differs, and that is not a C-representation concern.
-          (= name "StaticArray")
+          (pointer-like name arguments in-name?)
+          ;; `Array` and `StaticArray` share the runtime `Array` struct (only
+          ;; ownership differs, which is not a C-representation concern), so a
+          ;; type position renders that struct. A name cannot drop the
+          ;; element: `(Box (Array Int))` and `(Box (Array String))` are
+          ;; different structs, and the reference keeps them apart by spelling
+          ;; the element out.
+          (and (not in-name?) (or (= name "Array") (= name "StaticArray")))
           (Result.Success (String.copy "Array"))
           (= name "Byte")
           (Result.Success (String.copy "uint8_t"))
@@ -268,13 +355,16 @@ representation does not require ownership or lifetime lowering.")
           (Result.Success (String.copy "CChar"))
           (= name "Pattern")
           (Result.Success (String.copy "Pattern"))
-          (Result.Success (nominal-name name arguments)))
+          (nominal-name name arguments))
       (MonoType.Reference inner _)
-        (match (render-type-internal (Box.peek inner))
+        (match (render-type-internal (Box.peek inner) in-name?)
           (Result.Success rendered)
-            (Result.Success (String.append &rendered "*"))
+            (Result.Success (String.append &rendered &(pointer-suffix in-name?)))
           (Result.Error error) (Result.Error error))
-      (MonoType.Function _ _) (Result.Success (String.copy "Lambda"))))
+      (MonoType.Function arguments result)
+        (if in-name?
+          (function-name arguments result)
+          (Result.Success (String.copy "Lambda")))))
 
   (doc render-type "renders the concrete C ABI representation of a type.")
-  (defn render-type [type] (render-type-internal type)))
+  (defn render-type [type] (render-type-internal type false)))
