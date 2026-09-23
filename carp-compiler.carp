@@ -165,10 +165,15 @@ of its instantiated fields is (checked per instance).")
         (cond
           (contains-key? base-managed &(CAbi.type-key mono))
           true
+          ;; a deleter declared once for every instance of a type — core's
+          ;; `(sig delete (Fn [(Box a)] ()))` — is keyed generically. Without
+          ;; this, `(Box Int)` owns a heap cell no field of it accounts for
+          ;; and nothing ever frees it.
+          (contains-key? base-managed &(CAbi.generic-key mono))
+          true
           ;; builtin containers own heap storage at every instantiation but
           ;; have no constructor declarations to classify through.
-          (or (String.= name "Array")
-              (or (String.= name "StaticArray") (String.= name "Box")))
+          (or (String.= name "Array") (String.= name "StaticArray"))
           true
           (Int.> (Array.length args) 0)
           (managed-instance? mono constructors base-managed)
@@ -251,9 +256,7 @@ first derivation pass does not handle.")
             (Maybe.Just key) (contains-key? managed &key)
             (Maybe.Nothing) false)
         (String.= name "Ptr") false
-        (or (String.= name "Array")
-            (or (String.= name "StaticArray") (String.= name "Box")))
-          true
+        (or (String.= name "Array") (String.= name "StaticArray")) true
         (let-do [any false]
           (for [i 0 (Array.length arguments)]
             (when (field-managed?
@@ -516,6 +519,7 @@ so inference, specialization, ownership and the backend handle it normally.")
                           new-signatures
                           @(CoreModule.type-declarations core)
                           @(CoreModule.constructors core)
+                          @(CoreModule.recursive-types core)
                           @(CoreModule.interfaces core)
                           new-impls
                           @(CoreModule.system-includes core)
@@ -1316,6 +1320,7 @@ user-written `<T>.str` keep it.")
                                 @(CoreModule.signatures core)
                                 @(CoreModule.type-declarations core)
                                 @(CoreModule.constructors core)
+                                @(CoreModule.recursive-types core)
                                 @(CoreModule.interfaces core)
                                 impls
                                 @(CoreModule.system-includes core)
@@ -1323,6 +1328,40 @@ user-written `<T>.str` keep it.")
 
   (private worklist-generate)
   (hidden worklist-generate)
+  (private polymorphic-core-type?)
+  (hidden polymorphic-core-type?)
+  (private generic-delete-declared?)
+  (hidden generic-delete-declared?)
+  (doc generic-delete-declared? "whether a `<base>.delete` written once for
+every instance of the type is already in scope — core's
+`(sig delete (Fn [(Box a)] ()))`. Such a body specializes correctly for every
+instance and must stay the sole implementation: a concrete deleter derived
+beside it wins dispatch and deletes only the fields the DECLARATION shows,
+which for `(deftype (Box a) [data (Ptr a)])` is nothing at all. The signature,
+not the name, is what tells it apart from the per-instance deleters this
+worklist itself appends.
+
+Only for a type whose members are all indirections. Everywhere else the
+derived per-instance deleter is the right one — it frees the fields the
+instance actually holds — and suppressing it in favour of a generic body
+leaves an instance like `(Bucket Bool String)` with nothing to dispatch to.")
+  (defn generic-delete-declared? [sigs constructors base-name]
+    (let-do [found false
+             name (String.concat &[(String.copy base-name) @".delete"])
+             indirect (CoreIR.indirection-nominal? constructors base-name)
+             n (Array.length sigs)]
+      (for [i 0 n]
+        (let [candidate (Array.unsafe-nth sigs i)]
+          (when (and indirect
+                     (and
+                       (String.=
+                         (CoreRef.name (CoreSignature.reference candidate))
+                         &name)
+                       (polymorphic-core-type?
+                         (Box.peek (CoreSignature.signature candidate)))))
+            (set! found true))))
+      found))
+
   (defn worklist-generate [core worklist base-managed]
     (let-do [functions (Array.copy (CoreModule.functions core))
              impls (Array.copy (CoreModule.implementations core))
@@ -1348,14 +1387,21 @@ user-written `<T>.str` keep it.")
                                (constructors-declared? constructors base-name)
                              _ false)))
             (set! done (Array.push-back done key))
-            (let-do [new-insts (instance-deleter! inst
-                                                  constructors
-                                                  &base-managed
-                                                  &delete-ref
-                                                  &cell
-                                                  &functions
-                                                  &impls
-                                                  &sigs)
+            (let-do [base-name (match-ref inst
+                       (MonoType.Named name _) (String.copy name)
+                       _ (String.copy ""))
+                     new-insts (if (generic-delete-declared? &sigs
+                                                             constructors
+                                                             &base-name)
+                       (the (Array MonoType) [])
+                       (instance-deleter! inst
+                                          constructors
+                                          &base-managed
+                                          &delete-ref
+                                          &cell
+                                          &functions
+                                          &impls
+                                          &sigs))
                      copy-name (match-ref inst
                        (MonoType.Named base-name _)
                          (String.concat &[(String.copy base-name) @".copy"])
@@ -1388,6 +1434,7 @@ user-written `<T>.str` keep it.")
                           sigs
                           @(CoreModule.type-declarations core)
                           @(CoreModule.constructors core)
+                          @(CoreModule.recursive-types core)
                           @(CoreModule.interfaces core)
                           impls
                           @(CoreModule.system-includes core)
@@ -1416,8 +1463,6 @@ unchanged and lets the driver report the error.")
 (defmodule Derive
   (private copy-branch)
   (hidden copy-branch)
-  (private polymorphic-core-type?)
-  (hidden polymorphic-core-type?)
   (defn polymorphic-core-type? [type]
     (match-ref type
       (CoreType.Variable _) true
@@ -1753,6 +1798,7 @@ matching builtin is dropped so the function is emitted and links.")
                           @(CoreModule.signatures core)
                           @(CoreModule.type-declarations core)
                           @(CoreModule.constructors core)
+                          @(CoreModule.recursive-types core)
                           @(CoreModule.interfaces core)
                           new-impls
                           @(CoreModule.system-includes core)
@@ -1814,6 +1860,7 @@ links; a no-op when the builtin is absent.")
                           @(CoreModule.signatures core)
                           @(CoreModule.type-declarations core)
                           @(CoreModule.constructors core)
+                          @(CoreModule.recursive-types core)
                           @(CoreModule.interfaces core)
                           @(CoreModule.implementations core)
                           @(CoreModule.system-includes core)
@@ -2010,6 +2057,7 @@ their own `<T>.str` (e.g. via a user `derive`) are left alone.")
                           @(CoreModule.signatures core)
                           @(CoreModule.type-declarations core)
                           @(CoreModule.constructors core)
+                          @(CoreModule.recursive-types core)
                           @(CoreModule.interfaces core)
                           new-impls
                           @(CoreModule.system-includes core)
@@ -2188,6 +2236,7 @@ sums retain a real specializable body instead of a body-less Core declaration.")
                           new-signatures
                           @(CoreModule.type-declarations core)
                           @(CoreModule.constructors core)
+                          @(CoreModule.recursive-types core)
                           @(CoreModule.interfaces core)
                           new-impls
                           @(CoreModule.system-includes core)
@@ -2636,25 +2685,39 @@ borrows of non-lvalues are lifted to scope-lived temporaries.")
 (doc Validate "structural checks on a resolved module that neither resolution
 nor inference performs, mirroring the reference compiler's Validate pass.")
 (defmodule Validate
-  ;; the deftypes a member type mentions BY VALUE. `Ptr` and `Box` are heap
-  ;; indirections, so a recursive occurrence behind either is legal and stops
-  ;; the walk (the reference does the same in canBeUsedAsMemberType).
+  ;; the deftypes a member type mentions BY VALUE. `Ptr` and any type flagged
+  ;; `(recursive ...)` are heap indirections, so a recursive occurrence behind
+  ;; one is legal and stops the walk (the reference does the same in
+  ;; canBeUsedAsMemberType).
+  (private name-listed?)
+  (hidden name-listed?)
   (private value-nominals!)
   (hidden value-nominals!)
-  (sig value-nominals! (Fn [(Ref CoreType) (Ref (Array String))] ()))
-  (defn value-nominals! [type acc]
+  (sig value-nominals!
+       (Fn [(Ref CoreType) (Ref (Array String)) (Ref (Array String))] ()))
+  (defn value-nominals! [type recursive-types acc]
     (match-ref type
       (CoreType.Named name args)
-        (unless-do (or (String.= name "Ptr") (String.= name "Box"))
-          (Array.push-back! acc (String.copy name))
-          (for [i 0 (Array.length args)]
-            (value-nominals! (Box.peek (Array.unsafe-nth args i)) acc)))
-      _ ()))
+      ;; a `(recursive T)` type keeps its argument behind a pointer, so an
+      ;; occurrence of it breaks the cycle the same way `Ptr` does. The
+      ;; reference stops this walk on a flagged one-argument application
+      ;; (Validate.hs, `containsSelfByValue`), and so do we — `Box` earns
+      ;; its place here through core's own `(recursive Box)`, not by name.
+      (unless-do (or (String.= name "Ptr")
+                     (and (Int.= 1 (Array.length args))
+                          (name-listed? recursive-types name)))
+        (Array.push-back! acc (String.copy name))
+        (for [i 0 (Array.length args)]
+          (value-nominals! (Box.peek (Array.unsafe-nth args i))
+                           recursive-types
+                           acc)))
+      _
+      ()))
 
   ;; the by-value member types of every constructor of `type-name`.
   (private value-members)
   (hidden value-members)
-  (defn value-members [constructors type-name]
+  (defn value-members [constructors recursive-types type-name]
     (let-do [acc (the (Array String) [])]
       (for [i 0 (Array.length constructors)]
         (let [c (Array.unsafe-nth constructors i)]
@@ -2663,12 +2726,12 @@ nor inference performs, mirroring the reference compiler's Validate pass.")
               (when (String.= rname type-name)
                 (let [fields (CoreConstructorDeclaration.arguments c)]
                   (for [f 0 (Array.length fields)]
-                    (value-nominals! (Box.peek (Array.unsafe-nth fields f)) &acc))))
+                    (value-nominals! (Box.peek (Array.unsafe-nth fields f))
+                                     recursive-types
+                                     &acc))))
             _ ())))
       acc))
 
-  (private name-listed?)
-  (hidden name-listed?)
   (defn name-listed? [names target]
     (let-do [found false]
       (for [i 0 (Array.length names)]
@@ -2681,8 +2744,8 @@ catches mutual recursion (`A` holds a `B` that holds an `A`) as well as direct
 self-reference.")
   (private reaches-by-value?)
   (hidden reaches-by-value?)
-  (defn reaches-by-value? [constructors start target]
-    (let-do [pending (value-members constructors start)
+  (defn reaches-by-value? [constructors recursive-types start target]
+    (let-do [pending (value-members constructors recursive-types start)
              seen (the (Array String) [])
              found false
              cursor 0]
@@ -2691,7 +2754,7 @@ self-reference.")
           (when (String.= &name target) (set! found true))
           (unless-do (name-listed? &seen &name)
             (Array.push-back! &seen (String.copy &name))
-            (let [next (value-members constructors &name)]
+            (let [next (value-members constructors recursive-types &name)]
               (for [i 0 (Array.length &next)]
                 (Array.push-back! &pending @(Array.unsafe-nth &next i)))))
           (set! cursor (Int.inc cursor))))
@@ -2749,10 +2812,11 @@ variable the declaration head does not bind: `(deftype (Foo a) [x b])` has no
       result))
 
   (doc type-declarations "rejects a deftype that contains itself by value. Such
-a type has no finite size in C; the reference requires `Ptr` or `Box` to break
-the cycle. Returns the diagnostic, or Nothing when every declaration is sound.")
+a type has no finite size in C; the cycle has to pass through `Ptr` or through
+a type flagged `(recursive ...)`, which is how core's `Box` breaks it. Returns the diagnostic, or Nothing when every declaration is sound.")
   (defn type-declarations [core]
     (let-do [constructors (CoreModule.constructors core)
+             recursive-types (Array.copy (CoreModule.recursive-types core))
              ;; deftypes are known by their constructors' result types;
              ;; `type-declarations` carries only `register-type` entries.
              names (the (Array String) [])
@@ -2768,13 +2832,13 @@ the cycle. Returns the diagnostic, or Nothing when every declaration is sound.")
         (let [name (Array.unsafe-nth &names i)]
           (when (and
               (match-ref &result (Maybe.Nothing) true _ false)
-              (reaches-by-value? constructors name name))
+              (reaches-by-value? constructors &recursive-types name name))
             (set! result
                   (Maybe.Just
                     (String.concat
                       &[@"recursive type `"
                         (String.copy name)
-                        @"` appears by value in its own members; use `Ptr` or `Box`"]))))))
+                        @"` appears by value in its own members; use `Ptr`, or a type marked `(recursive ...)` such as `Box`"]))))))
       result)))
 
 (doc CompileError "identifies the compiler phase that rejected an input and
@@ -3277,6 +3341,7 @@ String " (accessor-symbol
                        @(CoreModule.signatures core)
                        @(CoreModule.type-declarations core)
                        @(CoreModule.constructors core)
+                       @(CoreModule.recursive-types core)
                        @(CoreModule.interfaces core)
                        @(CoreModule.implementations core)
                        includes

@@ -74,6 +74,7 @@
    builtins (Array TypedShape)
    signatures (Array TypedShape)
    type-declarations (Array TypeDeclarationShape)
+   recursive-types (Array String)
    interfaces (Array TypedShape)
    implementations (Array ImplementationShape)
    imports (Array ScopedImport)
@@ -111,6 +112,16 @@ references can resolve to all globals and imports visible in the base.")
 ;; defines it; collected during form collection, consulted when a reference
 ;; resolves to a global.
 (def *private-names* (the (Array String) []))
+
+;; qualified names this module defines itself (a `defn`, `def`, `register`,
+;; `deftemplate` or `definterface`). A definition shadows the binding its type
+;; declaration would derive under the same name — core's value-taking
+;; `Box.init` over the field constructor of `(deftype (Box a) [data (Ptr a)])`
+;; — and only a definition does: a compiler-provided primitive of that name
+;; (`Pair.a`) is not a definition and must not take the name from the accessor
+;; the deftype derives. Collected alongside the globals, consulted in
+;; `derived-binding`.
+(def *definition-names* (the (Array String) []))
 
 ;; type identity across redefinition: collection counts type declarations
 ;; (deftype/register-type) in source order and stamps every collected shape
@@ -453,8 +464,25 @@ contract for a caller-identified source.")
             (Maybe.Nothing)))
       _ (Maybe.Nothing)))
 
+  (private record-recursive-type!)
+  (hidden record-recursive-type!)
   (private record-type-declaration!)
   (hidden record-type-declaration!)
+  (doc record-recursive-type! "records the type a `(recursive T)` directive
+flags, qualified by the scope it appears in.")
+  (defn record-recursive-type! [collected form scope]
+    (match-ref (SurfaceNode.form form)
+      (SurfaceForm.List raw-items)
+        (let [items (semantic-items raw-items)]
+          (when (Int.> (Array.length &items) 1)
+            (match (type-head-name (Box.peek (Array.unsafe-nth &items 1)) scope)
+              (Maybe.Just name)
+                (Array.push-back!
+                  (CollectedForms.recursive-types collected)
+                  name)
+              (Maybe.Nothing) ())))
+      _ ()))
+
   (doc record-type-declaration! "advances the type-declaration stamp and
 records the declaration event; called by the collector at every
 deftype/register-type form.")
@@ -1062,14 +1090,6 @@ index, which is what `global-by-name` answers with.")
      (intrinsic-string-interface 2 "prn")
      (intrinsic-delete-interface)])
 
-  (defn intrinsic-box-unbox []
-    (let [box-a (CoreType.Named (String.copy "Box")
-                                [(Box.init (CoreType.Variable (String.copy "a")))])
-          a (CoreType.Variable (String.copy "a"))]
-      (CoreBuiltin.init
-        (CoreRef.init 4 (String.copy "Box.unbox") true)
-        (Box.init (CoreType.Function [(Box.init box-a)] (Box.init a))))))
-
   (defn intrinsic-length-named [id name]
     (let [a (CoreType.Variable (String.copy "a"))]
       (CoreBuiltin.init
@@ -1078,8 +1098,7 @@ index, which is what `global-by-name` answers with.")
           (CoreType.Function [(Box.init a)] (Box.init (CoreType.Integer)))))))
 
   (defn intrinsic-builtins []
-    [(intrinsic-box-unbox)
-     (intrinsic-ref)
+    [(intrinsic-ref)
      (intrinsic-deref)
      (intrinsic-null)
      (intrinsic-length-named 8 "length")
@@ -1596,8 +1615,21 @@ then reuse a reserved id.")
           (when (Int.> oid m) (set! m oid))))
       (Int.inc m)))
 
+  (private name-defined?)
+  (hidden name-defined?)
+  (doc name-defined? "whether the module defines this qualified name itself.")
+  (defn name-defined? [name]
+    (let-do [found false
+             n (Array.length &*definition-names*)]
+      (for [i 0 n]
+        (when (String.= (Array.unsafe-nth &*definition-names* i) name)
+          (set! found true)))
+      found))
+
   (defn add-global! [collected name]
-    (let [globals (CollectedForms.globals collected)]
+    (let-do [globals (CollectedForms.globals collected)
+             _ignored-definition (Array.push-back! &*definition-names*
+                                                   (String.copy name))]
       (match (global-by-name-scanned &*resolve-reuse-globals* name)
         (Maybe.Just reusable)
           (do (Array.push-back! globals (CoreRef.copy &reusable)) reusable)
@@ -1953,13 +1985,15 @@ then reuse a reserved id.")
                       shape)
                   (Result.Error error) (set! result (Result.Error error)))
 
-                ;; The reference stores this as metadata on a nominal type.
-                ;; Our backend already treats `Ptr`/`Box` as the indirections
-                ;; that break recursive layout walks, so there is no Core IR
-                ;; payload to preserve. Keep this top-level-only: `recursive`
+                ;; `(recursive T)` marks T as a heap indirection, so an
+                ;; occurrence of it may break by-value recursion in another
+                ;; type's members. The reference keeps this as metadata on the
+                ;; type binder and reads it back when it validates members
+                ;; (Validate.hs), so the name has to reach the Core module
+                ;; instead of being dropped here. Top-level only: `recursive`
                 ;; remains a valid ordinary function name in expressions.
                 (declaration? form @"recursive")
-                ()
+                (record-recursive-type! collected form scope)
 
                 (Array.push-back! (CollectedForms.expressions collected)
                                   (ScopedExpression.init (Box.init (SurfaceNode.copy form))
@@ -1970,6 +2004,7 @@ then reuse a reserved id.")
 
   (defn collect [forms]
     (let [collected (CollectedForms.init []
+                                         []
                                          []
                                          []
                                          []
@@ -2000,6 +2035,7 @@ no-redefinition case pays no second walk.")
             (Result.Success first-pass)
             (do
               (set! *private-names* [])
+              (set! *definition-names* [])
               (set! *type-decl-stamp* 0)
               (set! *type-decl-events* [])
               (collect forms))))
@@ -3802,6 +3838,10 @@ back to plain reference resolution.")
   (hidden constructor-base-name)
   (private constructor-arguments)
   (hidden constructor-arguments)
+  (private derived-binding)
+  (hidden derived-binding)
+  (private derived-binding-unless-defined)
+  (hidden derived-binding-unless-defined)
   (private add-constructor)
   (hidden add-constructor)
   (private field-types)
@@ -3838,6 +3878,8 @@ back to plain reference resolution.")
   (hidden collect-constructor-declarations-scoped)
   (private collect-constructor-declarations)
   (hidden collect-constructor-declarations)
+  (private constructor-binding)
+  (hidden constructor-binding)
   (private constructor-declarations-from-deftype)
   (hidden constructor-declarations-from-deftype)
 
@@ -3870,23 +3912,49 @@ back to plain reference resolution.")
             (Result.Success [])))
       _ (Result.Success [])))
 
+  (doc derived-binding "adds one binding a type declaration derives — a
+constructor, an accessor, a setter, an updater, a derived `copy` or `str`.
+A definition the module wrote itself shadows the derived binding, the way
+core's value-taking `Box.init` shadows the field constructor `(deftype (Box a)
+[data (Ptr a)])` generates. The derived binding is still added: the bodies
+this compiler generates (a deleter's match, an accessor's) destructure through
+the constructor's own reference, which needs its identity and its scheme.
+Only the NAME goes to the definition, by re-asserting it after the derived
+entry — `global-by-name` answers with the last global of a name, and the
+index behind it only ever grows.")
+  (doc derived-binding-unless-defined "adds a derived binding only when the
+module does not define that name itself. Unlike a constructor or an accessor,
+a derived `copy` or `str` is never destructured through, so nothing needs its
+identity once a definition exists — and deriving one anyway puts a shallow
+blit beside a hand-written deep copier, where whichever wins dispatch decides
+whether `@box` copies the cell or aliases it.")
+  (defn derived-binding-unless-defined [state name signature]
+    (if (name-defined? &name) @state (derived-binding state name signature)))
+
+  (defn derived-binding [state name signature]
+    (let [globals (Pair.a state)
+          builtins (Pair.b state)
+          shadowing (if (name-defined? &name)
+            (global-by-name globals &name)
+            (the (Maybe CoreRef) (Maybe.Nothing)))
+          reference (CoreRef.init (next-global-id globals) name true)
+          derived-globals (Array.push-back @globals (CoreRef.copy &reference))]
+      (Pair.init
+        (match shadowing
+          (Maybe.Just definition) (Array.push-back derived-globals definition)
+          (Maybe.Nothing) derived-globals)
+        (Array.push-back @builtins
+                         (CoreBuiltin.init reference (Box.init signature))))))
+
   (defn add-constructor [state type-name result-type node]
     (match (constructor-base-name node)
       (Maybe.Just base-name)
         (match (constructor-arguments node)
           (Result.Success arguments)
-            (let [globals (Pair.a state)
-                  constructors (Pair.b state)
-                  name (append-scope type-name &base-name)
-                  reference (CoreRef.init (next-global-id globals) name true)
+            (let [name (append-scope type-name &base-name)
                   signature (CoreType.Function arguments
                                                (Box.init (CoreType.copy result-type)))]
-              (Result.Success
-                (Pair.init
-                  (Array.push-back @globals (CoreRef.copy &reference))
-                  (Array.push-back @constructors
-                                   (CoreBuiltin.init reference
-                                                     (Box.init signature))))))
+              (Result.Success (derived-binding state name signature)))
           (Result.Error error) (Result.Error error))
       (Maybe.Nothing) (Result.Success @state)))
 
@@ -3918,25 +3986,15 @@ back to plain reference resolution.")
   (defn add-record-constructor [state type-name result-type fields]
     (match (field-types fields)
       (Result.Success arguments)
-        (let [globals (Pair.a state)
-              constructors (Pair.b state)
-              constructor-name (String.copy "init")
+        (let [constructor-name (String.copy "init")
               name (append-scope type-name &constructor-name)
-              reference (CoreRef.init (next-global-id globals) name true)
               signature (CoreType.Function arguments
                                            (Box.init (CoreType.copy result-type)))]
-          (Result.Success
-            (Pair.init
-              (Array.push-back @globals (CoreRef.copy &reference))
-              (Array.push-back @constructors
-                               (CoreBuiltin.init reference (Box.init signature))))))
+          (Result.Success (derived-binding state name signature)))
       (Result.Error error) (Result.Error error)))
 
   (defn add-accessor [state type-name record-type field-name field-type]
-    (let [globals (Pair.a state)
-          accessors (Pair.b state)
-          name (append-scope type-name field-name)
-          reference (CoreRef.init (next-global-id globals) name true)
+    (let [name (append-scope type-name field-name)
           signature (CoreType.Function
             [(Box.init
                (CoreType.Reference (Box.init (CoreType.copy record-type))
@@ -3944,11 +4002,7 @@ back to plain reference resolution.")
             (Box.init
               (CoreType.Reference (Box.init (CoreType.copy field-type))
                                   (CoreLifetime.Inferred 0))))]
-      (Result.Success
-        (Pair.init
-          (Array.push-back @globals (CoreRef.copy &reference))
-          (Array.push-back @accessors
-                           (CoreBuiltin.init reference (Box.init signature)))))))
+      (Result.Success (derived-binding state name signature))))
 
   (defn setter-name [field-name mutating?]
     (if mutating?
@@ -3956,11 +4010,8 @@ back to plain reference resolution.")
       (String.concat &[@"set-" (String.copy field-name)])))
 
   (defn add-setter [state type-name record-type field-name field-type mutating?]
-    (let [globals (Pair.a state)
-          accessors (Pair.b state)
-          local-name (setter-name field-name mutating?)
+    (let [local-name (setter-name field-name mutating?)
           name (append-scope type-name &local-name)
-          reference (CoreRef.init (next-global-id globals) name true)
           record-argument (if mutating?
             (CoreType.Reference (Box.init (CoreType.copy record-type))
                                 (CoreLifetime.Inferred 0))
@@ -3969,21 +4020,14 @@ back to plain reference resolution.")
           signature (CoreType.Function
             [(Box.init record-argument) (Box.init (CoreType.copy field-type))]
             (Box.init result-type))]
-      (Result.Success
-        (Pair.init
-          (Array.push-back @globals (CoreRef.copy &reference))
-          (Array.push-back @accessors
-                           (CoreBuiltin.init reference (Box.init signature)))))))
+      (Result.Success (derived-binding state name signature))))
 
   (defn updater-name [field-name]
     (String.concat &[@"update-" (String.copy field-name)]))
 
   (defn add-updater [state type-name record-type field-name field-type]
-    (let [globals (Pair.a state)
-          accessors (Pair.b state)
-          local-name (updater-name field-name)
+    (let [local-name (updater-name field-name)
           name (append-scope type-name &local-name)
-          reference (CoreRef.init (next-global-id globals) name true)
           updater (CoreType.Function [(Box.init (CoreType.copy field-type))]
                                      (Box.init (CoreType.copy field-type)))
           signature (CoreType.Function
@@ -3991,11 +4035,7 @@ back to plain reference resolution.")
              (Box.init
                (CoreType.Reference (Box.init updater) (CoreLifetime.Inferred 0)))]
             (Box.init (CoreType.copy record-type)))]
-      (Result.Success
-        (Pair.init
-          (Array.push-back @globals (CoreRef.copy &reference))
-          (Array.push-back @accessors
-                           (CoreBuiltin.init reference (Box.init signature)))))))
+      (Result.Success (derived-binding state name signature))))
 
   (defn add-field-helpers [state type-name record-type field-name field-type]
     (match (add-accessor state type-name record-type field-name field-type)
@@ -4034,44 +4074,22 @@ back to plain reference resolution.")
       _ false))
 
   (defn add-record-copy [state type-name record-type]
-    (let [globals (Pair.a state)
-          accessors (Pair.b state)
-          name (append-scope type-name "copy")]
-      (match (global-by-name globals &name)
-        (Maybe.Just _) (Result.Success @state)
-        (Maybe.Nothing)
-          (let [reference (CoreRef.init (next-global-id globals) name true)
-                signature (CoreType.Function
-                  [(Box.init
-                     (CoreType.Reference (Box.init (CoreType.copy record-type))
-                                         (CoreLifetime.Inferred 0)))]
-                  (Box.init (CoreType.copy record-type)))]
-            (Result.Success
-              (Pair.init
-                (Array.push-back @globals (CoreRef.copy &reference))
-                (Array.push-back @accessors
-                                 (CoreBuiltin.init reference
-                                                   (Box.init signature)))))))))
+    (let [name (append-scope type-name "copy")
+          signature (CoreType.Function
+            [(Box.init
+               (CoreType.Reference (Box.init (CoreType.copy record-type))
+                                   (CoreLifetime.Inferred 0)))]
+            (Box.init (CoreType.copy record-type)))]
+      (Result.Success (derived-binding-unless-defined state name signature))))
 
   (defn add-record-str [state type-name record-type]
-    (let [globals (Pair.a state)
-          accessors (Pair.b state)
-          name (append-scope type-name "str")]
-      (match (global-by-name globals &name)
-        (Maybe.Just _) (Result.Success @state)
-        (Maybe.Nothing)
-          (let [reference (CoreRef.init (next-global-id globals) name true)
-                signature (CoreType.Function
-                  [(Box.init
-                     (CoreType.Reference (Box.init (CoreType.copy record-type))
-                                         (CoreLifetime.Inferred 0)))]
-                  (Box.init (CoreType.String)))]
-            (Result.Success
-              (Pair.init
-                (Array.push-back @globals (CoreRef.copy &reference))
-                (Array.push-back @accessors
-                                 (CoreBuiltin.init reference
-                                                   (Box.init signature)))))))))
+    (let [name (append-scope type-name "str")
+          signature (CoreType.Function
+            [(Box.init
+               (CoreType.Reference (Box.init (CoreType.copy record-type))
+                                   (CoreLifetime.Inferred 0)))]
+            (Box.init (CoreType.String)))]
+      (Result.Success (derived-binding-unless-defined state name signature))))
 
   (defn add-accessors-from-fields [state type-name record-type fields]
     (let-do [result (the
@@ -4254,7 +4272,7 @@ distinct identities.")
   (defn collect-constructors [globals]
     (match (collect-constructors-scoped (Pair.init (Array.copy globals) []))
       (Result.Success state)
-        (match (collect-constructor-declarations (Pair.a &state))
+        (match (collect-constructor-declarations (Pair.a &state) (Pair.b &state))
           (Result.Success declarations)
             (Result.Success
               (ResolvedConstructors.init @(Pair.a &state)
@@ -4284,7 +4302,30 @@ distinct identities.")
             (Maybe.Nothing) ())))
       result))
 
+  (doc constructor-binding "the derived binding of a constructor, looked up
+among the bindings the type declarations produced rather than in the global
+table. A definition may shadow the constructor's NAME there (core's
+value-taking `Box.init` shadows the generated field constructor), and a
+declaration has to keep pointing at the constructor itself: the bodies
+generated for accessors and deleters destructure through this reference and
+need its scheme.")
+  (defn constructor-binding [builtins name]
+    ;; the generation rewrite `global-by-name` applies stays: a redefined type
+    ;; binds its declarations to the live generation of the constructor.
+    (let-do [rewritten (generation-qualify name *resolve-stamp*)
+             result (the (Maybe CoreRef) (Maybe.Nothing))
+             n (Array.length builtins)]
+      (for [i 0 n]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (when (String.=
+              (CoreRef.name (CoreBuiltin.reference builtin))
+              &rewritten)
+            (set! result
+                  (Maybe.Just (CoreRef.copy (CoreBuiltin.reference builtin)))))))
+      result))
+
   (defn constructor-declaration [globals
+                                 builtins
                                  type-name
                                  result-type
                                  base-name
@@ -4293,7 +4334,9 @@ distinct identities.")
                                  field-names
                                  node]
     (let [name (append-scope type-name base-name)]
-      (match (global-by-name globals &name)
+      (match (match (constructor-binding builtins &name)
+          (Maybe.Just reference) (Maybe.Just reference)
+          (Maybe.Nothing) (global-by-name globals &name))
         (Maybe.Just reference)
           (Result.Success
             (CoreConstructorDeclaration.init reference
@@ -4304,7 +4347,7 @@ distinct identities.")
         (Maybe.Nothing)
           (Result.Error (error-at node @"missing nominal constructor reference")))))
 
-  (defn constructor-declarations-from-deftype [form type-name globals]
+  (defn constructor-declarations-from-deftype [form type-name globals builtins]
     (match-ref (SurfaceNode.form form)
       (SurfaceForm.List raw-items)
         (let [items (semantic-items raw-items)]
@@ -4329,6 +4372,7 @@ distinct identities.")
                           (match (field-types fields)
                             (Result.Success arguments)
                               (match (constructor-declaration globals
+                                                              builtins
                                                               type-name
                                                               &result-type
                                                               "init"
@@ -4353,6 +4397,7 @@ distinct identities.")
                                   (match (constructor-arguments constructor)
                                     (Result.Success arguments)
                                       (match (constructor-declaration globals
+                                                                      builtins
                                                                       type-name
                                                                       &result-type
                                                                       &base-name
@@ -4381,7 +4426,7 @@ distinct identities.")
             (Result.Success [])))
       _ (Result.Success [])))
 
-  (defn collect-constructor-declarations [globals]
+  (defn collect-constructor-declarations [globals builtins]
     (let-do [result (the
                (Result (Array CoreConstructorDeclaration) ResolveError)
                (Result.Success []))
@@ -4397,7 +4442,8 @@ distinct identities.")
                 (let [gen-name (event-generation-name i)]
                   (match (constructor-declarations-from-deftype form
                                                                 &gen-name
-                                                                globals)
+                                                                globals
+                                                                builtins)
                     (Result.Success found)
                       (set! result
                             (Result.Success
@@ -4785,6 +4831,7 @@ guessed at.")
     ;; (The overload channel is reset later, in populate-arities!, which runs
     ;; AFTER collection — resetting private names there would wipe them.)
     (let-do [_ignored-private (set! *private-names* [])
+             _ignored-definitions (set! *definition-names* [])
              _ignored-stamp (set! *type-decl-stamp* 0)
              _ignored-events (set! *type-decl-events* [])
              _ignored-site-stamp (set! *resolve-stamp* 0)
@@ -4912,6 +4959,7 @@ guessed at.")
                                                                                       signatures
                                                                                       type-declarations
                                                                                       constructor-declarations
+                                                                                      @(CollectedForms.recursive-types &collected)
                                                                                       final-interfaces
                                                                                       final-implementations
                                                                                       @(CollectedForms.system-includes &collected)

@@ -648,6 +648,50 @@ cold process resolves exactly once, so the self-host fixed point and the
 reference suite cannot see stale state at all. The session tests in the phase
 suites are the only gate that resolves twice in one process.
 
+### 36. C type names and record layout are the reference's, because core writes them by hand [semantic (fidelity)]
+
+Core's own C templates name generated types and their members directly:
+`Box.from-ptr` is `"Box__$a $NAME($a* p)"` with a body that writes `b.data`.
+So the C name of a nominal application (`CAbi.nominal-name`: `Box__int`,
+`Pair__int_String`, pointers mangled `_MUL_` in argument position) and the
+layout of a record (flat, its own field names, no union and no tag) are ABI,
+not internal choices — a structural key that only has to be unique cannot
+serve, because the templates were written against the reference's spelling.
+Sum types keep the tagged union (`data`/`tag`), which no template names.
+The C and LLVM layouts must agree here too: the LLVM driver links its objects
+against the same deftemplate C, and its single-variant struct `{ {fields} }`
+matches the flat record because a one-member wrapper adds no padding.
+
+Enforcement: `parameterized-nominal-names-follow-the-reference?` (c-abi
+suite), `lays-records-out-flat?` (integration suite), and the reference suite
+itself — `test/box.carp` does not compile if either diverges.
+
+### 37. A definition shadows the binding its type derived; the derived binding still exists [semantic (fidelity)]
+
+`(deftype (Box a) [data (Ptr a)])` derives `Box.init` from the field, and
+core then defines a value-taking `Box.init` over it. The reference lets the
+later definition win the NAME while the type keeps its constructor. Here that
+is two different lookups: `global-by-name` (last of a name, so `derived-binding`
+re-asserts the definition after the derived entry) and `constructor-binding`
+(the constructor's own entry among the bindings the type declarations
+produced), which is what a generated accessor or deleter body destructures
+through and needs a scheme for. Only a name the module DEFINES shadows
+(`*definition-names*`): a compiler-provided primitive of the same name
+(`Pair.a`) is not a definition, and taking the name from the derived accessor
+that way cost a debugging session.
+
+Enforcement: `definition-shadows-the-derived-constructor?` (resolve suite).
+
+### 38. A deleter declared once for every instance of a type is keyed generically [implementation]
+
+`(sig delete (Fn [(Box a)] ()))` records the ownership fact under the key of
+`(Box a)`, not of any instance, so `managed-mono?` asks `CAbi.generic-key` as
+well as the instance key. Without it `(Box Int)` — a heap cell no field
+accounts for — classifies unmanaged, nothing frees it, and no gate catches it
+(the leak is in the compiled PROGRAM, not in the compiler).
+
+Enforcement: `deletes-generically-declared-owners?` (integration suite).
+
 ## Five things that look fragile but are actually safe
 
 1. **`-g` vs release divergence**: the debug path allocates ids differently
