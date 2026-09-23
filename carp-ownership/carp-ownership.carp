@@ -79,11 +79,12 @@ someone else owns, and `Unmanaged` values are plain data with no cleanup.")
 
 (doc OwnershipTypeFacts "declares, by structural ABI type key, which concrete
 types own memory (have a declared `delete`) and which a valid `blit` forces back
-to unmanaged. Classification consults these facts; it never inspects a type's
-spelling.")
+to unmanaged, plus the identities of the functions that implement `delete`.
+Classification consults these facts; it never inspects a type's spelling.")
 (deftype OwnershipTypeFacts
   [owned (Array String)
-   unmanaged-override (Array String)])
+   unmanaged-override (Array String)
+   deleters (Array Int)])
 
 (defmodule OwnershipClassify
   (private has-key?)
@@ -118,9 +119,16 @@ type with no declared delete stays `Unmanaged`.")
         (let [key (CAbi.type-key type)]
           (cond
             (has-key? (OwnershipTypeFacts.unmanaged-override facts) &key)
-              (OwnershipClass.Unmanaged)
+            (OwnershipClass.Unmanaged)
             (has-key? (OwnershipTypeFacts.owned facts) &key)
-              (OwnershipClass.Owned)
+            (OwnershipClass.Owned)
+            ;; a `delete` declared once for every instance of a type — core's
+            ;; `(sig delete (Fn [(Box a)] ()))` — is recorded under the key of
+            ;; `(Box a)`, so an instance has to ask for it generically too.
+            ;; Without this nothing schedules the delete, nothing demands the
+            ;; specialization, and the cell the type owns is never freed.
+            (has-key? (OwnershipTypeFacts.owned facts) &(CAbi.generic-key type))
+            (OwnershipClass.Owned)
             (OwnershipClass.Unmanaged))))
       _
       (let [key (CAbi.type-key type)]
@@ -200,6 +208,17 @@ generic-instance deleter's argument type can be keyed for ownership facts.")
                            (Box.init (resolved->mono (Box.peek ret))))
       (CoreType.Variable _) (MonoType.Variable 0)))
 
+  (private indirect-generic-target?)
+  (hidden indirect-generic-target?)
+  (doc indirect-generic-target? "whether a deleter's argument is a generic
+application of a type whose members are all indirections.")
+  (defn indirect-generic-target? [core type]
+    (match-ref type
+      (CoreType.Named name arguments)
+        (and (Int.> (Array.length arguments) 0)
+             (CoreIR.indirection-nominal? (CoreModule.constructors core) name))
+      _ false))
+
   (private deleted-type-key)
   (hidden deleted-type-key)
   (defn deleted-type-key [core-type]
@@ -218,21 +237,36 @@ skipped; functions are classified intrinsically because their registered
 deleters are polymorphic over each arity.")
   (defn facts-from-module [core]
     (let-do [owned (the (Array String) [])
+             deleters (the (Array Int) [])
              delete-ref (PrimitiveRegistry.delete-reference)
              impls (CoreModule.implementations core)
              n (Array.length impls)]
       (for [i 0 n]
         (let [im (Array.unsafe-nth impls i)]
-          (when (CoreIR.same-ref? (CoreImplementation.interface im) &delete-ref)
+          (when-do (CoreIR.same-ref? (CoreImplementation.interface im)
+                                     &delete-ref)
+            (Array.push-back! &deleters
+                              @(CoreRef.id (CoreImplementation.implementation im)))
             (match (signature-arg0 core (CoreImplementation.implementation im))
               (Maybe.Just arg0)
-                (match (deleted-type-key &arg0)
-                  (Maybe.Just key)
-                    (unless (has-key? &owned &key)
-                      (set! owned (Array.push-back owned key)))
-                  (Maybe.Nothing) ())
+                (do
+                  (match (deleted-type-key &arg0)
+                    (Maybe.Just key)
+                      (unless (has-key? &owned &key)
+                        (set! owned (Array.push-back owned key)))
+                    (Maybe.Nothing) ())
+                  ;; a deleter written once for every instance of a type whose
+                  ;; members are all indirections — core's `Box` — is the only
+                  ;; thing that can free what such a type owns, since nothing
+                  ;; derived from its declaration would free anything. Record
+                  ;; it generically so every instance finds it. Any other
+                  ;; generic deleter is left to the per-instance deriver.
+                  (when (indirect-generic-target? core &arg0)
+                    (let [generic (CAbi.generic-key &(resolved->mono &arg0))]
+                      (unless (has-key? &owned &generic)
+                        (set! owned (Array.push-back owned generic))))))
               (Maybe.Nothing) ()))))
-      (OwnershipTypeFacts.init owned []))))
+      (OwnershipTypeFacts.init owned [] deleters))))
 
 (defmodule Ownership
   (private invalid-id)
@@ -1882,12 +1916,31 @@ choosing where to put one.")
       (collect-into! expr facts context constructors &acc)
       acc))
 
+  (private deleter-function?)
+  (hidden deleter-function?)
+  (doc deleter-function? "whether this function is an implementation of the
+`delete` interface.")
+  (defn deleter-function? [facts reference]
+    (let-do [found false
+             ids (OwnershipTypeFacts.deleters facts)
+             n (Array.length ids)]
+      (for [i 0 n]
+        (when (Int.= @(Array.unsafe-nth ids i) @(CoreRef.id reference))
+          (set! found true)))
+      found))
+
   (private collect-param-deletes)
   (hidden collect-param-deletes)
   (doc collect-param-deletes "schedules a delete for every owned parameter the
 body does not consume (move out or into a call). A function receives ownership
-of its owned arguments and must release any it neither returns nor passes on.")
-  (defn collect-param-deletes [parameters signature body facts context]
+of its owned arguments and must release any it neither returns nor passes on.
+
+A `delete` implementation is the exception: the value it was handed is the one
+it is freeing, so an end-of-scope delete there would be this very function
+calling itself. The reference drops the same deleter (Memory.hs,
+`isOwnDeleterParam`); it reads the function's name, we read the implementation
+table.")
+  (defn collect-param-deletes [parameters signature body facts context deleter?]
     (match-ref signature
       (MonoType.Function arg-types _)
         (let-do [result (the (Array OwnershipAction) [])
@@ -1895,8 +1948,9 @@ of its owned arguments and must release any it neither returns nor passes on.")
           (for [i 0 n]
             (let [param (Array.unsafe-nth parameters i)
                   param-type (Box.peek (Array.unsafe-nth arg-types i))]
-              (when (and (owned-type? param-type facts)
-                         (not (consumed-on-all-paths? param body)))
+              (when (and (not (and deleter? (Int.= i 0)))
+                         (and (owned-type? param-type facts)
+                              (not (consumed-on-all-paths? param body))))
                 (Array.push-back! &result
                                   (make-delete-action context
                                                       (Specialize.expression-id body)
@@ -2038,7 +2092,9 @@ that are not moved out of their scope. Types are classified from `facts`.")
                                                        (Box.peek (Specialization.signature instance))
                                                        (Box.peek (SpecializedBody.body body))
                                                        facts
-                                                       i))))))
+                                                       i
+                                                       (deleter-function? facts
+                                                                          (Specialization.reference instance))))))))
                 (Result.Error error) (set! result (Result.Error error))))
           (Result.Error _) ()))
       (match-ref &result
