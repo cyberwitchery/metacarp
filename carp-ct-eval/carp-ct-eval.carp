@@ -64,6 +64,13 @@ and width 3 or above means the floating field carries the value.")
 ;; (Core Dynamic) reads it through the `Unsafe.load-stack` builtin.
 (def *ct-load-stack* (the (Array String) []))
 
+;; metadata a `meta-set!` recorded, as (qualified name + key) to the value
+;; syntax. The reference keeps this on the binder it annotates; expansion here
+;; runs before any binding exists, so the table lives beside the load stack
+;; and `meta` reads it back. Append-only: a later `meta-set!` for the same
+;; name and key shadows the earlier one, which is what a lookup takes.
+(def *ct-meta* (the (Array (Pair String (Box SurfaceNode))) []))
+
 ;; compile-time build commands (`system-include`, `add-cflag`, `add-lib`,
 ;; `add-pkg`) applied as dynamic functions: includes become synthesized
 ;; top-level forms the expansion drains into its output, flags accumulate for
@@ -110,6 +117,32 @@ say what a step in the middle saw.")
 
 (defmodule CtEval
   (defn reset-load-stack! [] (set! *ct-load-stack* []))
+
+  (private meta-entry-key)
+  (hidden meta-entry-key)
+  (defn meta-entry-key [name key]
+    (String.concat &[(String.copy name) @" " (String.copy key)]))
+
+  (doc reset-meta! "drops recorded metadata; a fresh compile-time session
+annotates nothing.")
+  (defn reset-meta! [] (set! *ct-meta* []))
+
+  (doc record-meta! "records one metadata entry for a qualified name.")
+  (defn record-meta! [name key value]
+    (Array.push-back! &*ct-meta*
+                      (Pair.init (meta-entry-key name key)
+                                 (Box.init (SurfaceNode.copy value)))))
+
+  (doc meta-value "the value recorded for a name and key, latest first.")
+  (defn meta-value [name key]
+    (let-do [composed (meta-entry-key name key)
+             result (the (Maybe (Box SurfaceNode)) (Maybe.Nothing))
+             n (Array.length &*ct-meta*)]
+      (for [i 0 n]
+        (let [entry (Array.unsafe-nth &*ct-meta* i)]
+          (when (String.= (Pair.a entry) &composed)
+            (set! result (Maybe.Just (Box.copy (Pair.b entry)))))))
+      result))
 
   (doc drain-pending-includes! "the `(system-include ...)` forms compile-time
 evaluation requested since the last drain, cleared on return; the expansion
@@ -2184,6 +2217,31 @@ depends on), anything floating divides in the floating domain.")
   (hidden special-members)
   (private special-managed)
   (hidden special-managed)
+  (private special-meta)
+  (hidden special-meta)
+  (doc special-meta "reads back what a `meta-set!` recorded for a binding.
+An annotation the program never made answers with the empty list, the way the
+reference answers with dynamic nil; the name is looked up as written and then
+unqualified, so a module's own annotation is found from inside and outside it.")
+  (defn special-meta [call name-form key-value]
+    (match (symbol-key name-form)
+      (Maybe.Just name)
+        (match (string-argument call key-value)
+          (Result.Success key)
+            (match (CtEval.meta-value &name &key)
+              (Maybe.Just found)
+              (Result.Success (CtValue.Syntax (Box.copy &found)))
+              (Maybe.Nothing)
+              ;; the empty list, which is what `'()` evaluates to here and
+              ;; what the reference answers an unset annotation with
+              (Result.Success
+                (CtValue.Syntax
+                  (Box.init
+                    (SurfaceNode.init @(SurfaceNode.span call)
+                                      (SurfaceForm.List []))))))
+          (Result.Error error) (Result.Error error))
+      (Maybe.Nothing) (Result.Error (error-at call @"meta expects a symbol"))))
+
   (private special-sexpr)
   (hidden special-sexpr)
   (private special-use)
@@ -2911,6 +2969,10 @@ opcodes are `CtSpecial`'s, and the two must agree.")
                          "__members_")
       (Int.= opcode (CtSpecial.managed-op))
         (special-managed call (Box.peek (Array.unsafe-nth raws 0)) state frame)
+      (Int.= opcode (CtSpecial.meta-op))
+        (special-meta call
+                      (Box.peek (Array.unsafe-nth raws 0))
+                      (Box.peek (Array.unsafe-nth values 0)))
       (Int.= opcode (CtSpecial.sexpr-op))
         (special-sexpr call (Box.peek (Array.unsafe-nth raws 0)) state frame)
       (Int.= opcode (CtSpecial.use-op))
