@@ -1,4 +1,9 @@
 (load "../carp-surface/carp-surface.carp")
+;; `type` answers with the type of an expression, so the compile-time
+;; evaluator needs the two passes that produce one. Neither loads this file,
+;; so the dependency runs one way.
+(load "../carp-resolve/carp-resolve.carp")
+(load "../carp-infer/carp-infer.carp")
 (load "../carp-ct-env/carp-ct-env.carp")
 (load "carp-ct-lower.carp")
 
@@ -71,6 +76,12 @@ and width 3 or above means the floating field carries the value.")
 ;; name and key shadows the earlier one, which is what a lookup takes.
 (def *ct-meta* (the (Array (Pair String (Box SurfaceNode))) []))
 
+;; the top-level forms expansion has finished so far, in source order. `type`
+;; infers against them: the reference can ask its global environment because
+;; it evaluates and types a form at a time, and this compiler expands
+;; everything before it resolves anything, so the forms are what there is.
+(def *ct-typing-forms* (the (Array (Box SurfaceNode)) []))
+
 ;; compile-time build commands (`system-include`, `add-cflag`, `add-lib`,
 ;; `add-pkg`) applied as dynamic functions: includes become synthesized
 ;; top-level forms the expansion drains into its output, flags accumulate for
@@ -126,6 +137,13 @@ say what a step in the middle saw.")
   (doc reset-meta! "drops recorded metadata; a fresh compile-time session
 annotates nothing.")
   (defn reset-meta! [] (set! *ct-meta* []))
+
+  (doc reset-typing-forms! "drops the forms `type` infers against.")
+  (defn reset-typing-forms! [] (set! *ct-typing-forms* []))
+
+  (doc record-typing-form! "keeps one finished top-level form for `type`.")
+  (defn record-typing-form! [form]
+    (Array.push-back! &*ct-typing-forms* (Box.init (SurfaceNode.copy form))))
 
   (doc record-meta! "records one metadata entry for a qualified name.")
   (defn record-meta! [name key value]
@@ -2217,6 +2235,124 @@ depends on), anything floating divides in the floating domain.")
   (hidden special-members)
   (private special-managed)
   (hidden special-managed)
+  (private symbol-syntax)
+  (hidden symbol-syntax)
+  (private list-syntax)
+  (hidden list-syntax)
+  (private array-syntax)
+  (hidden array-syntax)
+  (private type-syntax)
+  (hidden type-syntax)
+  (doc type-syntax "renders a concrete type as the syntax the reference
+reifies it to: a name is a symbol, an application is a list of them, and a
+function is `(Fn [args] result)`.")
+  (sig type-syntax (Fn [(Ref SurfaceSpan) (Ref MonoType)] SurfaceNode))
+  (defn type-syntax [span type]
+    (match-ref type
+      (MonoType.Integer) (symbol-syntax span "Int")
+      (MonoType.String) (symbol-syntax span "String")
+      (MonoType.Boolean) (symbol-syntax span "Bool")
+      (MonoType.Unit) (list-syntax span (the (Array (Box SurfaceNode)) []))
+      (MonoType.Variable variable)
+        (symbol-syntax span &(String.concat &[@"t" (Int.str @variable)]))
+      (MonoType.Reference inner _)
+        (list-syntax span
+                     [(Box.init (symbol-syntax span "Ref"))
+                      (Box.init (type-syntax span (Box.peek inner)))])
+      (MonoType.Function arguments result)
+        (let-do [rendered (the (Array (Box SurfaceNode)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &rendered
+                              (Box.init
+                                (type-syntax span
+                                             (Box.peek (Array.unsafe-nth arguments
+                                                                         i))))))
+          (list-syntax span
+                       [(Box.init (symbol-syntax span "Fn"))
+                        (Box.init (array-syntax span rendered))
+                        (Box.init (type-syntax span (Box.peek result)))]))
+      (MonoType.Named name arguments)
+        (if (Int.= 0 (Array.length arguments))
+          (symbol-syntax span name)
+          (let-do [rendered (the (Array (Box SurfaceNode)) [])]
+            (Array.push-back! &rendered (Box.init (symbol-syntax span name)))
+            (for [i 0 (Array.length arguments)]
+              (Array.push-back! &rendered
+                                (Box.init
+                                  (type-syntax span
+                                               (Box.peek (Array.unsafe-nth arguments
+                                                                           i))))))
+            (list-syntax span rendered)))))
+
+  (sig symbol-syntax (Fn [(Ref SurfaceSpan) (Ref String)] SurfaceNode))
+  (defn symbol-syntax [span name]
+    (SurfaceNode.init @span (SurfaceForm.Symbol [(String.copy name)])))
+
+  (sig list-syntax
+       (Fn [(Ref SurfaceSpan) (Array (Box SurfaceNode))] SurfaceNode))
+  (defn list-syntax [span items]
+    (SurfaceNode.init @span (SurfaceForm.List items)))
+
+  (sig array-syntax
+       (Fn [(Ref SurfaceSpan) (Array (Box SurfaceNode))] SurfaceNode))
+  (defn array-syntax [span items]
+    (SurfaceNode.init @span (SurfaceForm.Array items)))
+
+  (private special-type)
+  (hidden special-type)
+  (doc special-type "the type of an expression, inferred against everything
+expansion has finished so far. The reference annotates the form against its
+global environment, which it has because it evaluates and types a form at a
+time; here the equivalent is to resolve and infer the forms seen so far with
+this expression appended as the last root, and read that root's type back.
+Costly by construction — every call types the program again — and `type` is
+rare enough for that to be the right trade.
+
+The forms belong to one expansion, and a warm session expands a cell against a
+snapshot that carries none: `type` there sees the cell alone, so an expression
+naming a base binding fails to resolve and says so rather than answering with
+the wrong type.")
+  (defn special-type [call argument]
+    (let-do [forms (Array.copy &*ct-typing-forms*)
+             count 0]
+      (Array.push-back! &forms (Box.init (SurfaceNode.copy argument)))
+      (set! count (Array.length &forms))
+      (match (Resolve.module &(SurfaceModule.init forms))
+        (Result.Success core)
+          (match (Infer.module &core)
+            (Result.Success inferred)
+              (let [types (InferredModule.expression-types &inferred)
+                    n (Array.length types)]
+                (if (Int.= 0 n)
+                  (Result.Error (error-at call @"type cannot type this form"))
+                  ;; inference leaves variables behind; the module's final
+                  ;; substitution is what resolves them
+                  (Result.Success
+                    (CtValue.Syntax
+                      (Box.init
+                        (type-syntax (SurfaceNode.span call)
+                                     &(Type.apply (InferredModule.substitution &inferred)
+                                                  (Box.peek (Array.unsafe-nth types
+                                                                              (Int.dec n))))))))))
+            (Result.Error error)
+              (Result.Error
+                (error-at call
+                          (String.concat
+                            &[@"type cannot type this form: infer: "
+                              (String.copy (InferError.message &error))
+                              @" (forms "
+                              (Int.str count)
+                              @")"]))))
+        (Result.Error error)
+          (Result.Error
+            (error-at call
+                      (String.concat
+                        &[@"type cannot type this form: resolve: "
+                          (String.copy (ResolveError.message &error))
+                          @" (forms "
+                          (Int.str count)
+                          @")"]))))))
+
   (private special-meta)
   (hidden special-meta)
   (doc special-meta "reads back what a `meta-set!` recorded for a binding.
@@ -2969,6 +3105,8 @@ opcodes are `CtSpecial`'s, and the two must agree.")
                          "__members_")
       (Int.= opcode (CtSpecial.managed-op))
         (special-managed call (Box.peek (Array.unsafe-nth raws 0)) state frame)
+      (Int.= opcode (CtSpecial.type-op))
+        (special-type call (Box.peek (Array.unsafe-nth raws 0)))
       (Int.= opcode (CtSpecial.meta-op))
         (special-meta call
                       (Box.peek (Array.unsafe-nth raws 0))
