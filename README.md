@@ -64,6 +64,13 @@ a private helper is reached through the roots. There is no `main`, so the unit
 initializes its globals in a load-time constructor and `System.args` is empty.
 A top-level expression that does something has nowhere to run and is an error.
 
+Only the roots are exported: every other function and global the unit defines
+is `static`, so two Carp libraries in one host keep their own code and data.
+Core's C headers, and any C a library includes or wraps, still define
+functions of their own; build a shared library with `-fvisibility=hidden` so
+those stay inside it. Static archives have no such switch, and linking two of
+them still clashes on what those headers define.
+
 `(load ...)` resolves like the reference compiler's: the name as given
 (relative to the working directory), then relative to the loading file, then
 the Core directory, so a local file shadows the Core file it is named after.

@@ -3,7 +3,7 @@
 #
 #   run-assurance.sh phase  phase suites plus lint and formatting
 #   run-assurance.sh self   bootstrap, reference suite, fixed point, leaks,
-#                           expansion
+#                           expansion, library linkage
 #   run-assurance.sh sanitize  the reference suite again, every generated
 #                           program built with AddressSanitizer
 #   run-assurance.sh all    phase and self (not sanitize, which CI runs as its
@@ -72,6 +72,7 @@ run_self() {
   rm -rf "$self_work"
   trap - EXIT
   "$script_dir/diff-expansion.sh"
+  "$script_dir/check-library-linkage.sh"
 }
 
 run_sanitize() {
