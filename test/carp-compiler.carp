@@ -28,6 +28,41 @@
       (set! index (String.index-of-string &remaining fragment)))
     count))
 
+;; an accessor whose builtin the resolver never declared would otherwise just
+;; go missing and surface as a c link error.
+(defn missing-accessor-builtin-fails-derivation? []
+  (match (Surface.parse "(register-type Point [x Int])")
+    (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core)
+          (let [kept (Array.copy-filter
+                  &(fn [builtin]
+                    (not
+                      (String.=
+                        (CoreRef.name (CoreBuiltin.reference builtin))
+                        "Point.x")))
+                  (CoreModule.builtins &core))
+                without-getter (CoreModule.set-builtins core kept)]
+            (match (CarpCompiler.derive-module-for-inference &without-getter)
+              (Result.Success _) false
+              (Result.Error error)
+                (and
+                  (String.= (CompileError.phase &error) "derive")
+                  (contains-text? (CompileError.message &error) "Point.x"))))
+        (Result.Error _) false)
+    (Result.Error _) false))
+
+;; a module may define one of those names itself, as Core does for
+;; `Pattern.MatchResult.str`; its definition replaces the derived accessor.
+(defn own-accessor-definition-satisfies-derivation? []
+  (match (Surface.parse "(register-type Point [x Int])
+(register point-str (Fn [(Ref Point)] String) \"point_str\")
+(defmodule Point (defn str [p] (point-str p)))") (Result.Success surface)
+      (match (Resolve.module &surface)
+        (Result.Success core)
+          (Result.success? &(CarpCompiler.derive-module-for-inference &core))
+        (Result.Error _) false) (Result.Error _) false))
+
 (defn optional-copy-branch-count []
   (match (Surface.parse "(deftype (Optional a) (Some [a]) (None))")
     (Result.Success surface)
@@ -136,6 +171,48 @@
   (match (library-roots-result "(defn answer [] 42)
 (answer)" &[@"answer"]) (Result.Success _) false (Result.Error error)
       (contains-text? (CompileError.message &error) "top-level expressions")))
+
+;; only a library's roots are visible outside it: with default linkage a
+;; second library's calls and globals bind to the first one's on ELF.
+(defn library-exports-only-its-roots? []
+  (match (library-roots-result "(register compute (Fn [] Int) \"compute\")
+(def value (compute))
+(defn helper [] value)
+(defn read-value [] (helper))" &[@"read-value"]) (Result.Success c)
+      (let [root (CAbi.mangle "read-value" &(Type.function [] (Type.integer)))
+            helper (CAbi.mangle "helper" &(Type.function [] (Type.integer)))]
+        (and
+          (contains-text? &c
+                          &(String.concat
+                            &[@"__attribute__((visibility(\"default\"))) int "
+                              root]))
+          (contains-text? &c &(String.concat &[@"static int " helper]))
+          (contains-text? &c "static void carp_init_globals(")
+          (contains-text? &c "#pragma GCC visibility push(hidden)")
+          (contains-text? &c "#pragma GCC visibility pop")
+          (not (contains-text? &c "extern int ")))) (Result.Error _) false))
+
+;; a registered type's accessors are the c sources of the builtins the
+;; resolver declares for them, so they take a library's linkage like any other
+;; definition, and only the ones the library uses are emitted.
+(defn library-registered-accessors-are-static? []
+  (match (library-roots-result "(register-type Point [x Int])
+(sig read-x (Fn [(Ref Point)] (Ref Int)))
+(defn read-x [p] (Point.x p))" &[@"read-x"]) (Result.Success c)
+      (and (contains-text? &c "static int* ")
+           (contains-text? &c "return &(p->x); }")
+           (not (contains-text? &c "set_x45_x"))
+           (not (contains-text? &c "//registered accessor"))) (Result.Error _)
+      false))
+
+(defn executable-keeps-external-linkage? []
+  (match (CarpCompiler.compile-source "(defn answer [] 42)
+(answer)") (Result.Success c)
+      (and
+        (not (contains-text? &c "static void carp_init_globals("))
+        (not (contains-text? &c "visibility("))
+        (not (contains-text? &c "#pragma GCC visibility"))) (Result.Error _)
+      false))
 
 ;; every program's roots hold inert values (Core ends on `()`), which a
 ;; library may carry: only a top-level expression that does something fails.
@@ -849,6 +926,21 @@ answer")
   (assert-true t
     (library-accepts-inert-top-level-values?)
     "a library may carry inert top-level values")
+  (assert-true t
+    (library-exports-only-its-roots?)
+    "a library gives everything but its roots internal linkage")
+  (assert-true t
+    (own-accessor-definition-satisfies-derivation?)
+    "a module's own definition of an accessor name satisfies derivation")
+  (assert-true t
+    (missing-accessor-builtin-fails-derivation?)
+    "an accessor without its builtin fails derivation, not the c link")
+  (assert-true t
+    (library-registered-accessors-are-static?)
+    "a registered type's accessors are internal to a library")
+  (assert-true t
+    (executable-keeps-external-linkage?)
+    "an executable's linkage is unchanged")
   (assert-true t
     (library-rejects-builtin-roots?)
     "a registered builtin is not a library root")

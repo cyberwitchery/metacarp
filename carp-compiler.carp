@@ -3203,10 +3203,37 @@ interface and keying it by its return type.")
           (MonoLifetime.Static))
       _ (MonoType.Unit)))
 
-  (private accessor-symbol)
-  (hidden accessor-symbol)
-  (defn accessor-symbol [qualified-name signature]
-    (CAbi.identifier &(CAbi.mangle qualified-name signature)))
+  (private defines-function?)
+  (hidden defines-function?)
+  (defn defines-function? [core name]
+    (Array.any?
+      &(fn [function]
+        (String.= (CoreRef.name (CoreFunction.reference function)) name))
+      (CoreModule.functions core)))
+
+  (private add-accessor-source!)
+  (hidden add-accessor-source!)
+  (doc add-accessor-source! "gives the builtin the resolver declared for a
+registered type's accessor `name` its C source, as a template whose
+declaration spells `$NAME` and whose body opens with `$DECL`. A name with
+neither a builtin nor a definition of its own goes to `missing`, so it fails
+the compile instead of the C link.")
+  (defn add-accessor-source! [core sources missing name declaration body]
+    (let-do [builtins (CoreModule.builtins core)
+             found false]
+      (for [i 0 (Array.length builtins)]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (when-do (String.= (CoreRef.name (CoreBuiltin.reference builtin)) name)
+            (set! found true)
+            (Array.push-back! sources
+                              (CoreBuiltinSource.init @(CoreBuiltin.reference builtin)
+                                                      @(CoreBuiltin.signature builtin)
+                                                      (CoreBuiltinPayload.Template @&declaration
+                                                                                   @&body))))))
+      ;; a module that defines the name itself (Core's `Pattern.MatchResult.str`)
+      ;; replaces the derived accessor, so nothing is missing then.
+      (unless (or found (defines-function? core name))
+        (Array.push-back! missing @name))))
 
   (private register-type-typedefs)
   (hidden register-type-typedefs)
@@ -3214,9 +3241,14 @@ interface and keying it by its return type.")
 (e.g. `(register-type A \"void*\")`) aliases that existing C type to the name
 the backend renders for it, and a `register-type` with a member array gets its
 field accessors, setters, and constructor emitted against the existing C
-struct. Both ride the verbatim preamble channel.")
+struct. The typedef rides the verbatim preamble; each accessor becomes the C
+source of the builtin the resolver declared for it, so the backend renders it
+like any `deftemplate`: only when used, and with the linkage a library gives
+its own definitions. An accessor without its builtin is an error.")
   (defn register-type-typedefs [core]
     (let-do [includes (Array.copy (CoreModule.system-includes core))
+             sources (Array.copy (CoreModule.builtin-sources core))
+             missing (the (Array String) [])
              declarations (CoreModule.type-declarations core)
              n (Array.length declarations)]
       (for [i 0 n]
@@ -3235,40 +3267,19 @@ struct. Both ride the verbatim preamble channel.")
         (let-do [declaration (Array.unsafe-nth declarations i)
                  type-name (CoreTypeDeclaration.name declaration)
                  c-name (CAbi.nominal-symbol type-name)
-                 t-mono (MonoType.Named (String.copy type-name) [])
                  members (CoreTypeDeclaration.members declaration)
                  mcount (Array.length members)
                  init-params (StringBuf.create)
                  init-body (StringBuf.create)
                  str-format (StringBuf.create)
-                 str-args (StringBuf.create)
-                 init-argument-types (the (Array (Box MonoType)) [])]
+                 str-args (StringBuf.create)]
           (for [m 0 mcount]
             (let-do [member (Array.unsafe-nth members m)
                      f-name (Pair.a member)
                      f-mono (member-mono (Pair.b member))
                      f-c (match (CAbi.render-type &f-mono)
                        (Result.Success rendered) rendered
-                       (Result.Error _) (String.copy "int"))
-                     getter-sig (MonoType.Function
-                       [(Box.init
-                          (MonoType.Reference (Box.init (MonoType.copy &t-mono))
-                                              (MonoLifetime.Static)))]
-                       (Box.init
-                         (MonoType.Reference (Box.init (MonoType.copy &f-mono))
-                                             (MonoLifetime.Static))))
-                     setter-sig (MonoType.Function
-                       [(Box.init (MonoType.copy &t-mono))
-                        (Box.init (MonoType.copy &f-mono))]
-                       (Box.init (MonoType.copy &t-mono)))
-                     mutator-sig (MonoType.Function
-                       [(Box.init
-                          (MonoType.Reference (Box.init (MonoType.copy &t-mono))
-                                              (MonoLifetime.Static)))
-                        (Box.init (MonoType.copy &f-mono))]
-                       (Box.init (MonoType.Unit)))]
-              (Array.push-back! &init-argument-types
-                                (Box.init (MonoType.copy &f-mono)))
+                       (Result.Error _) (String.copy "int"))]
               ;; member rendering for the derived str: format specifier plus
               ;; the C expression that supplies it. Members whose type has no
               ;; printf rendering show as a literal `?` with no argument.
@@ -3312,50 +3323,80 @@ struct. Both ride the verbatim preamble channel.")
               (StringBuf.append-str &init-body " = a")
               (StringBuf.append-str &init-body &(Int.str m))
               (StringBuf.append-str &init-body ";")
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-" (String.copy &f-c) @"* " (accessor-symbol
-                                                   &(String.concat
-                                                     &[(String.copy type-name)
-                                                       @"."
-                                                       (String.copy f-name)])
-                                                   &getter-sig) @"(" (String.copy &c-name) @"* p) { return &(p->" (String.copy f-name) @"); }"]))
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-" (String.copy &c-name) @" " (accessor-symbol
-                                                   &(String.concat
-                                                     &[(String.copy type-name)
-                                                       @".set-"
-                                                       (String.copy f-name)])
-                                                   &setter-sig) @"(" (String.copy &c-name) @" p, " (String.copy &f-c) @" v) { p." (String.copy f-name) @" = v; return p; }"]))
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-void " (accessor-symbol
-                                                   &(String.concat
-                                                     &[(String.copy type-name)
-                                                       @".set-"
-                                                       (String.copy f-name)
-                                                       @"!"])
-                                                   &mutator-sig) @"(" (String.copy &c-name) @"* p, " (String.copy &f-c) @" v) { p->" (String.copy f-name) @" = v; }"]))))
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @"."
+                                        (String.copy f-name)])
+                                    (String.concat
+                                      &[(String.copy &f-c)
+                                        @"* $NAME("
+                                        (String.copy &c-name)
+                                        @"* p)"])
+                                    (String.concat
+                                      &[@"$DECL { return &(p->"
+                                        (String.copy f-name)
+                                        @"); }"]))
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @".set-"
+                                        (String.copy f-name)])
+                                    (String.concat
+                                      &[(String.copy &c-name)
+                                        @" $NAME("
+                                        (String.copy &c-name)
+                                        @" p, "
+                                        (String.copy &f-c)
+                                        @" v)"])
+                                    (String.concat
+                                      &[@"$DECL { p."
+                                        (String.copy f-name)
+                                        @" = v; return p; }"]))
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @".set-"
+                                        (String.copy f-name)
+                                        @"!"])
+                                    (String.concat
+                                      &[@"void $NAME("
+                                        (String.copy &c-name)
+                                        @"* p, "
+                                        (String.copy &f-c)
+                                        @" v)"])
+                                    (String.concat
+                                      &[@"$DECL { p->"
+                                        (String.copy f-name)
+                                        @" = v; }"]))))
           (when (Int.> mcount 0)
-            (let [init-sig (MonoType.Function init-argument-types
-                                              (Box.init (MonoType.copy &t-mono)))]
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-" (String.copy &c-name) @" " (accessor-symbol
-                                                   &(String.concat &[(String.copy type-name)
-                                                                     @".init"])
-                                                   &init-sig) @"(" (StringBuf.into-string init-params) @") { " (String.copy &c-name) @" r;" (StringBuf.into-string init-body) @" return r; }"]))))
+            (add-accessor-source! core
+                                  &sources
+                                  &missing
+                                  &(String.concat &[(String.copy type-name)
+                                                    @".init"])
+                                  (String.concat
+                                    &[(String.copy &c-name)
+                                      @" $NAME("
+                                      (StringBuf.into-string init-params)
+                                      @")"])
+                                  (String.concat
+                                    &[@"$DECL { "
+                                      (String.copy &c-name)
+                                      @" r;"
+                                      (StringBuf.into-string init-body)
+                                      @" return r; }"])))
           ;; the derived str for a registered struct renders like a deftype's:
           ;; `(Banana 2.3 1000)`. It rides the same verbatim channel as the
           ;; accessors because the struct layout is external C.
           (when (Int.> mcount 0)
-            (let [str-sig (MonoType.Function
-                    [(Box.init
-                       (MonoType.Reference (Box.init (MonoType.copy &t-mono))
-                                           (MonoLifetime.Static)))]
-                    (Box.init (MonoType.String)))
-                  format (String.concat
+            (let [format (String.concat
                     &[@"("
                       (String.copy type-name)
                       (StringBuf.into-string str-format)
@@ -3363,24 +3404,43 @@ void " (accessor-symbol
                   ;; drained once: `to-string` empties the buffer, so a second
                   ;; call emitted a format string with no arguments.
                   args-text (StringBuf.into-string str-args)]
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-String " (accessor-symbol
-                                                   &(String.concat &[(String.copy type-name)
-                                                                     @".str"])
-                                                   &str-sig) @"(" (String.copy &c-name) @"* p) { int size = snprintf(NULL, 0, \"" (String.copy &format) @"\"" (String.copy &args-text) @") + 1; String buffer = CARP_MALLOC(size); snprintf(buffer, size, \"" (String.copy &format) @"\"" (String.copy &args-text) @"); return buffer; }"]))))))
-      (CoreModule.init @(CoreModule.functions core)
-                       @(CoreModule.values core)
-                       @(CoreModule.builtins core)
-                       @(CoreModule.builtin-sources core)
-                       @(CoreModule.signatures core)
-                       @(CoreModule.type-declarations core)
-                       @(CoreModule.constructors core)
-                       @(CoreModule.recursive-types core)
-                       @(CoreModule.interfaces core)
-                       @(CoreModule.implementations core)
-                       includes
-                       @(CoreModule.expressions core))))
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat &[(String.copy type-name)
+                                                      @".str"])
+                                    (String.concat
+                                      &[@"String $NAME("
+                                        (String.copy &c-name)
+                                        @"* p)"])
+                                    (String.concat
+                                      &[@"$DECL { int size = snprintf(NULL, 0, \""
+                                        (String.copy &format)
+                                        @"\""
+                                        (String.copy &args-text)
+                                        @") + 1; String buffer = CARP_MALLOC(size); snprintf(buffer, size, \""
+                                        (String.copy &format)
+                                        @"\""
+                                        (String.copy &args-text)
+                                        @"); return buffer; }"]))))))
+      (if (Array.empty? &missing)
+        (Result.Success
+          (CoreModule.init @(CoreModule.functions core)
+                           @(CoreModule.values core)
+                           @(CoreModule.builtins core)
+                           sources
+                           @(CoreModule.signatures core)
+                           @(CoreModule.type-declarations core)
+                           @(CoreModule.constructors core)
+                           @(CoreModule.recursive-types core)
+                           @(CoreModule.interfaces core)
+                           @(CoreModule.implementations core)
+                           includes
+                           @(CoreModule.expressions core)))
+        (Result.Error
+          (String.append
+            "register-type: no builtin for the accessor "
+            &(String.join ", " &missing))))))
 
   (private lookup-symbol-for-key)
   (hidden lookup-symbol-for-key)
@@ -3728,28 +3788,34 @@ through the passes, and then gives the nodes the passes generated identities
 from the same allocator. Without that the derived module is renumbered
 owner-locally, and the map describes a program that no longer exists.")
   (defn derive-core-owned [core]
-    (if *want-source-map*
-      (let-do [_ignored-preserve (set! *derive-preserve-expression-ids* true)
-               derived (close-generics-owned
-                 (strs-owned
-                   (deletes-owned
-                     (copies-owned
-                       (pair-refs-owned (accessors-owned (typedefs-owned core)))))))
-               _ignored-restore (set! *derive-preserve-expression-ids* false)
-               identified (CoreIR.identify-generated &derived
-                                                     &*source-map*
-                                                     &*source-map-allocator*
-                                                     &(the (Maybe SourceSpan)
-                                                           (Maybe.Nothing)))]
-        (set! *source-map*
-              (CoreProvenance.copy
-                (ProvenancedCoreModule.provenance &identified)))
-        (CoreModule.copy (ProvenancedCoreModule.core &identified)))
-      (close-generics-owned
-        (strs-owned
-          (deletes-owned
-            (copies-owned
-              (pair-refs-owned (accessors-owned (typedefs-owned core)))))))))
+    (match (typedefs-owned core)
+      (Result.Success typed)
+        (Result.Success
+          (if *want-source-map*
+            (let-do [_ignored-preserve (set! *derive-preserve-expression-ids*
+                                             true)
+                     derived (close-generics-owned
+                       (strs-owned
+                         (deletes-owned
+                           (copies-owned
+                             (pair-refs-owned (accessors-owned typed))))))
+                     _ignored-restore (set! *derive-preserve-expression-ids*
+                                            false)
+                     identified (CoreIR.identify-generated &derived
+                                                           &*source-map*
+                                                           &*source-map-allocator*
+                                                           &(the (Maybe SourceSpan)
+                                                                 (Maybe.Nothing)))]
+              (set! *source-map*
+                    (CoreProvenance.copy
+                      (ProvenancedCoreModule.provenance &identified)))
+              (CoreModule.copy (ProvenancedCoreModule.core &identified)))
+            (close-generics-owned
+              (strs-owned
+                (deletes-owned
+                  (copies-owned (pair-refs-owned (accessors-owned typed))))))))
+      (Result.Error message)
+        (Result.Error (CompileError.init (String.copy "derive") message))))
 
   (doc derive-module-for-inference "validates and derives a resolved module
 for warm tooling that needs the same accessor, copy, delete, string, and
@@ -3758,8 +3824,7 @@ generic declarations as the normal compiler before inference.")
     (match (Validate.type-declarations core)
       (Maybe.Just message)
         (Result.Error (CompileError.init (String.copy "validate") message))
-      (Maybe.Nothing)
-        (Result.Success (derive-core-owned (CoreModule.copy core)))))
+      (Maybe.Nothing) (derive-core-owned (CoreModule.copy core))))
 
   (doc derive-module-for-inference-provenanced "derives a session module while
 preserving resolved user node identities, then gives every generated node a
@@ -3936,19 +4001,21 @@ because only here is the whole unit written.")
         (String.join "
 " &out))))
 
-  (private render-owned-with)
-  (hidden render-owned-with)
-  (defn render-owned-with [backend executable]
-    (let-do [_ignored (phase-mark! "phase: lowered")
-             _ignored-map (LineMap.install! (BackendModule.line-map &backend))
-             rendered (if executable
-               (CBackend.executable-translation-unit &backend)
-               (CBackend.library-translation-unit &backend))]
-      rendered))
-
   (private render-owned)
   (hidden render-owned)
-  (defn render-owned [backend] (render-owned-with backend true))
+  (defn render-owned [backend]
+    (let-do [_ignored (phase-mark! "phase: lowered")
+             _ignored-map (LineMap.install! (BackendModule.line-map &backend))
+             rendered (CBackend.executable-translation-unit &backend)]
+      rendered))
+
+  (private render-library)
+  (hidden render-library)
+  (defn render-library [backend exports]
+    (let-do [_ignored (phase-mark! "phase: lowered")
+             _ignored-map (LineMap.install! (BackendModule.line-map &backend))
+             rendered (CBackend.library-translation-unit &backend exports)]
+      rendered))
 
   (private lower-inferred-module-rooted)
   (hidden lower-inferred-module-rooted)
@@ -4087,6 +4154,21 @@ asks for an entry point must get it or an error, never a library without it.")
             "not a concrete function of this module: "
             &(String.join ", " &missing))))))
 
+  (private root-symbols)
+  (hidden root-symbols)
+  (doc root-symbols "the C symbols of the requested roots, the only ones a
+library unit exports.")
+  (defn root-symbols [core inferred roots]
+    (let-do [requests (Specialize.named-requests core inferred roots)
+             symbols (the (Array String) [])]
+      (for [i 0 (Array.length &requests)]
+        (let [call (SpecializationRequest.call (Array.unsafe-nth &requests i))
+              name (CoreRef.name (CallSite.reference call))]
+          (when (module-function? core name)
+            (Array.push-back! &symbols
+                              (CAbi.mangle name (Box.peek (CallSite.type call)))))))
+      symbols))
+
   (private compile-library-roots)
   (hidden compile-library-roots)
   (defn compile-library-roots [core inferred roots]
@@ -4096,9 +4178,9 @@ asks for an entry point must get it or an error, never a library without it.")
                                          &(the (Array Specialization) [])
                                          roots)
       (Result.Success incremental)
-        (match (render-owned-with
+        (match (render-library
             @(IncrementalLowering.module &incremental)
-            false)
+            &(root-symbols core inferred roots))
           (Result.Success c) (Result.Success c)
           (Result.Error error)
             (Result.Error
@@ -4152,83 +4234,88 @@ pipeline up to but not including C rendering, for alternative backends.")
                 ;; strs runs before close-generics so the generic fallback exists
                 ;; for uncovered instances while per-instance strs (specific, so
                 ;; preferred by dispatch) render constructor name plus fields.
-                (let-do [core (derive-core-owned resolved)]
-                  (match (CoreIR.duplicate-global-id &core)
-                    (Maybe.Just bad)
-                      (Result.Error
-                        (CompileError.init (String.copy "validate")
-                                           (fmt
-                                             "duplicate global reference id %d after derivation"
-                                             bad)))
-                    (Maybe.Nothing)
-                      (match (let-do [_ignored-phase-resolved (match (IO.getenv "CARP_DEBUG_PHASES")
-                                        (Maybe.Just _)
-                                          (IO.errorln "phase: resolved+derived")
-                                        (Maybe.Nothing) ())
-                                      _ignored-fdump (match (IO.getenv "CARP_DEBUG_RESOLVED")
-                                        (Maybe.Just _)
-                                          (let [functions (CoreModule.functions &core)]
-                                            (for [i 0 (Array.length functions)]
-                                              (let [f (Array.unsafe-nth functions
-                                                                        i)]
-                                                (IO.errorln
-                                                  &(fmt "function %s params=%d"
-                                                        (CoreRef.name (CoreFunction.reference f))
-                                                        (Array.length (CoreFunction.parameters f)))))))
-                                        (Maybe.Nothing) ())]
-                          (Infer.module &core))
-                        (Result.Success inferred)
-                          (let-do [_ignored-p7 (phase-mark! "phase: inferred")
-                                   facts (OwnershipClassify.facts-from-module &core)
-                                   seeds (Specialize.named-requests &core
-                                                                    &inferred
-                                                                    check-names)]
-                            (match (specialize-closed &core
-                                                      &inferred
-                                                      &facts
-                                                      &seeds)
-                              (Result.Success closed)
-                                (match (let-do [_ignored-p8 (phase-mark! "phase: specialized")]
-                                    (if echo
-                                      (echo-augment &core
-                                                    &inferred
-                                                    &facts
-                                                    &seeds
-                                                    &closed)
-                                      (Result.Success
-                                        (Pair.init (Pair.copy &closed)
-                                                   (the (Maybe EchoPlan)
-                                                        (Maybe.Nothing))))))
-                                  (Result.Success closed-with-echo)
-                                    (let [final (Pair.a &closed-with-echo)
-                                          delete-symbols (delete-symbols-for &core
-                                                                             (Pair.a final))
-                                          copy-symbols (copy-symbols-for &core
-                                                                         (Pair.a final))]
-                                      (match (lower-owned closed-with-echo
-                                                          delete-symbols
-                                                          copy-symbols)
-                                        (Result.Success backend)
-                                          (Result.Success backend)
-                                        (Result.Error error)
-                                          (Result.Error
-                                            (CompileError.init (String.copy "backend")
-                                                               @(BackendError.message &error)))))
-                                  (Result.Error error) (Result.Error error))
-                              (Result.Error error)
-                                (do
-                                  (match (IO.getenv "CARP_DEBUG_FN")
-                                    (Maybe.Just fn-name)
-                                      (debug-dump-function &core
-                                                           &fn-name
-                                                           830
-                                                           985)
-                                    (Maybe.Nothing) ())
-                                  (Result.Error error))))
-                        (Result.Error error)
+                (match (derive-core-owned resolved)
+                  (Result.Success core)
+                    (let-do []
+                      (match (CoreIR.duplicate-global-id &core)
+                        (Maybe.Just bad)
                           (Result.Error
-                            (CompileError.init (String.copy "infer")
-                                               @(InferError.message &error))))))))
+                            (CompileError.init (String.copy "validate")
+                                               (fmt
+                                                 "duplicate global reference id %d after derivation"
+                                                 bad)))
+                        (Maybe.Nothing)
+                          (match (let-do [_ignored-phase-resolved (match (IO.getenv "CARP_DEBUG_PHASES")
+                                            (Maybe.Just _)
+                                              (IO.errorln "phase: resolved+derived")
+                                            (Maybe.Nothing) ())
+                                          _ignored-fdump (match (IO.getenv "CARP_DEBUG_RESOLVED")
+                                            (Maybe.Just _)
+                                              (let [functions (CoreModule.functions &core)]
+                                                (for [i
+                                                      0
+                                                      (Array.length functions)]
+                                                  (let [f (Array.unsafe-nth functions
+                                                                            i)]
+                                                    (IO.errorln
+                                                      &(fmt "function %s params=%d"
+                                                            (CoreRef.name (CoreFunction.reference f))
+                                                            (Array.length (CoreFunction.parameters f)))))))
+                                            (Maybe.Nothing) ())]
+                              (Infer.module &core))
+                            (Result.Success inferred)
+                              (let-do [_ignored-p7 (phase-mark! "phase: inferred")
+                                       facts (OwnershipClassify.facts-from-module &core)
+                                       seeds (Specialize.named-requests &core
+                                                                        &inferred
+                                                                        check-names)]
+                                (match (specialize-closed &core
+                                                          &inferred
+                                                          &facts
+                                                          &seeds)
+                                  (Result.Success closed)
+                                    (match (let-do [_ignored-p8 (phase-mark! "phase: specialized")]
+                                        (if echo
+                                          (echo-augment &core
+                                                        &inferred
+                                                        &facts
+                                                        &seeds
+                                                        &closed)
+                                          (Result.Success
+                                            (Pair.init (Pair.copy &closed)
+                                                       (the (Maybe EchoPlan)
+                                                            (Maybe.Nothing))))))
+                                      (Result.Success closed-with-echo)
+                                        (let [final (Pair.a &closed-with-echo)
+                                              delete-symbols (delete-symbols-for &core
+                                                                                 (Pair.a final))
+                                              copy-symbols (copy-symbols-for &core
+                                                                             (Pair.a final))]
+                                          (match (lower-owned closed-with-echo
+                                                              delete-symbols
+                                                              copy-symbols)
+                                            (Result.Success backend)
+                                              (Result.Success backend)
+                                            (Result.Error error)
+                                              (Result.Error
+                                                (CompileError.init (String.copy "backend")
+                                                                   @(BackendError.message &error)))))
+                                      (Result.Error error) (Result.Error error))
+                                  (Result.Error error)
+                                    (do
+                                      (match (IO.getenv "CARP_DEBUG_FN")
+                                        (Maybe.Just fn-name)
+                                          (debug-dump-function &core
+                                                               &fn-name
+                                                               830
+                                                               985)
+                                        (Maybe.Nothing) ())
+                                      (Result.Error error))))
+                            (Result.Error error)
+                              (Result.Error
+                                (CompileError.init (String.copy "infer")
+                                                   @(InferError.message &error))))))
+                  (Result.Error error) (Result.Error error))))
           (Result.Error error)
             (Result.Error
               (CompileError.init (String.copy "resolve")
@@ -4406,24 +4493,29 @@ for ownership tooling.")
                 (Result.Error
                   (CompileError.init (String.copy "validate") message))
               (Maybe.Nothing)
-                (let [core (derive-core-owned resolved)]
-                  (match (Infer.module &core)
-                    (Result.Success inferred)
-                      (let [facts (OwnershipClassify.facts-from-module &core)
-                            seeds (Specialize.named-requests &core
-                                                             &inferred
-                                                             check-names)]
-                        (match (specialize-closed &core &inferred &facts &seeds)
-                          (Result.Success closed)
-                            (Result.Success
-                              (PlannedModule.init core
-                                                  inferred
-                                                  @(Pair.b &closed)))
-                          (Result.Error error) (Result.Error error)))
-                    (Result.Error error)
-                      (Result.Error
-                        (CompileError.init (String.copy "infer")
-                                           @(InferError.message &error))))))
+                (match (derive-core-owned resolved)
+                  (Result.Success core)
+                    (match (Infer.module &core)
+                      (Result.Success inferred)
+                        (let [facts (OwnershipClassify.facts-from-module &core)
+                              seeds (Specialize.named-requests &core
+                                                               &inferred
+                                                               check-names)]
+                          (match (specialize-closed &core
+                                                    &inferred
+                                                    &facts
+                                                    &seeds)
+                            (Result.Success closed)
+                              (Result.Success
+                                (PlannedModule.init core
+                                                    inferred
+                                                    @(Pair.b &closed)))
+                            (Result.Error error) (Result.Error error)))
+                      (Result.Error error)
+                        (Result.Error
+                          (CompileError.init (String.copy "infer")
+                                             @(InferError.message &error))))
+                  (Result.Error error) (Result.Error error)))
           (Result.Error error)
             (Result.Error
               (CompileError.init (String.copy "resolve")
@@ -4451,14 +4543,16 @@ types without emitting C.")
                 (Result.Error
                   (CompileError.init (String.copy "validate") message))
               (Maybe.Nothing)
-                (let [core (derive-core-owned resolved)]
-                  (match (Infer.module &core)
-                    (Result.Success inferred)
-                      (Result.Success (AnnotatedModule.init core inferred))
-                    (Result.Error error)
-                      (Result.Error
-                        (CompileError.init (String.copy "infer")
-                                           @(InferError.message &error))))))
+                (match (derive-core-owned resolved)
+                  (Result.Success core)
+                    (match (Infer.module &core)
+                      (Result.Success inferred)
+                        (Result.Success (AnnotatedModule.init core inferred))
+                      (Result.Error error)
+                        (Result.Error
+                          (CompileError.init (String.copy "infer")
+                                             @(InferError.message &error))))
+                  (Result.Error error) (Result.Error error)))
           (Result.Error error)
             (Result.Error
               (CompileError.init (String.copy "resolve")

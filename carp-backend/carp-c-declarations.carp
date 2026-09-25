@@ -63,9 +63,10 @@
           (match (instantiate-template-text source-declaration &bindings)
             (Result.Success typed-declaration)
               (Result.Success
-                (replace-template-token &typed-declaration
-                                        "$NAME"
-                                        &(sanitize symbol)))
+                (String.append &(linkage symbol)
+                               &(replace-template-token &typed-declaration
+                                                        "$NAME"
+                                                        &(sanitize symbol))))
             (Result.Error error) (Result.Error error))
         (Result.Error error) (Result.Error error))
     _ (Result.Error (BackendError.init @"declaration is not a source template"))))
@@ -288,12 +289,24 @@ binder in the body, first-of-a-name wins.")
 
 (defn clear-plain-locals! [] (set! *plain-local-ids* []))
 
-(defn callable-prototype [symbol signature parameters]
+(doc linkage "the storage prefix for a symbol this unit defines: nothing in an
+executable; in a library, default visibility for an exported root and
+`static` for everything else.")
+(defn linkage [symbol]
+  (match-ref &*library-exports*
+    (Maybe.Just exports)
+      (if (Array.contains? exports symbol)
+        @"__attribute__((visibility(\"default\"))) "
+        @"static ")
+    (Maybe.Nothing) @""))
+
+(defn callable-prototype-with [prefix symbol signature parameters]
   (match-ref signature
     (MonoType.Function arguments return-type)
       (match (render-type (Box.peek return-type))
         (Result.Success rendered-return)
           (let-do [buffer (StringBuf.create)
+                   _ignored-l (StringBuf.append-str &buffer prefix)
                    _ignored-a (StringBuf.append-str &buffer &rendered-return)
                    _ignored-b (StringBuf.append-char &buffer \space)
                    _ignored-c (StringBuf.append-str &buffer &(sanitize symbol))
@@ -312,6 +325,11 @@ binder in the body, first-of-a-name wins.")
       (Result.Error
         (BackendError.init @"callable declaration has a non-function signature"))))
 
+(doc callable-prototype "the prototype of a function this unit defines, with
+the linkage the unit gives its definitions.")
+(defn callable-prototype [symbol signature parameters]
+  (callable-prototype-with &(linkage symbol) symbol signature parameters))
+
 (defn prototype [declaration]
   (match-ref declaration
     (BackendDeclaration.Function symbol signature parameters _)
@@ -320,7 +338,12 @@ binder in the body, first-of-a-name wins.")
       (match (render-type (Box.peek signature))
         (Result.Success rendered)
           (Result.Success
-            (String.concat &[@"extern " rendered @" " (sanitize symbol) @";"]))
+            (String.concat
+              &[(if (Maybe.just? &*library-exports*) (linkage symbol) @"extern ")
+                rendered
+                @" "
+                (sanitize symbol)
+                @";"]))
         (Result.Error error) (Result.Error error))
     (BackendDeclaration.Intrinsic symbol signature external)
       (match-ref external
@@ -329,9 +352,11 @@ binder in the body, first-of-a-name wins.")
         (Maybe.Just _)
         (Result.Success (String.copy ""))
         (Maybe.Nothing)
+        ;; an intrinsic is declared here but never defined by the unit (the
+        ;; backend renders it inline), so it takes no linkage of its own.
         (match-ref (Box.peek signature)
           (MonoType.Function _ _)
-            (callable-prototype symbol (Box.peek signature) &[])
+            (callable-prototype-with "" symbol (Box.peek signature) &[])
           _
             (match (render-type (Box.peek signature))
               (Result.Success rendered)
@@ -971,6 +996,7 @@ signature and every emitted expression are in the unmanaged scalar subset.")
       (match (render-type (Box.peek return-type))
         (Result.Success rendered-return)
           (let-do [buffer (StringBuf.create)
+                   _ignored-l (StringBuf.append-str &buffer &(linkage symbol))
                    _ignored-a (StringBuf.append-str &buffer &rendered-return)
                    _ignored-b (StringBuf.append-char &buffer \space)
                    _ignored-c (StringBuf.append-str &buffer &(sanitize symbol))
@@ -1023,6 +1049,7 @@ self edge is rebuilt as a non-owning view of the fresh environment.")
            env-type (String.concat &[(String.copy &lambda-symbol) @"_env"])
            captures (ClosureFunction.captures closure-fn)
            buffer (StringBuf.create)]
+    (StringBuf.append-str &buffer &(linkage &env-type))
     (StringBuf.append-str &buffer "void* ")
     (StringBuf.append-str &buffer &env-type)
     (StringBuf.append-str &buffer "_copy(void* _raw) {
@@ -1124,6 +1151,7 @@ this callback and then frees the environment cell itself.")
              &[(sanitize (ClosureFunction.symbol closure-fn)) @"_env"])
            captures (ClosureFunction.captures closure-fn)
            buffer (StringBuf.create)]
+    (StringBuf.append-str &buffer &(linkage &env-type))
     (StringBuf.append-str &buffer "void ")
     (StringBuf.append-str &buffer &env-type)
     (StringBuf.append-str &buffer "_delete(void* _raw) {
@@ -1230,10 +1258,12 @@ sites and callback definitions can refer to them.")
                     (do
                       (StringBuf.append-str &buffer &typedef)
                       (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer &(linkage &env-type))
                       (StringBuf.append-str &buffer "void ")
                       (StringBuf.append-str &buffer &env-type)
                       (StringBuf.append-str &buffer "_delete(void* _raw);")
                       (StringBuf.append-char &buffer \newline)
+                      (StringBuf.append-str &buffer &(linkage &env-type))
                       (StringBuf.append-str &buffer "void* ")
                       (StringBuf.append-str &buffer &env-type)
                       (StringBuf.append-str &buffer "_copy(void* _raw);")
@@ -1388,7 +1418,8 @@ compile-time C initializer.")
                   (Result.Success initializer)
                     (Result.Success
                       (String.concat
-                        &[rendered-type
+                        &[(linkage symbol)
+                          rendered-type
                           @" "
                           (sanitize symbol)
                           @" = "
@@ -1396,14 +1427,16 @@ compile-time C initializer.")
                           @";"]))
                   (Result.Error error) (Result.Error error))
                 (Result.Success
-                  (String.concat &[rendered-type @" " (sanitize symbol) @";"])))
+                  (String.concat
+                    &[(linkage symbol) rendered-type @" " (sanitize symbol) @";"])))
             (Result.Error error) (Result.Error error))
           ;; a managed global is declared bare here; `global-initializers` emits
           ;; its startup assignment through the ownership-aware `append-result!`.
           (match (render-type (Box.peek signature))
             (Result.Success rendered-type)
               (Result.Success
-                (String.concat &[rendered-type @" " (sanitize symbol) @";"]))
+                (String.concat
+                  &[(linkage symbol) rendered-type @" " (sanitize symbol) @";"]))
             (Result.Error error) (Result.Error error))))
     _ (Result.Error (BackendError.init @"declaration is not a global value"))))
 
@@ -1571,8 +1604,13 @@ cycles retain declaration order.")
              ;; the reference signature: argc/argv feed `System.args` before
              ;; any other global initializes. The tentative definition merges
              ;; with the extern declaration programs that read it emit.
-             _ignored-open (StringBuf.append-str &buffer "Array System_args;
-void carp_init_globals(int argc, char** argv) {
+             _ignored-system-args (StringBuf.append-str &buffer
+                                                        "Array System_args;
+")
+             _ignored-linkage (StringBuf.append-str &buffer
+                                                    &(linkage "carp_init_globals"))
+             _ignored-open (StringBuf.append-str &buffer
+                                                 "void carp_init_globals(int argc, char** argv) {
   System_args.len = argc;
   System_args.data = argv;
 ")
