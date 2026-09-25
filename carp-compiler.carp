@@ -3203,10 +3203,21 @@ interface and keying it by its return type.")
           (MonoLifetime.Static))
       _ (MonoType.Unit)))
 
-  (private accessor-symbol)
-  (hidden accessor-symbol)
-  (defn accessor-symbol [qualified-name signature]
-    (CAbi.identifier &(CAbi.mangle qualified-name signature)))
+  (private add-accessor-source!)
+  (hidden add-accessor-source!)
+  (doc add-accessor-source! "gives the builtin the resolver declared for a
+registered type's accessor `name` its C source, as a template whose
+declaration spells `$NAME` and whose body opens with `$DECL`.")
+  (defn add-accessor-source! [core sources name declaration body]
+    (let-do [builtins (CoreModule.builtins core)]
+      (for [i 0 (Array.length builtins)]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (when (String.= (CoreRef.name (CoreBuiltin.reference builtin)) name)
+            (Array.push-back! sources
+                              (CoreBuiltinSource.init @(CoreBuiltin.reference builtin)
+                                                      @(CoreBuiltin.signature builtin)
+                                                      (CoreBuiltinPayload.Template @&declaration
+                                                                                   @&body))))))))
 
   (private register-type-typedefs)
   (hidden register-type-typedefs)
@@ -3214,9 +3225,13 @@ interface and keying it by its return type.")
 (e.g. `(register-type A \"void*\")`) aliases that existing C type to the name
 the backend renders for it, and a `register-type` with a member array gets its
 field accessors, setters, and constructor emitted against the existing C
-struct. Both ride the verbatim preamble channel.")
+struct. The typedef rides the verbatim preamble; each accessor becomes the C
+source of the builtin the resolver declared for it, so the backend renders it
+like any `deftemplate`: only when used, and with the linkage a library gives
+its own definitions.")
   (defn register-type-typedefs [core]
     (let-do [includes (Array.copy (CoreModule.system-includes core))
+             sources (Array.copy (CoreModule.builtin-sources core))
              declarations (CoreModule.type-declarations core)
              n (Array.length declarations)]
       (for [i 0 n]
@@ -3235,40 +3250,19 @@ struct. Both ride the verbatim preamble channel.")
         (let-do [declaration (Array.unsafe-nth declarations i)
                  type-name (CoreTypeDeclaration.name declaration)
                  c-name (CAbi.nominal-symbol type-name)
-                 t-mono (MonoType.Named (String.copy type-name) [])
                  members (CoreTypeDeclaration.members declaration)
                  mcount (Array.length members)
                  init-params (StringBuf.create)
                  init-body (StringBuf.create)
                  str-format (StringBuf.create)
-                 str-args (StringBuf.create)
-                 init-argument-types (the (Array (Box MonoType)) [])]
+                 str-args (StringBuf.create)]
           (for [m 0 mcount]
             (let-do [member (Array.unsafe-nth members m)
                      f-name (Pair.a member)
                      f-mono (member-mono (Pair.b member))
                      f-c (match (CAbi.render-type &f-mono)
                        (Result.Success rendered) rendered
-                       (Result.Error _) (String.copy "int"))
-                     getter-sig (MonoType.Function
-                       [(Box.init
-                          (MonoType.Reference (Box.init (MonoType.copy &t-mono))
-                                              (MonoLifetime.Static)))]
-                       (Box.init
-                         (MonoType.Reference (Box.init (MonoType.copy &f-mono))
-                                             (MonoLifetime.Static))))
-                     setter-sig (MonoType.Function
-                       [(Box.init (MonoType.copy &t-mono))
-                        (Box.init (MonoType.copy &f-mono))]
-                       (Box.init (MonoType.copy &t-mono)))
-                     mutator-sig (MonoType.Function
-                       [(Box.init
-                          (MonoType.Reference (Box.init (MonoType.copy &t-mono))
-                                              (MonoLifetime.Static)))
-                        (Box.init (MonoType.copy &f-mono))]
-                       (Box.init (MonoType.Unit)))]
-              (Array.push-back! &init-argument-types
-                                (Box.init (MonoType.copy &f-mono)))
+                       (Result.Error _) (String.copy "int"))]
               ;; member rendering for the derived str: format specifier plus
               ;; the C expression that supplies it. Members whose type has no
               ;; printf rendering show as a literal `?` with no argument.
@@ -3312,50 +3306,76 @@ struct. Both ride the verbatim preamble channel.")
               (StringBuf.append-str &init-body " = a")
               (StringBuf.append-str &init-body &(Int.str m))
               (StringBuf.append-str &init-body ";")
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-" (String.copy &f-c) @"* " (accessor-symbol
-                                                   &(String.concat
-                                                     &[(String.copy type-name)
-                                                       @"."
-                                                       (String.copy f-name)])
-                                                   &getter-sig) @"(" (String.copy &c-name) @"* p) { return &(p->" (String.copy f-name) @"); }"]))
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-" (String.copy &c-name) @" " (accessor-symbol
-                                                   &(String.concat
-                                                     &[(String.copy type-name)
-                                                       @".set-"
-                                                       (String.copy f-name)])
-                                                   &setter-sig) @"(" (String.copy &c-name) @" p, " (String.copy &f-c) @" v) { p." (String.copy f-name) @" = v; return p; }"]))
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-void " (accessor-symbol
-                                                   &(String.concat
-                                                     &[(String.copy type-name)
-                                                       @".set-"
-                                                       (String.copy f-name)
-                                                       @"!"])
-                                                   &mutator-sig) @"(" (String.copy &c-name) @"* p, " (String.copy &f-c) @" v) { p->" (String.copy f-name) @" = v; }"]))))
+              (add-accessor-source! core
+                                    &sources
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @"."
+                                        (String.copy f-name)])
+                                    (String.concat
+                                      &[(String.copy &f-c)
+                                        @"* $NAME("
+                                        (String.copy &c-name)
+                                        @"* p)"])
+                                    (String.concat
+                                      &[@"$DECL { return &(p->"
+                                        (String.copy f-name)
+                                        @"); }"]))
+              (add-accessor-source! core
+                                    &sources
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @".set-"
+                                        (String.copy f-name)])
+                                    (String.concat
+                                      &[(String.copy &c-name)
+                                        @" $NAME("
+                                        (String.copy &c-name)
+                                        @" p, "
+                                        (String.copy &f-c)
+                                        @" v)"])
+                                    (String.concat
+                                      &[@"$DECL { p."
+                                        (String.copy f-name)
+                                        @" = v; return p; }"]))
+              (add-accessor-source! core
+                                    &sources
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @".set-"
+                                        (String.copy f-name)
+                                        @"!"])
+                                    (String.concat
+                                      &[@"void $NAME("
+                                        (String.copy &c-name)
+                                        @"* p, "
+                                        (String.copy &f-c)
+                                        @" v)"])
+                                    (String.concat
+                                      &[@"$DECL { p->"
+                                        (String.copy f-name)
+                                        @" = v; }"]))))
           (when (Int.> mcount 0)
-            (let [init-sig (MonoType.Function init-argument-types
-                                              (Box.init (MonoType.copy &t-mono)))]
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-" (String.copy &c-name) @" " (accessor-symbol
-                                                   &(String.concat &[(String.copy type-name)
-                                                                     @".init"])
-                                                   &init-sig) @"(" (StringBuf.into-string init-params) @") { " (String.copy &c-name) @" r;" (StringBuf.into-string init-body) @" return r; }"]))))
+            (add-accessor-source! core
+                                  &sources
+                                  &(String.concat &[(String.copy type-name)
+                                                    @".init"])
+                                  (String.concat
+                                    &[(String.copy &c-name)
+                                      @" $NAME("
+                                      (StringBuf.into-string init-params)
+                                      @")"])
+                                  (String.concat
+                                    &[@"$DECL { "
+                                      (String.copy &c-name)
+                                      @" r;"
+                                      (StringBuf.into-string init-body)
+                                      @" return r; }"])))
           ;; the derived str for a registered struct renders like a deftype's:
           ;; `(Banana 2.3 1000)`. It rides the same verbatim channel as the
           ;; accessors because the struct layout is external C.
           (when (Int.> mcount 0)
-            (let [str-sig (MonoType.Function
-                    [(Box.init
-                       (MonoType.Reference (Box.init (MonoType.copy &t-mono))
-                                           (MonoLifetime.Static)))]
-                    (Box.init (MonoType.String)))
-                  format (String.concat
+            (let [format (String.concat
                     &[@"("
                       (String.copy type-name)
                       (StringBuf.into-string str-format)
@@ -3363,16 +3383,28 @@ void " (accessor-symbol
                   ;; drained once: `to-string` empties the buffer, so a second
                   ;; call emitted a format string with no arguments.
                   args-text (StringBuf.into-string str-args)]
-              (Array.push-back! &includes
-                                (String.concat &[@"//registered accessor
-String " (accessor-symbol
-                                                   &(String.concat &[(String.copy type-name)
-                                                                     @".str"])
-                                                   &str-sig) @"(" (String.copy &c-name) @"* p) { int size = snprintf(NULL, 0, \"" (String.copy &format) @"\"" (String.copy &args-text) @") + 1; String buffer = CARP_MALLOC(size); snprintf(buffer, size, \"" (String.copy &format) @"\"" (String.copy &args-text) @"); return buffer; }"]))))))
+              (add-accessor-source! core
+                                    &sources
+                                    &(String.concat &[(String.copy type-name)
+                                                      @".str"])
+                                    (String.concat
+                                      &[@"String $NAME("
+                                        (String.copy &c-name)
+                                        @"* p)"])
+                                    (String.concat
+                                      &[@"$DECL { int size = snprintf(NULL, 0, \""
+                                        (String.copy &format)
+                                        @"\""
+                                        (String.copy &args-text)
+                                        @") + 1; String buffer = CARP_MALLOC(size); snprintf(buffer, size, \""
+                                        (String.copy &format)
+                                        @"\""
+                                        (String.copy &args-text)
+                                        @"); return buffer; }"]))))))
       (CoreModule.init @(CoreModule.functions core)
                        @(CoreModule.values core)
                        @(CoreModule.builtins core)
-                       @(CoreModule.builtin-sources core)
+                       sources
                        @(CoreModule.signatures core)
                        @(CoreModule.type-declarations core)
                        @(CoreModule.constructors core)
