@@ -39,8 +39,9 @@ done
 # `static` is what keeps two static archives apart, and a shared build cannot
 # see it (the pragma hides the same symbols there). An object file can: the
 # only definitions a library may make visible beyond what its headers define
-# are its roots. The baseline is a unit of nothing but the library's own
-# #include lines, so it measures the headers and none of metacarp's output.
+# are its roots. The baseline is the library's own preamble, everything
+# before the visibility pragma (includes, preprocessor lines, typedefs), so it
+# measures the headers and none of metacarp's output.
 external_definitions() {
   nm -g "$1" | awk 'NF == 3 && $2 != "U" { sub(/^_/, "", $3); print $3 }' |
     sort -u
@@ -48,7 +49,8 @@ external_definitions() {
 roots=$(grep -oE 'C[0-9]+_[A-Za-z0-9_]+__[A-Za-z0-9_]+' "$fixtures/host.c" |
   sort -u)
 for name in alpha beta; do
-  grep '^#include' "$work_dir/$name.c" >"$work_dir/$name-headers.c"
+  sed '/^#pragma GCC visibility push/,$d' "$work_dir/$name.c" \
+    >"$work_dir/$name-headers.c"
   cc "${flags[@]}" -c -o "$work_dir/$name-headers.o" \
     "$work_dir/$name-headers.c"
   external_definitions "$work_dir/$name-headers.o" \
