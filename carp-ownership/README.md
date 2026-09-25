@@ -45,6 +45,24 @@ it (the let, the set! site, the branch body), so the backend can tell a
 set!-site delete from a scope-exit delete on the same binder. `match-ref`
 branches borrow and never schedule deletes.
 
+## Structured borrow places
+
+A borrow action carries an explicit `Shared` or `Unique` mode and an
+`OwnershipPlace`: a root resource followed by field, index, slice, or
+dereference projections. Unknown indices and slice bounds are represented
+explicitly and therefore overlap conservatively. `Ownership.places-overlap?`
+proves separation only for different roots and known-disjoint projections. It
+compares steps only while both paths count from the same offset (a slice with a
+different start shifts every step after it), and only when neither place
+dereferences past the path the two provably share: two references can point at
+the same memory. A place must carry a `Deref` for every step through a
+reference, including one from a reference-typed root.
+
+This representation does not itself introduce new rejection behavior. The
+current planner preserves its existing decisions, while reports serialize the
+borrow mode and root. Later loan checking can consume the structured place
+without changing the ownership-plan protocol again.
+
 ## Identity invariants
 
 Ownership locations are keyed by a concrete specialization context plus the
