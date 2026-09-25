@@ -57,10 +57,12 @@ With no `-b`/`-x`, the C translation unit is written to standard output (or
 `-b`/`-x` require `--core`, because linking needs the runtime headers the
 standard library ships with.
 
-`--library` emits an entry-point-free translation unit rooted at the named
-definitions in the input source. It is intended for embedding in a shared or
-static library whose host supplies the stable exported boundary; it does not
-emit executable startup or `main` glue.
+`--library` emits an entry-point-free translation unit for a shared or static
+library, rooted at the public definitions in the input source. A public
+definition that cannot be compiled on its own (a generic function) is an error;
+a private helper is reached through the roots. There is no `main`, so the unit
+initializes its globals in a load-time constructor and `System.args` is empty.
+Top-level expressions have nowhere to run and are an error.
 
 `(load ...)` resolves like the reference compiler's: relative to the loading
 file, then the Core directory — and git references install into the shared
