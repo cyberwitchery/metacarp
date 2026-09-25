@@ -37,7 +37,10 @@ to a sub-place. Unknown array indices and slice bounds are represented by
 
 (doc OwnershipPlace "names memory as a root resource followed by zero or more
 projections. A root-only place preserves the meaning of the former bare
-resource representation while allowing later field-sensitive loan checking.")
+resource representation while allowing later field-sensitive loan checking.
+Whoever builds a place must add a `Deref` for every step through a reference,
+including one taken from a reference-typed root: `places-overlap?` only knows
+memory can alias where it sees a dereference.")
 (deftype OwnershipPlace
   [root OwnershipResource
    projections (Array OwnershipProjection)])
@@ -305,19 +308,21 @@ deleters are polymorphic over each arity.")
       (OwnershipResource.Result)
         (match-ref right (OwnershipResource.Result) true _ false)))
 
+  (private known-le?)
+  (hidden known-le?)
+  (doc known-le? "whether both bounds are known and `a` is at most `b`.")
+  (defn known-le? [a b]
+    (match-ref a
+      (Maybe.Just x) (match-ref b (Maybe.Just y) (Int.<= @x @y) _ false)
+      _ false))
+
   (private index-outside-slice?)
   (hidden index-outside-slice?)
   (defn index-outside-slice? [index start end]
-    (match-ref index
-      (Maybe.Just i)
-        (match-ref start
-          (Maybe.Just s)
-            (if (Int.< @i @s)
-              true
-              (match-ref end (Maybe.Just e) (Int.>= @i @e) (Maybe.Nothing) false))
-          (Maybe.Nothing)
-            (match-ref end (Maybe.Just e) (Int.>= @i @e) (Maybe.Nothing) false))
-      (Maybe.Nothing) false))
+    (or (known-le? end index)
+        (match-ref index
+          (Maybe.Just i) (known-le? &(Maybe.Just (Int.inc @i)) start)
+          _ false)))
 
   (private projections-disjoint?)
   (hidden projections-disjoint?)
@@ -330,12 +335,7 @@ deleters are polymorphic over each arity.")
       (OwnershipProjection.Index l)
         (match-ref right
           (OwnershipProjection.Index r)
-            (match-ref l
-              (Maybe.Just li)
-                (match-ref r
-                  (Maybe.Just ri) (Int./= @li @ri)
-                  (Maybe.Nothing) false)
-              (Maybe.Nothing) false)
+            (and (Maybe.just? l) (Maybe.just? r) (/= l r))
           (OwnershipProjection.Slice start end)
             (index-outside-slice? l start end)
           _ false)
@@ -344,32 +344,24 @@ deleters are polymorphic over each arity.")
           (OwnershipProjection.Index index)
             (index-outside-slice? index lstart lend)
           (OwnershipProjection.Slice rstart rend)
-            (match-ref lend
-              (Maybe.Just le)
-                (match-ref rstart
-                  (Maybe.Just rs)
-                    (if (Int.<= @le @rs)
-                      true
-                      (match-ref rend
-                        (Maybe.Just re)
-                          (match-ref lstart
-                            (Maybe.Just ls) (Int.<= @re @ls)
-                            (Maybe.Nothing) false)
-                        (Maybe.Nothing) false))
-                  (Maybe.Nothing)
-                    (match-ref rend
-                      (Maybe.Just re)
-                        (match-ref lstart
-                          (Maybe.Just ls) (Int.<= @re @ls)
-                          (Maybe.Nothing) false)
-                      (Maybe.Nothing) false))
-              (Maybe.Nothing)
-                (match-ref rend
-                  (Maybe.Just re)
-                    (match-ref lstart
-                      (Maybe.Just ls) (Int.<= @re @ls)
-                      (Maybe.Nothing) false)
-                  (Maybe.Nothing) false))
+            (or (known-le? lend rstart) (known-le? rend lstart))
+          _ false)
+      _ false))
+
+  (private aligned-projection?)
+  (hidden aligned-projection?)
+  (doc aligned-projection? "whether two steps that may differ still leave the
+steps after them counting from the same offset: two indices each reach one
+element, and two slices with the same known start number their elements alike.
+Slices with different or unknown starts shift what follows, so a later step
+compares nothing.")
+  (defn aligned-projection? [left right]
+    (match-ref left
+      (OwnershipProjection.Index _)
+        (match-ref right (OwnershipProjection.Index _) true _ false)
+      (OwnershipProjection.Slice ls _)
+        (match-ref right
+          (OwnershipProjection.Slice rs _) (and (Maybe.just? ls) (= ls rs))
           _ false)
       _ false))
 
@@ -404,12 +396,13 @@ An unknown index or bound never does: two of them may differ.")
       found))
 
   (doc places-overlap? "conservatively decides whether two structured memory
-places can denote common bytes. Places are separate when, past the steps they
-provably share, one step is disjoint (different known fields, different known
-indices, non-overlapping half-open slices, or different roots) and neither
-place dereferences after that shared path: a reference can point anywhere, so
-two dereferences through different paths may meet. A whole place overlaps each
-of its subplaces.")
+places can denote common bytes. Different roots are separate unless either
+place dereferences. Under one root, the steps both places provably share are
+skipped; from the first step that differs, a disjoint step (different known
+fields, different known indices, non-overlapping half-open slices) proves them
+separate only if every step before it left both paths at the same offset and
+neither place dereferences past the shared path, since a reference can point
+anywhere. A whole place overlaps each of its subplaces.")
   (defn places-overlap? [left right]
     (let-do [left-projections (OwnershipPlace.projections left)
              right-projections (OwnershipPlace.projections right)
@@ -417,22 +410,24 @@ of its subplaces.")
                         (Array.length right-projections))
              same-root (same-resource? (OwnershipPlace.root left)
                                        (OwnershipPlace.root right))
-             shared 0]
-      (when same-root
-        (while-do (and (Int.< shared n)
-                       (same-projection?
-                         (Array.unsafe-nth left-projections shared)
-                         (Array.unsafe-nth right-projections shared)))
-          (set! shared (Int.inc shared))))
-      (if (or (deref-from? left-projections shared)
-              (deref-from? right-projections shared))
-        true
-        (let-do [disjoint (not same-root)]
-          (for [i shared n]
-            (when (projections-disjoint? (Array.unsafe-nth left-projections i)
-                                         (Array.unsafe-nth right-projections i))
-              (set! disjoint true)))
-          (not disjoint)))))
+             ;; 0 undecided, 1 overlap, 2 separate
+             verdict 0
+             i 0]
+      (if (not same-root)
+        (or (deref-from? left-projections 0) (deref-from? right-projections 0))
+        (do
+          (while-do (and (Int.= verdict 0) (Int.< i n))
+            (let [l (Array.unsafe-nth left-projections i)
+                  r (Array.unsafe-nth right-projections i)]
+              (cond
+                (same-projection? l r) (set! i (Int.inc i))
+                (or (deref-from? left-projections i)
+                    (deref-from? right-projections i))
+                  (set! verdict 1)
+                (projections-disjoint? l r) (set! verdict 2)
+                (aligned-projection? l r) (set! i (Int.inc i))
+                (set! verdict 1))))
+          (Int./= verdict 2)))))
 
   (private invalid-id)
   (hidden invalid-id)

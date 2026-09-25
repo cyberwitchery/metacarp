@@ -51,9 +51,12 @@ A borrow action carries an explicit `Shared` or `Unique` mode and an
 `OwnershipPlace`: a root resource followed by field, index, slice, or
 dereference projections. Unknown indices and slice bounds are represented
 explicitly and therefore overlap conservatively. `Ownership.places-overlap?`
-proves separation only for different roots and known-disjoint projections, and
-only when neither place dereferences past the path the two provably share: two
-references can point at the same memory.
+proves separation only for different roots and known-disjoint projections. It
+compares steps only while both paths count from the same offset (a slice with a
+different start shifts every step after it), and only when neither place
+dereferences past the path the two provably share: two references can point at
+the same memory. A place must carry a `Deref` for every step through a
+reference, including one from a reference-typed root.
 
 This representation does not itself introduce new rejection behavior. The
 current planner preserves its existing decisions, while reports serialize the
