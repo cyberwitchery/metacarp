@@ -1,0 +1,152 @@
+;; Runs the pass over a corpus of compile-time programs written for it, each one
+;; carrying the verdict it expects.
+;;
+;;   carp -x corpus/cases.carp          (from the library root)
+;;
+;; The other corpora answer narrower questions. `oracle.carp` checks the builtin
+;; table against the evaluator, `mutate.carp` seeds errors into the standard
+;; library and counts how many come back, `run.carp` asks whether a clean library
+;; stays clean. None of them can say whether the pass catches a mistake somebody
+;; would actually make, because none of them contains one: a mutant is an error
+;; the operators knew how to write, and a shape error in a macro body usually
+;; fails the first time the macro is used, so committed code has almost none.
+;;
+;; So the cases here are written by hand, one defect or one correct idiom per
+;; file, and each states what it expects:
+;;
+;;   expect: reject   a finding is the right answer, and its absence is a miss
+;;   expect: accept   a finding is a false positive
+;;   expect: gap      a complete checker would reject this; this one cannot see
+;;                    it yet, and the file says what it would take
+;;
+;; A case is checked on its own, so the only names the pass knows in it are the
+;; builtins and the definitions the file itself makes: Core's dynamic library is
+;; not loaded. A case that wants `caar` writes it out, which is no loss, since
+;; spelling the chain out is what makes an interprocedural case legible.
+;;
+;; The gaps are the point as much as the rejections. They are the roadmap, they
+;; fail nothing today, and the runner announces it the moment one starts being
+;; caught.
+
+(load "../carp-ct-infer.carp")
+(Project.no-echo)
+
+(def *cases-dir* @"corpus/cases")
+
+(defn read-source [path]
+  (match (IO.read-file path)
+    (Result.Success source) (Maybe.Just source)
+    (Result.Error _) (Maybe.Nothing)))
+
+(doc expectation "the verdict a case file declares, read off its header.")
+(defn expectation [source]
+  (let-do [found @"none"
+           lines (String.lines source)]
+    (for [i 0 (Array.length &lines)]
+      (let [line (String.trim (Array.unsafe-nth &lines i))]
+        (when (and (= &found "none") (String.starts-with? &line ";; expect:"))
+          (set! found
+                (String.trim &(String.suffix &line (String.length ";; expect:")))))))
+    found))
+
+(doc findings-for "checks one case on its own and answers how many findings it
+produced. Each case is a program of its own, so the pass is reset for it.")
+(defn findings-for [path source]
+  (do
+    (CtInfer.reset!)
+    (match (Surface.parse-in path source)
+      (Result.Error _) -1
+      (Result.Success module)
+        (do (CtInfer.check-parsed &module) (Array.length (CtInfer.findings))))))
+
+(defn print-findings []
+  (let-do [findings (CtInfer.findings)]
+    (for [i 0 (Array.length findings)]
+      (let [f (Array.unsafe-nth findings i)]
+        (IO.println
+          &(fmt "      [%s] %s" (CtShapeError.kind f) &(CtCheck.render f)))))))
+
+(defn manifest-cases [listing]
+  (let-do [out (the (Array String) [])
+           lines (String.lines listing)]
+    (for [i 0 (Array.length &lines)]
+      (let [line (String.trim (Array.unsafe-nth &lines i))]
+        (unless (or (String.empty? &line) (String.starts-with? &line ";"))
+          (set! out (Array.push-back out line)))))
+    out))
+
+(def *matched* 0)
+(def *false-positives* 0)
+(def *false-negatives* 0)
+(def *gaps-open* 0)
+(def *gaps-closed* 0)
+(def *broken* 0)
+
+(defn judge [name expect found]
+  (cond
+    (Int.= found -1)
+      (do
+        (IO.println &(fmt "  UNPARSED       %s" name))
+        (set! *broken* (Int.inc *broken*)))
+    (= expect "none")
+      (do
+        (IO.println &(fmt "  NO EXPECTATION %s" name))
+        (set! *broken* (Int.inc *broken*)))
+    (= expect "reject")
+      (if (Int.> found 0)
+        (set! *matched* (Int.inc *matched*))
+        (do
+          (IO.println
+            &(fmt "  MISSED         %s: expected a finding, got none" name))
+          (set! *false-negatives* (Int.inc *false-negatives*))))
+    (= expect "accept")
+      (if (Int.= found 0)
+        (set! *matched* (Int.inc *matched*))
+        (do
+          (IO.println
+            &(fmt "  FALSE POSITIVE %s: expected no finding, got %d" name found))
+          (print-findings)
+          (set! *false-positives* (Int.inc *false-positives*))))
+    (= expect "gap")
+      (if (Int.= found 0)
+        (set! *gaps-open* (Int.inc *gaps-open*))
+        (do
+          (IO.println
+            &(fmt
+              "  GAP CLOSED     %s: this is now caught, update the case"
+              name))
+          (print-findings)
+          (set! *gaps-closed* (Int.inc *gaps-closed*))))
+    (do
+      (IO.println &(fmt "  UNKNOWN VERDICT %s: '%s'" name expect))
+      (set! *broken* (Int.inc *broken*)))))
+
+(defn main []
+  (match (read-source &(String.concat &[@&*cases-dir* @"/MANIFEST"]))
+    (Maybe.Nothing)
+      (IO.println
+        "could not read corpus/cases/MANIFEST; run from the library root")
+    (Maybe.Just listing)
+      (let-do [cases (manifest-cases &listing)]
+        (for [i 0 (Array.length &cases)]
+          (let [name (Array.unsafe-nth &cases i)
+                path (String.concat &[@&*cases-dir* @"/" @name])]
+            (match (read-source &path)
+              (Maybe.Nothing)
+                (do
+                  (IO.println &(fmt "  MISSING        %s" name))
+                  (set! *broken* (Int.inc *broken*)))
+              (Maybe.Just source)
+                (judge name &(expectation &source) (findings-for &path &source)))))
+        (IO.println "")
+        (IO.println &(fmt "cases                 : %d" (Array.length &cases)))
+        (IO.println &(fmt "  matched             : %d" *matched*))
+        (IO.println &(fmt "  false positives     : %d" *false-positives*))
+        (IO.println &(fmt "  missed rejections   : %d" *false-negatives*))
+        (IO.println &(fmt "  gaps open           : %d" *gaps-open*))
+        (IO.println &(fmt "  gaps newly caught   : %d" *gaps-closed*))
+        (IO.println &(fmt "  unusable cases      : %d" *broken*))
+        (when (Int.>
+            (Int.+ *false-positives* (Int.+ *false-negatives* *broken*))
+            0)
+          (System.exit 1)))))

@@ -1,0 +1,1331 @@
+(doc CtSub "a set-theoretic type algebra for the compile-time language: tags,
+products and arrows, closed under union, intersection and negation, with
+subtyping decided as emptiness of `t ⊓ ¬s`.
+
+`carp-ct-types` is the tag-only fragment of this, the shape homomorphism `H`
+alone. Tags answer what a value is; they cannot answer what is *inside* a value
+or what a function does with one, so the constraints the shape pass has to leave
+unsaid — an argument whose elements must be symbols, the syntax a macro emits,
+what a closure returns — are exactly the ones that need structure. A container
+is structure: a sequence is either empty or a pair of a first element and a
+rest. So is a function: a domain and a codomain.
+
+Values fall in four kinds and the algebra keeps them apart, because a value is
+one of them and never two:
+
+  atomic    an Int, a Bool, a Symbol, a String, …
+  empty     the empty container, one leaf per container kind
+  product   a non-empty container: a first element, and a rest of the same kind
+  function  a closure, a macro or a builtin, described by its arrows
+
+A type is a union of clauses in disjunctive normal form. A clause carries the
+tag leaves it still allows as a bitmask — tag literals only ever shrink it, so
+one mask holds every positive and negative tag literal at once — plus the
+structured atoms it requires and the ones it forbids. Types are interned in an
+arena and named by their index, so a type is an `Int` here exactly as a shape is
+an `Int` in `carp-ct-types`.
+
+Emptiness is decided per kind, and each structured kind has its own rule:
+
+  products  a conjunction of required products minus a union of forbidden ones
+            is inhabited when the forbidden atoms can be split so that one side
+            leaves a first element and the other a rest
+
+  arrows    `s → t` holds the functions `f` with `f ⊓ (s × ¬t) = ⊥`, so a
+            witness against `u → v` is an argument in `u` and a result outside
+            `v` that every required arrow still accepts. That is a split of the
+            *required* arrows, and because a function value may hold many pairs,
+            each forbidden arrow can be answered separately
+
+Both rules enumerate subsets, which is where the cost of the decision procedure
+lives. `subset-limit` caps the enumeration and answers `inhabited` past the cap,
+so a pass built on this keeps reporting only what it can prove.
+
+`reset!` must run before anything else: ⊥ and ⊤ are arena entries, and reading
+one out of an empty arena is an out-of-bounds index rather than an error.")
+
+(doc CtAtom "one structured atom, in either dimension.
+
+`shape` says which. A product is a non-empty container of `kind` whose first
+element is `left` and whose rest is `right`; an arrow is a function of callable
+sort `kind` that answers in `right` for every argument in `left`. The two share
+a representation because they share every operation except the rule that
+decides their emptiness.")
+(deftype CtAtom [shape Int
+                 kind Int
+                 left Int
+                 right Int])
+
+(doc CtClause "one conjunction in disjunctive normal form: the tag leaves it
+allows, the structured atoms it requires, and the ones it forbids.")
+(deftype CtClause [tags Int
+                   pos (Array Int)
+                   neg (Array Int)])
+
+;; the type arena. A type id indexes this; ids 0 and 1 are ⊥ and ⊤, interned by
+;; `reset!` so that the two constants are cheap and always present.
+(def *ct-sub-types* (the (Array (Array CtClause)) []))
+(def *ct-sub-atoms* (the (Array CtAtom) []))
+
+;; one interned type per container kind. The product rule needs "every container
+;; of this kind" for the rest component of a clause with no required atoms, and
+;; it asks often enough that interning a fresh one each time would grow the
+;; arena without bound.
+(def *ct-sub-containers* (the (Array Int) []))
+
+;; interning. A type is named by its arena index, and two structurally equal
+;; types have to get the SAME index or nothing downstream can compare types
+;; cheaply: `equal?` would be two emptiness checks every time, and emptiness
+;; could not be memoised by identity. So every type and every atom is looked up
+;; by a canonical key before it is added.
+(def *ct-sub-index* (the (Map String Int) (Map.create)))
+(def *ct-sub-atom-index* (the (Map String Int) (Map.create)))
+
+;; emptiness is the one expensive question here, and the answer for a type never
+;; changes, so it is remembered per interned id.
+(def *ct-sub-empty-memo* (the (Map Int Bool) (Map.create)))
+
+;; recursive types, cached by what they describe. A type that mentions itself
+;; cannot be interned by its contents — the contents are not known until the id
+;; exists — so these are keyed by the question they answer instead.
+(def *ct-sub-recursive* (the (Map String Int) (Map.create)))
+
+;; the ids whose emptiness is currently being decided, and how often re-entering
+;; one has been assumed. A recursive type asks about itself, and the assumption
+;; that closes the loop is that it is empty until something proves otherwise:
+;; `µX. (Symbol × X)` has no finite value and comes out empty, while
+;; `µX. () ⊔ (Symbol × X)` holds the empty list and comes out inhabited. A result
+;; that leaned on an assumption is not remembered, because it was only true under
+;; that assumption.
+(def *ct-sub-pending* (the (Array Int) []))
+
+;; how a recursive type reads. It cannot be worked out by looking at one, because
+;; looking at one leads back to it, so the wording is kept from when it was built.
+(def *ct-sub-descriptions* (the (Map Int String) (Map.create)))
+
+;; the spellings singleton types are about. A symbol type says "a symbol"; a
+;; singleton says which one, which is what it takes to know that the head of an
+;; emitted form is `if` and not merely a symbol.
+(def *ct-sub-spellings* (the (Array String) []))
+(def *ct-sub-spelling-index* (the (Map String Int) (Map.create)))
+(def *ct-sub-assumptions* 0)
+
+(defmodule CtSub
+  (doc kind-count "the container kinds: list, array, static array, dictionary,
+collection. A conversion between two of them is not a subtyping relation, so
+they are siblings here as they are in the tag lattice.")
+  (defn kind-count [] 5)
+
+  (defn k-list [] 0)
+  (defn k-array [] 1)
+  (defn k-static-array [] 2)
+  (defn k-dictionary [] 3)
+  (defn k-collection [] 4)
+
+  (doc sort-count "the callable sorts. A macro binds its arguments unevaluated
+and a builtin is the evaluator answering for itself, so the three are not
+interchangeable and do not share arrows.")
+  (defn sort-count [] 3)
+
+  (defn s-closure [] 0)
+  (defn s-macro [] 1)
+  (defn s-builtin [] 2)
+
+  (doc shape-product "the product dimension.")
+  (defn shape-product [] 0)
+
+  (doc shape-arrow "the arrow dimension.")
+  (defn shape-arrow [] 1)
+
+  (doc shape-literal "the singleton dimension: one value of a leaf rather than
+every value of it.")
+  (defn shape-literal [] 2)
+
+  ;; bit layout: 11 atomic leaves, then one empty-container leaf per kind, then
+  ;; one product bit per kind, then one arrow bit per callable sort. A product or
+  ;; arrow bit is not a leaf a value can be on its own: it says a clause admits
+  ;; atoms of that dimension and kind, and the atoms say which ones.
+  (defn i-int [] 0)
+  (defn i-byte [] 1)
+  (defn i-long [] 2)
+  (defn i-float [] 3)
+  (defn i-double [] 4)
+  (defn i-bool [] 5)
+  (defn i-char [] 6)
+  (defn i-string [] 7)
+  (defn i-pattern [] 8)
+  (defn i-symbol [] 9)
+  (defn i-comment [] 10)
+  (defn i-empty [kind] (Int.+ 11 kind))
+  (defn i-product [kind] (Int.+ 16 kind))
+  (defn i-arrow [sort] (Int.+ 21 sort))
+  (defn i-closure [] (i-arrow (s-closure)))
+  (defn i-macro [] (i-arrow (s-macro)))
+  (defn i-builtin [] (i-arrow (s-builtin)))
+  (defn leaf-count [] 24)
+
+  (defn leaf [index] (Int.bit-shift-left 1 index))
+
+  (private range-mask)
+  (hidden range-mask)
+  (defn range-mask [from to]
+    (let-do [mask 0]
+      (for [i from (Int.inc to)] (set! mask (Int.bit-or mask (leaf i))))
+      mask))
+
+  (doc atomic-mask "every leaf a value can be without being a container or a
+function.")
+  (defn atomic-mask [] (range-mask (i-int) (i-comment)))
+
+  (doc empty-mask "the empty containers, one leaf per kind.")
+  (defn empty-mask [] (range-mask (i-empty 0) (i-empty 4)))
+
+  (doc product-mask "the bits that admit products, one per container kind.")
+  (defn product-mask [] (range-mask (i-product 0) (i-product 4)))
+
+  (doc arrow-mask "the bits that admit functions, one per callable sort.")
+  (defn arrow-mask [] (range-mask (i-arrow 0) (i-arrow 2)))
+
+  (doc value-mask "the leaves a value inhabits on its own: the atomic ones and
+the empty containers. A product bit and an arrow bit are not leaves a value can
+be; they say which structured atoms a clause admits.")
+  (defn value-mask [] (Int.bit-or (atomic-mask) (empty-mask)))
+
+  (doc structured-mask "the product and arrow bits together.")
+  (defn structured-mask [] (Int.bit-or (product-mask) (arrow-mask)))
+
+  (defn all-mask [] (Int.bit-or (value-mask) (structured-mask)))
+
+  (doc subset-limit "how many atoms one emptiness rule will enumerate subsets
+of. Past it the clause is called inhabited, which keeps the algebra on the side
+of proving nothing rather than proving something false.")
+  (defn subset-limit [] 12)
+
+  ;; ------------------------------------------------------------ the arena
+
+  (private intern)
+  (hidden intern)
+  (sig intern (Fn [(Array CtClause)] Int))
+  (private sorted-ints)
+  (hidden sorted-ints)
+  ;; insertion sort with duplicates dropped. These arrays are the atom lists of
+  ;; one clause, a handful of elements at most, and a canonical order is what
+  ;; makes two equal clauses produce one key.
+  (defn sorted-ints [xs]
+    (let-do [out (the (Array Int) [])]
+      (for [i 0 (Array.length xs)]
+        (let-do [v @(Array.unsafe-nth xs i)
+                 at (Array.length &out)
+                 seen false]
+          (for [j 0 (Array.length &out)]
+            (let [here @(Array.unsafe-nth &out j)]
+              (cond
+                (Int.= here v) (set! seen true)
+                (and (Int.> here v) (Int.= at (Array.length &out))) (set! at j)
+                ())))
+          (unless seen
+            (let-do [grown (the (Array Int) [])]
+              (for [j 0 at]
+                (set! grown (Array.push-back grown @(Array.unsafe-nth &out j))))
+              (set! grown (Array.push-back grown v))
+              (for [j at (Array.length &out)]
+                (set! grown (Array.push-back grown @(Array.unsafe-nth &out j))))
+              (set! out grown)))))
+      out))
+
+  (private shares-atom?)
+  (hidden shares-atom?)
+  (defn shares-atom? [a b]
+    (let-do [found false]
+      (for [i 0 (Array.length a)]
+        (for [j 0 (Array.length b)]
+          (when (Int.= @(Array.unsafe-nth a i) @(Array.unsafe-nth b j))
+            (set! found true))))
+      found))
+
+  (private ints-key)
+  (hidden ints-key)
+  (defn ints-key [xs]
+    (let-do [parts (the (Array String) [])]
+      (for [i 0 (Array.length xs)]
+        (set! parts (Array.push-back parts (Int.str @(Array.unsafe-nth xs i)))))
+      (String.join "," &parts)))
+
+  (private clause-key)
+  (hidden clause-key)
+  (defn clause-key [clause]
+    (String.concat
+      &[(Int.str @(CtClause.tags clause))
+        @":"
+        (ints-key (CtClause.pos clause))
+        @"!"
+        (ints-key (CtClause.neg clause))]))
+
+  (private normalize)
+  (hidden normalize)
+  (doc normalize "puts a clause list in canonical form: every atom list sorted
+and deduplicated, every clause that cannot hold a value dropped, and duplicate
+clauses removed. A clause admitting no leaf holds nothing, and neither does one
+that requires and forbids the same atom.")
+  (defn normalize [clauses]
+    (let-do [out (the (Array CtClause) [])
+             keys (the (Array String) [])]
+      (for [i 0 (Array.length &clauses)]
+        (let-do [clause (Array.unsafe-nth &clauses i)
+                 pos (sorted-ints (CtClause.pos clause))
+                 neg (sorted-ints (CtClause.neg clause))
+                 tags @(CtClause.tags clause)]
+          (unless (or (Int.= 0 tags) (shares-atom? &pos &neg))
+            ;; the duplicate check is a loop rather than `Array.any?` because a
+            ;; lambda capturing `key` would give it away and the push below needs
+            ;; it still
+            (let-do [kept (CtClause.init tags pos neg)
+                     key (clause-key &kept)
+                     duplicate false]
+              (for [k 0 (Array.length &keys)]
+                (when (= (Array.unsafe-nth &keys k) &key) (set! duplicate true)))
+              (unless-do duplicate
+                (set! keys (Array.push-back keys @&key))
+                (set! out (Array.push-back out kept)))))))
+      out))
+
+  (private type-key)
+  (hidden type-key)
+  (defn type-key [clauses]
+    (let-do [parts (the (Array String) [])]
+      (for [i 0 (Array.length clauses)]
+        (set! parts
+              (Array.push-back parts (clause-key (Array.unsafe-nth clauses i)))))
+      (String.join ";" &parts)))
+
+  (doc intern "the id of a type, canonicalised and shared: a structurally equal
+type built before gets the same id again.")
+  (defn intern [clauses]
+    (let [canonical (normalize clauses)
+          key (type-key &canonical)]
+      (match (Map.get-maybe &*ct-sub-index* &key)
+        (Maybe.Just id) id
+        (Maybe.Nothing)
+          (let-do [id (Array.length &*ct-sub-types*)]
+            (Array.push-back! &*ct-sub-types* canonical)
+            (Map.put! &*ct-sub-index* &key &id)
+            id))))
+
+  (private single)
+  (hidden single)
+  ;; one clause as a type. The array is built here rather than written as a
+  ;; literal at each use: an array literal inside a loop is hoisted above it, and
+  ;; the value it holds is then given away on the first pass.
+  (defn single [clause]
+    (intern (Array.push-back (the (Array CtClause) []) clause)))
+
+  (doc reset! "empties the arena and re-interns ⊥ and ⊤ as ids 0 and 1.")
+  (defn reset! []
+    (let-do [empty-clauses (the (Array CtClause) [])]
+      (set! *ct-sub-types* [])
+      (set! *ct-sub-atoms* [])
+      (set! *ct-sub-containers* [])
+      (set! *ct-sub-index* (Map.create))
+      (set! *ct-sub-atom-index* (Map.create))
+      (set! *ct-sub-empty-memo* (Map.create))
+      (set! *ct-sub-recursive* (Map.create))
+      (set! *ct-sub-descriptions* (Map.create))
+      (set! *ct-sub-spellings* [])
+      (set! *ct-sub-spelling-index* (Map.create))
+      (set! *ct-sub-pending* [])
+      (set! *ct-sub-assumptions* 0)
+      (ignore (intern @&empty-clauses))
+      (ignore (single (CtClause.init (all-mask) [] [])))
+      (for [kind 0 (kind-count)]
+        (let [id (single
+                (CtClause.init
+                  (Int.bit-or (leaf (i-empty kind)) (leaf (i-product kind)))
+                  []
+                  []))]
+          (Array.push-back! &*ct-sub-containers* id)))))
+
+  (doc bottom "⊥, inhabited by nothing.")
+  (defn bottom [] 0)
+
+  (doc top "⊤, every value.")
+  (defn top [] 1)
+
+  (private clauses-of)
+  (hidden clauses-of)
+  ;; the signature is written out because metacarp infers a copy of a
+  ;; parameterized element out of a global array as fully generic, and a generic
+  ;; accessor then fails specialization; the reference infers it
+  (sig clauses-of (Fn [Int] (Array CtClause)))
+  (defn clauses-of [id] @(Array.unsafe-nth &*ct-sub-types* id))
+
+  (private atom-at)
+  (hidden atom-at)
+  (defn atom-at [id] @(Array.unsafe-nth &*ct-sub-atoms* id))
+
+  (private atom-kind)
+  (hidden atom-kind)
+  (doc atom-kind "the container kind or callable sort of an atom.")
+  (defn atom-kind [id] @(CtAtom.kind &(atom-at id)))
+
+  (private atom-shape)
+  (hidden atom-shape)
+  (doc atom-shape "which dimension an atom lives in.")
+  (defn atom-shape [id] @(CtAtom.shape &(atom-at id)))
+
+  (private atom-left)
+  (hidden atom-left)
+  (defn atom-left [id] @(CtAtom.left &(atom-at id)))
+
+  (private atom-right)
+  (hidden atom-right)
+  (defn atom-right [id] @(CtAtom.right &(atom-at id)))
+
+  (private atom-bit)
+  (hidden atom-bit)
+  (doc atom-bit "the leaf bit that admits this atom.")
+  (defn atom-bit [id]
+    (cond
+      (Int.= (shape-product) (atom-shape id))
+      (leaf (i-product (atom-kind id)))
+      (Int.= (shape-arrow) (atom-shape id))
+      (leaf (i-arrow (atom-kind id)))
+      ;; a singleton refines a leaf a value can already be, so it is admitted by
+      ;; that leaf's own bit
+      (leaf (atom-kind id))))
+
+  (private spelling-id)
+  (hidden spelling-id)
+  (defn spelling-id [text]
+    (match (Map.get-maybe &*ct-sub-spelling-index* text)
+      (Maybe.Just id) id
+      (Maybe.Nothing)
+        (let-do [id (Array.length &*ct-sub-spellings*)]
+          (Array.push-back! &*ct-sub-spellings* @text)
+          (Map.put! &*ct-sub-spelling-index* text &id)
+          id)))
+
+  (doc spelling-of "the text a singleton atom is about.")
+  (defn spelling-of [id] @(Array.unsafe-nth &*ct-sub-spellings* (atom-left id)))
+
+  ;; ---------------------------------------------------------- construction
+
+  (doc tags "the type holding exactly the value leaves in `mask`. A product or
+arrow bit in the mask is dropped: use `product`, `arrow`, `container` or
+`callable` for those.")
+  (defn tags [mask]
+    (let [kept (Int.bit-and mask (value-mask))]
+      (if (Int.= 0 kept) (bottom) (single (CtClause.init kept [] [])))))
+
+  (private structured)
+  (hidden structured)
+  (private intern-atom)
+  (hidden intern-atom)
+  (defn intern-atom [shape kind left right]
+    (let [key (String.concat
+            &[(Int.str shape)
+              @"/"
+              (Int.str kind)
+              @"/"
+              (Int.str left)
+              @"/"
+              (Int.str right)])]
+      (match (Map.get-maybe &*ct-sub-atom-index* &key)
+        (Maybe.Just id) id
+        (Maybe.Nothing)
+          (let-do [id (Array.length &*ct-sub-atoms*)]
+            (Array.push-back! &*ct-sub-atoms*
+                              (CtAtom.init shape kind left right))
+            (Map.put! &*ct-sub-atom-index* &key &id)
+            id))))
+
+  (defn structured [shape kind left right]
+    (let-do [atom (intern-atom shape kind left right)]
+      (single
+        (CtClause.init (atom-bit atom)
+                       (Array.push-back (the (Array Int) []) atom)
+                       []))))
+
+  (doc product "a non-empty container of `kind` whose first element is `car` and
+whose rest is `cdr`.")
+  (defn product [kind car cdr] (structured (shape-product) kind car cdr))
+
+  (doc arrow "a function of callable sort `sort` answering in `cod` for every
+argument in `dom`. Nothing is claimed about an argument outside `dom`, which is
+what makes an intersection of arrows the way to say that a function handles
+several shapes.")
+  (defn arrow [sort dom cod] (structured (shape-arrow) sort dom cod))
+
+  (doc container "every container of `kind`: the empty one and every product.")
+  (defn container [kind] @(Array.unsafe-nth &*ct-sub-containers* kind))
+
+  (doc literal "exactly one value of the leaf at `index`: the symbol `if` rather
+than a symbol, say.")
+  (defn literal [index text]
+    (structured (shape-literal) index (spelling-id text) 0))
+
+  (doc callable "every function of `sort`, whatever it does.")
+  (defn callable [sort] (single (CtClause.init (leaf (i-arrow sort)) [] [])))
+
+  (doc chain-of "a container of `kind` holding these elements in order and then
+whatever `tail` is.
+
+With the empty container as the tail this is a fixed-length container. With a
+recursive tail it is a fixed prefix followed by any number of further elements,
+which is what a quasiquote with a splice in it produces: `(if %test (do %@body)
+())` is four forms whatever the splice turns out to be, and the third of them is
+`do` followed by any number.")
+  (defn chain-of [kind elements tail]
+    (let-do [result tail
+             n (Array.length elements)]
+      (for [i 0 n]
+        (let [at (Int.- (Int.dec n) i)]
+          (set! result (product kind @(Array.unsafe-nth elements at) result))))
+      result))
+
+  (doc list-of-kind "a fixed-length container of `kind`: the elements in order,
+ending in the empty container of that kind.")
+  (defn list-of-kind [kind elements]
+    (chain-of kind elements (tags (leaf (i-empty kind)))))
+
+  (doc list-of "a fixed-length list type: the elements in order, ending in the
+empty list. This is how an argument list is written down, which is what an
+arrow's domain is — the evaluator applies a function to a list of arguments, so
+the domain of a function of two parameters is a list of two element types.")
+  (defn list-of [elements] (list-of-kind (k-list) elements))
+
+  (private single-atom)
+  (hidden single-atom)
+  (doc single-atom "the one atom of `shape` a type consists of, when it consists
+of exactly one and nothing else.
+
+Reading a component back out of a type in general is a projection, and a
+projection is one of the characteristic homomorphisms this library does not
+have: there is no single first-element type for `(Int . ()) ⊔ (Bool . ())`
+without computing it, and none at all for an intersection of arrows. What the
+pass needs is narrower — the types it reads back are the ones it wrote down —
+so this answers for a single atom and declines otherwise, and a caller that gets
+`Nothing` has to fall back to knowing nothing.")
+  (defn single-atom [t shape]
+    (let [cs (clauses-of t)]
+      (if (Int./= 1 (Array.length &cs))
+        (Maybe.Nothing)
+        (let [clause (Array.unsafe-nth &cs 0)]
+          (if (and
+              (Int.= 1 (Array.length (CtClause.pos clause)))
+              (Int.= 0 (Array.length (CtClause.neg clause))))
+            (let [atom @(Array.unsafe-nth (CtClause.pos clause) 0)]
+              (if (Int.= shape (atom-shape atom))
+                (Maybe.Just atom)
+                (Maybe.Nothing)))
+            (Maybe.Nothing))))))
+
+  (doc nth-of "the element type at `index` of a list type written down by
+`list-of`, or ⊤ when it cannot be read back.")
+  (defn nth-of [t index]
+    (let-do [current t
+             answer (top)
+             i 0
+             going true]
+      (while-do (and going (Int.<= i index))
+        (match (single-atom current (shape-product))
+          (Maybe.Nothing) (set! going false)
+          (Maybe.Just atom)
+            (if (Int.= i index)
+              (do (set! answer (atom-left atom)) (set! going false))
+              (do (set! current (atom-right atom)) (set! i (Int.inc i))))))
+      answer))
+
+  (private open-bracket)
+  (hidden open-bracket)
+  (defn open-bracket [kind]
+    (cond
+      (Int.= kind (k-array)) @"["
+      (Int.= kind (k-static-array)) @"$["
+      (Int.= kind (k-dictionary)) @"{"
+      @"("))
+
+  (private close-bracket)
+  (hidden close-bracket)
+  (defn close-bracket [kind]
+    (cond
+      (Int.= kind (k-array)) @"]"
+      (Int.= kind (k-static-array)) @"]"
+      (Int.= kind (k-dictionary)) @"}"
+      @")"))
+
+  (private describe-clause)
+  (hidden describe-clause)
+  (private describe-atom)
+  (hidden describe-atom)
+  (private describe-chain)
+  (hidden describe-chain)
+  (sig leaf-name (Fn [Int] String))
+  (sig describe (Fn [Int] String))
+  (sig describe-clause (Fn [(Ref CtClause)] String))
+  (sig describe-atom (Fn [Int] String))
+  (sig describe-chain (Fn [Int] (Maybe String)))
+
+  (doc describe-chain "a finite container written out, when a type is one: the
+elements in order inside the brackets of its kind. A type that runs off into
+something other than an empty container is not one, and answers `Nothing`.")
+  (defn describe-chain [t]
+    (let-do [current t
+             parts (the (Array String) [])
+             kind -1
+             going true
+             ok false
+             guard 0]
+      (while-do (and going (Int.< guard 16))
+        (set! guard (Int.inc guard))
+        (match (single-atom current (shape-product))
+          (Maybe.Nothing)
+            (let-do [cs (clauses-of current)]
+              ;; the end of a chain is the empty container of the kind
+              (when (Int.= 1 (Array.length &cs))
+                (let [clause (Array.unsafe-nth &cs 0)]
+                  (when (and
+                      (Int.= 0 (Array.length (CtClause.pos clause)))
+                      (Int.>= kind 0))
+                    (when (Int.= @(CtClause.tags clause) (leaf (i-empty kind)))
+                      (set! ok true)))))
+              (set! going false))
+          (Maybe.Just atom)
+            (do
+              (when (Int.< kind 0) (set! kind (atom-kind atom)))
+              (if (Int./= kind (atom-kind atom))
+                (set! going false)
+                (do
+                  (set! parts
+                        (Array.push-back parts (describe (atom-left atom))))
+                  (set! current (atom-right atom)))))))
+      (if ok
+        (Maybe.Just
+          (String.concat
+            &[(open-bracket kind) (String.join " " &parts) (close-bracket kind)]))
+        (Maybe.Nothing))))
+
+  (defn describe-atom [id]
+    (cond
+      (Int.= (shape-literal) (atom-shape id))
+        (String.concat &[@"'" (spelling-of id)])
+      (Int.= (shape-product) (atom-shape id))
+        (match (describe-chain
+            (single
+              (CtClause.init (leaf (i-product (atom-kind id)))
+                             (Array.push-back (the (Array Int) []) id)
+                             [])))
+          (Maybe.Just text) text
+          (Maybe.Nothing)
+            (String.concat
+              &[(open-bracket (atom-kind id))
+                (describe (atom-left id))
+                @" . "
+                (describe (atom-right id))
+                (close-bracket (atom-kind id))]))
+      (String.concat
+        &[@"(Fn " (describe (atom-left id)) @" " (describe (atom-right id)) @")"])))
+
+  (defn describe-clause [clause]
+    (let-do [parts (the (Array String) [])
+             mask @(CtClause.tags clause)
+             pos @(CtClause.pos clause)
+             neg @(CtClause.neg clause)]
+      (if (Int.= 0 (Array.length &pos))
+        (for [i 0 (leaf-count)]
+          (when (Int./= 0 (Int.bit-and mask (leaf i)))
+            (set! parts (Array.push-back parts (leaf-name i)))))
+        (for [i 0 (Array.length &pos)]
+          (set! parts
+                (Array.push-back parts
+                                 (describe-atom @(Array.unsafe-nth &pos i))))))
+      (for [i 0 (Array.length &neg)]
+        (set! parts
+              (Array.push-back parts
+                               (String.concat
+                                 &[@"¬"
+                                   (describe-atom @(Array.unsafe-nth &neg i))]))))
+      (if (Int.= 0 (Array.length &parts)) @"⊥" (String.join " ⊓ " &parts))))
+
+  (doc describe "a type as something a person can read: a finite container
+written out with its elements, a recursive one written the way it was built, a
+function as its domain and result, and anything else as the union of what it
+holds.")
+  (defn describe [t]
+    (match (Map.get-maybe &*ct-sub-descriptions* &t)
+      (Maybe.Just remembered) remembered
+      (Maybe.Nothing)
+        (cond
+          (Int.= t (top)) @"Obj"
+          (Int.= t (bottom)) @"⊥"
+          (match (describe-chain t)
+            (Maybe.Just text) text
+            (Maybe.Nothing)
+              (let-do [cs (clauses-of t)
+                       parts (the (Array String) [])]
+                (for [i 0 (Array.length &cs)]
+                  (set! parts
+                        (Array.push-back parts
+                                         (describe-clause (Array.unsafe-nth &cs
+                                                                            i)))))
+                (if (Int.= 0 (Array.length &parts))
+                  @"⊥"
+                  (String.join " ⊔ " &parts)))))))
+
+  (private widen-clause)
+  (hidden widen-clause)
+  (sig widen (Fn [Int Int] Int))
+  (sig widen-clause (Fn [(Ref CtClause) Int] CtClause))
+
+  (doc widen "the same type with its structure cut off below `depth`.
+
+A fixed point over summaries does not have to converge on its own: a function
+that wraps its result in a container grows one level a round, for ever. Widening
+is what stops that, and cutting structure off is sound in both directions a
+summary is used — a wider result still holds everything the body can answer, and
+a wider domain claims that fewer arguments are impossible, never more.
+
+A recursive type is already finite and is left alone. Forbidden atoms are kept
+whole above the cut and dropped at it, because widening one of those the way a
+required one is widened would shrink the type rather than grow it.")
+  (defn widen [t depth]
+    (match (Map.get-maybe &*ct-sub-descriptions* &t)
+      (Maybe.Just _) t
+      (Maybe.Nothing)
+        (let-do [cs (clauses-of t)
+                 out (the (Array CtClause) [])]
+          (for [i 0 (Array.length &cs)]
+            (set! out
+                  (Array.push-back out
+                                   (widen-clause (Array.unsafe-nth &cs i) depth))))
+          (intern out))))
+
+  (defn widen-clause [clause depth]
+    (let-do [tags @(CtClause.tags clause)
+             pos @(CtClause.pos clause)
+             kept (the (Array Int) [])
+             none (the (Array Int) [])]
+      (if (Int.<= depth 0)
+        ;; the bits already say which kinds are admitted, and a clause with those
+        ;; bits and no atoms is exactly "any of those"
+        (CtClause.init tags @&none @&none)
+        (do
+          (for [i 0 (Array.length &pos)]
+            (let [atom @(Array.unsafe-nth &pos i)]
+              (set! kept
+                    (Array.push-back kept
+                                     (intern-atom (atom-shape atom)
+                                                  (atom-kind atom)
+                                                  (widen (atom-left atom)
+                                                         (Int.dec depth))
+                                                  (widen (atom-right atom)
+                                                         (Int.dec depth)))))))
+          (CtClause.init tags kept @(CtClause.neg clause))))))
+
+  (doc describe-as "records how a type reads.
+
+A union flattens the clauses of what it joins, so a type built out of several
+recursive ones no longer has them in it to recognise, and would print as ten
+clauses of brackets. Naming it when it is built is what keeps a diagnostic
+legible, and interning is what makes the name stick: the same union asked for
+twice is the same id.")
+  (defn describe-as [t text] (Map.put! &*ct-sub-descriptions* &t &text))
+
+  (doc every-of "a container of `kind` whose every element is in `element`, at
+any length: `µX. empty ⊔ (element × X)`.
+
+The id is reserved before the clauses are built, because they mention it. That is
+the whole of what recursion costs here — the arena already names types by index,
+so a type referring to itself is a type whose own index appears in its clauses,
+and emptiness closes the loop with an assumption instead of a fixed point.")
+  (defn every-of [kind element]
+    (let [key (String.concat &[(Int.str kind) @"*" (Int.str element)])]
+      (match (Map.get-maybe &*ct-sub-recursive* &key)
+        (Maybe.Just id) id
+        (Maybe.Nothing)
+          (let-do [id (Array.length &*ct-sub-types*)
+                   reserved (the (Array CtClause) [])]
+            (Array.push-back! &*ct-sub-types* reserved)
+            (Map.put! &*ct-sub-recursive* &key &id)
+            (Map.put! &*ct-sub-descriptions*
+                      &id
+                      &(String.concat
+                        &[(open-bracket kind)
+                          (describe element)
+                          @" …"
+                          (close-bracket kind)]))
+            (let-do [atom (intern-atom (shape-product) kind element id)
+                     clauses (the (Array CtClause) [])]
+              (set! clauses
+                    (Array.push-back clauses
+                                     (CtClause.init (leaf (i-empty kind)) [] [])))
+              (set! clauses
+                    (Array.push-back clauses
+                                     (CtClause.init (leaf (i-product kind))
+                                                    (Array.push-back (the (Array Int)
+                                                                          [])
+                                                                     atom)
+                                                    [])))
+              (Array.aset! &*ct-sub-types* id clauses))
+            id))))
+
+  (doc head-spelling "the symbol a container starts with, when it starts with
+one particular symbol rather than merely a symbol.")
+  (defn head-spelling [t]
+    (match (single-atom t (shape-product))
+      (Maybe.Nothing) (Maybe.Nothing)
+      (Maybe.Just atom)
+        (match (single-atom (atom-left atom) (shape-literal))
+          (Maybe.Nothing) (Maybe.Nothing)
+          (Maybe.Just written)
+            (if (Int.= (i-symbol) (atom-kind written))
+              (Maybe.Just (spelling-of written))
+              (Maybe.Nothing)))))
+
+  (doc chain-minimum "how many elements a container holds at the least.
+
+A fixed-length container holds exactly that many. One that runs into a recursive
+tail holds at least the elements written before the tail, which is what makes a
+claim about a spliced form possible at all: the splice may be empty, but what is
+written around it is there whatever it turns out to be.")
+  (defn chain-minimum [t]
+    (let-do [current t
+             count 0
+             going true
+             guard 0]
+      (while-do (and going (Int.< guard 64))
+        (set! guard (Int.inc guard))
+        (match (single-atom current (shape-product))
+          (Maybe.Nothing) (set! going false)
+          (Maybe.Just atom)
+            (do (set! count (Int.inc count)) (set! current (atom-right atom)))))
+      count))
+
+  (doc chain-exact "how many elements a container holds, when that is fixed: a
+chain that ends in the empty container holds exactly what is written in it, and
+one that runs into a tail holds an unknown number more, which is -1 here.")
+  (defn chain-exact [t]
+    (let-do [current t
+             count 0
+             going true
+             fixed false
+             guard 0]
+      (while-do (and going (Int.< guard 64))
+        (set! guard (Int.inc guard))
+        (match (single-atom current (shape-product))
+          (Maybe.Nothing)
+            (let-do [cs (clauses-of current)]
+              (when (Int.= 1 (Array.length &cs))
+                (let [clause (Array.unsafe-nth &cs 0)]
+                  (when (and
+                      (Int.= 0 (Array.length (CtClause.pos clause)))
+                      (Int./= 0
+                              (Int.bit-and @(CtClause.tags clause) (empty-mask))))
+                    (set! fixed true))))
+              (set! going false))
+          (Maybe.Just atom)
+            (do (set! count (Int.inc count)) (set! current (atom-right atom)))))
+      (if fixed count -1)))
+
+  (doc function-of "a function of `sort` taking the argument list `domains` and
+answering with `result`.")
+  (defn function-of [sort domains result] (arrow sort (list-of domains) result))
+
+  (doc function?
+    "whether a type is a single function whose domain and result can
+be read back.")
+  (defn function? [t] (Maybe.just? &(single-atom t (shape-arrow))))
+
+  (doc function-domain
+    "the type required of argument `index`, or ⊤ when there is
+nothing to read back.")
+  (defn function-domain [t index]
+    (match (single-atom t (shape-arrow))
+      (Maybe.Nothing) (top)
+      (Maybe.Just atom) (nth-of (atom-left atom) index)))
+
+  (doc function-result
+    "the type a call answers with, or ⊤ when there is nothing
+to read back.")
+  (defn function-result [t]
+    (match (single-atom t (shape-arrow))
+      (Maybe.Nothing) (top)
+      (Maybe.Just atom) (atom-right atom)))
+
+  ;; ------------------------------------------------------------ operations
+
+  (private union-of)
+  (hidden union-of)
+  (defn union-of [a b]
+    (let-do [left (clauses-of a)
+             right (clauses-of b)]
+      (cond
+        (Int.= 0 (Array.length &left)) b
+        (Int.= 0 (Array.length &right)) a
+        (intern (Array.concat &[left right])))))
+
+  (private meet-clause)
+  (hidden meet-clause)
+  (defn meet-clause [left right]
+    (CtClause.init
+      (Int.bit-and @(CtClause.tags left) @(CtClause.tags right))
+      (Array.concat &[@(CtClause.pos left) @(CtClause.pos right)])
+      (Array.concat &[@(CtClause.neg left) @(CtClause.neg right)])))
+
+  (private intersection-of)
+  (hidden intersection-of)
+  (defn intersection-of [a b]
+    (let-do [left (clauses-of a)
+             right (clauses-of b)
+             out (the (Array CtClause) [])]
+      (for [i 0 (Array.length &left)]
+        (for [j 0 (Array.length &right)]
+          (let [met (meet-clause (Array.unsafe-nth &left i)
+                                 (Array.unsafe-nth &right j))]
+            ;; a clause that admits no leaf at all admits no value either, so it
+            ;; is dropped rather than carried through every later meet
+            (when (Int./= 0 @(CtClause.tags &met))
+              (set! out (Array.push-back out met))))))
+      (if (Int.= 0 (Array.length &out)) (bottom) (intern out))))
+
+  ;; The laws about ⊥ and ⊤ are worth spelling out rather than letting the
+  ;; general path discover them. A pass built on this spends most of its time
+  ;; meeting something with ⊤ — an unconstrained position — and the general path
+  ;; would canonicalise a key and walk the clause product to come back with the
+  ;; operand it was handed.
+  (doc union "τ ⊔ π.")
+  (defn union [a b]
+    (cond
+      (Int.= a b) a
+      (Int.= a (bottom)) b
+      (Int.= b (bottom)) a
+      (Int.= a (top)) (top)
+      (Int.= b (top)) (top)
+      (union-of a b)))
+
+  (doc intersection "τ ⊓ π, distributed back into disjunctive normal form.")
+  (defn intersection [a b]
+    (cond
+      (Int.= a b) a
+      (Int.= a (top)) b
+      (Int.= b (top)) a
+      (Int.= a (bottom)) (bottom)
+      (Int.= b (bottom)) (bottom)
+      (intersection-of a b)))
+
+  (private without-atom)
+  (hidden without-atom)
+  ;; ¬atom: every value that is not of its dimension and kind, or one that is
+  ;; and is not this atom
+  (defn without-atom [atom]
+    (let [bit (atom-bit atom)]
+      (intern
+        (Array.push-back
+          (Array.push-back (the (Array CtClause) [])
+                           (CtClause.init
+                             (Int.bit-and (all-mask) (Int.bit-not bit))
+                             []
+                             []))
+          (CtClause.init bit [] (Array.push-back (the (Array Int) []) atom))))))
+
+  (private negate-clause)
+  (hidden negate-clause)
+  (defn negate-clause [clause]
+    (let-do [result (tags
+               (Int.bit-and (value-mask) (Int.bit-not @(CtClause.tags clause))))
+             pos @(CtClause.pos clause)
+             neg @(CtClause.neg clause)]
+      ;; the structured bits the clause excluded have to come back: a clause
+      ;; admitting no list still admits every other kind, and its negation
+      ;; admits the lists
+      (set! result
+            (union result
+                   (single
+                     (CtClause.init
+                       (Int.bit-and (structured-mask)
+                                    (Int.bit-not @(CtClause.tags clause)))
+                       []
+                       []))))
+      (for [i 0 (Array.length &pos)]
+        (set! result (union result (without-atom @(Array.unsafe-nth &pos i)))))
+      (for [i 0 (Array.length &neg)]
+        (let [atom @(Array.unsafe-nth &neg i)]
+          (set! result
+                (union result
+                       (single
+                         (CtClause.init (atom-bit atom)
+                                        (Array.push-back (the (Array Int) [])
+                                                         atom)
+                                        []))))))
+      result))
+
+  (private negation-of)
+  (hidden negation-of)
+  (sig negation-of (Fn [Int] Int))
+
+  (doc negation "¬τ. De Morgan over the clauses, distributed back into
+disjunctive normal form, so the result is exponential in the clause count in the
+worst case and small in practice.")
+  (defn negation [a]
+    (cond (Int.= a (top)) (bottom) (Int.= a (bottom)) (top) (negation-of a)))
+
+  (defn negation-of [a]
+    (let-do [cs (clauses-of a)
+             result (top)]
+      (for [i 0 (Array.length &cs)]
+        (set! result
+              (intersection result (negate-clause (Array.unsafe-nth &cs i)))))
+      result))
+
+  (doc difference
+    "τ ⊓ ¬π. A type minus itself is ⊥, which interning makes a
+cheap thing to notice.")
+  (defn difference [a b]
+    (cond
+      (Int.= a b) (bottom)
+      (Int.= b (bottom)) a
+      (Int.= b (top)) (bottom)
+      (Int.= a (bottom)) (bottom)
+      (intersection a (negation b))))
+
+  ;; ------------------------------------------------------------- emptiness
+
+  (private atoms-of)
+  (hidden atoms-of)
+  (doc atoms-of "the atoms in `ids` that live in one dimension and kind.")
+  (defn atoms-of [ids shape kind]
+    (let-do [out (the (Array Int) [])]
+      (for [i 0 (Array.length ids)]
+        (let [atom @(Array.unsafe-nth ids i)]
+          (when (and (Int.= shape (atom-shape atom))
+                     (Int.= kind (atom-kind atom)))
+            (set! out (Array.push-back out atom)))))
+      out))
+
+  (private clause-empty?)
+  (hidden clause-empty?)
+  (private product-inhabited?)
+  (hidden product-inhabited?)
+  (private arrow-inhabited?)
+  (hidden arrow-inhabited?)
+  (private literal-inhabited?)
+  (hidden literal-inhabited?)
+  (private arrow-violated?)
+  (hidden arrow-violated?)
+  (sig uninhabited? (Fn [Int] Bool))
+  (sig uninhabited-of? (Fn [Int] Bool))
+  (sig clause-empty? (Fn [(Ref CtClause)] Bool))
+  (sig product-inhabited? (Fn [Int (Ref (Array Int)) (Ref (Array Int))] Bool))
+  (sig arrow-inhabited? (Fn [(Ref (Array Int)) (Ref (Array Int))] Bool))
+  (sig literal-inhabited? (Fn [(Ref (Array Int)) (Ref (Array Int))] Bool))
+  (sig arrow-violated? (Fn [(Ref (Array Int)) Int] Bool))
+
+  (doc product-inhabited? "whether a conjunction of required products of one
+kind, minus the forbidden ones, holds a value.
+
+This is the subset rule: the conjunction is inhabited exactly when the forbidden
+atoms can be split so that one side leaves a first element and the other a rest.
+With no required atoms the components start at ⊤ and at every container of the
+kind, which is what a product of that kind is made of.")
+  (defn product-inhabited? [kind pos neg]
+    (let-do [car-required (top)
+             cdr-required (container kind)
+             n (Array.length neg)
+             inhabited false]
+      (for [i 0 (Array.length pos)]
+        (let-do [atom @(Array.unsafe-nth pos i)]
+          (set! car-required (intersection car-required (atom-left atom)))
+          (set! cdr-required (intersection cdr-required (atom-right atom)))))
+      (if (Int.> n (subset-limit))
+        true
+        (let-do [subsets (Int.bit-shift-left 1 n)
+                 s 0]
+          (while-do (and (not inhabited) (Int.< s subsets))
+            (let-do [left car-required
+                     right cdr-required]
+              (for [j 0 n]
+                (let [atom @(Array.unsafe-nth neg j)]
+                  (if (Int./= 0 (Int.bit-and s (Int.bit-shift-left 1 j)))
+                    (set! left (difference left (atom-left atom)))
+                    (set! right (difference right (atom-right atom))))))
+              (when (and (not (uninhabited? left)) (not (uninhabited? right)))
+                (set! inhabited true)))
+            (set! s (Int.inc s)))
+          inhabited))))
+
+  (doc arrow-violated? "whether a function meeting every required arrow can also
+break `forbidden`.
+
+`s → t` holds the functions whose pairs never take an argument in `s` to a
+result outside `t`, so breaking `u → v` means holding one pair that does: an
+argument in `u` and a result outside `v`. The required arrows that cover that
+argument are the ones whose codomains the result must still satisfy, and which
+those are is the subset being enumerated — the argument has to avoid the domains
+of all the others.")
+  (defn arrow-violated? [pos forbidden]
+    (let-do [n (Array.length pos)
+             domain (atom-left forbidden)
+             codomain (atom-right forbidden)
+             violated false]
+      (if (Int.> n (subset-limit))
+        true
+        (let-do [subsets (Int.bit-shift-left 1 n)
+                 s 0]
+          (while-do (and (not violated) (Int.< s subsets))
+            (let-do [argument domain
+                     result (difference (top) codomain)]
+              (for [i 0 n]
+                (let [atom @(Array.unsafe-nth pos i)]
+                  (if (Int./= 0 (Int.bit-and s (Int.bit-shift-left 1 i)))
+                    ;; this arrow covers the argument, so its codomain binds the
+                    ;; result
+                    (set! result (intersection result (atom-right atom)))
+                    ;; this one does not, so the argument must stay out of its
+                    ;; domain
+                    (set! argument (difference argument (atom-left atom))))))
+              (when (and (not (uninhabited? argument))
+                         (not (uninhabited? result)))
+                (set! violated true)))
+            (set! s (Int.inc s)))
+          violated))))
+
+  (doc arrow-inhabited? "whether a conjunction of required arrows, minus the
+forbidden ones, holds a function.
+
+A conjunction of arrows alone always does: the function holding no pairs at all
+meets every arrow. Each forbidden arrow is answered on its own, because a
+function value may hold many pairs and the witnesses against different forbidden
+arrows need not be the same pair.")
+  (defn arrow-inhabited? [pos neg]
+    (let-do [answer true]
+      (for [j 0 (Array.length neg)]
+        (when answer
+          (unless (arrow-violated? pos @(Array.unsafe-nth neg j))
+            (set! answer false))))
+      answer))
+
+  (doc literal-inhabited?
+    "whether a conjunction of singletons of one leaf, minus
+the forbidden ones, holds a value.
+
+Two different singletons of the same leaf are two different values, so requiring
+both holds nothing. Requiring one holds that one, unless it is also forbidden.
+Requiring none holds the leaf minus finitely many values, and every leaf a
+singleton refines has more values than a clause can forbid.")
+  (defn literal-inhabited? [pos neg]
+    (let-do [answer true]
+      (when (Int.> (Array.length pos) 1)
+        (let-do [first @(Array.unsafe-nth pos 0)]
+          (for [i 1 (Array.length pos)]
+            (unless (Int.= first @(Array.unsafe-nth pos i)) (set! answer false)))))
+      (when (Int.= 1 (Array.length pos))
+        (let [only @(Array.unsafe-nth pos 0)]
+          (for [i 0 (Array.length neg)]
+            (when (Int.= only @(Array.unsafe-nth neg i)) (set! answer false)))))
+      answer))
+
+  (defn clause-empty? [clause]
+    (let-do [mask @(CtClause.tags clause)
+             pos @(CtClause.pos clause)
+             neg @(CtClause.neg clause)
+             inhabited false]
+      ;; a value that is neither a product nor a function satisfies every
+      ;; forbidden atom, so the leaf part alone decides it — but only when the
+      ;; clause requires no atom, since a value is never two kinds
+      (when (and (Int.= 0 (Array.length &pos))
+                 (Int./= 0 (Int.bit-and mask (value-mask))))
+        (set! inhabited true))
+      (for [kind 0 (kind-count)]
+        (unless inhabited
+          (when (Int./= 0 (Int.bit-and mask (leaf (i-product kind))))
+            (let [here (atoms-of &pos (shape-product) kind)]
+              ;; a required atom of another kind rules this one out: a value has
+              ;; one kind and cannot satisfy both
+              (when (Int.= (Array.length &here) (Array.length &pos))
+                (when (product-inhabited? kind
+                                          &here
+                                          &(atoms-of &neg (shape-product) kind))
+                  (set! inhabited true)))))))
+      (for [index 0 (leaf-count)]
+        (unless inhabited
+          (when (Int./= 0 (Int.bit-and mask (leaf index)))
+            (let [here (atoms-of &pos (shape-literal) index)]
+              (when (and (Int.> (Array.length &here) 0)
+                         (Int.= (Array.length &here) (Array.length &pos)))
+                (when (literal-inhabited? &here
+                                          &(atoms-of &neg (shape-literal) index))
+                  (set! inhabited true)))))))
+      (for [sort 0 (sort-count)]
+        (unless inhabited
+          (when (Int./= 0 (Int.bit-and mask (leaf (i-arrow sort))))
+            (let [here (atoms-of &pos (shape-arrow) sort)]
+              (when (Int.= (Array.length &here) (Array.length &pos))
+                (when (arrow-inhabited? &here
+                                        &(atoms-of &neg (shape-arrow) sort))
+                  (set! inhabited true)))))))
+      (not inhabited)))
+
+  (doc uninhabited? "whether a type holds no value. This is the whole decision
+procedure: subtyping is emptiness of the difference.")
+  (defn uninhabited? [t]
+    (cond (Int.= t (bottom)) true (Int.= t (top)) false (uninhabited-of? t)))
+
+  (private pending?)
+  (hidden pending?)
+  (defn pending? [t]
+    (let-do [found false]
+      (for [i 0 (Array.length &*ct-sub-pending*)]
+        (when (Int.= t @(Array.unsafe-nth &*ct-sub-pending* i))
+          (set! found true)))
+      found))
+
+  (private drop-pending!)
+  (hidden drop-pending!)
+  (defn drop-pending! [t]
+    (let-do [kept (the (Array Int) [])
+             dropped false]
+      (for [i 0 (Array.length &*ct-sub-pending*)]
+        (let [here @(Array.unsafe-nth &*ct-sub-pending* i)]
+          (if (and (not dropped) (Int.= here t))
+            (set! dropped true)
+            (set! kept (Array.push-back kept here)))))
+      (set! *ct-sub-pending* kept)))
+
+  (private uninhabited-of?)
+  (hidden uninhabited-of?)
+  (defn uninhabited-of? [t]
+    (if (pending? t)
+      ;; the loop closes here: assume empty, and record that the assumption was
+      ;; used so nothing computed under it is remembered
+      (do (set! *ct-sub-assumptions* (Int.inc *ct-sub-assumptions*)) true)
+      (match (Map.get-maybe &*ct-sub-empty-memo* &t)
+        (Maybe.Just remembered) remembered
+        (Maybe.Nothing)
+          (let-do [cs (clauses-of t)
+                   answer true
+                   before *ct-sub-assumptions*]
+            (Array.push-back! &*ct-sub-pending* t)
+            (for [i 0 (Array.length &cs)]
+              (when answer
+                (unless (clause-empty? (Array.unsafe-nth &cs i))
+                  (set! answer false))))
+            (drop-pending! t)
+            (when (Int.= before *ct-sub-assumptions*)
+              (Map.put! &*ct-sub-empty-memo* &t &answer))
+            answer))))
+
+  (doc inhabited? "the complement of `uninhabited?`, for reading.")
+  (defn inhabited? [t] (not (uninhabited? t)))
+
+  (doc subtype? "τ ≤ π, decided as emptiness of τ ⊓ ¬π.")
+  (defn subtype? [a b]
+    (cond
+      (Int.= a b) true
+      (Int.= b (top)) true
+      (Int.= a (bottom)) true
+      (uninhabited? (difference a b))))
+
+  (doc equivalent? "whether two types hold the same values. Interning makes the
+common case an integer comparison; two different ids still have to be checked
+both ways, because the same set can be written in ways no normal form here
+collapses — an intersection of arrows and the arrow of a union, say.")
+  (defn equivalent? [a b] (or (Int.= a b) (and (subtype? a b) (subtype? b a))))
+
+  ;; ---------------------------------------------------------------- reading
+
+  (private leaf-name)
+  (hidden leaf-name)
+  (defn leaf-name [index]
+    (cond
+      (Int.= index (i-int)) @"Int"
+      (Int.= index (i-byte)) @"Byte"
+      (Int.= index (i-long)) @"Long"
+      (Int.= index (i-float)) @"Float"
+      (Int.= index (i-double)) @"Double"
+      (Int.= index (i-bool)) @"Bool"
+      (Int.= index (i-char)) @"Char"
+      (Int.= index (i-string)) @"String"
+      (Int.= index (i-pattern)) @"Pattern"
+      (Int.= index (i-symbol)) @"Symbol"
+      (Int.= index (i-comment)) @"Comment"
+      (Int.= index (i-empty (k-list))) @"()"
+      (Int.= index (i-empty (k-array))) @"[]"
+      (Int.= index (i-empty (k-static-array))) @"$[]"
+      (Int.= index (i-empty (k-dictionary))) @"{}"
+      (Int.= index (i-empty (k-collection))) @"Collection()"
+      (Int.= index (i-product (k-list))) @"List+"
+      (Int.= index (i-product (k-array))) @"Array+"
+      (Int.= index (i-product (k-static-array))) @"StaticArray+"
+      (Int.= index (i-product (k-dictionary))) @"Dictionary+"
+      (Int.= index (i-product (k-collection))) @"Collection+"
+      (Int.= index (i-closure)) @"Closure"
+      (Int.= index (i-macro)) @"Macro"
+      (Int.= index (i-builtin)) @"Builtin"
+      @"?"))
+
+  (private atom-name)
+  (hidden atom-name)
+  (defn atom-name [id]
+    (if (Int.= (shape-product) (atom-shape id))
+      (fmt "(%d . %d)" (atom-left id) (atom-right id))
+      (fmt "(%d -> %d)" (atom-left id) (atom-right id))))
+
+  (private render-clause)
+  (hidden render-clause)
+  (defn render-clause [clause]
+    (let-do [parts (the (Array String) [])
+             mask @(CtClause.tags clause)
+             pos @(CtClause.pos clause)
+             neg @(CtClause.neg clause)]
+      (for [i 0 (leaf-count)]
+        (when (Int./= 0 (Int.bit-and mask (leaf i)))
+          (set! parts (Array.push-back parts (leaf-name i)))))
+      (for [i 0 (Array.length &pos)]
+        (set! parts
+              (Array.push-back parts (atom-name @(Array.unsafe-nth &pos i)))))
+      (for [i 0 (Array.length &neg)]
+        (set! parts
+              (Array.push-back parts
+                               (String.concat
+                                 &[@"¬" (atom-name @(Array.unsafe-nth &neg i))]))))
+      (if (Int.= 0 (Array.length &parts)) @"⊥" (String.join " ⊓ " &parts))))
+
+  (doc render "renders a type as its clauses, for diagnostics and tests. A
+component shows as the id of the type it is, because a component is a type and
+printing it in full would not terminate once there are recursive ones.")
+  (defn render [t]
+    (let-do [cs (clauses-of t)
+             parts (the (Array String) [])]
+      (for [i 0 (Array.length &cs)]
+        (set! parts
+              (Array.push-back parts (render-clause (Array.unsafe-nth &cs i)))))
+      (if (Int.= 0 (Array.length &parts)) @"⊥" (String.join " ⊔ " &parts))))
+
+  (doc clauses "the clauses of a type, copied out. Exposed so that a harness can
+interpret a type directly against a universe of values instead of trusting the
+decision procedure it is meant to check.")
+  (sig clauses (Fn [Int] (Array CtClause)))
+  (defn clauses [t] (clauses-of t))
+
+  (doc leaf-name-of "the name of one leaf of the old tag lattice, for a facade
+that renders shapes the way the tag lattice did.")
+  (defn leaf-name-of [index]
+    (cond
+      (Int.< index 10) (leaf-name index)
+      (Int.= index 10) @"List"
+      (Int.= index 11) @"Array"
+      (Int.= index 12) @"StaticArray"
+      (Int.= index 13) @"Dictionary"
+      (Int.= index 14) @"Comment"
+      (Int.= index 15) @"Closure"
+      (Int.= index 16) @"Macro"
+      (Int.= index 17) @"Builtin"
+      @"Collection"))
+
+  (doc atom "the structured atom with this id.")
+  (defn atom [id] (atom-at id))
+
+  (doc atom-count "how many structured atoms the arena holds.")
+  (defn atom-count [] (Array.length &*ct-sub-atoms*))
+
+  (doc type-count "how many types the arena holds.")
+  (defn type-count [] (Array.length &*ct-sub-types*)))
