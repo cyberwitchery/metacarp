@@ -5,9 +5,9 @@
 # The fixtures define the same global and helper names. With default linkage,
 # ELF binds the second shared library's references to the first one's
 # definitions, so its constructor initializes the wrong globals and its code
-# reads the other library's data. Everything but a library's roots is `static`,
-# and shared libraries are built with -fvisibility=hidden as the readme says,
-# which also hides what Core's headers define.
+# reads the other library's data. Everything but a library's roots is `static`
+# and hidden, so this holds with or without -fvisibility=hidden; the flag,
+# which the readme recommends, only adds hiding what Core's headers define.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -29,21 +29,30 @@ case "$(uname -s)" in
   Darwin) suffix=dylib ;;
   *) suffix=so ;;
 esac
-flags=(-std=c99 -D_DEFAULT_SOURCE -fPIC -fvisibility=hidden -I "$core_dir")
+flags=(-std=c99 -D_DEFAULT_SOURCE -fPIC -I "$core_dir")
 
 for name in alpha beta; do
   "$compiler" --library -c "$core_dir" -o "$work_dir/$name.c" \
     "$fixtures/$name.carp"
-  cc "${flags[@]}" -shared -o "$work_dir/lib$name.$suffix" \
-    "$work_dir/$name.c" -lm
 done
-cc -o "$work_dir/host" "$fixtures/host.c" -L "$work_dir" -lalpha -lbeta
 
-output=$(LD_LIBRARY_PATH="$work_dir" DYLD_LIBRARY_PATH="$work_dir" \
-  "$work_dir/host")
 expected=$'alpha\nbeta'
-if [[ "$output" != "$expected" ]]; then
-  printf 'library linkage: expected\n%s\ngot\n%s\n' "$expected" "$output" >&2
-  exit 1
-fi
+for visibility in default hidden; do
+  extra=()
+  if [[ "$visibility" == hidden ]]; then
+    extra=(-fvisibility=hidden)
+  fi
+  for name in alpha beta; do
+    cc "${flags[@]}" ${extra[@]+"${extra[@]}"} -shared \
+      -o "$work_dir/lib$name.$suffix" "$work_dir/$name.c" -lm
+  done
+  cc -o "$work_dir/host" "$fixtures/host.c" -L "$work_dir" -lalpha -lbeta
+  output=$(LD_LIBRARY_PATH="$work_dir" DYLD_LIBRARY_PATH="$work_dir" \
+    "$work_dir/host")
+  if [[ "$output" != "$expected" ]]; then
+    printf 'library linkage (%s visibility): expected\n%s\ngot\n%s\n' \
+      "$visibility" "$expected" "$output" >&2
+    exit 1
+  fi
+done
 printf 'library linkage: two libraries keep their own globals\n'

@@ -65,7 +65,8 @@ initializes its globals in a load-time constructor and `System.args` is empty.
 A top-level expression that does something has nowhere to run and is an error.
 
 Only the roots are exported: every other function and global the unit defines
-is `static`, so two Carp libraries in one host keep their own code and data.
+is `static`, and hidden besides, so two Carp libraries in one host keep their
+own code and data.
 Core's C headers, and any C a library includes or wraps, still define
 functions of their own; build a shared library with `-fvisibility=hidden` so
 those stay inside it. Static archives have no such switch, and linking two of
