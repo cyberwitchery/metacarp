@@ -3936,23 +3936,25 @@ because only here is the whole unit written.")
         (String.join "
 " &out))))
 
-  (private render-owned)
-  (hidden render-owned)
-  (defn render-owned [backend]
+  (private render-owned-with)
+  (hidden render-owned-with)
+  (defn render-owned-with [backend executable]
     (let-do [_ignored (phase-mark! "phase: lowered")
              _ignored-map (LineMap.install! (BackendModule.line-map &backend))
-             rendered (CBackend.executable-translation-unit &backend)]
+             rendered (if executable
+               (CBackend.executable-translation-unit &backend)
+               (CBackend.library-translation-unit &backend))]
       rendered))
 
-  (doc lower-inferred-module-with-known "lowers one inferred cell against
-concrete instances already compiled by its session. The backend module is a
-delta; the returned instance array is the complete cache to commit only after
-the cell succeeds.")
-  (defn lower-inferred-module-with-known [core inferred echo known]
+  (private render-owned)
+  (hidden render-owned)
+  (defn render-owned [backend] (render-owned-with backend true))
+
+  (private lower-inferred-module-rooted)
+  (hidden lower-inferred-module-rooted)
+  (defn lower-inferred-module-rooted [core inferred echo known names]
     (let-do [facts (OwnershipClassify.facts-from-module core)
-             seeds (Specialize.named-requests core
-                                              inferred
-                                              &(the (Array String) []))]
+             seeds (Specialize.named-requests core inferred names)]
       (match (specialize-closed-known core inferred &facts &seeds known)
         (Result.Success incremental)
           (match (if echo
@@ -3979,6 +3981,17 @@ the cell succeeds.")
                                          @(BackendError.message &error)))))
             (Result.Error error) (Result.Error error))
         (Result.Error error) (Result.Error error))))
+
+  (doc lower-inferred-module-with-known "lowers one inferred cell against
+concrete instances already compiled by its session. The backend module is a
+delta; the returned instance array is the complete cache to commit only after
+the cell succeeds.")
+  (defn lower-inferred-module-with-known [core inferred echo known]
+    (lower-inferred-module-rooted core
+                                  inferred
+                                  echo
+                                  known
+                                  &(the (Array String) [])))
 
   (private lower-inferred-module-with)
   (hidden lower-inferred-module-with)
@@ -4032,6 +4045,77 @@ cell is a top-level, and a value it ends on is printed by the same `str` the
 driver would pick — by reference for a derived one, by value for a scalar.")
   (defn compile-inferred-module-echoed [core inferred]
     (compile-inferred-module-with core inferred true))
+
+  (private module-function?)
+  (hidden module-function?)
+  (defn module-function? [core name]
+    (let-do [found false
+             functions (CoreModule.functions core)]
+      (for [i 0 (Array.length functions)]
+        (when (String.= name
+                        (CoreRef.name
+                          (CoreFunction.reference (Array.unsafe-nth functions i))))
+          (set! found true)))
+      found))
+
+  (private unreachable-roots)
+  (hidden unreachable-roots)
+  (doc unreachable-roots "names every requested root that specialization would
+drop: an unknown name, or a function whose type is not concrete. A host that
+asks for an entry point must get it or an error, never a library without it.")
+  (defn unreachable-roots [core inferred roots]
+    (let-do [requests (Specialize.named-requests core inferred roots)
+             missing (the (Array String) [])]
+      (for [i 0 (Array.length roots)]
+        (let-do [root (Array.unsafe-nth roots i)
+                 found false]
+          ;; `named-requests` also answers for registered builtins, which
+          ;; the library would not define; a root must be this module's own.
+          (for [j 0 (Array.length &requests)]
+            (when (String.= root
+                            (CoreRef.name
+                              (CallSite.reference
+                                (SpecializationRequest.call (Array.unsafe-nth &requests
+                                                                              j)))))
+              (set! found true)))
+          (unless (and found (module-function? core root))
+            (Array.push-back! &missing @root))))
+      (if (Array.empty? &missing)
+        (the (Maybe String) (Maybe.Nothing))
+        (Maybe.Just
+          (String.append
+            "not a concrete function of this module: "
+            &(String.join ", " &missing))))))
+
+  (private compile-library-roots)
+  (hidden compile-library-roots)
+  (defn compile-library-roots [core inferred roots]
+    (match (lower-inferred-module-rooted core
+                                         inferred
+                                         false
+                                         &(the (Array Specialization) [])
+                                         roots)
+      (Result.Success incremental)
+        (match (render-owned-with
+            @(IncrementalLowering.module &incremental)
+            false)
+          (Result.Success c) (Result.Success c)
+          (Result.Error error)
+            (Result.Error
+              (CompileError.init (String.copy "backend")
+                                 @(BackendError.message &error))))
+      (Result.Error error) (Result.Error error)))
+
+  (doc compile-inferred-library-roots "as `compile-inferred-module`, but
+rooted at the named source-level functions and rendered without a process
+entry point, for a native host that links it into a shared or static library.
+Every host-visible function must be a root; calls reachable from the roots
+stay direct native calls.")
+  (defn compile-inferred-library-roots [core inferred roots]
+    (match (unreachable-roots core inferred roots)
+      (Maybe.Just message)
+        (Result.Error (CompileError.init (String.copy "library") message))
+      (Maybe.Nothing) (compile-library-roots core inferred roots)))
 
   (doc lower-module-full "expands, resolves, derives, infers, specializes,
 ownership-plans, and lowers a loaded module to the backend model — the whole
@@ -4386,4 +4470,23 @@ types without emitting C.")
                                         (SurfaceSpan.start (ResolveError.span &error)))))))
       (Result.Error error)
         (Result.Error
-          (CompileError.init (String.copy "expand") @(CtError.message &error))))))
+          (CompileError.init (String.copy "expand") @(CtError.message &error)))))
+
+  (doc compile-module-library-full "compiles a loaded module to one C
+translation unit without `main`, rooted at `roots` and checked the way
+`compile-inferred-library-roots` checks an embedder's roots.")
+  (defn compile-module-library-full [module config roots]
+    (match (infer-module-with module config)
+      (Result.Success annotated)
+        (match (CoreIR.duplicate-global-id (AnnotatedModule.core &annotated))
+          (Maybe.Just bad)
+            (Result.Error
+              (CompileError.init (String.copy "validate")
+                                 (fmt
+                                   "duplicate global reference id %d after derivation"
+                                   bad)))
+          (Maybe.Nothing)
+            (compile-inferred-library-roots (AnnotatedModule.core &annotated)
+                                            (AnnotatedModule.inferred &annotated)
+                                            roots))
+      (Result.Error error) (Result.Error error))))
