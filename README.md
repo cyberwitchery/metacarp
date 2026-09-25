@@ -62,11 +62,13 @@ library, rooted at the public definitions in the input source. A public
 definition that cannot be compiled on its own (a generic function) is an error;
 a private helper is reached through the roots. There is no `main`, so the unit
 initializes its globals in a load-time constructor and `System.args` is empty.
-Top-level expressions have nowhere to run and are an error.
+A top-level expression that does something has nowhere to run and is an error.
 
-`(load ...)` resolves like the reference compiler's: relative to the loading
-file, then the Core directory — and git references install into the shared
-cache (`~/.cache/carp/libs/...`) on first use:
+`(load ...)` resolves like the reference compiler's: the name as given
+(relative to the working directory), then relative to the loading file, then
+the Core directory, so a local file shadows the Core file it is named after.
+Git references install into the shared cache (`~/.cache/carp/libs/...`) on
+first use:
 
 ```clojure
 (load "git@github.com:carpentry-org/strbuf@0.3.0")
