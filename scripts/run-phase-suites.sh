@@ -4,9 +4,7 @@
 # assurance both call this script.
 #
 # CARP_REFERENCE may instead name a self-hosted compiler, in which case
-# CARP_PHASE_CORE must name the Core it compiles against. That compiler has no
-# `--log-memory`, so the memory suite, which measures `Debug.memory-balance`,
-# is left out.
+# CARP_PHASE_CORE must name the Core it compiles against.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -45,7 +43,8 @@ run_phase_test() {
     fi
     printf '== %s/%s\n' "$test_dir" "$test_file"
     if [[ "$mode" == memory ]]; then
-      "$reference" -x --log-memory "$test_file"
+      "$reference" ${compiler_args[@]+"${compiler_args[@]}"} -x --log-memory \
+        "$test_file"
     else
       "$reference" ${compiler_args[@]+"${compiler_args[@]}"} -x "$test_file"
     fi
@@ -74,9 +73,7 @@ phase_tasks() {
   emit_task . test/carp-compiler.carp normal
   emit_task . carp-session/test/carp-session.carp normal
   emit_task . carp-session/test/core.carp normal
-  if [[ -z "$core_dir" ]]; then
-    emit_task . carp-session/test/memory.carp memory
-  fi
+  emit_task . carp-session/test/memory.carp memory
 
   for directory in \
     carp-graph carp-c-abi carp-primitives carp-module carp-ct-env \

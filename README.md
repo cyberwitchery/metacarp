@@ -45,6 +45,8 @@ carp-compiler [options] <source.carp>
   -c, --core <dir>      compile against the Carp standard library in <dir>
   -o, --output <file>   output path — the C file, or the executable under -b
   --optimize            build -b/-x executables with clang -O3 -D NDEBUG
+  --log-memory          build -b/-x executables with LOG_MEMORY, so
+                        Debug.memory-balance counts allocations
   --library             emit a translation unit without main (needs --core)
   --no-core             skip the implicit Core load; the source's own
                         (load "X.carp") directives still resolve in --core
@@ -160,8 +162,7 @@ The assurance harness keeps the self-host honest:
   provenance file) when `CARP_FIXED_POINT_OUT` names its directory.
 - `scripts/run-assurance.sh phase-self` runs the phase/session suites through
   gen 2 instead of the reference, using `CARP_PHASE_COMPILER` or building one.
-  The memory suite needs `--log-memory`, which gen 2 lacks, and is skipped. CI
-  runs it on Linux after the self group.
+  CI runs it on Linux after the self group.
 - `scripts/run-assurance.sh all` runs both groups and is the default. CI calls
   the same phase and self groups rather than maintaining its own command list.
   The self-host group executes generated programs on both x86-64 Linux and
