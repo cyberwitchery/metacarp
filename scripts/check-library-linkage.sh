@@ -49,6 +49,12 @@ external_definitions() {
 roots=$(grep -oE 'C[0-9]+_[A-Za-z0-9_]+__[A-Za-z0-9_]+' "$fixtures/host.c" |
   sort -u)
 for name in alpha beta; do
+  # without the pragma the cut below keeps the whole unit, and every symbol
+  # would pass as a header's
+  if ! grep -q '^#pragma GCC visibility push' "$work_dir/$name.c"; then
+    printf 'library linkage: %s has no visibility pragma\n' "$name" >&2
+    exit 1
+  fi
   sed '/^#pragma GCC visibility push/,$d' "$work_dir/$name.c" \
     >"$work_dir/$name-headers.c"
   cc "${flags[@]}" -c -o "$work_dir/$name-headers.o" \
