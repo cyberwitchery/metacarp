@@ -243,7 +243,9 @@ records the original design and implementation history.
 - A binding consumed on one control-flow path and reassigned later leaks the
   reassigned value (the plan is any-path conservative; it never double-frees).
 - Error messages are deliberately this compiler's own; only rejection behavior
-  matches the reference, not diagnostic text.
+  matches the reference, not diagnostic text. One rejection goes further:
+  returning a reference to a by-value parameter is an error here, while the
+  reference accepts it and the caller reads freed memory.
 
 ## Dependencies
 
