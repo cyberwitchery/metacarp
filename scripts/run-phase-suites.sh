@@ -2,12 +2,21 @@
 # Run every compiler-phase test against the reference Carp compiler.
 # Keep this as the single source of truth for the phase suite: CI and local
 # assurance both call this script.
+#
+# CARP_REFERENCE may instead name a self-hosted compiler, in which case
+# CARP_PHASE_CORE must name the Core it compiles against.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 reference=${CARP_REFERENCE:-carp}
 jobs=${CARP_PHASE_JOBS:-1}
+core_dir=${CARP_PHASE_CORE:-}
+
+compiler_args=()
+if [[ -n "$core_dir" ]]; then
+  compiler_args=(-c "$core_dir")
+fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   ulimit -s 524288
@@ -34,9 +43,10 @@ run_phase_test() {
     fi
     printf '== %s/%s\n' "$test_dir" "$test_file"
     if [[ "$mode" == memory ]]; then
-      "$reference" -x --log-memory "$test_file"
+      "$reference" ${compiler_args[@]+"${compiler_args[@]}"} -x --log-memory \
+        "$test_file"
     else
-      "$reference" -x "$test_file"
+      "$reference" ${compiler_args[@]+"${compiler_args[@]}"} -x "$test_file"
     fi
   )
 }
