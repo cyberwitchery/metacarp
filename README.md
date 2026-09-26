@@ -263,9 +263,10 @@ records the original design and implementation history.
 
 - The host architecture and OS are stamped for the build machine
   (`aarch64`/`darwin`) in the `--core` path.
-- Delete placement is scope-based, not liveness-based: values die at scope or
-  branch exit rather than after their last use, so peak memory can exceed the
-  reference compiler's on the same program.
+- Delete placement is only partly liveness-based: a binder that is never
+  conditionally moved is freed right after the last declaration in its `let`
+  chain that needs it, but other values still die at scope or branch exit, so
+  peak memory can exceed the reference compiler's on the same program.
 - A binding consumed on one control-flow path and reassigned later leaks the
   reassigned value (the plan is any-path conservative; it never double-frees).
 - Error messages are deliberately this compiler's own; only rejection behavior
