@@ -155,7 +155,13 @@ The assurance harness keeps the self-host honest:
 - `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
   checks the self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated
-  workers; CI uses all two Linux or three macOS runner cores.
+  workers; CI uses all two Linux or three macOS runner cores. Gen 2 is built
+  as strict C99, must run `examples/hello.carp`, and is kept (with a
+  provenance file) when `CARP_FIXED_POINT_OUT` names its directory.
+- `scripts/run-assurance.sh phase-self` runs the phase/session suites through
+  gen 2 instead of the reference, using `CARP_PHASE_COMPILER` or building one.
+  The memory suite needs `--log-memory`, which gen 2 lacks, and is skipped. CI
+  runs it on Linux after the self group.
 - `scripts/run-assurance.sh all` runs both groups and is the default. CI calls
   the same phase and self groups rather than maintaining its own command list.
   The self-host group executes generated programs on both x86-64 Linux and

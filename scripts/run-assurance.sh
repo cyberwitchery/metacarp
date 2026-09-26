@@ -2,6 +2,8 @@
 # The canonical local and CI assurance entry point.
 #
 #   run-assurance.sh phase  phase suites plus lint and formatting
+#   run-assurance.sh phase-self  phase suites through the generation-2
+#                           compiler (CARP_PHASE_COMPILER, or built fresh)
 #   run-assurance.sh self   bootstrap, reference suite, fixed point, leaks,
 #                           expansion, library linkage
 #   run-assurance.sh sanitize  the reference suite again, every generated
@@ -64,15 +66,41 @@ run_self() {
   "$reference" -b --optimize main.carp
   "$script_dir/run-carp-suite-self.sh"
   # Both checks want a generation-2 compiler; share one work directory so it
-  # is built once.
-  self_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-self.XXXXXX")
-  trap 'rm -rf "$self_work"' EXIT
+  # is built once. A caller-supplied CARP_FIXED_POINT_OUT is kept afterwards,
+  # so a later `phase-self` can reuse the compiler (CI does).
+  self_work=${CARP_FIXED_POINT_OUT:-}
+  if [[ -z "$self_work" ]]; then
+    self_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-self.XXXXXX")
+    trap 'rm -rf "$self_work"' EXIT
+  fi
   CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-fixed-point.sh"
   CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-leaks.sh"
-  rm -rf "$self_work"
-  trap - EXIT
+  if [[ -z "${CARP_FIXED_POINT_OUT:-}" ]]; then
+    rm -rf "$self_work"
+    trap - EXIT
+  fi
   "$script_dir/diff-expansion.sh"
   "$script_dir/check-library-linkage.sh"
+}
+
+run_phase_self() {
+  carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
+  core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
+  gen2_compiler=${CARP_PHASE_COMPILER:-}
+  if [[ -z "$gen2_compiler" ]]; then
+    cd "$repo_root"
+    "$reference" -b --optimize main.carp
+    phase_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-phase-self.XXXXXX")
+    trap 'rm -rf "$phase_work"' EXIT
+    CARP_FIXED_POINT_OUT="$phase_work" "$script_dir/check-fixed-point.sh"
+    gen2_compiler="$phase_work/carp-compiler-gen2"
+  fi
+  if [[ ! -x "$gen2_compiler" ]]; then
+    printf 'generation-2 compiler not executable: %s\n' "$gen2_compiler" >&2
+    exit 2
+  fi
+  CARP_REFERENCE="$gen2_compiler" CARP_PHASE_CORE="$core_dir" \
+    "$script_dir/run-phase-suites.sh"
 }
 
 run_sanitize() {
@@ -83,6 +111,7 @@ run_sanitize() {
 
 case "$group" in
   phase) run_phase ;;
+  phase-self) run_phase_self ;;
   self) run_self ;;
   sanitize) run_sanitize ;;
   all)
@@ -90,7 +119,7 @@ case "$group" in
     run_self
     ;;
   *)
-    printf 'usage: %s [phase|self|sanitize|all]\n' "$0" >&2
+    printf 'usage: %s [phase|phase-self|self|sanitize|all]\n' "$0" >&2
     exit 2
     ;;
 esac
