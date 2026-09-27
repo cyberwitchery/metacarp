@@ -266,8 +266,6 @@ records the original design and implementation history.
 - Delete placement is scope-based, not liveness-based: values die at scope or
   branch exit rather than after their last use, so peak memory can exceed the
   reference compiler's on the same program.
-- A binding consumed on one control-flow path and reassigned later leaks the
-  reassigned value (the plan is any-path conservative; it never double-frees).
 - Error messages are deliberately this compiler's own; only rejection behavior
   matches the reference, not diagnostic text. One rejection goes further:
   returning a reference to a by-value parameter is an error here, while the
