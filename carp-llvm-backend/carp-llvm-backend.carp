@@ -2223,6 +2223,45 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
         (llvm-emit-error! @"indirect call without function type in llvm backend")
         (llvm-dummy-value ctx))))
 
+(doc llvm-delete-in-place! "calls the plan's deleter for `type` on the value
+stored at `place`, if the type is managed. The deleter is called the way
+`llvm-emit-global-call-dispatch` calls any global: through its pointer-protocol
+entry when it is an LLVM-side function with a C adapter, or C-native and moving
+an aggregate (the entry then takes the place itself); otherwise directly, with
+the value loaded.")
+(hidden llvm-delete-in-place!)
+(defn llvm-delete-in-place! [ctx builder mod type place]
+  (match (llvm-managed-symbol &*llvm-delete-symbols* type)
+    (Maybe.Just deleter)
+      (if (or (llvm-cimpl? &deleter)
+              (and (llvm-cnative? &deleter) (llvm-aggregate-monotype? type)))
+        (let [pfnty (LLVM.function-type (LLVM.void-type ctx)
+                                        &[(LLVM.pointer-type (LLVM.int8-type ctx)
+                                                             0)]
+                                        false)]
+          (ignore
+            (LLVM.build-call builder
+                             pfnty
+                             (llvm-runtime-fn mod
+                                              &(llvm-protocol-target &deleter)
+                                              pfnty)
+                             &[place]
+                             (llvm-cstr &@""))))
+        (let [field-ty (llvm-lower-type ctx type)
+              deleter-fnty (LLVM.function-type (LLVM.void-type ctx)
+                                               &[field-ty]
+                                               false)]
+          (ignore
+            (LLVM.build-call builder
+                             deleter-fnty
+                             (llvm-runtime-fn mod &deleter deleter-fnty)
+                             &[(LLVM.build-load builder
+                                                field-ty
+                                                place
+                                                (llvm-cstr &@"oldv"))]
+                             (llvm-cstr &@"")))))
+    (Maybe.Nothing) ()))
+
 ;; llvm-emit-expr and the construct emitters below are mutually recursive.
 (defn llvm-emit-expr [ctx builder mod func expression]
   (let-do [_debug (llvm-debug-set-builder! ctx builder expression)
@@ -2550,18 +2589,26 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
                    (unless (and (Int.>= ci 0)
                                 (unit-type?
                                   &(llvm-ctor-field-monotype ci &subject member)))
-                     (ignore
-                       (LLVM.build-store builder
-                                         value
-                                         (LLVM.build-struct-gep builder
-                                                                variant-ty
-                                                                unionp
-                                                                (if (Int.>= ci 0)
-                                                                  (llvm-ctor-adjusted-index ci
-                                                                                            &subject
-                                                                                            member)
-                                                                  member)
-                                                                (llvm-cstr &@"fsfield")))))
+                     (let-do [fieldp (LLVM.build-struct-gep builder
+                                                            variant-ty
+                                                            unionp
+                                                            (if (Int.>= ci 0)
+                                                              (llvm-ctor-adjusted-index ci
+                                                                                        &subject
+                                                                                        member)
+                                                              member)
+                                                            (llvm-cstr &@"fsfield"))]
+                       ;; the write drops whatever the field held: free it
+                       ;; first, after the new value is evaluated, like the C
+                       ;; backend
+                       (llvm-delete-in-place! ctx
+                                              builder
+                                              mod
+                                              &(Specialize.expression-type
+                                                (Box.peek (Array.unsafe-nth arguments
+                                                                            3)))
+                                              (LLVM.dup &fieldp))
+                       (ignore (LLVM.build-store builder value fieldp))))
                    (llvm-dummy-value ctx))
                  ;; Array/StaticArray length (ids 9/10): load `.len` behind the ref
                  (and
