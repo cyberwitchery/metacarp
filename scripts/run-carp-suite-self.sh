@@ -72,8 +72,7 @@ failed=0
 gaps=0
 
 # reference tests we knowingly fail, each with its tracking issue:
-#   nested_module_multisym.carp       nested-module multisym dispatch (#8)
-known_gaps="nested_module_multisym"
+known_gaps=""
 
 known_gap() {
   base=$(basename "$1" .carp)
