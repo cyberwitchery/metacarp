@@ -1666,13 +1666,67 @@ move it out of the borrowed container.")
               (set! result (Maybe.Just @instance)))))
         result)))
 
+  (private overload-for)
+  (hidden overload-for)
+  (defn overload-for [core reference]
+    (let-do [result (the (Maybe CoreOverload) (Maybe.Nothing))
+             overloads (CoreModule.overloads core)]
+      (for [i 0 (Array.length overloads)]
+        (let [overload (Array.unsafe-nth overloads i)]
+          (when (CoreIR.same-ref? (CoreOverload.reference overload) reference)
+            (set! result (Maybe.Just @overload)))))
+      result))
+
+  (private candidate-for)
+  (hidden candidate-for)
+  (doc candidate-for "the candidate of an overload that a concrete call site
+chooses: the one whose type fits. Inference settles every choice its types
+decide, so what arrives here is an instance of a definition generalized over
+an open choice, whose concrete types decide it now.")
+  (defn candidate-for [inferred call overload]
+    (let-do [signature (Box.peek (CallSite.type call))
+             environment (InferredModule.environment inferred)
+             fitting (the (Array CallSite) [])
+             candidates (CoreOverload.candidates overload)]
+      (for [i 0 (Array.length candidates)]
+        (let [candidate (Array.unsafe-nth candidates i)]
+          (match (scheme-for environment candidate)
+            (Maybe.Just scheme)
+              (let [empty (Type.empty-substitution)]
+                (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
+                                          signature
+                                          &empty)
+                  (Result.Success substitution)
+                    (Array.push-back! &fitting
+                                      (CallSite.init @(CallSite.id call)
+                                                     @candidate
+                                                     (Box.init
+                                                       (Type.apply &substitution
+                                                                   (Box.peek (TypeScheme.body &scheme))))
+                                                     (copy-call-owner call)))
+                  (Result.Error _) ()))
+            (Maybe.Nothing) ())))
+      (if (Int.= 1 (Array.length &fitting))
+        (Result.Success @(Array.unsafe-nth &fitting 0))
+        (Result.Error
+          (SpecializeError.init
+            (String.concat
+              &[(if (Int.= 0 (Array.length &fitting))
+                  @"no candidate of "
+                  @"ambiguous ")
+                @(CoreRef.name (CoreOverload.reference overload))
+                @" for "
+                (Type.render signature)]))))))
+
   (private concrete-call)
   (hidden concrete-call)
   (defn concrete-call [core inferred call]
     (let [reference (CallSite.reference call)]
       (if (interface? (CoreModule.interfaces core) reference)
         (implementation-for core inferred call)
-        (Result.Success @call))))
+        (match (overload-for core reference)
+          (Maybe.Just overload) (candidate-for inferred call &overload)
+          (Maybe.Nothing) (Result.Success @call)))))
 
   (private materialize-calls)
   (hidden materialize-calls)
@@ -2752,8 +2806,7 @@ definitions while its instance cache contains both old and new instances.")
                 signature (MonoType.copy (Box.peek (CallSite.type &call)))]
             ;; interface dispatch runs before the concreteness gate: a call
             ;; whose free variables are pinned by the unique matching
-            ;; implementation (overload interfaces declare no linking
-            ;; signature) resolves through the dispatch substitution.
+            ;; implementation resolves through the dispatch substitution.
             (if (interface? interfaces &reference)
               (match (implementation-for core inferred &call)
                 (Result.Success implementation)
@@ -2769,42 +2822,61 @@ definitions while its instance cache contains both old and new instances.")
                           (contextual-specialize-error &origin
                                                        (SpecializeError.message &error)))))
               (when (concrete-signature? &signature)
-                (if (or (has-definition? functions &reference)
-                        (or (has-value? values &reference)
-                            (has-builtin? builtins &reference)))
-                  (unless-do (contains-instance? &instances
-                                                 &reference
-                                                 &signature)
-                    (match (dependencies-for core inferred &reference &signature)
-                      (Result.Success dependencies)
-                        (let-do [symbol (symbol-for core &reference &signature)]
-                          (Array.push-back! &instances
-                                            (Specialization.init (CoreRef.copy &reference)
-                                                                 (Box.init (MonoType.copy &signature))
-                                                                 symbol))
-                          (buckets-note! &reference
-                                         (Int.dec (Array.length &instances)))
-                          (let [n (Array.length &dependencies)]
-                            (for [i 0 n]
-                              (Array.push-back! &queue
-                                                (SpecializationRequest.init @(Array.unsafe-nth &dependencies
-                                                                                               i)
-                                                                            (String.concat
-                                                                              &[(String.copy (CoreRef.name &reference))
-                                                                                @" at "
-                                                                                (Type.render &signature)]))))))
+                (match (overload-for core &reference)
+                  (Maybe.Just overload)
+                    (match (candidate-for inferred &call &overload)
+                      (Result.Success candidate)
+                        (Array.push-back! &queue
+                                          (SpecializationRequest.init candidate
+                                                                      (String.copy &origin)))
                       (Result.Error error)
                         (do
                           (set! failed true)
                           (set! failure
                                 (contextual-specialize-error &origin
-                                                             (SpecializeError.message &error))))))
+                                                             (SpecializeError.message &error)))))
+                  (Maybe.Nothing)
+                    (if (or (has-definition? functions &reference)
+                            (or (has-value? values &reference)
+                                (has-builtin? builtins &reference)))
+                      (unless-do (contains-instance? &instances
+                                                     &reference
+                                                     &signature)
+                        (match (dependencies-for core
+                                                 inferred
+                                                 &reference
+                                                 &signature)
+                          (Result.Success dependencies)
+                            (let-do [symbol (symbol-for core
+                                                        &reference
+                                                        &signature)]
+                              (Array.push-back! &instances
+                                                (Specialization.init (CoreRef.copy &reference)
+                                                                     (Box.init (MonoType.copy &signature))
+                                                                     symbol))
+                              (buckets-note! &reference
+                                             (Int.dec (Array.length &instances)))
+                              (let [n (Array.length &dependencies)]
+                                (for [i 0 n]
+                                  (Array.push-back! &queue
+                                                    (SpecializationRequest.init @(Array.unsafe-nth &dependencies
+                                                                                                   i)
+                                                                                (String.concat
+                                                                                  &[(String.copy (CoreRef.name &reference))
+                                                                                    @" at "
+                                                                                    (Type.render &signature)]))))))
+                          (Result.Error error)
+                            (do
+                              (set! failed true)
+                              (set! failure
+                                    (contextual-specialize-error &origin
+                                                                 (SpecializeError.message &error))))))
 
-                  (do
-                    (set! failed true)
-                    (set! failure
-                          (contextual-specialize-error &origin
-                                                       "call has no function or builtin definition"))))))))
+                      (do
+                        (set! failed true)
+                        (set! failure
+                              (contextual-specialize-error &origin
+                                                           "call has no function or builtin definition")))))))))
         (set! cursor (Int.inc cursor)))
       (let-do [result (if failed
                  (Result.Error (SpecializeError.init failure))

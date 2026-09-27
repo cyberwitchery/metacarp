@@ -8,7 +8,8 @@
 (deftype InferGlobalEnvironment
   [bindings (Array SchemeBinding)
    indexes (Array Int)
-   variables (Array Int)])
+   variables (Array Int)
+   overloads (Array CoreOverload)])
 
 (deftype InferEnvironment
   [globals (Ptr InferGlobalEnvironment)
@@ -37,7 +38,8 @@
 (deftype InferenceTrace
   [calls (Array CallSite)
    node-types (Array InferredNodeType)
-   binding-types (Array InferredBindingType)])
+   binding-types (Array InferredBindingType)
+   choices (Array TypeChoice)])
 
 (deftype InferState
   [next-variable Int
@@ -291,7 +293,8 @@ name to give.")
                          (MonoType.copy
                            (Box.peek (ConvertedType.type &converted))))
                        (declaration-names &quantified
-                                          (ConvertedType.variables &converted)))))
+                                          (ConvertedType.variables &converted))
+                       [])))
 
   (private binding-for)
   (hidden binding-for)
@@ -481,32 +484,20 @@ name to give.")
   (hidden generalize)
   (private generalize-local)
   (hidden generalize-local)
-  (defn generalize [environment type]
-    (let-do [environment-variables (free-environment environment)
-             type-variables (Type.free-variables type)
-             quantified (the (Array Int) [])
-             n (Array.length &type-variables)]
-      (for [i 0 n]
-        (let [variable @(Array.unsafe-nth &type-variables i)]
-          (unless-do (Type.contains-variable? &environment-variables variable)
-            (set! quantified (Type.append-variable &quantified variable)))))
-      (TypeScheme.init quantified
-                       (Type.free-lifetimes type)
-                       (Box.init (MonoType.copy type))
-                       (the (Array String) []))))
-
-  (defn generalize-local [environment type]
-    (let-do [scheme (generalize environment type)]
-      (TypeScheme.init @(TypeScheme.variables &scheme)
-                       []
-                       @(TypeScheme.body &scheme)
-                       @(TypeScheme.names &scheme))))
-
   (private instantiate)
   (hidden instantiate)
   (private instantiate-tagged)
   (hidden instantiate-tagged)
-  (defn instantiate-tagged [scheme state tag]
+  (private instantiate-parts)
+  (hidden instantiate-parts)
+  (doc instantiate-parts "a scheme's body and choices with fresh variables for
+its quantified ones, renamed alike. The choices are returned, not opened: a
+caller that only asks whether a type fits must not constrain anything.")
+  (sig instantiate-parts
+       (Fn
+         [(Ref TypeScheme) (Ref InferState) (Ref String)]
+         (Pair FreshType (Array TypeChoice))))
+  (defn instantiate-parts [scheme state tag]
     (let-do [mapping (Type.empty-substitution)
              variables (TypeScheme.variables scheme)
              lifetimes (TypeScheme.lifetime-variables scheme)
@@ -556,16 +547,441 @@ name to give.")
           (set! next-variable (Int.inc next-variable))))
       ;; constructor variables (lowercase nominal heads, e.g. fmap's `(f a)`)
       ;; are implicitly quantified: freshen them per instantiation so two call
-      ;; sites do not share one `f`.
-      (let-do [applied (Type.apply &mapping (Box.peek (TypeScheme.body scheme)))
+      ;; sites do not share one `f`. A choice shares them with the body, so
+      ;; the two are freshened together.
+      (let-do [choices (TypeScheme.choices scheme)
+               applied (Type.apply &mapping (Box.peek (TypeScheme.body scheme)))
+               choice-types (the (Array (Box MonoType)) [])
                counter [next-variable]
-               freshened (Type.freshen-constructors &applied &counter)]
-        (FreshType.init (Box.init freshened)
-                        (InferState.init @(Array.unsafe-nth &counter 0)
-                                         @(InferState.solver state)
-                                         @(InferState.trace state))))))
+               renamed (the (Array TypeChoice) [])]
+        (for [i 0 (Array.length choices)]
+          (Array.push-back! &choice-types
+                            (Box.init
+                              (Type.apply &mapping
+                                          (Box.peek
+                                            (TypeChoice.type (Array.unsafe-nth choices
+                                                                               i)))))))
+        (let [joint (Type.freshen-constructors &(Type.function choice-types
+                                                               applied)
+                                               &counter)
+              body (match-ref &joint
+                (MonoType.Function types result)
+                  (do
+                    (for [i 0 (Array.length types)]
+                      (let [choice (Array.unsafe-nth choices i)]
+                        (Array.push-back! &renamed
+                                          (TypeChoice.init @(TypeChoice.overload choice)
+                                                           @(TypeChoice.name choice)
+                                                           @(Array.unsafe-nth types
+                                                                              i)
+                                                           @(TypeChoice.candidates choice)))))
+                    (MonoType.copy (Box.peek result)))
+                _ (MonoType.copy &joint))]
+          (Pair.init
+            (FreshType.init (Box.init body)
+                            (InferState.init @(Array.unsafe-nth &counter 0)
+                                             @(InferState.solver state)
+                                             @(InferState.trace state)))
+            renamed)))))
+
+  (private open-choice!)
+  (hidden open-choice!)
+  (defn open-choice! [state choice]
+    (Array.push-back!
+      (InferenceTrace.choices (Pointer.to-ref @(InferState.trace state)))
+      choice))
+
+  (doc instantiate-tagged "instantiates a scheme at a use: the body with fresh
+variables, and each of its choices opened here, where the use's types can
+settle it.")
+  (defn instantiate-tagged [scheme state tag]
+    (let-do [parts (instantiate-parts scheme state tag)
+             choices (Pair.b &parts)]
+      (for [i 0 (Array.length choices)]
+        (open-choice! (FreshType.state (Pair.a &parts))
+                      @(Array.unsafe-nth choices i)))
+      @(Pair.a &parts)))
 
   (defn instantiate [scheme state] (instantiate-tagged scheme state "?"))
+
+  (private overload-for)
+  (hidden overload-for)
+  (doc overload-for "the overload a global reference names, if it names one.")
+  (defn overload-for [environment reference]
+    (let-do [result (the (Maybe CoreOverload) (Maybe.Nothing))
+             overloads (InferGlobalEnvironment.overloads
+               (Pointer.to-ref @(InferEnvironment.globals environment)))]
+      (when @(CoreRef.global reference)
+        (for [i 0 (Array.length overloads)]
+          (let [entry (Array.unsafe-nth overloads i)]
+            (when (CoreIR.same-ref? (CoreOverload.reference entry) reference)
+              (set! result (Maybe.Just @entry))))))
+      result))
+
+  (private open-overload)
+  (hidden open-overload)
+  (doc open-overload "a reference to an overload: a fresh type, constrained to
+be the type of one of its candidates.")
+  (defn open-overload [overload state]
+    (let-do [fresh-result (fresh state)
+             candidates (the (Array Int) [])]
+      (for [i 0 (Array.length (CoreOverload.candidates overload))]
+        (Array.push-back! &candidates
+                          @(CoreRef.id
+                            (Array.unsafe-nth (CoreOverload.candidates overload)
+                                              i))))
+      (open-choice! (FreshType.state &fresh-result)
+                    (TypeChoice.init
+                      @(CoreRef.id (CoreOverload.reference overload))
+                      @(CoreRef.name (CoreOverload.reference overload))
+                      @(FreshType.type &fresh-result)
+                      candidates))
+      (InferredExpression.init @(FreshType.type &fresh-result)
+                               @(FreshType.state &fresh-result))))
+
+  (private candidate-scheme)
+  (hidden candidate-scheme)
+  (defn candidate-scheme [environment id]
+    (binding-for environment &(CoreRef.init id @"" true)))
+
+  (private candidate-fits?)
+  (hidden candidate-fits?)
+  (doc candidate-fits? "whether one candidate's type still fits a choice,
+asked without constraining anything: both sides are normalized through the
+solver and unified in a scratch one, which succeeds exactly when the solver's
+constraints can be extended by that choice.")
+  (defn candidate-fits? [environment state wanted id]
+    (match (candidate-scheme environment id)
+      (Maybe.Just scheme)
+        (let-do [parts (instantiate-parts &scheme state "fit")
+                 solver @(InferState.solver state)
+                 left (Type.solver-apply-at solver wanted)
+                 right (Type.solver-apply-at solver
+                                             (Box.peek (FreshType.type (Pair.a &parts))))
+                 scratch (Type.solver)]
+          (Result.success? &(Type.solver-unify! &scratch &left &right)))
+      (Maybe.Nothing) false))
+
+  (private commit-choice)
+  (hidden commit-choice)
+  (doc commit-choice "settles a choice on its one fitting candidate: its type is
+unified with the candidate's, whose own choices open here.")
+  (defn commit-choice [environment state choice id]
+    (match (candidate-scheme environment id)
+      (Maybe.Just scheme)
+        (let [instance (instantiate &scheme state)]
+          (match (Type.solver-unify-at!
+              @(InferState.solver (FreshType.state &instance))
+              (Box.peek (TypeChoice.type choice))
+              (Box.peek (FreshType.type &instance)))
+            (Result.Success _) (Result.Success @(FreshType.state &instance))
+            (Result.Error error)
+              (Result.Error (InferError.init @(TypeError.message &error)))))
+      (Maybe.Nothing)
+        (Result.Error
+          (InferError.init
+            (String.concat
+              &[@"missing type scheme for a candidate of "
+                @(TypeChoice.name choice)])))))
+
+  (private choice-error)
+  (hidden choice-error)
+  (doc choice-error "names the overload, the type asked of it, and the
+candidates still in the choice, so the reader sees what was ambiguous or what
+was on offer.")
+  (defn choice-error [environment state choice what]
+    (let-do [names (the (Array String) [])
+             overloads (InferGlobalEnvironment.overloads
+               (Pointer.to-ref @(InferEnvironment.globals environment)))]
+      (for [i 0 (Array.length overloads)]
+        (let [overload (Array.unsafe-nth overloads i)]
+          (when (Int.=
+              @(CoreRef.id (CoreOverload.reference overload))
+              @(TypeChoice.overload choice))
+            (for [j 0 (Array.length (CoreOverload.candidates overload))]
+              (let [candidate (Array.unsafe-nth (CoreOverload.candidates overload)
+                                                j)]
+                (when (Array.contains? (TypeChoice.candidates choice)
+                                       (CoreRef.id candidate))
+                  (Array.push-back! &names @(CoreRef.name candidate))))))))
+      (InferError.init
+        (String.concat
+          &[(String.copy what)
+            @" "
+            @(TypeChoice.name choice)
+            @" for "
+            (Type.render
+              &(Type.solver-apply-at @(InferState.solver state)
+                                     (Box.peek (TypeChoice.type choice))))
+            (if (Array.empty? &names)
+              @""
+              (String.concat &[@" (candidates: " (String.join ", " &names) @")"]))]))))
+
+  (private take-choices!)
+  (hidden take-choices!)
+  (doc take-choices! "empties the trace's open choices and returns them.")
+  (defn take-choices! [state]
+    (let-do [trace (Pointer.to-ref @(InferState.trace state))
+             open @(InferenceTrace.choices trace)]
+      (InferenceTrace.set-choices! trace [])
+      open))
+
+  (private put-choices!)
+  (hidden put-choices!)
+  (doc put-choices! "reopens `choices` ahead of whatever was opened since they
+were taken.")
+  (defn put-choices! [state choices]
+    (let-do [trace (Pointer.to-ref @(InferState.trace state))
+             merged choices]
+      (for [i 0 (Array.length (InferenceTrace.choices trace))]
+        (Array.push-back! &merged
+                          @(Array.unsafe-nth (InferenceTrace.choices trace) i)))
+      (InferenceTrace.set-choices! trace merged)))
+
+  (private open-choices?)
+  (hidden open-choices?)
+  (defn open-choices? [state]
+    (Int.>
+      (Array.length
+        (InferenceTrace.choices (Pointer.to-ref @(InferState.trace state))))
+      0))
+
+  (private settle-open-choices!)
+  (hidden settle-open-choices!)
+  (private settle-choices!)
+  (hidden settle-choices!)
+  (doc settle-choices! "narrows every open overload choice to the candidates
+whose types still fit it. A choice with one left commits to it, one with none
+is a type error, and the rest stay open, narrowed. Committing constrains other
+choices, so it repeats until a pass commits nothing.")
+  (defn settle-open-choices! [environment state]
+    (let-do [current (state-copy state)
+             result (the (Result Unit InferError) (Result.Success ()))
+             progress true]
+      (while-do (and progress (Result.success? &result))
+        (set! progress false)
+        (let-do [open (take-choices! &current)
+                 remaining (the (Array TypeChoice) [])]
+          (for [i 0 (Array.length &open)]
+            (let-do [choice (Array.unsafe-nth &open i)
+                     fitting (the (Array Int) [])]
+              (when-do (Result.success? &result)
+                (for [j 0 (Array.length (TypeChoice.candidates choice))]
+                  (let [id @(Array.unsafe-nth (TypeChoice.candidates choice) j)]
+                    (when (candidate-fits? environment
+                                           &current
+                                           (Box.peek (TypeChoice.type choice))
+                                           id)
+                      (Array.push-back! &fitting id))))
+                (cond
+                  (Int.= 0 (Array.length &fitting))
+                    (set! result
+                          (Result.Error
+                            (choice-error environment
+                                          &current
+                                          choice
+                                          "no candidate of")))
+                  (Int.= 1 (Array.length &fitting))
+                    (match (commit-choice environment
+                                          &current
+                                          choice
+                                          @(Array.unsafe-nth &fitting 0))
+                      (Result.Success next)
+                        (do (set! current next) (set! progress true))
+                      (Result.Error error) (set! result (Result.Error error)))
+                  (Array.push-back! &remaining
+                                    (TypeChoice.init @(TypeChoice.overload choice)
+                                                     @(TypeChoice.name choice)
+                                                     @(TypeChoice.type choice)
+                                                     fitting))))))
+          ;; commits opened their candidates' choices meanwhile
+          (put-choices! &current remaining)))
+      (match result
+        (Result.Success _) (Result.Success current)
+        (Result.Error error) (Result.Error error))))
+
+  ;; almost every call has no choice open: settling is then free
+  (defn settle-choices! [environment state]
+    (if (open-choices? state)
+      (settle-open-choices! environment state)
+      (Result.Success (state-copy state))))
+
+  (private quantify)
+  (hidden quantify)
+  (defn quantify [environment-variables type-variables]
+    (let-do [quantified (the (Array Int) [])]
+      (for [i 0 (Array.length type-variables)]
+        (let [variable @(Array.unsafe-nth type-variables i)]
+          (unless (Type.contains-variable? environment-variables variable)
+            (set! quantified (Type.append-variable &quantified variable)))))
+      quantified))
+
+  (private applied-environment-variables)
+  (hidden applied-environment-variables)
+  (doc applied-environment-variables "the variables the environment fixes, seen
+through the solver: an environment variable bound since it was recorded fixes
+the variables of what it is bound to.")
+  (defn applied-environment-variables [environment state]
+    (let-do [raw (free-environment environment)
+             result (the (Array Int) [])]
+      (for [i 0 (Array.length &raw)]
+        (let [free (Type.free-variables
+                &(Type.solver-apply-at @(InferState.solver state)
+                                       &(Type.variable @(Array.unsafe-nth &raw i))))]
+          (for [j 0 (Array.length &free)]
+            (set! result
+                  (Type.append-variable &result @(Array.unsafe-nth &free j))))))
+      result))
+
+  (private mentions-any?)
+  (hidden mentions-any?)
+  (defn mentions-any? [type variables]
+    (let-do [free (Type.free-variables type)
+             found false]
+      (for [i 0 (Array.length &free)]
+        (when (Type.contains-variable? variables @(Array.unsafe-nth &free i))
+          (set! found true)))
+      found))
+
+  (doc generalize "settles the open overload choices, then generalizes a
+definition's type over what the environment does not fix. A choice over a
+quantified variable becomes part of the scheme, a qualified type, with its
+other local variables quantified alongside. Every other choice stays open (see
+`reject-undecidable-choices`).")
+  (sig generalize
+       (Fn
+         [(Ref InferEnvironment) (Ref InferState) (Ref MonoType)]
+         (Result (Pair TypeScheme InferState) InferError)))
+  (defn generalize [environment state type]
+    (match (settle-choices! environment state)
+      (Result.Success settled)
+        (let-do [solver @(InferState.solver &settled)
+                 solved (Type.solver-apply-at solver type)
+                 ;; the applied environment walks every global's variables:
+                 ;; only an open choice needs it
+                 fixed (if (open-choices? &settled)
+                   (applied-environment-variables environment &settled)
+                   [])
+                 quantified (quantify &(free-environment environment)
+                                      &(Type.free-variables &solved))
+                 lifetimes (Type.free-lifetimes &solved)
+                 trace (Pointer.to-ref @(InferState.trace &settled))
+                 open @(InferenceTrace.choices trace)
+                 taken (Array.replicate (Array.length &open) &false)
+                 attached (the (Array TypeChoice) [])
+                 kept (the (Array TypeChoice) [])
+                 changed true]
+          ;; attaching a choice quantifies its other variables, which can bring
+          ;; another choice in, so this repeats until nothing more attaches
+          (while-do changed
+            (set! changed false)
+            (for [i 0 (Array.length &open)]
+              (unless @(Array.unsafe-nth &taken i)
+                (let [choice (Array.unsafe-nth &open i)
+                      choice-type (Type.solver-apply-at solver
+                                                        (Box.peek (TypeChoice.type choice)))]
+                  (when-do (mentions-any? &choice-type &quantified)
+                    (Array.aset! &taken i true)
+                    (set! changed true)
+                    (let-do [free (Type.free-variables &choice-type)
+                             free-lifetimes (Type.free-lifetimes &choice-type)]
+                      (for [j 0 (Array.length &free)]
+                        (let [variable @(Array.unsafe-nth &free j)]
+                          (unless (Type.contains-variable? &fixed variable)
+                            (set! quantified
+                                  (Type.append-variable &quantified variable)))))
+                      (for [j 0 (Array.length &free-lifetimes)]
+                        (set! lifetimes
+                              (Type.append-variable &lifetimes
+                                                    @(Array.unsafe-nth &free-lifetimes
+                                                                       j)))))
+                    (Array.push-back! &attached
+                                      (TypeChoice.init @(TypeChoice.overload choice)
+                                                       @(TypeChoice.name choice)
+                                                       (Box.init choice-type)
+                                                       @(TypeChoice.candidates choice))))))))
+          (for [i 0 (Array.length &open)]
+            (unless @(Array.unsafe-nth &taken i)
+              (Array.push-back! &kept @(Array.unsafe-nth &open i))))
+          (InferenceTrace.set-choices! trace kept)
+          (Result.Success
+            (Pair.init
+              (TypeScheme.init quantified
+                               lifetimes
+                               (Box.init solved)
+                               (the (Array String) [])
+                               attached)
+              settled)))
+      (Result.Error error) (Result.Error error)))
+
+  (private reject-undecidable-choices)
+  (hidden reject-undecidable-choices)
+  (doc reject-undecidable-choices "fails on the first open choice over none of
+the variables `environment` fixes, once every definition that could have
+claimed it is generalized: nothing inferred later can reach its variables, so
+it can never be decided. That is an ambiguity, as in the reference.")
+  (defn reject-undecidable-choices [environment state]
+    (let-do [fixed (if (open-choices? state)
+               (applied-environment-variables environment state)
+               [])
+             open (InferenceTrace.choices
+               (Pointer.to-ref @(InferState.trace state)))
+             result (the (Result Unit InferError) (Result.Success ()))]
+      (for [i 0 (Array.length open)]
+        (let [choice (Array.unsafe-nth open i)]
+          (when (and (Result.success? &result)
+                     (not
+                       (mentions-any?
+                         &(Type.solver-apply-at @(InferState.solver state)
+                                                (Box.peek (TypeChoice.type choice)))
+                         &fixed)))
+            (set! result
+                  (Result.Error
+                    (choice-error environment state choice "ambiguous"))))))
+      result))
+
+  (doc generalize-local "settles the open overload choices, then generalizes a
+local or global value's type. A value is inferred once and not specialized per
+use, so a variable an open choice constrains stays monomorphic, and the choice
+stays open for the enclosing scope to settle.")
+  (sig generalize-local
+       (Fn
+         [(Ref InferEnvironment) (Ref InferState) (Ref MonoType)]
+         (Result (Pair TypeScheme InferState) InferError)))
+  (defn generalize-local [environment state type]
+    (match (settle-choices! environment state)
+      (Result.Success settled)
+        (let-do [solver @(InferState.solver &settled)
+                 solved (Type.solver-apply-at solver type)
+                 candidates (quantify &(free-environment environment)
+                                      &(Type.free-variables &solved))
+                 open (InferenceTrace.choices
+                   (Pointer.to-ref @(InferState.trace &settled)))
+                 constrained (the (Array Int) [])
+                 quantified (the (Array Int) [])]
+          (for [i 0 (Array.length open)]
+            (let [free (Type.free-variables
+                    &(Type.solver-apply-at solver
+                                           (Box.peek
+                                             (TypeChoice.type (Array.unsafe-nth open
+                                                                                i)))))]
+              (for [j 0 (Array.length &free)]
+                (set! constrained
+                      (Type.append-variable &constrained
+                                            @(Array.unsafe-nth &free j))))))
+          (for [i 0 (Array.length &candidates)]
+            (let [variable @(Array.unsafe-nth &candidates i)]
+              (unless (Type.contains-variable? &constrained variable)
+                (set! quantified (Type.append-variable &quantified variable)))))
+          (Result.Success
+            (Pair.init
+              (TypeScheme.init quantified
+                               []
+                               (Box.init solved)
+                               (the (Array String) [])
+                               [])
+              settled)))
+      (Result.Error error) (Result.Error error)))
 
   (private infer-arguments)
   (hidden infer-arguments)
@@ -803,7 +1219,8 @@ monomorphic sharing the array relies on.")
             pre-scheme (TypeScheme.init []
                                         []
                                         (Box.init (MonoType.copy &placeholder))
-                                        (the (Array String) []))
+                                        (the (Array String) [])
+                                        [])
             pre-env (extend-environment environment reference &pre-scheme)
             value-state (InferState.copy (FreshType.state &fresh-result))]
         (match (infer-expression &pre-env (Box.peek value) &value-state)
@@ -824,7 +1241,8 @@ monomorphic sharing the array relies on.")
                          scheme (TypeScheme.init []
                                                  []
                                                  (Box.init (MonoType.copy &value-type))
-                                                 (the (Array String) []))
+                                                 (the (Array String) [])
+                                                 [])
                          extended (extend-environment environment
                                                       reference
                                                       &scheme)
@@ -841,27 +1259,35 @@ monomorphic sharing the array relies on.")
       (let [value-state (InferState.copy state)]
         (match (infer-expression environment (Box.peek value) &value-state)
           (Result.Success inferred-value)
-            (let-do [value-type (Type.solver-apply-at
-                       @(InferState.solver
-                         (InferredExpression.state &inferred-value))
-                       (Box.peek (InferredExpression.type &inferred-value)))
-                     scheme (if (and (generalizable-value? (Box.peek value))
-                                     (not
-                                       (assigns-reference? (Box.peek body)
-                                                           reference)))
-                       (generalize-local environment &value-type)
-                       (TypeScheme.init []
-                                        []
-                                        (Box.init (MonoType.copy &value-type))
-                                        (the (Array String) [])))
-                     extended (extend-environment environment reference &scheme)
-                     body-state (InferState.copy
-                       (InferredExpression.state &inferred-value))]
-              (record-binding-type! &body-state
-                                    environment
-                                    reference
-                                    &value-type)
-              (infer-expression &extended (Box.peek body) &body-state))
+            (let [value-state (InferredExpression.state &inferred-value)
+                  value-type (Type.solver-apply-at @(InferState.solver value-state)
+                                                   (Box.peek
+                                                     (InferredExpression.type &inferred-value)))
+                  generalized (if (and (generalizable-value? (Box.peek value))
+                                       (not
+                                         (assigns-reference? (Box.peek body)
+                                                             reference)))
+                    (generalize-local environment value-state &value-type)
+                    (Result.Success
+                      (Pair.init
+                        (TypeScheme.init []
+                                         []
+                                         (Box.init (MonoType.copy &value-type))
+                                         (the (Array String) [])
+                                         [])
+                        (state-copy value-state))))]
+              (match generalized
+                (Result.Success pair)
+                  (let-do [extended (extend-environment environment
+                                                        reference
+                                                        (Pair.a &pair))
+                           body-state (InferState.copy (Pair.b &pair))]
+                    (record-binding-type! &body-state
+                                          environment
+                                          reference
+                                          &value-type)
+                    (infer-expression &extended (Box.peek body) &body-state))
+                (Result.Error error) (Result.Error error)))
           (Result.Error error) (Result.Error error)))))
 
   (defn infer-lambda [environment parameters body state]
@@ -1027,7 +1453,8 @@ monomorphic sharing the array relies on.")
                                              (Box.init
                                                (MonoType.copy
                                                  (Box.peek (FreshType.type &fresh-result))))
-                                             (the (Array String) []))]
+                                             (the (Array String) [])
+                                             [])]
               (record-binding-type! (FreshType.state &fresh-result)
                                     (Pair.a pair)
                                     binding
@@ -1044,34 +1471,47 @@ monomorphic sharing the array relies on.")
   (hidden constrain-match-pattern)
   (defn constrain-core-pattern [environment pattern subject state by-ref]
     (match-ref pattern
-      (CorePattern.Ignore) (Result.Success (state-copy state))
+      (CorePattern.Ignore)
+      (Result.Success (state-copy state))
       (CorePattern.Bind reference)
-        (match (binding-for environment reference)
-          (Maybe.Just scheme)
-            (if by-ref
-              (let-do [fresh (fresh-lifetime state)
-                       bound (Type.reference (MonoType.copy subject)
-                                             @(FreshLifetime.lifetime &fresh))
-                       work-state (FreshLifetime.state &fresh)]
-                (match (Type.solver-unify-at! @(InferState.solver work-state)
-                                              (Box.peek (TypeScheme.body &scheme))
-                                              &bound)
-                  (Result.Success _) (Result.Success (state-copy work-state))
-                  (Result.Error error)
-                    (Result.Error (InferError.init @(TypeError.message &error)))))
-              (match (Type.solver-unify-at! @(InferState.solver state)
+      (match (binding-for environment reference)
+        (Maybe.Just scheme)
+          (if by-ref
+            (let-do [fresh (fresh-lifetime state)
+                     bound (Type.reference (MonoType.copy subject)
+                                           @(FreshLifetime.lifetime &fresh))
+                     work-state (FreshLifetime.state &fresh)]
+              (match (Type.solver-unify-at! @(InferState.solver work-state)
                                             (Box.peek (TypeScheme.body &scheme))
-                                            subject)
-                (Result.Success _) (Result.Success (state-copy state))
+                                            &bound)
+                (Result.Success _) (Result.Success (state-copy work-state))
                 (Result.Error error)
                   (Result.Error (InferError.init @(TypeError.message &error)))))
-          (Maybe.Nothing)
-            (Result.Error (InferError.init @"missing match binding type")))
+            (match (Type.solver-unify-at! @(InferState.solver state)
+                                          (Box.peek (TypeScheme.body &scheme))
+                                          subject)
+              (Result.Success _) (Result.Success (state-copy state))
+              (Result.Error error)
+                (Result.Error (InferError.init @(TypeError.message &error)))))
+        (Maybe.Nothing)
+          (Result.Error (InferError.init @"missing match binding type")))
       (CorePattern.Constructor constructor children)
-        (match (binding-for environment constructor)
-          (Maybe.Just scheme)
-            (let-do [instantiated (instantiate-tagged &scheme state "pattern")
-                     arguments (the (Array (Box MonoType)) [])
+      ;; an ambiguous constructor (`Fire` in two `use`d types) is an
+      ;; overload: its choice is constrained by the subject like any other
+      (let [constructor-type (match (overload-for environment constructor)
+              (Maybe.Just overload)
+                (let [opened (open-overload &overload state)]
+                  (Maybe.Just
+                    (FreshType.init @(InferredExpression.type &opened)
+                                    @(InferredExpression.state &opened))))
+              (Maybe.Nothing)
+                (match (binding-for environment constructor)
+                  (Maybe.Just scheme)
+                    (Maybe.Just (instantiate-tagged &scheme state "pattern"))
+                  (Maybe.Nothing) (the (Maybe FreshType) (Maybe.Nothing))))]
+        (match constructor-type
+          (Maybe.Just instantiated)
+            (let-do [arguments (the (Array (Box MonoType)) [])
                      argument-state (InferState.copy (FreshType.state &instantiated))
                      argument-index 0
                      n (Array.length children)]
@@ -1108,7 +1548,7 @@ monomorphic sharing the array relies on.")
                   (Result.Error error)
                     (Result.Error (InferError.init @(TypeError.message &error))))))
           (Maybe.Nothing)
-            (Result.Error (InferError.init @"missing match constructor scheme")))))
+            (Result.Error (InferError.init @"missing match constructor scheme"))))))
 
   (defn constrain-match-pattern [environment branch by-reference scrutinee state]
     (if by-reference
@@ -1326,7 +1766,8 @@ monomorphic sharing the array relies on.")
                                              (Box.init
                                                (MonoType.copy
                                                  (Box.peek (FreshType.type &fresh-result))))
-                                             (the (Array String) []))]
+                                             (the (Array String) [])
+                                             [])]
               (record-binding-type! (FreshType.state &fresh-result)
                                     (Pair.a pair)
                                     parameter
@@ -1443,22 +1884,25 @@ monomorphic sharing the array relies on.")
         (infer-array-literal environment expressions "StaticArray" state)
       (CoreExpr.Do _ expressions) (infer-do environment expressions state)
       (CoreExpr.Reference _ reference)
-        (match (binding-for environment reference)
-          (Maybe.Just scheme)
-            (let [fresh-result (instantiate-tagged &scheme state "ref")]
-              (Result.Success
-                (InferredExpression.init
-                  (Box.init
-                    (MonoType.copy (Box.peek (FreshType.type &fresh-result))))
-                  @(FreshType.state &fresh-result))))
+        (match (overload-for environment reference)
+          (Maybe.Just overload) (Result.Success (open-overload &overload state))
           (Maybe.Nothing)
-            (Result.Error
-              (InferError.init
-                (String.concat
-                  &[@"missing type scheme for "
-                    (String.copy (CoreRef.name reference))
-                    @"#"
-                    (Int.str @(CoreRef.id reference))]))))
+            (match (binding-for environment reference)
+              (Maybe.Just scheme)
+                (let [fresh-result (instantiate-tagged &scheme state "ref")]
+                  (Result.Success
+                    (InferredExpression.init
+                      (Box.init
+                        (MonoType.copy (Box.peek (FreshType.type &fresh-result))))
+                      @(FreshType.state &fresh-result))))
+              (Maybe.Nothing)
+                (Result.Error
+                  (InferError.init
+                    (String.concat
+                      &[@"missing type scheme for "
+                        (String.copy (CoreRef.name reference))
+                        @"#"
+                        (Int.str @(CoreRef.id reference))])))))
       (CoreExpr.If _ condition then-branch else-branch)
         (infer-if environment condition then-branch else-branch state)
       (CoreExpr.Let _ reference value body)
@@ -1513,9 +1957,14 @@ monomorphic sharing the array relies on.")
                                                         (Box.peek callee)
                                                         &unified-state
                                                         &callee-type)]
-                        (Result.Success
-                          (InferredExpression.init (Box.init result-type)
-                                                   recorded-state)))
+                        ;; the call is what an overload choice waits for: its
+                        ;; arguments may leave one candidate
+                        (match (settle-choices! environment &recorded-state)
+                          (Result.Success settled)
+                            (Result.Success
+                              (InferredExpression.init (Box.init result-type)
+                                                       settled))
+                          (Result.Error error) (Result.Error error)))
                     (Result.Error error)
                       (Result.Error (call-type-error (Box.peek callee) &error))))
               (Result.Error error) (Result.Error error))
@@ -1567,7 +2016,8 @@ monomorphic sharing the array relies on.")
                                              (Box.init
                                                (MonoType.copy
                                                  (Box.peek (FreshType.type &fresh-result))))
-                                             (the (Array String) []))]
+                                             (the (Array String) [])
+                                             [])]
               (record-binding-type! (FreshType.state &fresh-result)
                                     (Pair.a pair)
                                     parameter
@@ -1617,7 +2067,8 @@ monomorphic sharing the array relies on.")
                         scheme (TypeScheme.init []
                                                 []
                                                 (Box.init placeholder)
-                                                (the (Array String) []))]
+                                                (the (Array String) [])
+                                                [])]
                     (set! result
                           (Result.Success
                             (Pair.init
@@ -1703,7 +2154,8 @@ monomorphic sharing the array relies on.")
                                                 (Box.init
                                                   (MonoType.copy
                                                     (Box.peek (FreshType.type &fresh-result))))
-                                                (the (Array String) []))]
+                                                (the (Array String) [])
+                                                [])]
                     (set! result
                           (Result.Success
                             (Pair.init
@@ -1848,6 +2300,7 @@ monomorphic sharing the array relies on.")
   (defn finalize-functions [functions base-environment placeholders state]
     (let-do [result (the (Result InferEnvironment InferError)
                          (Result.Success (InferEnvironment.copy base-environment)))
+             current (state-copy state)
              n (Array.length functions)]
       (for [i 0 n]
         (match-ref &result
@@ -1856,9 +2309,8 @@ monomorphic sharing the array relies on.")
                   reference (CoreFunction.reference function)]
               (match (binding-for placeholders reference)
                 (Maybe.Just placeholder)
-                  (let-do [function-type (Type.solver-apply-at @(InferState.solver state)
-                                                               (Box.peek (TypeScheme.body &placeholder)))
-                           scheme (generalize base-environment &function-type)]
+                  (let-do [function-type (Type.solver-apply-at @(InferState.solver &current)
+                                                               (Box.peek (TypeScheme.body &placeholder)))]
                     (match (IO.getenv "CARP_DEBUG_INSTANTIATE")
                       (Maybe.Just _)
                         (IO.errorln
@@ -1867,19 +2319,37 @@ monomorphic sharing the array relies on.")
                                 &(str (Box.peek (TypeScheme.body &placeholder)))
                                 &(str &function-type)))
                       (Maybe.Nothing) ())
-                    (set! result
-                          (Result.Success
-                            (extend-environment environment reference &scheme))))
+                    (match (generalize base-environment &current &function-type)
+                      (Result.Success generalized)
+                        (do
+                          (set! current @(Pair.b &generalized))
+                          (set! result
+                                (Result.Success
+                                  (extend-environment environment
+                                                      reference
+                                                      (Pair.a &generalized)))))
+                      (Result.Error error)
+                        (set! result
+                              (Result.Error
+                                (contextual-error "function"
+                                                  reference
+                                                  (InferError.message &error))))))
                 (Maybe.Nothing)
                   (set! result
                         (Result.Error
                           (InferError.init @"missing function placeholder")))))
           (Result.Error _) ()))
-      result))
+      (match result
+        (Result.Success environment)
+          (match (reject-undecidable-choices base-environment &current)
+            (Result.Success _) (Result.Success (Pair.init environment current))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))))
 
   (defn finalize-values [values base-environment placeholders state]
     (let-do [result (the (Result InferEnvironment InferError)
                          (Result.Success (InferEnvironment.copy base-environment)))
+             current (state-copy state)
              n (Array.length values)]
       (for [i 0 n]
         (match-ref &result
@@ -1888,18 +2358,36 @@ monomorphic sharing the array relies on.")
                   reference (CoreValue.reference value)]
               (match (binding-for placeholders reference)
                 (Maybe.Just placeholder)
-                  (let [value-type (Type.solver-apply-at @(InferState.solver state)
-                                                         (Box.peek (TypeScheme.body &placeholder)))
-                        scheme (generalize-local base-environment &value-type)]
-                    (set! result
-                          (Result.Success
-                            (extend-environment environment reference &scheme))))
+                  (let [value-type (Type.solver-apply-at @(InferState.solver &current)
+                                                         (Box.peek (TypeScheme.body &placeholder)))]
+                    (match (generalize-local base-environment
+                                             &current
+                                             &value-type)
+                      (Result.Success generalized)
+                        (do
+                          (set! current @(Pair.b &generalized))
+                          (set! result
+                                (Result.Success
+                                  (extend-environment environment
+                                                      reference
+                                                      (Pair.a &generalized)))))
+                      (Result.Error error)
+                        (set! result
+                              (Result.Error
+                                (contextual-error "value"
+                                                  reference
+                                                  (InferError.message &error))))))
                 (Maybe.Nothing)
                   (set! result
                         (Result.Error
                           (InferError.init @"missing value placeholder")))))
           (Result.Error _) ()))
-      result))
+      (match result
+        (Result.Success environment)
+          (match (reject-undecidable-choices base-environment &current)
+            (Result.Success _) (Result.Success (Pair.init environment current))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))))
 
   (private function-index)
   (hidden function-index)
@@ -1934,22 +2422,43 @@ monomorphic sharing the array relies on.")
           (set! found true)))
       found))
 
-  (defn add-reference-dependency! [functions reference dependencies]
-    (when @(CoreRef.global reference)
+  (doc add-reference-dependency! "records that a definition needs the function
+a global reference names. A reference to an overload needs every candidate:
+settling its choice asks for their types.")
+  (defn add-reference-dependency! [functions overloads reference dependencies]
+    (when-do @(CoreRef.global reference)
       (match (function-index functions reference)
         (Maybe.Just index)
           (unless (dependency-present? dependencies index)
             (Array.push-back! dependencies index))
-        (Maybe.Nothing) ())))
+        (Maybe.Nothing) ())
+      (for [i 0 (Array.length overloads)]
+        (let [overload (Array.unsafe-nth overloads i)]
+          (when (CoreIR.same-ref? (CoreOverload.reference overload) reference)
+            (for [j 0 (Array.length (CoreOverload.candidates overload))]
+              (match (function-index functions
+                                     (Array.unsafe-nth (CoreOverload.candidates overload)
+                                                       j))
+                (Maybe.Just index)
+                  (unless (dependency-present? dependencies index)
+                    (Array.push-back! dependencies index))
+                (Maybe.Nothing) ())))))))
 
-  (defn add-expression-array-dependencies! [functions expressions dependencies]
+  (defn add-expression-array-dependencies! [functions
+                                            overloads
+                                            expressions
+                                            dependencies]
     (let [n (Array.length expressions)]
       (for [i 0 n]
         (add-expression-dependencies! functions
+                                      overloads
                                       (Box.peek (Array.unsafe-nth expressions i))
                                       dependencies))))
 
-  (defn add-expression-dependencies! [functions expression dependencies]
+  (defn add-expression-dependencies! [functions
+                                      overloads
+                                      expression
+                                      dependencies]
     (match-ref expression
       (CoreExpr.IntLit _ _) ()
       (CoreExpr.ByteLit _ _) ()
@@ -1962,68 +2471,106 @@ monomorphic sharing the array relies on.")
       (CoreExpr.BoolLit _ _) ()
       (CoreExpr.UnitLit _) ()
       (CoreExpr.ArrayLit _ expressions)
-        (add-expression-array-dependencies! functions expressions dependencies)
+        (add-expression-array-dependencies! functions
+                                            overloads
+                                            expressions
+                                            dependencies)
       (CoreExpr.StaticArrayLit _ expressions)
-        (add-expression-array-dependencies! functions expressions dependencies)
+        (add-expression-array-dependencies! functions
+                                            overloads
+                                            expressions
+                                            dependencies)
       (CoreExpr.Reference _ reference)
-        (add-reference-dependency! functions reference dependencies)
+        (add-reference-dependency! functions overloads reference dependencies)
       (CoreExpr.Call _ callee arguments)
         (do
-          (add-expression-dependencies! functions (Box.peek callee) dependencies)
-          (add-expression-array-dependencies! functions arguments dependencies))
+          (add-expression-dependencies! functions
+                                        overloads
+                                        (Box.peek callee)
+                                        dependencies)
+          (add-expression-array-dependencies! functions
+                                              overloads
+                                              arguments
+                                              dependencies))
       (CoreExpr.Do _ expressions)
-        (add-expression-array-dependencies! functions expressions dependencies)
+        (add-expression-array-dependencies! functions
+                                            overloads
+                                            expressions
+                                            dependencies)
       (CoreExpr.If _ condition then-branch else-branch)
         (do
           (add-expression-dependencies! functions
+                                        overloads
                                         (Box.peek condition)
                                         dependencies)
           (add-expression-dependencies! functions
+                                        overloads
                                         (Box.peek then-branch)
                                         dependencies)
           (add-expression-dependencies! functions
+                                        overloads
                                         (Box.peek else-branch)
                                         dependencies))
       (CoreExpr.Let _ _ value body)
         (do
-          (add-expression-dependencies! functions (Box.peek value) dependencies)
-          (add-expression-dependencies! functions (Box.peek body) dependencies))
+          (add-expression-dependencies! functions
+                                        overloads
+                                        (Box.peek value)
+                                        dependencies)
+          (add-expression-dependencies! functions
+                                        overloads
+                                        (Box.peek body)
+                                        dependencies))
       (CoreExpr.Set _ reference value)
         (do
-          (add-reference-dependency! functions reference dependencies)
-          (add-expression-dependencies! functions (Box.peek value) dependencies))
+          (add-reference-dependency! functions overloads reference dependencies)
+          (add-expression-dependencies! functions
+                                        overloads
+                                        (Box.peek value)
+                                        dependencies))
       (CoreExpr.While _ condition body)
         (do
           (add-expression-dependencies! functions
+                                        overloads
                                         (Box.peek condition)
                                         dependencies)
-          (add-expression-dependencies! functions (Box.peek body) dependencies))
+          (add-expression-dependencies! functions
+                                        overloads
+                                        (Box.peek body)
+                                        dependencies))
       (CoreExpr.Break _) ()
       (CoreExpr.Lambda _ _ body)
-        (add-expression-dependencies! functions (Box.peek body) dependencies)
+        (add-expression-dependencies! functions
+                                      overloads
+                                      (Box.peek body)
+                                      dependencies)
       (CoreExpr.Match _ _ scrutinee branches)
         (do
           (add-expression-dependencies! functions
+                                        overloads
                                         (Box.peek scrutinee)
                                         dependencies)
           (let [n (Array.length branches)]
             (for [i 0 n]
               (add-expression-dependencies! functions
+                                            overloads
                                             (Box.peek
                                               (CoreMatchBranch.body (Array.unsafe-nth branches
                                                                                       i)))
                                             dependencies))))
       (CoreExpr.Annotation _ expression _)
         (add-expression-dependencies! functions
+                                      overloads
                                       (Box.peek expression)
                                       dependencies)))
 
-  (defn function-dependency-graph [functions]
+  (defn function-dependency-graph [functions overloads]
     (let-do [n (Array.length functions)
              empty (the (Array Int) [])
              edges (Array.replicate n &empty)]
       (for [i 0 n]
         (add-expression-dependencies! functions
+                                      overloads
                                       (Box.peek
                                         (CoreFunction.body (Array.unsafe-nth functions
                                                                              i)))
@@ -2071,9 +2618,7 @@ monomorphic sharing the array relies on.")
                                                  (Pair.a &predeclared)
                                                  (Pair.b &inferred))
                         (Result.Success finalized)
-                          (set! result
-                                (Result.Success
-                                  (Pair.init finalized @(Pair.b &inferred))))
+                          (set! result (Result.Success finalized))
                         (Result.Error error) (set! result (Result.Error error)))
                     (Result.Error error) (set! result (Result.Error error)))
                 (Result.Error error) (set! result (Result.Error error))))
@@ -2083,7 +2628,9 @@ monomorphic sharing the array relies on.")
   (defn infer-functions [functions values signatures environment state]
     (match (predeclare-values values signatures environment state)
       (Result.Success predeclared-values)
-        (let [graph (function-dependency-graph functions)
+        (let [graph (function-dependency-graph functions
+                                               (InferGlobalEnvironment.overloads
+                                                 (Pointer.to-ref @(InferEnvironment.globals environment))))
               components (IntGraph.strong-components &graph)]
           (match (infer-function-components functions
                                             &components
@@ -2099,9 +2646,7 @@ monomorphic sharing the array relies on.")
                                           (Pair.a &inferred-functions)
                                           (Pair.a &predeclared-values)
                                           (Pair.b &inferred-values))
-                    (Result.Success final-environment)
-                      (Result.Success
-                        (Pair.init final-environment @(Pair.b &inferred-values)))
+                    (Result.Success finalized) (Result.Success finalized)
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
             (Result.Error error) (Result.Error error)))
@@ -2121,17 +2666,28 @@ monomorphic sharing the array relies on.")
                                      (Box.peek (Array.unsafe-nth expressions i))
                                      (Pair.b pair))
               (Result.Success inferred)
-                (set! result
-                      (Result.Success
-                        (Pair.init
-                          (Array.push-back @(Pair.a pair)
-                                           (Box.init
-                                             (MonoType.copy
-                                               (Box.peek (InferredExpression.type &inferred)))))
-                          @(InferredExpression.state &inferred))))
+                (match (settle-choices! &environment
+                                        (InferredExpression.state &inferred))
+                  (Result.Success settled)
+                    (set! result
+                          (Result.Success
+                            (Pair.init
+                              (Array.push-back @(Pair.a pair)
+                                               (Box.init
+                                                 (MonoType.copy
+                                                   (Box.peek (InferredExpression.type &inferred)))))
+                              settled)))
+                  (Result.Error error) (set! result (Result.Error error)))
               (Result.Error error) (set! result (Result.Error error)))
           (Result.Error _) ()))
-      result))
+      ;; a root is not generalized: a choice still open after it is inferred
+      ;; has nothing left to settle it
+      (match result
+        (Result.Success pair)
+          (match (reject-undecidable-choices &environment (Pair.b &pair))
+            (Result.Success _) (Result.Success pair)
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))))
 
   (doc spanned-node-types "joins inferred node types with source provenance and
 applies the inference module's final substitution.")
@@ -2267,8 +2823,11 @@ inference base.")
   (defn module-with-bindings [core]
     (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
              solver (Type.solver)
-             trace (InferenceTrace.init [] [] [])
-             globals (InferGlobalEnvironment.init [] [] [])
+             trace (InferenceTrace.init [] [] [] [])
+             globals (InferGlobalEnvironment.init []
+                                                  []
+                                                  []
+                                                  (Array.copy (CoreModule.overloads core)))
              initial-environment (InferEnvironment.init (Pointer.address &globals)
                                                         []
                                                         []

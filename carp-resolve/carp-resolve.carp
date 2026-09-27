@@ -11,14 +11,16 @@
    parameters (Array (Box SurfaceNode))
    body (Box SurfaceNode)
    span SurfaceSpan
-   stamp Int])
+   stamp Int
+   withs (Array String)])
 
 (deftype ValueShape
   [name String
    scope String
    body (Box SurfaceNode)
    span SurfaceSpan
-   stamp Int])
+   stamp Int
+   withs (Array String)])
 
 (deftype TypedShape
   [name String
@@ -40,9 +42,11 @@
    span SurfaceSpan
    stamp Int])
 
-(deftype ScopedExpression [node (Box SurfaceNode)
-                           scope String
-                           stamp Int])
+(deftype ScopedExpression
+  [node (Box SurfaceNode)
+   scope String
+   stamp Int
+   withs (Array String)])
 
 ;; one deftype/register-type occurrence in source order: the form itself, the
 ;; scope it appeared in, its stamp, and its scope-qualified type name. The
@@ -99,13 +103,11 @@ references can resolve to all globals and imports visible in the base.")
 ;; reference's multisym resolution does (approximated by arity).
 (def *resolve-arities* (the (Array (Pair String Int)) []))
 
-;; synthetic overload interfaces for ambiguous bare names (the reference's
-;; multisym resolution): when several same-named candidates stay ambiguous at
-;; resolve time, the name becomes an interface over the candidates and
-;; specialization picks the implementation whose inferred type unifies with the
-;; call site. Collected during body resolution, appended at module assembly.
-(def *overload-interfaces* (the (Array CoreInterface) []))
-(def *overload-implementations* (the (Array CoreImplementation) []))
+;; overloads for ambiguous bare names (the reference's multisym): when several
+;; same-named candidates stay ambiguous at resolve time, the name resolves to
+;; an overload over exactly those candidates, which inference narrows by type.
+;; Collected during body resolution, appended at module assembly.
+(def *overloads* (the (Array CoreOverload) []))
 
 ;; qualified names declared `(private X)` (or defined by the `defn-`/`def-`
 ;; sugar). A private binding may only be referenced from inside the module that
@@ -130,6 +132,12 @@ references can resolve to all globals and imports visible in the base.")
 ;; keeps the plain name (so user code, check-names, and C emission stay
 ;; stable). A reference site binds the generation live at its stamp.
 (def *type-decl-stamp* 0)
+
+;; the modules the `with` forms around the form being collected bring in,
+;; innermost last. A `with` is a `use` for its own body only, as the
+;; reference's `qualifyWith` makes it; each collected definition records the
+;; ones around it, and its body is resolved with them.
+(def *collect-withs* (the (Array String) []))
 (def *type-decl-events* (the (Array TypeDeclEvent) []))
 ;; only names declared more than once, with their ordered declaration stamps;
 ;; empty in the common case so every lookup fast-paths.
@@ -383,7 +391,8 @@ contract for a caller-identified source.")
                                                 (Array.copy names)
                                                 (Box.init (SurfaceNode.copy body))
                                                 @(SurfaceNode.span node)
-                                                *type-decl-stamp*)))
+                                                *type-decl-stamp*
+                                                (Array.copy &*collect-withs*))))
                       _
                         (Result.Error
                           (let [rendered (str parameters)]
@@ -429,7 +438,8 @@ contract for a caller-identified source.")
                                          (String.copy scope)
                                          (Box.init (SurfaceNode.copy body))
                                          @(SurfaceNode.span node)
-                                         *type-decl-stamp*)))
+                                         *type-decl-stamp*
+                                         (Array.copy &*collect-withs*))))
                   (Maybe.Nothing)
                     (Result.Error
                       (error-at name-node
@@ -1182,19 +1192,18 @@ submodules — may use its private bindings; everyone else may not.")
 count (Array.length) is wrong once the seed has gaps (e.g. builtins whose ids are
 reserved by the intrinsic table but not registered), because a new global would
 then reuse a reserved id.")
-  ;; synthetic overload interfaces live in their own table but share the
-  ;; global id space: the watermark covers both, so neither allocation path
-  ;; can reuse the other's ids.
+  ;; overloads live in their own table but share the global id space: the
+  ;; watermark covers both, so neither allocation path can reuse the other's
+  ;; ids.
   (defn next-global-id [globals]
     (let-do [m -1
              n (Array.length globals)]
       (for [i 0 n]
         (let [gid @(CoreRef.id (Array.unsafe-nth globals i))]
           (when (Int.> gid m) (set! m gid))))
-      (for [i 0 (Array.length &*overload-interfaces*)]
+      (for [i 0 (Array.length &*overloads*)]
         (let [oid @(CoreRef.id
-                (CoreInterface.reference
-                  (Array.unsafe-nth &*overload-interfaces* i)))]
+                (CoreOverload.reference (Array.unsafe-nth &*overloads* i)))]
           (when (Int.> oid m) (set! m oid))))
       (Int.inc m)))
 
@@ -1298,6 +1307,18 @@ then reuse a reserved id.")
             (ignore (add-global! collected name))
             (Array.push-back! (CollectedForms.interfaces collected)
                               (TypedShape.copy shape))))))
+
+  (private imports-with)
+  (hidden imports-with)
+  (doc imports-with "the imports a body is resolved with: the module's, plus a
+`use` in its own scope for every `with` around it.")
+  (defn imports-with [imports scope withs]
+    (let-do [result (Array.copy imports)]
+      (for [i 0 (Array.length withs)]
+        (Array.push-back! &result
+                          (ScopedImport.init (String.copy scope)
+                                             @(Array.unsafe-nth withs i))))
+      result))
 
   (defn add-import! [collected scope module-name]
     (Array.push-back! (CollectedForms.imports collected)
@@ -1408,12 +1429,15 @@ then reuse a reserved id.")
                 (declaration? form @"with")
                 (match (with-shape form)
                   (Result.Success shape)
-                    (do
-                      (add-import! collected scope (ModuleShape.name &shape))
+                    (let-do [outer @&*collect-withs*]
+                      (set! *collect-withs*
+                            (Array.push-back @&*collect-withs*
+                                             @(ModuleShape.name &shape)))
                       (set! result
                             (collect-scoped! (ModuleShape.body &shape)
                                              scope
-                                             collected)))
+                                             collected))
+                      (set! *collect-withs* outer))
                   (Result.Error error) (set! result (Result.Error error)))
 
                 (declaration? form @"do")
@@ -1440,17 +1464,20 @@ then reuse a reserved id.")
                                     (Array.push-back! (CollectedForms.expressions collected)
                                                       (ScopedExpression.init (Box.init (SurfaceNode.copy branch))
                                                                              (String.copy scope)
-                                                                             *type-decl-stamp*))))
+                                                                             *type-decl-stamp*
+                                                                             (Array.copy &*collect-withs*)))))
                             (Result.Error _) ()))
                         (Array.push-back! (CollectedForms.expressions collected)
                                           (ScopedExpression.init (Box.init (SurfaceNode.copy form))
                                                                  (String.copy scope)
-                                                                 *type-decl-stamp*))))
+                                                                 *type-decl-stamp*
+                                                                 (Array.copy &*collect-withs*)))))
                   _
                     (Array.push-back! (CollectedForms.expressions collected)
                                       (ScopedExpression.init (Box.init (SurfaceNode.copy form))
                                                              (String.copy scope)
-                                                             *type-decl-stamp*)))
+                                                             *type-decl-stamp*
+                                                             (Array.copy &*collect-withs*))))
 
                 (signature-metadata? form)
                 (match (signature-metadata-shape form scope)
@@ -1577,12 +1604,32 @@ then reuse a reserved id.")
                 (Array.push-back! (CollectedForms.expressions collected)
                                   (ScopedExpression.init (Box.init (SurfaceNode.copy form))
                                                          (String.copy scope)
-                                                         *type-decl-stamp*))))
+                                                         *type-decl-stamp*
+                                                         (Array.copy &*collect-withs*)))))
           (Result.Error _) ()))
       result))
 
+  (private starting-imports)
+  (hidden starting-imports)
+  (doc starting-imports "the imports a module starts with: the seed, plus the
+`(use String)` the reference's starting environment has (StartingEnv.hs), so
+a bare name `String` defines is a candidate everywhere, as it is there.")
+  (defn starting-imports []
+    (let-do [imports (Array.copy &*resolve-seed-imports*)
+             present false]
+      (for [i 0 (Array.length &imports)]
+        (let [import (Array.unsafe-nth &imports i)]
+          (when (and
+              (String.empty? (ScopedImport.scope import))
+              (= (ScopedImport.module-name import) "String"))
+            (set! present true))))
+      (unless present
+        (Array.push-back! &imports (ScopedImport.init @"" @"String")))
+      imports))
+
   (defn collect [forms]
-    (let [collected (CollectedForms.init []
+    (let [_ignored-withs (set! *collect-withs* [])
+          collected (CollectedForms.init []
                                          []
                                          []
                                          []
@@ -1590,7 +1637,7 @@ then reuse a reserved id.")
                                          []
                                          []
                                          []
-                                         (Array.copy &*resolve-seed-imports*)
+                                         (starting-imports)
                                          []
                                          []
                                          (Array.copy &*resolve-seed-globals*))]
@@ -1650,10 +1697,8 @@ no-redefinition case pays no second walk.")
 
   (private scoped-global-by-name)
   (hidden scoped-global-by-name)
-  (private imported-global-by-name)
-  (hidden imported-global-by-name)
-  (private prefer-imported-over-root)
-  (hidden prefer-imported-over-root)
+  (private root-yields-to-imports?)
+  (hidden root-yields-to-imports?)
   (private compatibility-global-by-name)
   (hidden compatibility-global-by-name)
   (private unique-member-global-by-name)
@@ -1699,48 +1744,16 @@ no-redefinition case pays no second walk.")
           (Maybe.Just reference) (Maybe.Just reference)
           (Maybe.Nothing) (global-by-name globals name)))))
 
-  (defn imported-global-by-name [globals imports scope name]
-    (let-do [result (the (Maybe CoreRef) (Maybe.Nothing))
-             n (Array.length imports)]
-      (for [i 0 n]
-        (match-ref &result
-          (Maybe.Just _) ()
-          (Maybe.Nothing)
-            (let [import (Array.unsafe-nth imports i)
-                  import-scope (ScopedImport.scope import)]
-              (when (or (= import-scope scope) (String.empty? import-scope))
-                (let [module-name (ScopedImport.module-name import)
-                      ;; `(use Id)` in module Color may name Color.Id (relative)
-                      ;; or a top-level Id (absolute); try both qualifications.
-                      absolute (append-scope module-name name)
-                      relative (append-scope &(append-scope import-scope
-                                                            module-name)
-                                             name)]
-                  (match (global-by-name globals &absolute)
-                    (Maybe.Just reference) (set! result (Maybe.Just reference))
-                    (Maybe.Nothing)
-                      (match (global-by-name globals &relative)
-                        (Maybe.Just reference)
-                          (set! result (Maybe.Just reference))
-                        (Maybe.Nothing) ())))))))
-      result))
+  (defn root-yields-to-imports? [scope symbol reference]
+    (and
+      (or (= symbol "unsafe-nth")
+          (or (= symbol "unsafe-raw")
+              (and (= symbol "suffix") (String.empty? scope))))
+      (and (not (qualified-name? symbol)) (= (CoreRef.name reference) symbol))))
 
-  (defn prefer-imported-over-root [globals imports scope symbol reference]
-    (let-do [result (CoreRef.copy &reference)]
-      (when (and
-          (or (= symbol "unsafe-nth")
-              (or (= symbol "unsafe-raw")
-                  (and (= symbol "suffix") (String.empty? scope))))
-          (and (not (qualified-name? symbol))
-               (= (CoreRef.name &reference) symbol)))
-        (match (imported-global-by-name globals imports scope symbol)
-          (Maybe.Just imported) (set! result imported)
-          (Maybe.Nothing) ()))
-      result))
-
-  ;; like imported-global-by-name, but resolves the implicit `.init` constructor
-  ;; of an imported type: `(C)` under `(use Wrap2)` finds `Wrap2.C.init`. The bare
-  ;; name is qualified through each import first, then `.init` is appended.
+  ;; resolves the implicit `.init` constructor of an imported type: `(C)` under
+  ;; `(use Wrap2)` finds `Wrap2.C.init`. The bare name is qualified through each
+  ;; import first, then `.init` is appended.
   (private imported-init-by-name)
   (hidden imported-init-by-name)
   (defn imported-init-by-name [globals imports scope name]
@@ -1869,56 +1882,46 @@ the type-dispatched candidate set.")
             (Array.push-back! &result @candidate))))
       result))
 
-  (private overload-implemented?)
-  (hidden overload-implemented?)
-  (defn overload-implemented? [interface implementation]
-    (let-do [found false
-             n (Array.length &*overload-implementations*)]
-      (for [i 0 n]
-        (let [entry (Array.unsafe-nth &*overload-implementations* i)]
-          (when (and
-              (CoreIR.same-ref? (CoreImplementation.interface entry) interface)
-              (CoreIR.same-ref?
-                (CoreImplementation.implementation entry)
-                implementation))
-            (set! found true))))
-      found))
+  (private same-candidates?)
+  (hidden same-candidates?)
+  (defn same-candidates? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (for [i 0 (Array.length left)]
+        (let-do [candidate (Array.unsafe-nth left i)
+                 present false]
+          (for [j 0 (Array.length right)]
+            (when (CoreIR.same-ref? (Array.unsafe-nth right j) candidate)
+              (set! present true)))
+          (unless present (set! same false))))
+      same))
 
   (private synthesize-overload!)
   (hidden synthesize-overload!)
-  (doc synthesize-overload! "registers (or reuses) a synthetic interface for an
-ambiguous bare name — the reference's multisym resolution deferred to type
-dispatch. Every candidate becomes an implementation; specialization later picks
-the one whose inferred type unifies with the call site.")
+  (doc synthesize-overload! "the overload an ambiguous bare name resolves to:
+one per name and candidate set, so a site is only ever offered the candidates
+it could see (another site of the same name may see others, or fewer).")
   (defn synthesize-overload! [name candidates globals]
-    (let-do [interface-ref (the (Maybe CoreRef) (Maybe.Nothing))
-             interface-count (Array.length &*overload-interfaces*)]
-      (for [i 0 interface-count]
-        (let [entry (Array.unsafe-nth &*overload-interfaces* i)]
-          (when (String.= (CoreRef.name (CoreInterface.reference entry)) name)
-            (set! interface-ref (Maybe.Just @(CoreInterface.reference entry))))))
-      (let-do [reference (match interface-ref
-                 (Maybe.Just found)
-                 found
-                 (Maybe.Nothing)
-                 ;; fresh interface ids come from the shared global watermark
-                 ;; (next-global-id also scans the overload table).
-                 (let-do [fresh (CoreRef.init (next-global-id globals)
-                                              (String.copy name)
-                                              true)]
-                   (set! *overload-interfaces*
-                         (Array.push-back @&*overload-interfaces*
-                                          (CoreInterface.init (CoreRef.copy &fresh)
-                                                              (Box.init (CoreType.Variable @"a")))))
-                   fresh))]
-        (for [i 0 (Array.length candidates)]
-          (let [candidate (Array.unsafe-nth candidates i)]
-            (unless (overload-implemented? &reference candidate)
-              (set! *overload-implementations*
-                    (Array.push-back @&*overload-implementations*
-                                     (CoreImplementation.init (CoreRef.copy &reference)
-                                                              @candidate))))))
-        reference)))
+    (let-do [found (the (Maybe CoreRef) (Maybe.Nothing))]
+      (for [i 0 (Array.length &*overloads*)]
+        (let [entry (Array.unsafe-nth &*overloads* i)]
+          (when (and
+              (String.= (CoreRef.name (CoreOverload.reference entry)) name)
+              (same-candidates? (CoreOverload.candidates entry) candidates))
+            (set! found (Maybe.Just @(CoreOverload.reference entry))))))
+      (match found
+        (Maybe.Just reference)
+        reference
+        (Maybe.Nothing)
+        ;; fresh ids come from the shared global watermark (next-global-id
+        ;; also scans the overload table).
+        (let-do [fresh (CoreRef.init (next-global-id globals)
+                                     (String.copy name)
+                                     true)]
+          (set! *overloads*
+                (Array.push-back @&*overloads*
+                                 (CoreOverload.init (CoreRef.copy &fresh)
+                                                    (Array.copy candidates))))
+          fresh))))
 
   (private resolve-reference-name)
   (hidden resolve-reference-name)
@@ -2014,6 +2017,32 @@ at it wastes the reader's time.")
                   (Result.Error
                     (unknown-binding-error node symbol scope locals globals)))))))
 
+  (private resolve-through-imports)
+  (hidden resolve-through-imports)
+  (doc resolve-through-imports "what a bare name means through the `use`d
+modules, top-level and the enclosing module's alike, as the reference's
+`lookupInUsed`: the lone candidate, or an overload over several.")
+  (defn resolve-through-imports [globals imports scope name]
+    (let-do [used (imported-globals-matching-where globals
+                                                   imports
+                                                   scope
+                                                   name
+                                                   true)
+             scoped (imported-globals-matching-where globals
+                                                     imports
+                                                     scope
+                                                     name
+                                                     false)]
+      (for [i 0 (Array.length &scoped)]
+        (Array.push-back! &used @(Array.unsafe-nth &scoped i)))
+      (let [candidates (distinct-refs &used)]
+        (cond
+          (Int.= 1 (Array.length &candidates))
+            (Maybe.Just @(Array.unsafe-nth &candidates 0))
+          (Int.>= (Array.length &candidates) 2)
+            (Maybe.Just (synthesize-overload! name &candidates globals))
+          (the (Maybe CoreRef) (Maybe.Nothing))))))
+
   (private resolve-reference-name-raw)
   (hidden resolve-reference-name-raw)
   (defn resolve-reference-name-raw [node name locals globals imports scope]
@@ -2023,39 +2052,33 @@ at it wastes the reader's time.")
         (Maybe.Nothing)
           (match (scoped-global-by-name globals scope &symbol)
             (Maybe.Just reference)
-            (Result.Success
-              (prefer-imported-over-root globals imports scope &symbol reference))
+              (Result.Success
+                ;; a few root names give way to a used module's (see
+                ;; `root-yields-to-imports?`): resolve them as if unbound
+                (if (root-yields-to-imports? scope &symbol &reference)
+                  (match (resolve-through-imports globals imports scope &symbol)
+                    (Maybe.Just imported) imported
+                    (Maybe.Nothing) reference)
+                  reference))
             (Maybe.Nothing)
-            ;; several distinct top-level-`use` candidates for a bare name:
-            ;; the reference keeps the multisym and lets types decide, so
-            ;; the name becomes a synthetic overload interface.
-            (let [matches (imported-globals-matching-where globals
-                                                           imports
-                                                           scope
-                                                           &symbol
-                                                           true)
-                  ambiguous (distinct-refs &matches)]
-              (if (Int.>= (Array.length &ambiguous) 2)
-                (Result.Success
-                  (synthesize-overload! &symbol &ambiguous globals))
-                (match (imported-global-by-name globals imports scope &symbol)
-                  (Maybe.Just reference) (Result.Success reference)
-                  (Maybe.Nothing)
-                    (match (compatibility-global-by-name globals &symbol)
-                      (Maybe.Just reference) (Result.Success reference)
-                      (Maybe.Nothing)
-                        (match (unique-member-global-by-name globals &symbol)
-                          (Maybe.Just reference)
-                          (Result.Success reference)
-                          (Maybe.Nothing)
-                          ;; implicit `.init`: `(A)` on a type name `A` calls its
-                          ;; zero-or-more-argument constructor `A.init`.
-                          (resolve-init-reference-name node
-                                                       &symbol
-                                                       locals
-                                                       globals
-                                                       imports
-                                                       scope))))))))))
+              (match (resolve-through-imports globals imports scope &symbol)
+                (Maybe.Just reference) (Result.Success reference)
+                (Maybe.Nothing)
+                  (match (compatibility-global-by-name globals &symbol)
+                    (Maybe.Just reference) (Result.Success reference)
+                    (Maybe.Nothing)
+                      (match (unique-member-global-by-name globals &symbol)
+                        (Maybe.Just reference)
+                        (Result.Success reference)
+                        (Maybe.Nothing)
+                        ;; implicit `.init`: `(A)` on a type name `A` calls its
+                        ;; zero-or-more-argument constructor `A.init`.
+                        (resolve-init-reference-name node
+                                                     &symbol
+                                                     locals
+                                                     globals
+                                                     imports
+                                                     scope))))))))
 
   (doc resolve-reference-name "resolves a symbol to the binding it names, then
 enforces visibility: a `private` binding may only be referenced from inside the
@@ -2792,8 +2815,7 @@ the primitive registry.")
     (let-do [table (the (Array (Pair String Int)) [])
              ;; per-module reset of the overload-synthesis channel filled
              ;; during body resolution.
-             _ignored-interfaces (set! *overload-interfaces* [])
-             _ignored-implementations (set! *overload-implementations* [])]
+             _ignored-overloads (set! *overloads* [])]
       (let [functions (CollectedForms.functions collected)]
         (for [i 0 (Array.length functions)]
           (let [shape (Array.unsafe-nth functions i)]
@@ -2844,11 +2866,12 @@ the primitive registry.")
   (private resolve-call-head)
   (hidden resolve-call-head)
   (doc resolve-call-head "resolves a call's head symbol with the call's arity
-in hand, mirroring the reference's multisym preference order: a `use`d module's
-lone arity-matching candidate wins outright, several become a synthetic
-overload interface dispatched by type, and only an import-less name falls back
-to the module-member scan (same single/several policy). Everything else falls
-back to plain reference resolution.")
+in hand, mirroring the reference's multisym preference order: the `use`d
+modules' lone arity-matching candidate wins outright, whether the `use` is
+top-level or the enclosing module's, several become an overload chosen by
+type, and only a name no used module has falls back to the module-member scan
+(same single/several policy). Everything else falls back to plain reference
+resolution.")
   (defn resolve-call-head [head name arity locals globals imports scope]
     (if (match (local-by-name locals name)
         (Maybe.Just _) true
@@ -2860,43 +2883,35 @@ back to plain reference resolution.")
               (Maybe.Nothing) false)]
         (if positional-ok
           (resolve-reference-name head name locals globals imports scope)
-          ;; top-level `use`s pin types like the reference: a lone candidate is
-          ;; picked outright, several dispatch by type. Module-scoped `use`s
-          ;; and the member scan never pin — their candidates always join a
-          ;; type-dispatched overload set.
-          (let [hard (imported-globals-matching-where globals
-                                                      imports
-                                                      scope
-                                                      name
-                                                      true)
-                hard-matching (arity-matching &hard arity)]
-            (cond
-              (Int.= 1 (Array.length &hard-matching))
-                (Result.Success @(Array.unsafe-nth &hard-matching 0))
-              (Int.>= (Array.length &hard-matching) 2)
-                (Result.Success
-                  (synthesize-overload! name &hard-matching globals))
-              (let-do [soft (imported-globals-matching-where globals
-                                                             imports
-                                                             scope
-                                                             name
-                                                             false)
-                       members (member-globals-matching globals name)]
-                (for [i 0 (Array.length &members)]
-                  (Array.push-back! &soft @(Array.unsafe-nth &members i)))
-                (let [soft-matching (arity-matching &soft arity)]
-                  (cond
-                    (Int.= 1 (Array.length &soft-matching))
-                      (Result.Success @(Array.unsafe-nth &soft-matching 0))
-                    (Int.>= (Array.length &soft-matching) 2)
-                      (Result.Success
-                        (synthesize-overload! name &soft-matching globals))
-                    (resolve-reference-name head
-                                            name
-                                            locals
-                                            globals
-                                            imports
-                                            scope))))))))))
+          ;; the `use`d modules pin types like the reference's
+          ;; `lookupInUsed`, top-level and module-scoped `use`s alike: a lone
+          ;; candidate is picked outright, several dispatch by type. Only when
+          ;; no used module has the name does the member scan
+          ;; (`lookupEverywhere`) supply the candidates, on the same terms.
+          (let-do [used (imported-globals-matching-where globals
+                                                         imports
+                                                         scope
+                                                         name
+                                                         true)
+                   scoped (imported-globals-matching-where globals
+                                                           imports
+                                                           scope
+                                                           name
+                                                           false)]
+            (for [i 0 (Array.length &scoped)]
+              (Array.push-back! &used @(Array.unsafe-nth &scoped i)))
+            (let [used-matching (arity-matching &used arity)
+                  candidates (if (Int.> (Array.length &used-matching) 0)
+                    used-matching
+                    (arity-matching &(member-globals-matching globals name)
+                                    arity))]
+              (cond
+                (Int.= 1 (Array.length &candidates))
+                  (Result.Success @(Array.unsafe-nth &candidates 0))
+                (Int.>= (Array.length &candidates) 2)
+                  (Result.Success
+                    (synthesize-overload! name &candidates globals))
+                (resolve-reference-name head name locals globals imports scope))))))))
 
   (defn resolve-call [node items locals globals imports scope]
     (let [head (Box.peek (Array.unsafe-nth items 0))
@@ -3163,7 +3178,9 @@ back to plain reference resolution.")
                         (match (resolve-expression (Box.peek (FunctionShape.body shape))
                                                    &resolution-locals
                                                    globals
-                                                   imports
+                                                   &(imports-with imports
+                                                                  (FunctionShape.scope shape)
+                                                                  (FunctionShape.withs shape))
                                                    (FunctionShape.scope shape))
                           (Result.Success body)
                             (Array.push-back! &functions
@@ -3200,7 +3217,9 @@ back to plain reference resolution.")
                   (match (resolve-expression (Box.peek (ValueShape.body shape))
                                              &locals
                                              globals
-                                             imports
+                                             &(imports-with imports
+                                                            (ValueShape.scope shape)
+                                                            (ValueShape.withs shape))
                                              (ValueShape.scope shape))
                     (Result.Success body)
                       (set! result
@@ -4141,7 +4160,9 @@ name-matched function that does not fit the interface is never selected.")
                   (Box.peek (ScopedExpression.node scoped))
                   &locals
                   globals
-                  imports
+                  &(imports-with imports
+                                 (ScopedExpression.scope scoped)
+                                 (ScopedExpression.withs scoped))
                   (ScopedExpression.scope scoped))
                 (Result.Success expression)
                   (set! result
@@ -4477,10 +4498,7 @@ guessed at.")
                                                                                           &all-globals
                                                                                           (CollectedForms.imports &collected))
                                                       (Result.Success expressions)
-                                                        (let [final-interfaces (append-core-interfaces &all-interfaces
-                                                                                                       &*overload-interfaces*)
-                                                              final-implementations (append-core-implementations &all-implementations
-                                                                                                                 &*overload-implementations*)
+                                                        (let [final-overloads @&*overloads*
                                                               module (CoreModule.init functions
                                                                                       values
                                                                                       all-builtins
@@ -4489,8 +4507,9 @@ guessed at.")
                                                                                       type-declarations
                                                                                       constructor-declarations
                                                                                       @(CollectedForms.recursive-types &collected)
-                                                                                      final-interfaces
-                                                                                      final-implementations
+                                                                                      all-interfaces
+                                                                                      all-implementations
+                                                                                      final-overloads
                                                                                       @(CollectedForms.system-includes &collected)
                                                                                       expressions)]
                                                           (if *provenance-enabled*
