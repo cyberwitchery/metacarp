@@ -147,28 +147,37 @@ requires the generated hot loop to materialize its stable array data pointer.
 It also reports reference/generated executable runtime without imposing a
 noise-sensitive CI timing threshold.
 
-The assurance harness keeps the self-host honest:
+The assurance harness keeps the self-host honest. It builds everything with
+this compiler: gen 1 comes from a seed, a compiler an earlier build of this
+repository produced (`CARP_SEED_COMPILER`, else the `out/carp-compiler`
+already there), and only without a usable seed is gen 1 built through the
+reference, once. The reference otherwise runs only where it is the thing
+compared against: the expansion diff and the generation benchmark.
 
-- `scripts/run-assurance.sh phase` runs lint and formatting before every
-  phase/session suite. Set `CARP_SKIP_STYLE=1` when the two style tools are
-  unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run independent test groups
-  concurrently; CI runs this architecture-neutral group once on two Linux
-  workers.
-- `scripts/run-assurance.sh self` builds gen 1, runs the reference suite,
-  checks the self-hosted fixed point, and compares expansion behavior. Set
+- `scripts/run-assurance.sh bootstrap` only builds gen 1.
+- `scripts/run-assurance.sh phase` runs lint and formatting, then every
+  phase/session suite through gen 2. Set `CARP_SKIP_STYLE=1` when the two
+  style tools are unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run
+  independent test groups concurrently; CI runs this architecture-neutral
+  group once on two Linux workers.
+- `scripts/run-assurance.sh self` runs the reference suite, checks the
+  self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated
   workers; CI uses all two Linux or three macOS runner cores. Gen 2 is built
   as strict C99, must run `examples/hello.carp`, and is kept (with a
   provenance file) when `CARP_FIXED_POINT_OUT` names its directory.
-- `scripts/run-assurance.sh phase-self` runs the phase/session suites through
-  gen 2 instead of the reference, using `CARP_PHASE_COMPILER` or building one.
-  CI runs it on Linux after the self group.
-- `scripts/run-assurance.sh all` runs both groups and is the default. CI calls
-  the same phase and self groups rather than maintaining its own command list.
-  The self-host group executes generated programs on both x86-64 Linux and
-  ARM64 macOS for every commit. CI caches the versioned Carp library checkouts
-  on both architectures and the pinned Ubuntu style-tool binaries; generated
-  compiler and test outputs are deliberately never cached.
+- `scripts/run-assurance.sh sanitize` runs the reference suite again with
+  every generated program built under AddressSanitizer.
+- `scripts/run-assurance.sh llvm` builds the LLVM driver, runs its backend's
+  tests, and requires each memory fixture to balance under both drivers.
+- `scripts/run-assurance.sh all` runs phase and self and is the default. CI
+  calls the same groups rather than maintaining its own command list. The
+  self-host group executes generated programs on both x86-64 Linux and ARM64
+  macOS for every commit. CI caches the versioned Carp library checkouts on
+  both architectures, the pinned Ubuntu style-tool binaries, and one seed
+  compiler per platform, the gen 1 of the latest passing main build. A seed
+  only builds gen 1; the fixed point still checks what the current source
+  produces, and test outputs are never cached.
 
 - `scripts/run-carp-suite-self.sh` runs the reference repository's own test
   suite (examples, produces-output diffs, `test/*.carp`, error-rejection
