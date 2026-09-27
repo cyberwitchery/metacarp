@@ -2503,10 +2503,46 @@ before ownership so managed temporaries are freed correctly.")
       (SpecializedExpr.ArrayLit @id
                                 (Box.init (MonoType.copy (Box.peek type)))
                                 (extract-array elements cell counter))
+      ;; a static array literal borrows storage that has to live as long as
+      ;; the borrow and be freed with it, like `&[...]`: the reference gives it
+      ;; a stack temporary in the statement's scope. Lifting it into one here
+      ;; gives each evaluation (every call, every recursion depth, every loop
+      ;; iteration) its own storage, and ownership then deletes its elements
+      ;; at scope exit. A global's initializer keeps static storage (slot 3).
       (SpecializedExpr.StaticArrayLit id type elements)
-      (SpecializedExpr.StaticArrayLit @id
-                                      (Box.init (MonoType.copy (Box.peek type)))
-                                      (extract-array elements cell counter))
+      (let [extracted (extract-array elements cell counter)]
+        (match-ref (Box.peek type)
+          (MonoType.Reference storage-type _)
+            (if (Int.= 0 @(Array.unsafe-nth counter 3))
+              (SpecializedExpr.StaticArrayLit @id
+                                              (Box.init (MonoType.copy (Box.peek type)))
+                                              extracted)
+              (let-do [fresh-id (next-id! counter)
+                       tmp (CoreRef.init fresh-id
+                                         (String.concat &[@"_reflift"
+                                                          (Int.str fresh-id)])
+                                         false)]
+                (Array.push-back! cell
+                                  (Pair.init (CoreRef.copy &tmp)
+                                             (SpecializedExpr.StaticArrayLit @id
+                                                                             (Box.init (MonoType.copy (Box.peek storage-type)))
+                                                                             extracted)))
+                (SpecializedExpr.GlobalCall (next-eid! counter)
+                                            (Box.init (MonoType.copy (Box.peek type)))
+                                            (PrimitiveRegistry.ref-reference)
+                                            (Box.init
+                                              (MonoType.Function
+                                                [(Box.init (MonoType.copy (Box.peek storage-type)))]
+                                                (Box.init (MonoType.copy (Box.peek type)))))
+                                            (String.copy "ref")
+                                            [(Box.init
+                                               (SpecializedExpr.Reference (next-eid! counter)
+                                                                          (Box.init (MonoType.copy (Box.peek storage-type)))
+                                                                          tmp))])))
+          _
+            (SpecializedExpr.StaticArrayLit @id
+                                            (Box.init (MonoType.copy (Box.peek type)))
+                                            extracted)))
       ;; a lambda in value position keeps its own body scope; borrows inside
       ;; the body are lifted at the body's statement level.
       (SpecializedExpr.Lambda id type parameters body)
@@ -2668,7 +2704,10 @@ wants a map says so, and then the ids start above every id in the module.")
                                    (if *want-source-map*
                                      @(Array.unsafe-nth counter 2)
                                      (Int.inc
-                                       (max-eid (Box.peek (SpecializedBody.body b))))))]
+                                       (max-eid (Box.peek (SpecializedBody.body b))))))
+             ;; a global's initializer runs once and its value lives on, so its
+             ;; static array literals keep static storage
+             _static (Array.aset! counter 3 (if @(SpecializedBody.value b) 0 1))]
       (SpecializedBody.init @(SpecializedBody.specialization b)
                             (Array.copy (SpecializedBody.parameters b))
                             (Box.init
@@ -2680,13 +2719,15 @@ wants a map says so, and then the ids start above every id in the module.")
 borrows of non-lvalues are lifted to scope-lived temporaries.")
   (defn module [m]
     (let-do [counter (the (Array Int)
-                          [(Int.dec (Specialize.min-local-id m)) 0 0])
+                          [(Int.dec (Specialize.min-local-id m)) 0 0 1])
              new-bodies (the (Array SpecializedBody) [])
              new-roots (the (Array (Box SpecializedExpr)) [])
              bodies (SpecializationModule.bodies m)
              roots (SpecializationModule.roots m)]
       ;; slot 2 is the module-wide ceiling: an id above everything written
-      ;; anywhere in the module, so a temporary cannot be mistaken for a form
+      ;; anywhere in the module, so a temporary cannot be mistaken for a form.
+      ;; slot 3 is 1 where static array literals get scope storage, 0 in a
+      ;; global's initializer.
       (Array.aset! &counter 2 (Int.inc (module-ceiling bodies roots)))
       (for [i 0 (Array.length bodies)]
         (Array.push-back! &new-bodies
@@ -2699,6 +2740,7 @@ borrows of non-lvalues are lifted to scope-lived temporaries.")
                 (Int.max roots-max
                          (max-eid (Box.peek (Array.unsafe-nth roots i))))))
         (Array.aset! &counter 1 (Int.inc roots-max)))
+      (Array.aset! &counter 3 1)
       (for [i 0 (Array.length roots)]
         (Array.push-back! &new-roots
                           (Box.init
