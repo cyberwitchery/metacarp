@@ -72,11 +72,8 @@ failed=0
 gaps=0
 
 # reference tests we knowingly fail, each with its tracking issue:
-#   expand_qualified_shadow.carp      qualified lookup vs sibling macros (#16)
-#   expand_value_position_macro.carp  value-position macro substitution (#16)
-#   memory_global_ref_in_loop.carp    qualified-member multisym fallback (#8)
 #   nested_module_multisym.carp       nested-module multisym dispatch (#8)
-known_gaps="expand_qualified_shadow expand_value_position_macro memory_global_ref_in_loop nested_module_multisym"
+known_gaps="nested_module_multisym"
 
 known_gap() {
   base=$(basename "$1" .carp)
