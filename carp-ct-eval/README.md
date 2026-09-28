@@ -17,7 +17,7 @@ dynamic operations Core bootstrap macros use: list construction and accessors
 `empty?`, `list?`, `array?`), `array` and `append`, comparisons, Boolean
 operations, small integer arithmetic, string operations (`String.length`,
 `String.slice`, `String.append`, `String.prefix`/`suffix`, `String.head`/`tail`,
-…), `str`, `macro-error`, and `Symbol.from`/`Symbol.concat`/`Symbol.prefix`.
+…), `str`, `macro-error`, and `Symbol.from`/`Symbol.concat`/`Symbol.prefix`/`Symbol.str`.
 Collections convert to array syntax where an evaluated macro expression requires
 syntax.
 
