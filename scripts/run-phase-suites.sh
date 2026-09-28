@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run every compiler-phase test against the reference Carp compiler.
-# Keep this as the single source of truth for the phase suite: CI and local
-# assurance both call this script.
+# Run every compiler-phase test. Keep this as the single source of truth for
+# the phase suite: CI and local assurance both call this script.
 #
-# CARP_REFERENCE may instead name a self-hosted compiler, in which case
-# CARP_PHASE_CORE must name the Core it compiles against.
+# CARP_REFERENCE names the compiler that builds the tests. `run-assurance.sh
+# phase` passes generation 2 of this compiler, with CARP_PHASE_CORE naming the
+# Core it compiles against; without either, stock `carp` builds them.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
