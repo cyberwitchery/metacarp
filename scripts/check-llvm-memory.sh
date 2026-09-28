@@ -36,14 +36,16 @@ for fixture in "$fixture_dir"/*.carp; do
     if [[ "$lane" == c ]]; then compiler=$c_compiler; else compiler=$llvm_compiler; fi
     # -x builds into ./out, so each lane gets its own directory
     mkdir -p "$work_dir/$lane"
+    # the programs' output is compared; the build's diagnostics (clang
+    # warnings naming each driver's own temporary file) go to stderr apart
     if (cd "$work_dir/$lane" \
       && "$compiler" -c "$core_dir" -x --log-memory "$fixture") \
-      >"$work_dir/$name.$lane.out" 2>&1
+      >"$work_dir/$name.$lane.out" 2>"$work_dir/$name.$lane.err"
     then
       printf '[ok]   %s (%s)\n' "$name" "$lane"
     else
       printf '[fail] %s (%s)\n' "$name" "$lane"
-      sed 's/^/       /' "$work_dir/$name.$lane.out"
+      sed 's/^/       /' "$work_dir/$name.$lane.err" "$work_dir/$name.$lane.out"
       failed=1
     fi
   done
