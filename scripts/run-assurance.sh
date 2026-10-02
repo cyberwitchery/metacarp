@@ -96,6 +96,23 @@ bootstrap() {
   bootstrapped=true
 }
 
+# Build and check generation 2 into $1. With CARP_FIXED_POINT_REUSE=1, a
+# directory that already holds a passed check of this revision is kept instead:
+# CI hands one job's generation 2 to the next. It is opt-in because a revision
+# does not name uncommitted changes, so only a clean checkout may reuse.
+fixed_point() {
+  provenance="$1/bootstrap-provenance.txt"
+  if [[ "${CARP_FIXED_POINT_REUSE:-0}" == "1" && -f "$provenance" \
+    && -x "$1/carp-compiler-gen2" ]] \
+    && grep -qx "source_revision=$(git -C "$repo_root" rev-parse HEAD)" \
+      "$provenance"
+  then
+    printf 'fixed point: reusing the check in %s\n' "$1"
+    return
+  fi
+  CARP_FIXED_POINT_OUT="$1" "$script_dir/check-fixed-point.sh"
+}
+
 run_phase() {
   (
     cd "$repo_root"
@@ -108,7 +125,7 @@ run_phase() {
   if [[ -z "$phase_work" ]]; then
     phase_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-phase.XXXXXX")
   fi
-  CARP_FIXED_POINT_OUT="$phase_work" "$script_dir/check-fixed-point.sh"
+  fixed_point "$phase_work"
   CARP_REFERENCE="$phase_work/carp-compiler-gen2" CARP_PHASE_CORE="$core_dir" \
     "$script_dir/run-phase-suites.sh"
   if [[ -z "${CARP_FIXED_POINT_OUT:-}" ]]; then
@@ -127,7 +144,7 @@ run_self() {
     self_work=$(mktemp -d "${TMPDIR:-/tmp}/carp-self.XXXXXX")
     trap 'rm -rf "$self_work"' EXIT
   fi
-  CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-fixed-point.sh"
+  fixed_point "$self_work"
   CARP_FIXED_POINT_OUT="$self_work" "$script_dir/check-leaks.sh"
   if [[ -z "${CARP_FIXED_POINT_OUT:-}" ]]; then
     rm -rf "$self_work"

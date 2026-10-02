@@ -157,15 +157,18 @@ compared against: the expansion diff and the generation benchmark.
 - `scripts/run-assurance.sh bootstrap` only builds gen 1.
 - `scripts/run-assurance.sh phase` runs lint and formatting, then every
   phase/session suite through gen 2. Set `CARP_SKIP_STYLE=1` when the two
-  style tools are unavailable. Set `CARP_PHASE_JOBS=2` or `3` to run
+  style tools are unavailable. Set `CARP_PHASE_JOBS` (1 to 4) to run
   independent test groups concurrently; CI runs this architecture-neutral
-  group once on two Linux workers.
+  group once, on every core of a Linux runner up to 4.
 - `scripts/run-assurance.sh self` runs the reference suite, checks the
   self-hosted fixed point, and compares expansion behavior. Set
   `CARP_SELF_JOBS=2` or `3` to split the reference suite across isolated
   workers; CI uses all two Linux or three macOS runner cores. Gen 2 is built
   as strict C99, must run `examples/hello.carp`, and is kept (with a
-  provenance file) when `CARP_FIXED_POINT_OUT` names its directory.
+  provenance file) when `CARP_FIXED_POINT_OUT` names its directory. With
+  `CARP_FIXED_POINT_REUSE=1`, a directory that already holds a passed check
+  of the current revision is used as is; CI hands one job's gen 2 to the next
+  this way.
 - `scripts/run-assurance.sh sanitize` runs the reference suite again with
   every generated program built under AddressSanitizer.
 - `scripts/run-assurance.sh llvm` builds the LLVM driver, runs its backend's

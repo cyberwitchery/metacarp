@@ -87,9 +87,9 @@ phase_tasks() {
 }
 
 case "$jobs" in
-  1|2|3) ;;
+  1|2|3|4) ;;
   *)
-    printf 'CARP_PHASE_JOBS must be 1, 2, or 3, got %s\n' "$jobs" >&2
+    printf 'CARP_PHASE_JOBS must be 1 to 4, got %s\n' "$jobs" >&2
     exit 2
     ;;
 esac
