@@ -148,6 +148,21 @@ and the complete concrete instance cache after satisfying that cell's roots.")
 (def *owner-bucket-start* (the (Array Int) []))
 (def *owner-bucket-items* (the (Array Int) []))
 
+(doc PositionBuckets "positions grouped by an integer key: `items` holds them
+slot by slot, `starts` where each slot begins, and `slot-of` maps a key to its
+slot.")
+(deftype PositionBuckets
+  [slot-of (Map Int Int)
+   starts (Array Int)
+   items (Array Int)])
+
+;; call-site positions grouped by owner the same way, so the calls one
+;; definition makes are found without scanning every call in the module per
+;; specialized instance. Only valid between `prime-trace!` and
+;; `clear-caches!`; a lookup outside that window scans.
+(def *call-buckets* (PositionBuckets.init (Map.create) [] []))
+(def *call-buckets-ready* false)
+
 ;; expr-id → trace position for the owner named by *trace-owner-key*;
 ;; expression ids repeat across owners, so the index is per-owner and is
 ;; rebuilt when the owner changes (once per materialized instance).
@@ -659,14 +674,42 @@ trace's length; slots fill on first touch in `expression-type-for`.")
 one linear pass: count per slot, prefix-sum into starts, then place.")
   (defn build-owner-buckets! [inferred]
     (let-do [node-types (InferredModule.node-types inferred)
-             n (Array.length node-types)
+             keys (the (Array Int) [])]
+      (for [i 0 (Array.length node-types)]
+        (Array.push-back! &keys
+                          (owner-trace-key
+                            (InferredNodeType.owner (Array.unsafe-nth node-types
+                                                                      i)))))
+      (let-do [buckets (bucket-positions &keys)]
+        (set! *owner-slot-of-key* @(PositionBuckets.slot-of &buckets))
+        (set! *owner-bucket-start* @(PositionBuckets.starts &buckets))
+        (set! *owner-bucket-items* @(PositionBuckets.items &buckets)))))
+
+  (private build-call-buckets!)
+  (hidden build-call-buckets!)
+  (defn build-call-buckets! [inferred]
+    (let-do [calls (InferredModule.calls inferred)
+             keys (the (Array Int) [])]
+      (for [i 0 (Array.length calls)]
+        (Array.push-back! &keys
+                          (owner-trace-key
+                            (CallSite.owner (Array.unsafe-nth calls i)))))
+      (set! *call-buckets* (bucket-positions &keys))
+      (set! *call-buckets-ready* true)))
+
+  (private bucket-positions)
+  (hidden bucket-positions)
+  (doc bucket-positions "groups the positions of `keys` by key in one linear
+pass: count per slot, prefix-sum into starts, then place. Positions keep their
+order within a slot.")
+  (defn bucket-positions [keys]
+    (let-do [n (Array.length keys)
              slot-of (the (Map Int Int) (Map.create))
              slots (Array.allocate n)
              counts (the (Array Int) [])]
       (for [i 0 n]
-        (let [key (owner-trace-key
-                (InferredNodeType.owner (Array.unsafe-nth node-types i)))]
-          (match (Map.get-maybe &slot-of &key)
+        (let [key (Array.unsafe-nth keys i)]
+          (match (Map.get-maybe &slot-of key)
             (Maybe.Just slot)
               (do
                 (Array.aset-uninitialized! &slots i slot)
@@ -675,7 +718,7 @@ one linear pass: count per slot, prefix-sum into starts, then place.")
                              (Int.inc @(Array.unsafe-nth &counts slot))))
             (Maybe.Nothing)
               (let-do [slot (Array.length &counts)]
-                (ignore (Map.put! &slot-of &key &slot))
+                (ignore (Map.put! &slot-of key &slot))
                 (Array.push-back! &counts 1)
                 (Array.aset-uninitialized! &slots i slot)))))
       (let-do [slot-count (Array.length &counts)
@@ -693,9 +736,7 @@ one linear pass: count per slot, prefix-sum into starts, then place.")
                      at @(Array.unsafe-nth &cursor slot)]
               (Array.aset! &items at i)
               (Array.aset! &cursor slot (Int.inc at))))
-          (set! *owner-slot-of-key* slot-of)
-          (set! *owner-bucket-start* starts)
-          (set! *owner-bucket-items* items)))))
+          (PositionBuckets.init slot-of starts items)))))
 
   (defn prime-trace! [inferred]
     (let-do [n (Array.length (InferredModule.node-types inferred))
@@ -706,6 +747,7 @@ one linear pass: count per slot, prefix-sum into starts, then place.")
             (Type.solver-from-substitution (InferredModule.substitution inferred)))
       (set! *module-solver-ready* true)
       (build-owner-buckets! inferred)
+      (build-call-buckets! inferred)
       (set! *trace-owner-key* -1000000002)))
 
   (private clear-caches!)
@@ -724,6 +766,8 @@ its concrete node types, so none of these memoized values are needed afterward."
       (set! *owner-slot-of-key* (the (Map Int Int) (Map.create)))
       (set! *owner-bucket-start* [])
       (set! *owner-bucket-items* [])
+      (set! *call-buckets* (PositionBuckets.init (Map.create) [] []))
+      (set! *call-buckets-ready* false)
       (set! *trace-positions* [])
       (set! *trace-owner-key* -1000000002)))
 
@@ -1066,23 +1110,39 @@ one.")
   (defn root-call? [call]
     (match-ref (CallSite.owner call) (Maybe.Just _) false (Maybe.Nothing) true))
 
-  (defn calls-for-function [-core inferred reference]
+  (private calls-owned-by)
+  (hidden calls-owned-by)
+  (doc calls-owned-by "the calls `reference`'s definition makes, in trace
+order: its owner bucket when one is primed, else a scan of every call.")
+  (defn calls-owned-by [inferred reference]
     (let-do [result (the (Array CallSite) [])
-             calls (InferredModule.calls inferred)
-             n (Array.length calls)]
-      (for [i 0 n]
-        (let [call (Array.unsafe-nth calls i)]
-          (when (call-owned-by? call reference) (Array.push-back! &result @call))))
+             calls (InferredModule.calls inferred)]
+      (if *call-buckets-ready*
+        (match (Map.get-maybe
+            (PositionBuckets.slot-of &*call-buckets*)
+            (CoreRef.id reference))
+          (Maybe.Just slot)
+            (let [starts (PositionBuckets.starts &*call-buckets*)]
+              (for [b
+                    @(Array.unsafe-nth starts slot)
+                    @(Array.unsafe-nth starts (Int.inc slot))]
+                (let [call (Array.unsafe-nth calls
+                                             @(Array.unsafe-nth (PositionBuckets.items &*call-buckets*)
+                                                                b))]
+                  (when (call-owned-by? call reference)
+                    (Array.push-back! &result @call)))))
+          (Maybe.Nothing) ())
+        (for [i 0 (Array.length calls)]
+          (let [call (Array.unsafe-nth calls i)]
+            (when (call-owned-by? call reference)
+              (Array.push-back! &result @call)))))
       result))
 
+  (defn calls-for-function [-core inferred reference]
+    (calls-owned-by inferred reference))
+
   (defn calls-for-value [-core inferred reference]
-    (let-do [result (the (Array CallSite) [])
-             calls (InferredModule.calls inferred)
-             n (Array.length calls)]
-      (for [i 0 n]
-        (let [call (Array.unsafe-nth calls i)]
-          (when (call-owned-by? call reference) (Array.push-back! &result @call))))
-      result))
+    (calls-owned-by inferred reference))
 
   (private root-calls)
   (hidden root-calls)
