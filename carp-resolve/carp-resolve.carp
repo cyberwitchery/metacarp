@@ -101,7 +101,7 @@ references can resolve to all globals and imports visible in the base.")
 ;; callable-name → arity table for the current module, used by
 ;; `resolve-call-head` to pick among same-named candidates the way the
 ;; reference's multisym resolution does (approximated by arity).
-(def *resolve-arities* (the (Array (Pair String Int)) []))
+(def *resolve-arities* (the (Map String Int) (Map.create)))
 
 ;; overloads for ambiguous bare names (the reference's multisym): when several
 ;; same-named candidates stay ambiguous at resolve time, the name resolves to
@@ -113,7 +113,7 @@ references can resolve to all globals and imports visible in the base.")
 ;; sugar). A private binding may only be referenced from inside the module that
 ;; defines it; collected during form collection, consulted when a reference
 ;; resolves to a global.
-(def *private-names* (the (Array String) []))
+(def *private-names* (the (Set String) (Set.create)))
 
 ;; qualified names this module defines itself (a `defn`, `def`, `register`,
 ;; `deftemplate` or `definterface`). A definition shadows the binding its type
@@ -1075,7 +1075,7 @@ marks, so references from outside the defining module can be rejected.")
             ;; as in a top-level `(private Foo.bar)` naming a record accessor.
             (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
               (Maybe.Just name)
-                (Array.push-back! &*private-names* (qualify-name scope &name))
+                (Set.put! &*private-names* &(qualify-name scope &name))
               (Maybe.Nothing) ())))
       _ ()))
 
@@ -1107,7 +1107,7 @@ like a direct `(private X)` declaration.")
           (when (Int.= (Array.length &items) 4)
             (match (symbol-key (Box.peek (Array.unsafe-nth &items 1)))
               (Maybe.Just name)
-                (Array.push-back! &*private-names* (qualify-name scope &name))
+                (Set.put! &*private-names* &(qualify-name scope &name))
               (Maybe.Nothing) ())))
       _ ()))
 
@@ -1117,10 +1117,7 @@ submodules — may use its private bindings; everyone else may not.")
   (private private-access-error?)
   (hidden private-access-error?)
   (defn private-access-error? [name scope]
-    (let-do [private false]
-      (for [i 0 (Array.length &*private-names*)]
-        (when (String.= (Array.unsafe-nth &*private-names* i) name)
-          (set! private true)))
+    (let [private (Set.contains? &*private-names* name)]
       (if private
         (let [owner (parent-scope name)]
           (not
@@ -1532,8 +1529,7 @@ then reuse a reserved id.")
                     (do
                       ;; `defn-` is `private` + `hidden` + `defn`.
                       (when (declaration? form @"defn-")
-                        (Array.push-back! &*private-names*
-                                          @(FunctionShape.name &shape)))
+                        (Set.put! &*private-names* (FunctionShape.name &shape)))
                       (add-function! collected &shape))
                   (Result.Error error) (set! result (Result.Error error)))
 
@@ -1542,8 +1538,7 @@ then reuse a reserved id.")
                   (Result.Success shape)
                     (do
                       (when (declaration? form @"def-")
-                        (Array.push-back! &*private-names*
-                                          @(ValueShape.name &shape)))
+                        (Set.put! &*private-names* (ValueShape.name &shape)))
                       (add-value! collected &shape))
                   (Result.Error error) (set! result (Result.Error error)))
 
@@ -1662,7 +1657,7 @@ no-redefinition case pays no second walk.")
           (if (Int.= 0 (Array.length &*type-redefinitions*))
             (Result.Success first-pass)
             (do
-              (set! *private-names* [])
+              (set! *private-names* (Set.create))
               (set! *definition-names* (the (Map String Int) (Map.create)))
               (set! *type-decl-stamp* 0)
               (set! *type-decl-events* [])
@@ -2763,14 +2758,7 @@ the second binding silently shadow the first within a single scope.")
 
   (private arity-of)
   (hidden arity-of)
-  (defn arity-of [name]
-    (let-do [result (the (Maybe Int) (Maybe.Nothing))
-             n (Array.length &*resolve-arities*)]
-      (for [i 0 n]
-        (let [entry (Array.unsafe-nth &*resolve-arities* i)]
-          (when (String.= (Pair.a entry) name)
-            (set! result (Maybe.Just @(Pair.b entry))))))
-      result))
+  (defn arity-of [name] (Map.get-maybe &*resolve-arities* name))
 
   (private arity-compatible?)
   (hidden arity-compatible?)
@@ -2804,41 +2792,38 @@ the second binding silently shadow the first within a single scope.")
 resolve-call-head, from function shapes, register/deftemplate signatures, and
 the primitive registry.")
   (defn populate-arities! [collected constructor-builtins]
-    (let-do [table (the (Array (Pair String Int)) [])
+    (let-do [table (the (Map String Int) (Map.create))
              ;; per-module reset of the overload-synthesis channel filled
              ;; during body resolution.
              _ignored-overloads (set! *overloads* [])]
       (let [functions (CollectedForms.functions collected)]
         (for [i 0 (Array.length functions)]
           (let [shape (Array.unsafe-nth functions i)]
-            (Array.push-back! &table
-                              (Pair.init @(FunctionShape.name shape)
-                                         (Array.length (FunctionShape.parameters shape)))))))
+            (Map.put! &table
+                      (FunctionShape.name shape)
+                      &(Array.length (FunctionShape.parameters shape))))))
       (let [builtins (CollectedForms.builtins collected)]
         (for [i 0 (Array.length builtins)]
           (let [shape (Array.unsafe-nth builtins i)]
             (let [arity (surface-signature-arity (Box.peek (TypedShape.signature shape)))]
               (when (Int.>= arity 0)
-                (Array.push-back! &table
-                                  (Pair.init @(TypedShape.name shape) arity)))))))
+                (Map.put! &table (TypedShape.name shape) &arity))))))
       (let [registry (PrimitiveRegistry.builtins)]
         (for [i 0 (Array.length &registry)]
           (let [builtin (Array.unsafe-nth &registry i)]
             (match-ref (Box.peek (CoreBuiltin.signature builtin))
               (CoreType.Function signature-arguments _)
-                (Array.push-back! &table
-                                  (Pair.init
-                                    @(CoreRef.name (CoreBuiltin.reference builtin))
-                                    (Array.length signature-arguments)))
+                (Map.put! &table
+                          (CoreRef.name (CoreBuiltin.reference builtin))
+                          &(Array.length signature-arguments))
               _ ()))))
       (for [i 0 (Array.length constructor-builtins)]
         (let [builtin (Array.unsafe-nth constructor-builtins i)]
           (match-ref (Box.peek (CoreBuiltin.signature builtin))
             (CoreType.Function signature-arguments _)
-              (Array.push-back! &table
-                                (Pair.init
-                                  @(CoreRef.name (CoreBuiltin.reference builtin))
-                                  (Array.length signature-arguments)))
+              (Map.put! &table
+                        (CoreRef.name (CoreBuiltin.reference builtin))
+                        &(Array.length signature-arguments))
             _ ())))
       (set! *resolve-arities* table)))
 
@@ -4297,7 +4282,7 @@ guessed at.")
     ;; per-module reset of the visibility channel, which `collect` fills.
     ;; (The overload channel is reset later, in populate-arities!, which runs
     ;; AFTER collection — resetting private names there would wipe them.)
-    (let-do [_ignored-private (set! *private-names* [])
+    (let-do [_ignored-private (set! *private-names* (Set.create))
              _ignored-definitions (set! *definition-names*
                                         (the (Map String Int) (Map.create)))
              _ignored-stamp (set! *type-decl-stamp* 0)
