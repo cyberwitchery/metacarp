@@ -5,10 +5,15 @@
 (deftype SchemeBinding [reference CoreRef
                         scheme TypeScheme])
 
+(doc InferGlobalEnvironment "the global bindings inference sees. `variables`
+lists every variable a global binding has had free; `counts` says how many
+bindings still have it free, so a placeholder a generalized scheme replaced no
+longer fixes anything.")
 (deftype InferGlobalEnvironment
   [bindings (Array SchemeBinding)
    indexes (Array Int)
    variables (Array Int)
+   counts (Map Int Int)
    overloads (Array CoreOverload)])
 
 (deftype InferEnvironment
@@ -382,11 +387,22 @@ name to give.")
             (Array.push-back! indexes -1))
           (let [existing @(Array.unsafe-nth indexes id)]
             (if (Int.>= existing 0)
-              (Array.aset!
-                (InferGlobalEnvironment.bindings global-environment)
-                existing
-                (SchemeBinding.init (CoreRef.copy reference)
-                                    (TypeScheme.copy scheme)))
+              (let-do [released (free-scheme
+                         (SchemeBinding.scheme
+                           (Array.unsafe-nth
+                             (InferGlobalEnvironment.bindings global-environment)
+                             existing)))]
+                (for [i 0 (Array.length &released)]
+                  (Map.update-with-default!
+                    (InferGlobalEnvironment.counts global-environment)
+                    (Array.unsafe-nth &released i)
+                    &Int.dec
+                    0))
+                (Array.aset!
+                  (InferGlobalEnvironment.bindings global-environment)
+                  existing
+                  (SchemeBinding.init (CoreRef.copy reference)
+                                      (TypeScheme.copy scheme))))
               (let-do [index (Array.length
                          (InferGlobalEnvironment.bindings global-environment))]
                 (Array.push-back!
@@ -395,7 +411,12 @@ name to give.")
                                       (TypeScheme.copy scheme)))
                 (Array.aset! indexes id index))))
           (for [i 0 (Array.length &free-variables)]
-            (let [variable @(Array.unsafe-nth &free-variables i)]
+            (let-do [variable @(Array.unsafe-nth &free-variables i)]
+              (Map.update-with-default!
+                (InferGlobalEnvironment.counts global-environment)
+                &variable
+                &Int.inc
+                0)
               (unless-do (Type.contains-variable?
                   (InferGlobalEnvironment.variables global-environment)
                   variable)
@@ -810,12 +831,60 @@ choices, so it repeats until a pass commits nothing.")
 
   (private quantify)
   (hidden quantify)
-  (defn quantify [environment-variables type-variables]
-    (let-do [quantified (the (Array Int) [])]
+  (private bound-environment-variables)
+  (hidden bound-environment-variables)
+  (doc bound-environment-variables "the environment's variables the solver has
+bound since they were recorded, leaving out `excluded` and any global variable
+no binding has free any more. These are the ones whose bindings fix more than
+themselves.")
+  (defn bound-environment-variables [environment state excluded]
+    (let-do [solver @(InferState.solver state)
+             globals (Pointer.to-ref @(InferEnvironment.globals environment))
+             global-variables (InferGlobalEnvironment.variables globals)
+             counts (InferGlobalEnvironment.counts globals)
+             locals (InferEnvironment.variables environment)
+             result (the (Array Int) [])]
+      (for [i 0 (Array.length global-variables)]
+        (let [variable (Array.unsafe-nth global-variables i)]
+          (when (and
+              (Int.> (Map.get-with-default counts variable &0) 0)
+              (not (Type.contains-variable? excluded @variable))
+              (Type.solver-bound? solver @variable))
+            (Array.push-back! &result @variable))))
+      (for [i 0 (Array.length locals)]
+        (let [variable @(Array.unsafe-nth locals i)]
+          (when (Type.solver-bound? solver variable)
+            (Array.push-back! &result variable))))
+      result))
+
+  (doc quantify "the variables of `type-variables` the environment does not
+fix. A recorded environment variable fixes itself and, once the solver binds
+it, the variables of what it is bound to: unifying a use of a global whose
+type is still open binds the global's variable, so its new variables are not
+the definition's to quantify. `excluded` names the placeholders of the group
+being generalized, which generalizes against the environment without itself.
+The solver is only consulted when something is left to quantify.")
+  (defn quantify [environment state type-variables excluded]
+    (let-do [raw (free-environment environment)
+             quantified (the (Array Int) [])]
       (for [i 0 (Array.length type-variables)]
         (let [variable @(Array.unsafe-nth type-variables i)]
-          (unless (Type.contains-variable? environment-variables variable)
+          (unless (Type.contains-variable? &raw variable)
             (set! quantified (Type.append-variable &quantified variable)))))
+      (unless (Array.empty? &quantified)
+        (let-do [solver @(InferState.solver state)
+                 bound (bound-environment-variables environment state excluded)]
+          (for [i 0 (Array.length &bound)]
+            (let-do [reached (Type.free-variables
+                       &(Type.solver-apply-at solver
+                                              &(Type.variable @(Array.unsafe-nth &bound
+                                                                                 i))))
+                     kept (the (Array Int) [])]
+              (for [j 0 (Array.length &quantified)]
+                (let [candidate @(Array.unsafe-nth &quantified j)]
+                  (unless (Type.contains-variable? &reached candidate)
+                    (Array.push-back! &kept candidate))))
+              (set! quantified kept)))))
       quantified))
 
   (private applied-environment-variables)
@@ -823,13 +892,14 @@ choices, so it repeats until a pass commits nothing.")
   (doc applied-environment-variables "the variables the environment fixes, seen
 through the solver: an environment variable bound since it was recorded fixes
 the variables of what it is bound to.")
-  (defn applied-environment-variables [environment state]
-    (let-do [raw (free-environment environment)
-             result (the (Array Int) [])]
-      (for [i 0 (Array.length &raw)]
+  (defn applied-environment-variables [environment state excluded]
+    (let-do [result (free-environment environment)
+             bound (bound-environment-variables environment state excluded)]
+      (for [i 0 (Array.length &bound)]
         (let [free (Type.free-variables
                 &(Type.solver-apply-at @(InferState.solver state)
-                                       &(Type.variable @(Array.unsafe-nth &raw i))))]
+                                       &(Type.variable @(Array.unsafe-nth &bound
+                                                                          i))))]
           (for [j 0 (Array.length &free)]
             (set! result
                   (Type.append-variable &result @(Array.unsafe-nth &free j))))))
@@ -849,12 +919,16 @@ the variables of what it is bound to.")
 definition's type over what the environment does not fix. A choice over a
 quantified variable becomes part of the scheme, a qualified type, with its
 other local variables quantified alongside. Every other choice stays open (see
-`reject-undecidable-choices`).")
+`reject-undecidable-choices`). `excluded` is the group's own placeholders (see
+`quantify`).")
   (sig generalize
        (Fn
-         [(Ref InferEnvironment) (Ref InferState) (Ref MonoType)]
+         [(Ref InferEnvironment)
+          (Ref InferState)
+          (Ref MonoType)
+          (Ref (Array Int))]
          (Result (Pair TypeScheme InferState) InferError)))
-  (defn generalize [environment state type]
+  (defn generalize [environment state type excluded]
     (match (settle-choices! environment state)
       (Result.Success settled)
         (let-do [solver @(InferState.solver &settled)
@@ -862,10 +936,12 @@ other local variables quantified alongside. Every other choice stays open (see
                  ;; the applied environment walks every global's variables:
                  ;; only an open choice needs it
                  fixed (if (open-choices? &settled)
-                   (applied-environment-variables environment &settled)
+                   (applied-environment-variables environment &settled excluded)
                    [])
-                 quantified (quantify &(free-environment environment)
-                                      &(Type.free-variables &solved))
+                 quantified (quantify environment
+                                      &settled
+                                      &(Type.free-variables &solved)
+                                      excluded)
                  lifetimes (Type.free-lifetimes &solved)
                  trace (Pointer.to-ref @(InferState.trace &settled))
                  open @(InferenceTrace.choices trace)
@@ -924,7 +1000,7 @@ claimed it is generalized: nothing inferred later can reach its variables, so
 it can never be decided. That is an ambiguity, as in the reference.")
   (defn reject-undecidable-choices [environment state]
     (let-do [fixed (if (open-choices? state)
-               (applied-environment-variables environment state)
+               (applied-environment-variables environment state &[])
                [])
              open (InferenceTrace.choices
                (Pointer.to-ref @(InferState.trace state)))
@@ -945,18 +1021,24 @@ it can never be decided. That is an ambiguity, as in the reference.")
   (doc generalize-local "settles the open overload choices, then generalizes a
 local or global value's type. A value is inferred once and not specialized per
 use, so a variable an open choice constrains stays monomorphic, and the choice
-stays open for the enclosing scope to settle.")
+stays open for the enclosing scope to settle. `excluded` is as for
+`generalize`.")
   (sig generalize-local
        (Fn
-         [(Ref InferEnvironment) (Ref InferState) (Ref MonoType)]
+         [(Ref InferEnvironment)
+          (Ref InferState)
+          (Ref MonoType)
+          (Ref (Array Int))]
          (Result (Pair TypeScheme InferState) InferError)))
-  (defn generalize-local [environment state type]
+  (defn generalize-local [environment state type excluded]
     (match (settle-choices! environment state)
       (Result.Success settled)
         (let-do [solver @(InferState.solver &settled)
                  solved (Type.solver-apply-at solver type)
-                 candidates (quantify &(free-environment environment)
-                                      &(Type.free-variables &solved))
+                 candidates (quantify environment
+                                      &settled
+                                      &(Type.free-variables &solved)
+                                      excluded)
                  open (InferenceTrace.choices
                    (Pointer.to-ref @(InferState.trace &settled)))
                  constrained (the (Array Int) [])
@@ -1269,7 +1351,7 @@ monomorphic sharing the array relies on.")
                                        (not
                                          (assigns-reference? (Box.peek body)
                                                              reference)))
-                    (generalize-local environment value-state &value-type)
+                    (generalize-local environment value-state &value-type &[])
                     (Result.Success
                       (Pair.init
                         (TypeScheme.init []
@@ -2299,10 +2381,47 @@ monomorphic sharing the array relies on.")
           (Result.Error _) ()))
       result))
 
+  (private placeholder-variable)
+  (hidden placeholder-variable)
+  (doc placeholder-variable "the variable a definition predeclared without a
+signature stands for.")
+  (defn placeholder-variable [placeholders reference]
+    (match (binding-for placeholders reference)
+      (Maybe.Just scheme)
+        (match-ref (Box.peek (TypeScheme.body &scheme))
+          (MonoType.Variable variable) (Maybe.Just @variable)
+          _ (Maybe.Nothing))
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (private function-placeholders)
+  (hidden function-placeholders)
+  (defn function-placeholders [functions placeholders]
+    (let-do [result (the (Array Int) [])]
+      (for [i 0 (Array.length functions)]
+        (match (placeholder-variable placeholders
+                                     (CoreFunction.reference (Array.unsafe-nth functions
+                                                                               i)))
+          (Maybe.Just variable) (Array.push-back! &result variable)
+          (Maybe.Nothing) ()))
+      result))
+
+  (private value-placeholders)
+  (hidden value-placeholders)
+  (defn value-placeholders [values placeholders]
+    (let-do [result (the (Array Int) [])]
+      (for [i 0 (Array.length values)]
+        (match (placeholder-variable placeholders
+                                     (CoreValue.reference (Array.unsafe-nth values
+                                                                            i)))
+          (Maybe.Just variable) (Array.push-back! &result variable)
+          (Maybe.Nothing) ()))
+      result))
+
   (defn finalize-functions [functions base-environment placeholders state]
     (let-do [result (the (Result InferEnvironment InferError)
                          (Result.Success (InferEnvironment.copy base-environment)))
              current (state-copy state)
+             group (function-placeholders functions placeholders)
              n (Array.length functions)]
       (for [i 0 n]
         (match-ref &result
@@ -2321,7 +2440,10 @@ monomorphic sharing the array relies on.")
                                 &(str (Box.peek (TypeScheme.body &placeholder)))
                                 &(str &function-type)))
                       (Maybe.Nothing) ())
-                    (match (generalize base-environment &current &function-type)
+                    (match (generalize base-environment
+                                       &current
+                                       &function-type
+                                       &group)
                       (Result.Success generalized)
                         (do
                           (set! current @(Pair.b &generalized))
@@ -2352,6 +2474,7 @@ monomorphic sharing the array relies on.")
     (let-do [result (the (Result InferEnvironment InferError)
                          (Result.Success (InferEnvironment.copy base-environment)))
              current (state-copy state)
+             group (value-placeholders values placeholders)
              n (Array.length values)]
       (for [i 0 n]
         (match-ref &result
@@ -2364,7 +2487,8 @@ monomorphic sharing the array relies on.")
                                                          (Box.peek (TypeScheme.body &placeholder)))]
                     (match (generalize-local base-environment
                                              &current
-                                             &value-type)
+                                             &value-type
+                                             &group)
                       (Result.Success generalized)
                         (do
                           (set! current @(Pair.b &generalized))
@@ -2829,6 +2953,7 @@ inference base.")
              globals (InferGlobalEnvironment.init []
                                                   []
                                                   []
+                                                  (Map.create)
                                                   (Array.copy (CoreModule.overloads core)))
              initial-environment (InferEnvironment.init (Pointer.address &globals)
                                                         []
