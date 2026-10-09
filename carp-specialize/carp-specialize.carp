@@ -614,15 +614,16 @@ names.")
           (CoreBuiltinPayload.Template _ _) (mangled-symbol reference signature))
       (Maybe.Nothing) (mangled-symbol reference signature)))
 
-  (private scheme-for-linear)
-  (hidden scheme-for-linear)
-  (defn scheme-for-linear [environment reference]
-    (let-do [result (the (Maybe TypeScheme) (Maybe.Nothing))
+  (private scheme-position-linear)
+  (hidden scheme-position-linear)
+  (defn scheme-position-linear [environment reference]
+    (let-do [result -1
              n (Array.length environment)]
       (for [i 0 n]
-        (let [binding (Array.unsafe-nth environment i)]
-          (when (CoreIR.same-ref? (SchemeBinding.reference binding) reference)
-            (set! result (Maybe.Just @(SchemeBinding.scheme binding))))))
+        (when (CoreIR.same-ref?
+            (SchemeBinding.reference (Array.unsafe-nth environment i))
+            reference)
+          (set! result i)))
       result))
 
   (private prime-schemes!)
@@ -726,19 +727,30 @@ its concrete node types, so none of these memoized values are needed afterward."
       (set! *trace-positions* [])
       (set! *trace-owner-key* -1000000002)))
 
+  (private scheme-position)
+  (hidden scheme-position)
+  (doc scheme-position "where `reference`'s scheme sits in `environment`, or
+-1. A caller that only reads the scheme reads it there instead of copying it.")
+  (defn scheme-position [environment reference]
+    (let [id @(CoreRef.id reference)]
+      (if (or (Int.< id 0) (Int.>= id (Array.length &*scheme-id-index*)))
+        -1
+        (let [at @(Array.unsafe-nth &*scheme-id-index* id)]
+          (cond
+            (or (Int.< at 0) (Int.>= at (Array.length environment))) -1
+            (CoreIR.same-ref?
+              (SchemeBinding.reference (Array.unsafe-nth environment at))
+              reference)
+              at
+            (scheme-position-linear environment reference))))))
+
   (private scheme-for)
   (hidden scheme-for)
   (defn scheme-for [environment reference]
-    (let [id @(CoreRef.id reference)]
-      (if (or (Int.< id 0) (Int.>= id (Array.length &*scheme-id-index*)))
+    (let [at (scheme-position environment reference)]
+      (if (Int.< at 0)
         (Maybe.Nothing)
-        (let [at @(Array.unsafe-nth &*scheme-id-index* id)]
-          (if (or (Int.< at 0) (Int.>= at (Array.length environment)))
-            (Maybe.Nothing)
-            (let [binding (Array.unsafe-nth environment at)]
-              (if (CoreIR.same-ref? (SchemeBinding.reference binding) reference)
-                (Maybe.Just @(SchemeBinding.scheme binding))
-                (scheme-for-linear environment reference))))))))
+        (Maybe.Just @(SchemeBinding.scheme (Array.unsafe-nth environment at))))))
 
   (private implementation-for)
   (hidden implementation-for)
@@ -804,26 +816,10 @@ one.")
   (defn implementation-for [core inferred call]
     (let-do [interface (CallSite.reference call)
              signature (Box.peek (CallSite.type call))
-             result (the (Result CallSite SpecializeError)
-                         (Result.Error
-                           (SpecializeError.init
-                             ;; the interface and the type it was asked for are
-                             ;; the whole diagnosis, and what to do about it
-                             ;; follows from them: implement it for that type
-                             (String.concat
-                               &[@"no implementation of "
-                                 (String.copy (CoreRef.name interface))
-                                 @" for "
-                                 (Type.render signature)
-                                 @"; define one and say (implements "
-                                 (String.copy (CoreRef.name interface))
-                                 @" <your function>)"]))))
+             result (the (Maybe CallSite) (Maybe.Nothing))
              implementations (CoreModule.implementations core)
              environment (InferredModule.environment inferred)
              found false
-             found-name (String.copy "")
-             found-type (String.copy "")
-             found-reference (CoreRef.init -1 (String.copy "") true)
              found-specificity 1000000
              found-structure -1
              n (Array.length implementations)]
@@ -831,20 +827,22 @@ one.")
         (let [candidate (Array.unsafe-nth implementations i)]
           (when (CoreIR.same-ref? (CoreImplementation.interface candidate)
                                   interface)
-            (match (scheme-for environment
-                               (CoreImplementation.implementation candidate))
-              (Maybe.Just scheme)
-                (let [empty (Type.empty-substitution)]
-                  (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
+            (let [at (scheme-position environment
+                                      (CoreImplementation.implementation candidate))]
+              (when (Int.>= at 0)
+                (let [scheme (SchemeBinding.scheme (Array.unsafe-nth environment
+                                                                     at))
+                      empty (Type.empty-substitution)]
+                  (match (Type.unify-strict (Box.peek (TypeScheme.body scheme))
                                             signature
                                             &empty)
                     (Result.Success substitution)
                       (let [implementation-type (Type.apply &substitution
-                                                            (Box.peek (TypeScheme.body &scheme)))
+                                                            (Box.peek (TypeScheme.body scheme)))
                             ;; the most specific implementation (fewest free type
                             ;; variables in its declared type) wins; only a tie at
                             ;; the same specificity is a genuine ambiguity.
-                            declared-type (Box.peek (TypeScheme.body &scheme))
+                            declared-type (Box.peek (TypeScheme.body scheme))
                             candidate-structure (constructor-structure declared-type)
                             candidate-specificity (Int.+
                               (Array.length &(Type.free-variables declared-type))
@@ -867,15 +865,8 @@ one.")
                                 (set! found true)
                                 (set! found-structure candidate-structure)
                                 (set! found-specificity candidate-specificity)
-                                (set! found-name
-                                      @(CoreRef.name
-                                        (CoreImplementation.implementation candidate)))
-                                (set! found-reference
-                                      @(CoreImplementation.implementation candidate))
-                                (set! found-type
-                                      (Type.render (Box.peek (TypeScheme.body &scheme))))
                                 (set! result
-                                      (Result.Success
+                                      (Maybe.Just
                                         (CallSite.init @(CallSite.id call)
                                                        @(CoreImplementation.implementation candidate)
                                                        (Box.init implementation-type)
@@ -883,24 +874,30 @@ one.")
                             (and
                               (Int.= candidate-structure found-structure)
                               (Int.= candidate-specificity found-specificity))
-                              (do
-                                (set! found-name
-                                      @(CoreRef.name
-                                        (CoreImplementation.implementation candidate)))
-                                (set! found-reference
-                                      @(CoreImplementation.implementation candidate))
-                                (set! found-type
-                                      (Type.render (Box.peek (TypeScheme.body &scheme))))
-                                (set! result
-                                      (Result.Success
-                                        (CallSite.init @(CallSite.id call)
-                                                       @(CoreImplementation.implementation candidate)
-                                                       (Box.init implementation-type)
-                                                       (copy-call-owner call)))))
+                              (set! result
+                                    (Maybe.Just
+                                      (CallSite.init @(CallSite.id call)
+                                                     @(CoreImplementation.implementation candidate)
+                                                     (Box.init implementation-type)
+                                                     (copy-call-owner call))))
                             ())))
-                    (Result.Error _) ()))
-              (Maybe.Nothing) ()))))
-      result))
+                    (Result.Error _) ())))))))
+      (match result
+        (Maybe.Just site) (Result.Success site)
+        (Maybe.Nothing)
+          (Result.Error
+            (SpecializeError.init
+              ;; the interface and the type it was asked for are the whole
+              ;; diagnosis, and what to do about it follows from them:
+              ;; implement it for that type
+              (String.concat
+                &[@"no implementation of "
+                  (String.copy (CoreRef.name interface))
+                  @" for "
+                  (Type.render signature)
+                  @"; define one and say (implements "
+                  (String.copy (CoreRef.name interface))
+                  @" <your function>)"]))))))
 
   (sig collect-global-values-from-expressions!
        (Fn
