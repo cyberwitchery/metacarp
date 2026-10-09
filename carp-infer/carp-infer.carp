@@ -22,6 +22,13 @@ longer fixes anything.")
    variables (Array Int)
    owner (Maybe CoreRef)])
 
+(doc DependencyIndex "functions and overloads by reference id, for building a
+dependency graph without scanning per reference.")
+(deftype DependencyIndex
+  [references (Array CoreRef)
+   positions (Map Int Int)
+   overload-positions (Map Int (Array Int))])
+
 (deftype CallSite
   [id Int
    reference CoreRef
@@ -2514,6 +2521,8 @@ signature stands for.")
 
   (private function-index)
   (hidden function-index)
+  (private dependency-index)
+  (hidden dependency-index)
   (private dependency-present?)
   (hidden dependency-present?)
   (private add-expression-dependencies!)
@@ -2527,15 +2536,42 @@ signature stands for.")
   (private infer-function-components)
   (hidden infer-function-components)
 
-  (defn function-index [functions reference]
-    (let-do [result (the (Maybe Int) (Maybe.Nothing))
-             n (Array.length functions)]
-      (for [i 0 n]
-        (when (CoreIR.same-ref?
-            (CoreFunction.reference (Array.unsafe-nth functions i))
-            reference)
-          (set! result (Maybe.Just i))))
-      result))
+  (defn function-index [index reference]
+    (let [references (DependencyIndex.references index)]
+      (match (Map.get-maybe (DependencyIndex.positions index)
+                            (CoreRef.id reference))
+        (Maybe.Just at)
+        (if (CoreIR.same-ref? (Array.unsafe-nth references at) reference)
+          (Maybe.Just at)
+          (let-do [result (the (Maybe Int) (Maybe.Nothing))]
+            (for [i 0 (Array.length references)]
+              (when (CoreIR.same-ref? (Array.unsafe-nth references i) reference)
+                (set! result (Maybe.Just i))))
+            result))
+        ;; references with different ids are never the same reference
+        (Maybe.Nothing)
+        (Maybe.Nothing))))
+
+  (doc dependency-index "indexes `functions` and `overloads` by reference id
+once per dependency graph, so each reference in each body is looked up rather
+than scanned for. The last function with an id wins, as the scan it replaces
+answered.")
+  (defn dependency-index [functions overloads]
+    (let-do [references (the (Array CoreRef) [])
+             positions (the (Map Int Int) (Map.create))
+             overload-positions (the (Map Int (Array Int)) (Map.create))]
+      (for [i 0 (Array.length functions)]
+        (let-do [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
+          (Array.push-back! &references @reference)
+          (Map.put! &positions (CoreRef.id reference) &i)))
+      (for [i 0 (Array.length overloads)]
+        (let [id (CoreRef.id
+                (CoreOverload.reference (Array.unsafe-nth overloads i)))]
+          (match (Map.get-maybe &overload-positions id)
+            (Maybe.Just at)
+              (Map.put! &overload-positions id &(Array.push-back at i))
+            (Maybe.Nothing) (Map.put! &overload-positions id &[i]))))
+      (DependencyIndex.init references positions overload-positions)))
 
   (defn dependency-present? [dependencies candidate]
     (let-do [found false
@@ -2548,40 +2584,44 @@ signature stands for.")
   (doc add-reference-dependency! "records that a definition needs the function
 a global reference names. A reference to an overload needs every candidate:
 settling its choice asks for their types.")
-  (defn add-reference-dependency! [functions overloads reference dependencies]
+  (defn add-reference-dependency! [index overloads reference dependencies]
     (when-do @(CoreRef.global reference)
-      (match (function-index functions reference)
-        (Maybe.Just index)
-          (unless (dependency-present? dependencies index)
-            (Array.push-back! dependencies index))
+      (match (function-index index reference)
+        (Maybe.Just at)
+          (unless (dependency-present? dependencies at)
+            (Array.push-back! dependencies at))
         (Maybe.Nothing) ())
-      (for [i 0 (Array.length overloads)]
-        (let [overload (Array.unsafe-nth overloads i)]
-          (when (CoreIR.same-ref? (CoreOverload.reference overload) reference)
-            (for [j 0 (Array.length (CoreOverload.candidates overload))]
-              (match (function-index functions
-                                     (Array.unsafe-nth (CoreOverload.candidates overload)
-                                                       j))
-                (Maybe.Just index)
-                  (unless (dependency-present? dependencies index)
-                    (Array.push-back! dependencies index))
-                (Maybe.Nothing) ())))))))
+      (match (Map.get-maybe
+          (DependencyIndex.overload-positions index)
+          (CoreRef.id reference))
+        (Maybe.Just positions)
+          (for [k 0 (Array.length &positions)]
+            (let [overload (Array.unsafe-nth overloads
+                                             @(Array.unsafe-nth &positions k))]
+              (when (CoreIR.same-ref? (CoreOverload.reference overload)
+                                      reference)
+                (for [j 0 (Array.length (CoreOverload.candidates overload))]
+                  (match (function-index index
+                                         (Array.unsafe-nth (CoreOverload.candidates overload)
+                                                           j))
+                    (Maybe.Just at)
+                      (unless (dependency-present? dependencies at)
+                        (Array.push-back! dependencies at))
+                    (Maybe.Nothing) ())))))
+        (Maybe.Nothing) ())))
 
-  (defn add-expression-array-dependencies! [functions
+  (defn add-expression-array-dependencies! [index
                                             overloads
                                             expressions
                                             dependencies]
     (let [n (Array.length expressions)]
       (for [i 0 n]
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! index
                                       overloads
                                       (Box.peek (Array.unsafe-nth expressions i))
                                       dependencies))))
 
-  (defn add-expression-dependencies! [functions
-                                      overloads
-                                      expression
-                                      dependencies]
+  (defn add-expression-dependencies! [index overloads expression dependencies]
     (match-ref expression
       (CoreExpr.IntLit _ _) ()
       (CoreExpr.ByteLit _ _) ()
@@ -2594,95 +2634,95 @@ settling its choice asks for their types.")
       (CoreExpr.BoolLit _ _) ()
       (CoreExpr.UnitLit _) ()
       (CoreExpr.ArrayLit _ expressions)
-        (add-expression-array-dependencies! functions
+        (add-expression-array-dependencies! index
                                             overloads
                                             expressions
                                             dependencies)
       (CoreExpr.StaticArrayLit _ expressions)
-        (add-expression-array-dependencies! functions
+        (add-expression-array-dependencies! index
                                             overloads
                                             expressions
                                             dependencies)
       (CoreExpr.Reference _ reference)
-        (add-reference-dependency! functions overloads reference dependencies)
+        (add-reference-dependency! index overloads reference dependencies)
       (CoreExpr.Call _ callee arguments)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek callee)
                                         dependencies)
-          (add-expression-array-dependencies! functions
+          (add-expression-array-dependencies! index
                                               overloads
                                               arguments
                                               dependencies))
       (CoreExpr.Do _ expressions)
-        (add-expression-array-dependencies! functions
+        (add-expression-array-dependencies! index
                                             overloads
                                             expressions
                                             dependencies)
       (CoreExpr.If _ condition then-branch else-branch)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek condition)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek then-branch)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek else-branch)
                                         dependencies))
       (CoreExpr.Let _ _ value body)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek value)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek body)
                                         dependencies))
       (CoreExpr.Set _ reference value)
         (do
-          (add-reference-dependency! functions overloads reference dependencies)
-          (add-expression-dependencies! functions
+          (add-reference-dependency! index overloads reference dependencies)
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek value)
                                         dependencies))
       (CoreExpr.While _ condition body)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek condition)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek body)
                                         dependencies))
       (CoreExpr.Break _) ()
       (CoreExpr.Lambda _ _ body)
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! index
                                       overloads
                                       (Box.peek body)
                                       dependencies)
       (CoreExpr.Match _ _ scrutinee branches)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek scrutinee)
                                         dependencies)
           (let [n (Array.length branches)]
             (for [i 0 n]
-              (add-expression-dependencies! functions
+              (add-expression-dependencies! index
                                             overloads
                                             (Box.peek
                                               (CoreMatchBranch.body (Array.unsafe-nth branches
                                                                                       i)))
                                             dependencies))))
       (CoreExpr.Annotation _ expression _)
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! index
                                       overloads
                                       (Box.peek expression)
                                       dependencies)))
@@ -2690,9 +2730,10 @@ settling its choice asks for their types.")
   (defn function-dependency-graph [functions overloads]
     (let-do [n (Array.length functions)
              empty (the (Array Int) [])
-             edges (Array.replicate n &empty)]
+             edges (Array.replicate n &empty)
+             index (dependency-index functions overloads)]
       (for [i 0 n]
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! &index
                                       overloads
                                       (Box.peek
                                         (CoreFunction.body (Array.unsafe-nth functions
