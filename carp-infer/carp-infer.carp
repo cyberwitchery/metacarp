@@ -3031,6 +3031,49 @@ inference base.")
 
   (private run-module)
   (hidden run-module)
+  (defn run-module [core]
+    (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
+             solver (Type.solver)
+             trace (InferenceTrace.init [] [] [] [])
+             globals (InferGlobalEnvironment.init []
+                                                  []
+                                                  []
+                                                  (Map.create)
+                                                  (Array.copy (CoreModule.overloads core)))
+             initial-environment (InferEnvironment.init (Pointer.address &globals)
+                                                        []
+                                                        []
+                                                        (Maybe.Nothing))
+             builtin-environment (extend-builtins &initial-environment
+                                                  (CoreModule.builtins core))
+             declaration-environment (extend-interfaces &builtin-environment
+                                                        (CoreModule.interfaces core))
+             initial-state (InferState.init 0
+                                            (Pointer.address &solver)
+                                            (Pointer.address &trace))]
+      (match (infer-functions (CoreModule.functions core)
+                              (CoreModule.values core)
+                              (CoreModule.signatures core)
+                              &declaration-environment
+                              &initial-state)
+        (Result.Success function-result)
+          (match (infer-top-level-expressions (CoreModule.expressions core)
+                                              (InferEnvironment.copy (Pair.a &function-result))
+                                              (Pair.b &function-result))
+            (Result.Success expression-result)
+              (Result.Success
+                (Pair.init
+                  (InferredModule.init
+                    (Array.copy (InferGlobalEnvironment.bindings &globals))
+                    @(Pair.a &expression-result)
+                    (Array.copy (InferenceTrace.calls &trace))
+                    (Array.copy (InferenceTrace.node-types &trace))
+                    (Array.copy (InferenceTrace.binding-types &trace))
+                    (Type.solver-snapshot &solver))
+                  @(InferState.next-variable (Pair.b &expression-result))))
+            (Result.Error error) (Result.Error error))
+        (Result.Error error) (Result.Error error))))
+
   (defn module-with-bindings [core]
     (match (run-module core)
       (Result.Success run) (Result.Success @(Pair.a &run))
@@ -3065,6 +3108,8 @@ inference base.")
             (InferenceBase.init @(Pair.a &run) @(Pair.b &run) defined builtins))
         (Result.Error error) (Result.Error error))))
 
+  (sig refers-to-any-of?
+       (Fn [(Ref (Array (Box CoreExpr))) (Ref (Set Int))] Bool))
   (private refers-to-any?)
   (hidden refers-to-any?)
   (doc refers-to-any? "whether `expression` refers to any global id in `ids`.")
@@ -3117,65 +3162,6 @@ inference base.")
         (when (refers-to-any? (Box.peek (Array.unsafe-nth expressions i)) ids)
           (set! found true)))
       found))
-
-  (doc module-from-base "infers `core`, a module that extends the one `base`
-was inferred from: it has every function, value and top-level expression that
-module had, unchanged, and adds more. Only the additions are inferred, on top
-of the base's schemes, substitution and trace. An addition can take over a
-builtin's id; when anything the base already inferred refers to such an id,
-its type may change, and the whole module is inferred again instead.")
-  (sig module-from-base
-       (Fn [(Ref CoreModule) (Ref InferenceBase)]
-           (Result InferredModule InferError)))
-  (defn module-from-base [core base]
-    (let-do [defined (InferenceBase.defined base)
-             builtins (InferenceBase.builtins base)
-             functions (CoreModule.functions core)
-             values (CoreModule.values core)
-             added-functions (the (Array CoreFunction) [])
-             added-values (the (Array CoreValue) [])
-             taken-over (the (Set Int) (Set.create))
-             inferred-again false]
-      (for [i 0 (Array.length functions)]
-        (let [function (Array.unsafe-nth functions i)
-              id (CoreRef.id (CoreFunction.reference function))]
-          (unless-do (Set.contains? defined id)
-            (Array.push-back! &added-functions @function)
-            (when (Set.contains? builtins id) (Set.put! &taken-over id)))))
-      (for [i 0 (Array.length values)]
-        (let [value (Array.unsafe-nth values i)
-              id (CoreRef.id (CoreValue.reference value))]
-          (unless-do (Set.contains? defined id)
-            (Array.push-back! &added-values @value)
-            (when (Set.contains? builtins id) (Set.put! &taken-over id)))))
-      (when-do (Int.> (Set.length &taken-over) 0)
-        (for [i 0 (Array.length functions)]
-          (let [function (Array.unsafe-nth functions i)]
-            (when (and
-                (Set.contains? defined
-                               (CoreRef.id (CoreFunction.reference function)))
-                (refers-to-any? (Box.peek (CoreFunction.body function))
-                                &taken-over))
-              (set! inferred-again true))))
-        (for [i 0 (Array.length values)]
-          (let [value (Array.unsafe-nth values i)]
-            (when (and
-                (Set.contains? defined (CoreRef.id (CoreValue.reference value)))
-                (refers-to-any? (Box.peek (CoreValue.body value)) &taken-over))
-              (set! inferred-again true))))
-        (when (refers-to-any-of? (CoreModule.expressions core) &taken-over)
-          (set! inferred-again true))
-        (let [overloads (CoreModule.overloads core)]
-          (for [i 0 (Array.length overloads)]
-            (let [candidates (CoreOverload.candidates (Array.unsafe-nth overloads
-                                                                        i))]
-              (for [j 0 (Array.length candidates)]
-                (when (Set.contains? &taken-over
-                                     (CoreRef.id (Array.unsafe-nth candidates j)))
-                  (set! inferred-again true)))))))
-      (if inferred-again
-        (module core)
-        (infer-additions core base &added-functions &added-values &taken-over))))
 
   (private infer-additions)
   (hidden infer-additions)
@@ -3237,45 +3223,61 @@ its type may change, and the whole module is inferred again instead.")
                 (Type.solver-snapshot &solver))))
         (Result.Error error) (Result.Error error))))
 
-  (defn run-module [core]
-    (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
-             solver (Type.solver)
-             trace (InferenceTrace.init [] [] [] [])
-             globals (InferGlobalEnvironment.init []
-                                                  []
-                                                  []
-                                                  (Map.create)
-                                                  (Array.copy (CoreModule.overloads core)))
-             initial-environment (InferEnvironment.init (Pointer.address &globals)
-                                                        []
-                                                        []
-                                                        (Maybe.Nothing))
-             builtin-environment (extend-builtins &initial-environment
-                                                  (CoreModule.builtins core))
-             declaration-environment (extend-interfaces &builtin-environment
-                                                        (CoreModule.interfaces core))
-             initial-state (InferState.init 0
-                                            (Pointer.address &solver)
-                                            (Pointer.address &trace))]
-      (match (infer-functions (CoreModule.functions core)
-                              (CoreModule.values core)
-                              (CoreModule.signatures core)
-                              &declaration-environment
-                              &initial-state)
-        (Result.Success function-result)
-          (match (infer-top-level-expressions (CoreModule.expressions core)
-                                              (InferEnvironment.copy (Pair.a &function-result))
-                                              (Pair.b &function-result))
-            (Result.Success expression-result)
-              (Result.Success
-                (Pair.init
-                  (InferredModule.init
-                    (Array.copy (InferGlobalEnvironment.bindings &globals))
-                    @(Pair.a &expression-result)
-                    (Array.copy (InferenceTrace.calls &trace))
-                    (Array.copy (InferenceTrace.node-types &trace))
-                    (Array.copy (InferenceTrace.binding-types &trace))
-                    (Type.solver-snapshot &solver))
-                  @(InferState.next-variable (Pair.b &expression-result))))
-            (Result.Error error) (Result.Error error))
-        (Result.Error error) (Result.Error error)))))
+  (doc module-from-base "infers `core`, a module that extends the one `base`
+was inferred from: it has every function, value and top-level expression that
+module had, unchanged, and adds more. Only the additions are inferred, on top
+of the base's schemes, substitution and trace. An addition can take over a
+builtin's id; when anything the base already inferred refers to such an id,
+its type may change, and the whole module is inferred again instead.")
+  (sig module-from-base
+       (Fn [(Ref CoreModule) (Ref InferenceBase)]
+           (Result InferredModule InferError)))
+  (defn module-from-base [core base]
+    (let-do [defined (InferenceBase.defined base)
+             builtins (InferenceBase.builtins base)
+             functions (CoreModule.functions core)
+             values (CoreModule.values core)
+             added-functions (the (Array CoreFunction) [])
+             added-values (the (Array CoreValue) [])
+             taken-over (the (Set Int) (Set.create))
+             inferred-again false]
+      (for [i 0 (Array.length functions)]
+        (let [function (Array.unsafe-nth functions i)
+              id (CoreRef.id (CoreFunction.reference function))]
+          (unless-do (Set.contains? defined id)
+            (Array.push-back! &added-functions @function)
+            (when (Set.contains? builtins id) (Set.put! &taken-over id)))))
+      (for [i 0 (Array.length values)]
+        (let [value (Array.unsafe-nth values i)
+              id (CoreRef.id (CoreValue.reference value))]
+          (unless-do (Set.contains? defined id)
+            (Array.push-back! &added-values @value)
+            (when (Set.contains? builtins id) (Set.put! &taken-over id)))))
+      (when-do (Int.> (Set.length &taken-over) 0)
+        (for [i 0 (Array.length functions)]
+          (let [function (Array.unsafe-nth functions i)]
+            (when (and
+                (Set.contains? defined
+                               (CoreRef.id (CoreFunction.reference function)))
+                (refers-to-any? (Box.peek (CoreFunction.body function))
+                                &taken-over))
+              (set! inferred-again true))))
+        (for [i 0 (Array.length values)]
+          (let [value (Array.unsafe-nth values i)]
+            (when (and
+                (Set.contains? defined (CoreRef.id (CoreValue.reference value)))
+                (refers-to-any? (Box.peek (CoreValue.body value)) &taken-over))
+              (set! inferred-again true))))
+        (when (refers-to-any-of? (CoreModule.expressions core) &taken-over)
+          (set! inferred-again true))
+        (let [overloads (CoreModule.overloads core)]
+          (for [i 0 (Array.length overloads)]
+            (let [candidates (CoreOverload.candidates (Array.unsafe-nth overloads
+                                                                        i))]
+              (for [j 0 (Array.length candidates)]
+                (when (Set.contains? &taken-over
+                                     (CoreRef.id (Array.unsafe-nth candidates j)))
+                  (set! inferred-again true)))))))
+      (if inferred-again
+        (module core)
+        (infer-additions core base &added-functions &added-values &taken-over)))))
