@@ -138,48 +138,152 @@ characters. Underscores and punctuation are escaped by Unicode code point.")
   (defn framed [value]
     (String.concat &[(Int.str (String.length value)) @"_" (String.copy value)]))
 
-  (private arguments-key)
-  (hidden arguments-key)
-  (private type-key-internal)
-  (hidden type-key-internal)
-  (defn arguments-key [arguments]
-    (let-do [buffer (StringBuf.create)
-             n (Array.length arguments)]
-      (for [i 0 n]
-        (let [key (type-key-internal (Box.peek (Array.unsafe-nth arguments i)))]
-          (StringBuf.append-str &buffer &(framed &key))))
-      (StringBuf.into-string buffer)))
+  ;; A type key is written into one buffer sized up front. Each nested key is
+  ;; framed by its length, so lengths are computed without building anything
+  ;; and every level writes straight into the buffer.
+  (private decimal-length)
+  (hidden decimal-length)
+  (defn decimal-length [n]
+    (let-do [length (if (Int.< n 0) 2 1)
+             rest (Int.abs n)]
+      (while-do (Int.>= rest 10)
+        (set! rest (Int./ rest 10))
+        (set! length (Int.inc length)))
+      length))
 
-  (defn type-key-internal [type]
+  (private ascii?)
+  (hidden ascii?)
+  (defn ascii? [value]
+    (let-do [result true
+             n (String.length value)]
+      (for [i 0 n]
+        (when (Int.> (Char.to-int (String.char-at value i)) 127)
+          (set! result false)))
+      result))
+
+  (private component-length)
+  (hidden component-length)
+  (doc component-length "the length of `(component value)`, without building
+it when `value` is ASCII.")
+  (defn component-length [value]
+    (if (ascii? value)
+      (let-do [length 0
+               n (String.length value)]
+        (for [i 0 n]
+          (let [character (String.char-at value i)]
+            (set! length
+                  (Int.+ length
+                         (if (ascii-alphanumeric? character)
+                           1
+                           (Int.+ 3 (decimal-length (Char.to-int character))))))))
+        length)
+      (String.length &(component value))))
+
+  (private write-component!)
+  (hidden write-component!)
+  (defn write-component! [buffer value]
+    (if (ascii? value)
+      (for [i 0 (String.length value)]
+        (let [character (String.char-at value i)]
+          (if (ascii-alphanumeric? character)
+            (StringBuf.append-char buffer character)
+            (do
+              (StringBuf.append-str buffer "_x")
+              (StringBuf.append-int buffer (Char.to-int character))
+              (StringBuf.append-char buffer \_)))))
+      (StringBuf.append-str buffer &(component value))))
+
+  (private framed-length)
+  (hidden framed-length)
+  (defn framed-length [length] (Int.+ (decimal-length length) (Int.inc length)))
+
+  (private key-length)
+  (hidden key-length)
+  (private arguments-length)
+  (hidden arguments-length)
+  (private write-key!)
+  (hidden write-key!)
+  (private write-framed-key!)
+  (hidden write-framed-key!)
+  (private write-arguments!)
+  (hidden write-arguments!)
+  (defn arguments-length [arguments]
+    (let-do [length 0]
+      (for [i 0 (Array.length arguments)]
+        (set! length
+              (Int.+ length
+                     (framed-length
+                       (key-length (Box.peek (Array.unsafe-nth arguments i)))))))
+      length))
+
+  (doc key-length "the length of `type`'s key.")
+  (defn key-length [type]
+    (match-ref type
+      (MonoType.Variable variable) (Int.+ 2 (decimal-length @variable))
+      (MonoType.Named name arguments)
+        (Int.+
+          (Int.+ 2 (framed-length (component-length name)))
+          (Int.+
+            (decimal-length (Array.length arguments))
+            (arguments-length arguments)))
+      (MonoType.Reference inner _)
+        (Int.inc (framed-length (key-length (Box.peek inner))))
+      (MonoType.Function arguments result)
+        (Int.+
+          (Int.+ 3 (decimal-length (Array.length arguments)))
+          (Int.+ (arguments-length arguments)
+                 (framed-length (key-length (Box.peek result)))))
+      _ 1))
+
+  (defn write-framed-key! [buffer type]
+    (do
+      (StringBuf.append-int buffer (key-length type))
+      (StringBuf.append-char buffer \_)
+      (write-key! buffer type)))
+
+  (defn write-arguments! [buffer arguments]
+    (for [i 0 (Array.length arguments)]
+      (write-framed-key! buffer (Box.peek (Array.unsafe-nth arguments i)))))
+
+  (defn write-key! [buffer type]
     (match-ref type
       (MonoType.Variable variable)
-        (String.concat &[@"V" (Int.str @variable) @"_"])
-      (MonoType.Integer) (String.copy "I")
-      (MonoType.String) (String.copy "S")
-      (MonoType.Boolean) (String.copy "B")
-      (MonoType.Unit) (String.copy "U")
+        (do
+          (StringBuf.append-char buffer \V)
+          (StringBuf.append-int buffer @variable)
+          (StringBuf.append-char buffer \_))
+      (MonoType.Integer) (StringBuf.append-char buffer \I)
+      (MonoType.String) (StringBuf.append-char buffer \S)
+      (MonoType.Boolean) (StringBuf.append-char buffer \B)
+      (MonoType.Unit) (StringBuf.append-char buffer \U)
       (MonoType.Named name arguments)
-        (let [encoded-name (component name)
-              encoded-arguments (arguments-key arguments)]
-          (String.concat
-            &[@"N"
-              (framed &encoded-name)
-              (Int.str (Array.length arguments))
-              @"_"
-              encoded-arguments]))
+        (do
+          (StringBuf.append-char buffer \N)
+          (StringBuf.append-int buffer (component-length name))
+          (StringBuf.append-char buffer \_)
+          (write-component! buffer name)
+          (StringBuf.append-int buffer (Array.length arguments))
+          (StringBuf.append-char buffer \_)
+          (write-arguments! buffer arguments))
       (MonoType.Reference inner _)
-        (let [key (type-key-internal (Box.peek inner))]
-          (String.concat &[@"R" (framed &key)]))
+        (do
+          (StringBuf.append-char buffer \R)
+          (write-framed-key! buffer (Box.peek inner)))
       (MonoType.Function arguments result)
-        (let [encoded-arguments (arguments-key arguments)
-              result-key (type-key-internal (Box.peek result))]
-          (String.concat
-            &[@"F"
-              (Int.str (Array.length arguments))
-              @"_"
-              encoded-arguments
-              @"Z"
-              (framed &result-key)]))))
+        (do
+          (StringBuf.append-char buffer \F)
+          (StringBuf.append-int buffer (Array.length arguments))
+          (StringBuf.append-char buffer \_)
+          (write-arguments! buffer arguments)
+          (StringBuf.append-char buffer \Z)
+          (write-framed-key! buffer (Box.peek result)))))
+
+  (private type-key-internal)
+  (hidden type-key-internal)
+  (defn type-key-internal [type]
+    (let-do [buffer (StringBuf.with-capacity (Int.inc (key-length type)))]
+      (write-key! &buffer type)
+      (StringBuf.into-string buffer)))
 
   (doc type-key "returns the structural, identifier-safe ABI key for a type.")
   (defn type-key [type] (type-key-internal type))

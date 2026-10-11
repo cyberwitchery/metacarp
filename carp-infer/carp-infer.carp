@@ -22,6 +22,13 @@ longer fixes anything.")
    variables (Array Int)
    owner (Maybe CoreRef)])
 
+(doc DependencyIndex "functions and overloads by reference id, for building a
+dependency graph without scanning per reference.")
+(deftype DependencyIndex
+  [references (Array CoreRef)
+   positions (Map Int Int)
+   overload-positions (Map Int (Array Int))])
+
 (deftype CallSite
   [id Int
    reference CoreRef
@@ -85,6 +92,16 @@ longer fixes anything.")
    node-types (Array InferredNodeType)
    binding-types (Array InferredBindingType)
    substitution TypeSubstitution])
+
+(doc InferenceBase "an inferred module that a later, larger module can build
+on: the inference result, the first type variable the run had not used yet,
+and which global ids the module defined (functions and values) and which it
+only declared as builtins.")
+(deftype InferenceBase
+  [inferred InferredModule
+   next-variable Int
+   defined (Set Int)
+   builtins (Set Int)])
 
 (doc SpannedNodeType "is an inferred expression type with final substitution
 applied and its caller-facing source span attached.")
@@ -597,7 +614,8 @@ caller that only asks whether a type fits must not constrain anything.")
                                                            @(TypeChoice.name choice)
                                                            @(Array.unsafe-nth types
                                                                               i)
-                                                           @(TypeChoice.candidates choice)))))
+                                                           @(TypeChoice.candidates choice)
+                                                           @(TypeChoice.filtered choice)))))
                     (MonoType.copy (Box.peek result)))
                 _ (MonoType.copy &joint))]
           (Pair.init
@@ -658,7 +676,8 @@ be the type of one of its candidates.")
                       @(CoreRef.id (CoreOverload.reference overload))
                       @(CoreRef.name (CoreOverload.reference overload))
                       @(FreshType.type &fresh-result)
-                      candidates))
+                      candidates
+                      false))
       (InferredExpression.init @(FreshType.type &fresh-result)
                                @(FreshType.state &fresh-result))))
 
@@ -670,20 +689,36 @@ be the type of one of its candidates.")
   (private candidate-fits?)
   (hidden candidate-fits?)
   (doc candidate-fits? "whether one candidate's type still fits a choice,
-asked without constraining anything: both sides are normalized through the
-solver and unified in a scratch one, which succeeds exactly when the solver's
+asked without constraining anything: `applied` is the choice's type already
+normalized through the solver, the candidate's is normalized here, and the two
+are unified in a scratch solver, which succeeds exactly when the solver's
 constraints can be extended by that choice.")
-  (defn candidate-fits? [environment state wanted id]
+  (defn candidate-fits? [environment state applied id]
     (match (candidate-scheme environment id)
       (Maybe.Just scheme)
         (let-do [parts (instantiate-parts &scheme state "fit")
-                 solver @(InferState.solver state)
-                 left (Type.solver-apply-at solver wanted)
-                 right (Type.solver-apply-at solver
+                 right (Type.solver-apply-at @(InferState.solver state)
                                              (Box.peek (FreshType.type (Pair.a &parts))))
                  scratch (Type.solver)]
-          (Result.success? &(Type.solver-unify! &scratch &left &right)))
+          (Result.success? &(Type.solver-unify! &scratch applied &right)))
       (Maybe.Nothing) false))
+
+  (private candidates-unchanged?)
+  (hidden candidates-unchanged?)
+  (doc candidates-unchanged? "whether the solver leaves every candidate's type
+as it was. A candidate inferred in the same group as the call still has a
+placeholder type, and binding it can make the candidate stop fitting.")
+  (defn candidates-unchanged? [environment solver candidates]
+    (let-do [unchanged true]
+      (for [i 0 (Array.length candidates)]
+        (when unchanged
+          (match (candidate-scheme environment @(Array.unsafe-nth candidates i))
+            (Maybe.Just scheme)
+              (when (Type.solver-changes? solver
+                                          (Box.peek (TypeScheme.body &scheme)))
+                (set! unchanged false))
+            (Maybe.Nothing) (set! unchanged false))))
+      unchanged))
 
   (private commit-choice)
   (hidden commit-choice)
@@ -699,7 +734,7 @@ unified with the candidate's, whose own choices open here.")
               (Box.peek (FreshType.type &instance)))
             (Result.Success _) (Result.Success @(FreshType.state &instance))
             (Result.Error error)
-              (Result.Error (InferError.init @(TypeError.message &error)))))
+              (Result.Error (InferError.init (TypeError.message &error)))))
       (Maybe.Nothing)
         (Result.Error
           (InferError.init
@@ -787,15 +822,30 @@ choices, so it repeats until a pass commits nothing.")
                  remaining (the (Array TypeChoice) [])]
           (for [i 0 (Array.length &open)]
             (let-do [choice (Array.unsafe-nth &open i)
+                     solver @(InferState.solver &current)
+                     ;; a fit depends on the choice's type and on each
+                     ;; candidate's, so a choice keeps its candidates while the
+                     ;; solver has changed neither
+                     unchanged (and @(TypeChoice.filtered choice)
+                                    (and
+                                      (not
+                                        (Type.solver-changes? solver
+                                                              (Box.peek (TypeChoice.type choice))))
+                                      (candidates-unchanged? environment
+                                                             solver
+                                                             (TypeChoice.candidates choice))))
+                     applied (if unchanged
+                       (MonoType.copy (Box.peek (TypeChoice.type choice)))
+                       (Type.solver-apply-at solver
+                                             (Box.peek (TypeChoice.type choice))))
                      fitting (the (Array Int) [])]
               (when-do (Result.success? &result)
-                (for [j 0 (Array.length (TypeChoice.candidates choice))]
-                  (let [id @(Array.unsafe-nth (TypeChoice.candidates choice) j)]
-                    (when (candidate-fits? environment
-                                           &current
-                                           (Box.peek (TypeChoice.type choice))
-                                           id)
-                      (Array.push-back! &fitting id))))
+                (if unchanged
+                  (set! fitting @(TypeChoice.candidates choice))
+                  (for [j 0 (Array.length (TypeChoice.candidates choice))]
+                    (let [id @(Array.unsafe-nth (TypeChoice.candidates choice) j)]
+                      (when (candidate-fits? environment &current &applied id)
+                        (Array.push-back! &fitting id)))))
                 (cond
                   (Int.= 0 (Array.length &fitting))
                     (set! result
@@ -815,8 +865,9 @@ choices, so it repeats until a pass commits nothing.")
                   (Array.push-back! &remaining
                                     (TypeChoice.init @(TypeChoice.overload choice)
                                                      @(TypeChoice.name choice)
-                                                     @(TypeChoice.type choice)
-                                                     fitting))))))
+                                                     (Box.init applied)
+                                                     fitting
+                                                     true))))))
           ;; commits opened their candidates' choices meanwhile
           (put-choices! &current remaining)))
       (match result
@@ -977,7 +1028,8 @@ other local variables quantified alongside. Every other choice stays open (see
                                       (TypeChoice.init @(TypeChoice.overload choice)
                                                        @(TypeChoice.name choice)
                                                        (Box.init choice-type)
-                                                       @(TypeChoice.candidates choice))))))))
+                                                       @(TypeChoice.candidates choice)
+                                                       @(TypeChoice.filtered choice))))))))
           (for [i 0 (Array.length &open)]
             (unless @(Array.unsafe-nth &taken i)
               (Array.push-back! &kept @(Array.unsafe-nth &open i))))
@@ -1133,9 +1185,7 @@ stays open for the enclosing scope to settle. `excluded` is as for
         (match-ref &result
           (Result.Success types)
             (match (annotation-type (Box.peek (Array.unsafe-nth arguments i)))
-              (Result.Success type)
-                (set! result
-                      (Result.Success (Array.push-back @types (Box.init type))))
+              (Result.Success type) (Array.push-back! types (Box.init type))
               (Result.Error error) (set! result (Result.Error error)))
           (Result.Error _) ()))
       result))
@@ -1204,7 +1254,7 @@ stays open for the enclosing scope to settle. `excluded` is as for
                   (InferredExpression.init (Box.init result-type)
                                            annotation-state)))
             (Result.Error error)
-              (Result.Error (InferError.init @(TypeError.message &error))))
+              (Result.Error (InferError.init (TypeError.message &error))))
         (Result.Error error) (Result.Error error))))
 
   (doc generalizable-value? "the value restriction: only syntactic values
@@ -1338,7 +1388,7 @@ monomorphic sharing the array relies on.")
                                         &value-type)
                   (infer-expression &extended (Box.peek body) &body-state))
               (Result.Error error)
-                (Result.Error (InferError.init @(TypeError.message &error))))
+                (Result.Error (InferError.init (TypeError.message &error))))
           (Result.Error error) (Result.Error error)))
       (let [value-state (InferState.copy state)]
         (match (infer-expression environment (Box.peek value) &value-state)
@@ -1456,11 +1506,11 @@ monomorphic sharing the array relies on.")
                                                              result-state)))
                               (Result.Error error)
                                 (Result.Error
-                                  (InferError.init @(TypeError.message &error))))
+                                  (InferError.init (TypeError.message &error))))
                           (Result.Error error) (Result.Error error)))
                     (Result.Error error) (Result.Error error)))
               (Result.Error error)
-                (Result.Error (InferError.init @(TypeError.message &error)))))
+                (Result.Error (InferError.init (TypeError.message &error)))))
         (Result.Error error) (Result.Error error))))
 
   (defn infer-set [environment reference value state]
@@ -1483,7 +1533,7 @@ monomorphic sharing the array relies on.")
                   (Result.Success
                     (InferredExpression.init (Box.init (Type.unit)) result-state)))
               (Result.Error error)
-                (Result.Error (InferError.init @(TypeError.message &error))))
+                (Result.Error (InferError.init (TypeError.message &error))))
           (Result.Error error) (Result.Error error))
       (Maybe.Nothing)
         (Result.Error
@@ -1517,7 +1567,7 @@ monomorphic sharing the array relies on.")
                                                @(InferredExpression.state &inferred-body)))
                   (Result.Error error) (Result.Error error)))
             (Result.Error error)
-              (Result.Error (InferError.init @(TypeError.message &error)))))
+              (Result.Error (InferError.init (TypeError.message &error)))))
       (Result.Error error) (Result.Error error)))
 
   (defn infer-match-bindings [environment bindings state]
@@ -1570,13 +1620,13 @@ monomorphic sharing the array relies on.")
                                             &bound)
                 (Result.Success _) (Result.Success (state-copy work-state))
                 (Result.Error error)
-                  (Result.Error (InferError.init @(TypeError.message &error)))))
+                  (Result.Error (InferError.init (TypeError.message &error)))))
             (match (Type.solver-unify-at! @(InferState.solver state)
                                           (Box.peek (TypeScheme.body &scheme))
                                           subject)
               (Result.Success _) (Result.Success (state-copy state))
               (Result.Error error)
-                (Result.Error (InferError.init @(TypeError.message &error)))))
+                (Result.Error (InferError.init (TypeError.message &error)))))
         (Maybe.Nothing)
           (Result.Error (InferError.init @"missing match binding type")))
       (CorePattern.Constructor constructor children)
@@ -1630,7 +1680,7 @@ monomorphic sharing the array relies on.")
                           (Result.Error _) ()))
                       result)
                   (Result.Error error)
-                    (Result.Error (InferError.init @(TypeError.message &error))))))
+                    (Result.Error (InferError.init (TypeError.message &error))))))
           (Maybe.Nothing)
             (Result.Error (InferError.init @"missing match constructor scheme"))))))
 
@@ -1655,7 +1705,7 @@ monomorphic sharing the array relies on.")
                   (Pair.init (InferEnvironment.copy environment) constrained))
               (Result.Error error) (Result.Error error))
           (Result.Error error)
-            (Result.Error (InferError.init @(TypeError.message &error)))))
+            (Result.Error (InferError.init (TypeError.message &error)))))
       (match (constrain-core-pattern environment
                                      (CoreMatchBranch.pattern branch)
                                      scrutinee
@@ -1716,7 +1766,7 @@ monomorphic sharing the array relies on.")
                             (Result.Error error)
                               (set! result
                                     (Result.Error
-                                      (InferError.init @(TypeError.message &error)))))
+                                      (InferError.init (TypeError.message &error)))))
                         (Result.Error error) (set! result (Result.Error error)))
                     (Result.Error error) (set! result (Result.Error error)))
                 (Result.Error error) (set! result (Result.Error error))))
@@ -1772,7 +1822,7 @@ monomorphic sharing the array relies on.")
                             (InferError.init
                               (String.concat
                                 &[@"a non-final expression in `do` must be Unit: "
-                                  (String.copy (TypeError.message &error))]))))
+                                  (TypeError.message &error)]))))
                       (Result.Success inferred))
                     (Result.Error error)
                     (Result.Error error)))
@@ -1817,7 +1867,7 @@ monomorphic sharing the array relies on.")
                       (Result.Error error)
                         (set! result
                               (Result.Error
-                                (InferError.init @(TypeError.message &error)))))
+                                (InferError.init (TypeError.message &error)))))
                   (Result.Error error) (set! result (Result.Error error))))
             (Result.Error _) ()))
         (match result
@@ -1899,11 +1949,10 @@ monomorphic sharing the array relies on.")
             &[@"in call to "
               (String.copy (CoreRef.name reference))
               @": "
-              (String.copy (TypeError.message error))]))
+              (TypeError.message error)]))
       _
         (InferError.init
-          (String.concat
-            &[@"in call expression: " (String.copy (TypeError.message error))]))))
+          (String.concat &[@"in call expression: " (TypeError.message error)]))))
 
   (defn record-call [environment call-id callee state type]
     (match-ref callee
@@ -2314,7 +2363,7 @@ monomorphic sharing the array relies on.")
                                 (Result.Error
                                   (contextual-error "value"
                                                     reference
-                                                    (TypeError.message &error)))))
+                                                    &(TypeError.message &error)))))
                     (Maybe.Nothing)
                       (set! result
                             (Result.Error
@@ -2365,7 +2414,7 @@ monomorphic sharing the array relies on.")
                                 (Result.Error
                                   (contextual-error "function"
                                                     reference
-                                                    (TypeError.message &error)))))
+                                                    &(TypeError.message &error)))))
                     (Maybe.Nothing)
                       (set! result
                             (Result.Error
@@ -2517,6 +2566,8 @@ signature stands for.")
 
   (private function-index)
   (hidden function-index)
+  (private dependency-index)
+  (hidden dependency-index)
   (private dependency-present?)
   (hidden dependency-present?)
   (private add-expression-dependencies!)
@@ -2530,15 +2581,42 @@ signature stands for.")
   (private infer-function-components)
   (hidden infer-function-components)
 
-  (defn function-index [functions reference]
-    (let-do [result (the (Maybe Int) (Maybe.Nothing))
-             n (Array.length functions)]
-      (for [i 0 n]
-        (when (CoreIR.same-ref?
-            (CoreFunction.reference (Array.unsafe-nth functions i))
-            reference)
-          (set! result (Maybe.Just i))))
-      result))
+  (defn function-index [index reference]
+    (let [references (DependencyIndex.references index)]
+      (match (Map.get-maybe (DependencyIndex.positions index)
+                            (CoreRef.id reference))
+        (Maybe.Just at)
+        (if (CoreIR.same-ref? (Array.unsafe-nth references at) reference)
+          (Maybe.Just at)
+          (let-do [result (the (Maybe Int) (Maybe.Nothing))]
+            (for [i 0 (Array.length references)]
+              (when (CoreIR.same-ref? (Array.unsafe-nth references i) reference)
+                (set! result (Maybe.Just i))))
+            result))
+        ;; references with different ids are never the same reference
+        (Maybe.Nothing)
+        (Maybe.Nothing))))
+
+  (doc dependency-index "indexes `functions` and `overloads` by reference id
+once per dependency graph, so each reference in each body is looked up rather
+than scanned for. The last function with an id wins, as the scan it replaces
+answered.")
+  (defn dependency-index [functions overloads]
+    (let-do [references (the (Array CoreRef) [])
+             positions (the (Map Int Int) (Map.create))
+             overload-positions (the (Map Int (Array Int)) (Map.create))]
+      (for [i 0 (Array.length functions)]
+        (let-do [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
+          (Array.push-back! &references @reference)
+          (Map.put! &positions (CoreRef.id reference) &i)))
+      (for [i 0 (Array.length overloads)]
+        (let [id (CoreRef.id
+                (CoreOverload.reference (Array.unsafe-nth overloads i)))]
+          (match (Map.get-maybe &overload-positions id)
+            (Maybe.Just at)
+              (Map.put! &overload-positions id &(Array.push-back at i))
+            (Maybe.Nothing) (Map.put! &overload-positions id &[i]))))
+      (DependencyIndex.init references positions overload-positions)))
 
   (defn dependency-present? [dependencies candidate]
     (let-do [found false
@@ -2551,40 +2629,44 @@ signature stands for.")
   (doc add-reference-dependency! "records that a definition needs the function
 a global reference names. A reference to an overload needs every candidate:
 settling its choice asks for their types.")
-  (defn add-reference-dependency! [functions overloads reference dependencies]
+  (defn add-reference-dependency! [index overloads reference dependencies]
     (when-do @(CoreRef.global reference)
-      (match (function-index functions reference)
-        (Maybe.Just index)
-          (unless (dependency-present? dependencies index)
-            (Array.push-back! dependencies index))
+      (match (function-index index reference)
+        (Maybe.Just at)
+          (unless (dependency-present? dependencies at)
+            (Array.push-back! dependencies at))
         (Maybe.Nothing) ())
-      (for [i 0 (Array.length overloads)]
-        (let [overload (Array.unsafe-nth overloads i)]
-          (when (CoreIR.same-ref? (CoreOverload.reference overload) reference)
-            (for [j 0 (Array.length (CoreOverload.candidates overload))]
-              (match (function-index functions
-                                     (Array.unsafe-nth (CoreOverload.candidates overload)
-                                                       j))
-                (Maybe.Just index)
-                  (unless (dependency-present? dependencies index)
-                    (Array.push-back! dependencies index))
-                (Maybe.Nothing) ())))))))
+      (match (Map.get-maybe
+          (DependencyIndex.overload-positions index)
+          (CoreRef.id reference))
+        (Maybe.Just positions)
+          (for [k 0 (Array.length &positions)]
+            (let [overload (Array.unsafe-nth overloads
+                                             @(Array.unsafe-nth &positions k))]
+              (when (CoreIR.same-ref? (CoreOverload.reference overload)
+                                      reference)
+                (for [j 0 (Array.length (CoreOverload.candidates overload))]
+                  (match (function-index index
+                                         (Array.unsafe-nth (CoreOverload.candidates overload)
+                                                           j))
+                    (Maybe.Just at)
+                      (unless (dependency-present? dependencies at)
+                        (Array.push-back! dependencies at))
+                    (Maybe.Nothing) ())))))
+        (Maybe.Nothing) ())))
 
-  (defn add-expression-array-dependencies! [functions
+  (defn add-expression-array-dependencies! [index
                                             overloads
                                             expressions
                                             dependencies]
     (let [n (Array.length expressions)]
       (for [i 0 n]
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! index
                                       overloads
                                       (Box.peek (Array.unsafe-nth expressions i))
                                       dependencies))))
 
-  (defn add-expression-dependencies! [functions
-                                      overloads
-                                      expression
-                                      dependencies]
+  (defn add-expression-dependencies! [index overloads expression dependencies]
     (match-ref expression
       (CoreExpr.IntLit _ _) ()
       (CoreExpr.ByteLit _ _) ()
@@ -2597,95 +2679,95 @@ settling its choice asks for their types.")
       (CoreExpr.BoolLit _ _) ()
       (CoreExpr.UnitLit _) ()
       (CoreExpr.ArrayLit _ expressions)
-        (add-expression-array-dependencies! functions
+        (add-expression-array-dependencies! index
                                             overloads
                                             expressions
                                             dependencies)
       (CoreExpr.StaticArrayLit _ expressions)
-        (add-expression-array-dependencies! functions
+        (add-expression-array-dependencies! index
                                             overloads
                                             expressions
                                             dependencies)
       (CoreExpr.Reference _ reference)
-        (add-reference-dependency! functions overloads reference dependencies)
+        (add-reference-dependency! index overloads reference dependencies)
       (CoreExpr.Call _ callee arguments)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek callee)
                                         dependencies)
-          (add-expression-array-dependencies! functions
+          (add-expression-array-dependencies! index
                                               overloads
                                               arguments
                                               dependencies))
       (CoreExpr.Do _ expressions)
-        (add-expression-array-dependencies! functions
+        (add-expression-array-dependencies! index
                                             overloads
                                             expressions
                                             dependencies)
       (CoreExpr.If _ condition then-branch else-branch)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek condition)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek then-branch)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek else-branch)
                                         dependencies))
       (CoreExpr.Let _ _ value body)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek value)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek body)
                                         dependencies))
       (CoreExpr.Set _ reference value)
         (do
-          (add-reference-dependency! functions overloads reference dependencies)
-          (add-expression-dependencies! functions
+          (add-reference-dependency! index overloads reference dependencies)
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek value)
                                         dependencies))
       (CoreExpr.While _ condition body)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek condition)
                                         dependencies)
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek body)
                                         dependencies))
       (CoreExpr.Break _) ()
       (CoreExpr.Lambda _ _ body)
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! index
                                       overloads
                                       (Box.peek body)
                                       dependencies)
       (CoreExpr.Match _ _ scrutinee branches)
         (do
-          (add-expression-dependencies! functions
+          (add-expression-dependencies! index
                                         overloads
                                         (Box.peek scrutinee)
                                         dependencies)
           (let [n (Array.length branches)]
             (for [i 0 n]
-              (add-expression-dependencies! functions
+              (add-expression-dependencies! index
                                             overloads
                                             (Box.peek
                                               (CoreMatchBranch.body (Array.unsafe-nth branches
                                                                                       i)))
                                             dependencies))))
       (CoreExpr.Annotation _ expression _)
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! index
                                       overloads
                                       (Box.peek expression)
                                       dependencies)))
@@ -2693,9 +2775,10 @@ settling its choice asks for their types.")
   (defn function-dependency-graph [functions overloads]
     (let-do [n (Array.length functions)
              empty (the (Array Int) [])
-             edges (Array.replicate n &empty)]
+             edges (Array.replicate n &empty)
+             index (dependency-index functions overloads)]
       (for [i 0 n]
-        (add-expression-dependencies! functions
+        (add-expression-dependencies! &index
                                       overloads
                                       (Box.peek
                                         (CoreFunction.body (Array.unsafe-nth functions
@@ -2946,7 +3029,9 @@ inference base.")
       []
       (Type.empty-substitution)))
 
-  (defn module-with-bindings [core]
+  (private run-module)
+  (hidden run-module)
+  (defn run-module [core]
     (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
              solver (Type.solver)
              trace (InferenceTrace.init [] [] [] [])
@@ -2977,12 +3062,222 @@ inference base.")
                                               (Pair.b &function-result))
             (Result.Success expression-result)
               (Result.Success
-                (InferredModule.init
-                  (Array.copy (InferGlobalEnvironment.bindings &globals))
-                  @(Pair.a &expression-result)
-                  (Array.copy (InferenceTrace.calls &trace))
-                  (Array.copy (InferenceTrace.node-types &trace))
-                  (Array.copy (InferenceTrace.binding-types &trace))
-                  (Type.solver-snapshot &solver)))
+                (Pair.init
+                  (InferredModule.init
+                    (Array.copy (InferGlobalEnvironment.bindings &globals))
+                    @(Pair.a &expression-result)
+                    (Array.copy (InferenceTrace.calls &trace))
+                    (Array.copy (InferenceTrace.node-types &trace))
+                    (Array.copy (InferenceTrace.binding-types &trace))
+                    (Type.solver-snapshot &solver))
+                  @(InferState.next-variable (Pair.b &expression-result))))
             (Result.Error error) (Result.Error error))
-        (Result.Error error) (Result.Error error)))))
+        (Result.Error error) (Result.Error error))))
+
+  (defn module-with-bindings [core]
+    (match (run-module core)
+      (Result.Success run) (Result.Success @(Pair.a &run))
+      (Result.Error error) (Result.Error error)))
+
+  (doc module-resumable "infers `core` like `module`, keeping what
+`module-from-base` needs to infer a larger module built on it.")
+  (sig module-resumable
+       (Fn [(Ref CoreModule)] (Result InferenceBase InferError)))
+  (defn module-resumable [core]
+    (let-do [_ignored-base (set! *infer-base-bindings* [])
+             defined (the (Set Int) (Set.create))
+             builtins (the (Set Int) (Set.create))]
+      (for [i 0 (Array.length (CoreModule.functions core))]
+        (Set.put! &defined
+                  (CoreRef.id
+                    (CoreFunction.reference
+                      (Array.unsafe-nth (CoreModule.functions core) i)))))
+      (for [i 0 (Array.length (CoreModule.values core))]
+        (Set.put! &defined
+                  (CoreRef.id
+                    (CoreValue.reference
+                      (Array.unsafe-nth (CoreModule.values core) i)))))
+      (for [i 0 (Array.length (CoreModule.builtins core))]
+        (Set.put! &builtins
+                  (CoreRef.id
+                    (CoreBuiltin.reference
+                      (Array.unsafe-nth (CoreModule.builtins core) i)))))
+      (match (run-module core)
+        (Result.Success run)
+          (Result.Success
+            (InferenceBase.init @(Pair.a &run) @(Pair.b &run) defined builtins))
+        (Result.Error error) (Result.Error error))))
+
+  (sig refers-to-any-of?
+       (Fn [(Ref (Array (Box CoreExpr))) (Ref (Set Int))] Bool))
+  (private refers-to-any?)
+  (hidden refers-to-any?)
+  (doc refers-to-any? "whether `expression` refers to any global id in `ids`.")
+  (defn refers-to-any? [expression ids]
+    (match-ref expression
+      (CoreExpr.Reference _ reference)
+        (and @(CoreRef.global reference)
+             (Set.contains? ids (CoreRef.id reference)))
+      (CoreExpr.Set _ reference value)
+        (or
+          (and @(CoreRef.global reference)
+               (Set.contains? ids (CoreRef.id reference)))
+          (refers-to-any? (Box.peek value) ids))
+      (CoreExpr.ArrayLit _ items) (refers-to-any-of? items ids)
+      (CoreExpr.StaticArrayLit _ items) (refers-to-any-of? items ids)
+      (CoreExpr.Call _ callee arguments)
+        (or (refers-to-any? (Box.peek callee) ids)
+            (refers-to-any-of? arguments ids))
+      (CoreExpr.Do _ expressions) (refers-to-any-of? expressions ids)
+      (CoreExpr.If _ condition consequent alternative)
+        (or
+          (refers-to-any? (Box.peek condition) ids)
+          (or
+            (refers-to-any? (Box.peek consequent) ids)
+            (refers-to-any? (Box.peek alternative) ids)))
+      (CoreExpr.Let _ _ value body)
+        (or (refers-to-any? (Box.peek value) ids)
+            (refers-to-any? (Box.peek body) ids))
+      (CoreExpr.While _ condition body)
+        (or
+          (refers-to-any? (Box.peek condition) ids)
+          (refers-to-any? (Box.peek body) ids))
+      (CoreExpr.Lambda _ _ body) (refers-to-any? (Box.peek body) ids)
+      (CoreExpr.Match _ _ scrutinee branches)
+        (let-do [found (refers-to-any? (Box.peek scrutinee) ids)]
+          (for [i 0 (Array.length branches)]
+            (when (refers-to-any?
+                (Box.peek (CoreMatchBranch.body (Array.unsafe-nth branches i)))
+                ids)
+              (set! found true)))
+          found)
+      (CoreExpr.Annotation _ inner _) (refers-to-any? (Box.peek inner) ids)
+      _ false))
+
+  (private refers-to-any-of?)
+  (hidden refers-to-any-of?)
+  (defn refers-to-any-of? [expressions ids]
+    (let-do [found false]
+      (for [i 0 (Array.length expressions)]
+        (when (refers-to-any? (Box.peek (Array.unsafe-nth expressions i)) ids)
+          (set! found true)))
+      found))
+
+  (private infer-additions)
+  (hidden infer-additions)
+  (defn infer-additions [core base functions values taken-over]
+    (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
+             _ignored-base (set! *infer-base-bindings* [])
+             inferred (InferenceBase.inferred base)
+             solver (Type.solver-from-substitution (InferredModule.substitution inferred))
+             trace (InferenceTrace.init [] [] [] [])
+             globals (InferGlobalEnvironment.init []
+                                                  []
+                                                  []
+                                                  (Map.create)
+                                                  (Array.copy (CoreModule.overloads core)))
+             environment (InferEnvironment.init (Pointer.address &globals)
+                                                []
+                                                []
+                                                (Maybe.Nothing))
+             bindings (InferredModule.environment inferred)
+             _ignored-seed (for [i 0 (Array.length bindings)]
+               (let [binding (Array.unsafe-nth bindings i)
+                     reference (SchemeBinding.reference binding)]
+                 (unless (and @(CoreRef.global reference)
+                              (Set.contains? taken-over (CoreRef.id reference)))
+                   (extend-environment! &environment
+                                        reference
+                                        (SchemeBinding.scheme binding)))))
+             state (InferState.init @(InferenceBase.next-variable base)
+                                    (Pointer.address &solver)
+                                    (Pointer.address &trace))]
+      (match (infer-functions functions
+                              values
+                              (CoreModule.signatures core)
+                              &environment
+                              &state)
+        (Result.Success _)
+          (let-do [calls (Array.copy (InferredModule.calls inferred))
+                   node-types (Array.copy (InferredModule.node-types inferred))
+                   binding-types (Array.copy (InferredModule.binding-types inferred))]
+            (for [i 0 (Array.length (InferenceTrace.calls &trace))]
+              (Array.push-back! &calls
+                                @(Array.unsafe-nth (InferenceTrace.calls &trace)
+                                                   i)))
+            (for [i 0 (Array.length (InferenceTrace.node-types &trace))]
+              (Array.push-back! &node-types
+                                @(Array.unsafe-nth (InferenceTrace.node-types &trace)
+                                                   i)))
+            (for [i 0 (Array.length (InferenceTrace.binding-types &trace))]
+              (Array.push-back! &binding-types
+                                @(Array.unsafe-nth (InferenceTrace.binding-types &trace)
+                                                   i)))
+            (Result.Success
+              (InferredModule.init
+                (Array.copy (InferGlobalEnvironment.bindings &globals))
+                (Array.copy (InferredModule.expression-types inferred))
+                calls
+                node-types
+                binding-types
+                (Type.solver-snapshot &solver))))
+        (Result.Error error) (Result.Error error))))
+
+  (doc module-from-base "infers `core`, a module that extends the one `base`
+was inferred from: it has every function, value and top-level expression that
+module had, unchanged, and adds more. Only the additions are inferred, on top
+of the base's schemes, substitution and trace. An addition can take over a
+builtin's id; when anything the base already inferred refers to such an id,
+its type may change, and the whole module is inferred again instead.")
+  (sig module-from-base
+       (Fn [(Ref CoreModule) (Ref InferenceBase)]
+           (Result InferredModule InferError)))
+  (defn module-from-base [core base]
+    (let-do [defined (InferenceBase.defined base)
+             builtins (InferenceBase.builtins base)
+             functions (CoreModule.functions core)
+             values (CoreModule.values core)
+             added-functions (the (Array CoreFunction) [])
+             added-values (the (Array CoreValue) [])
+             taken-over (the (Set Int) (Set.create))
+             inferred-again false]
+      (for [i 0 (Array.length functions)]
+        (let [function (Array.unsafe-nth functions i)
+              id (CoreRef.id (CoreFunction.reference function))]
+          (unless-do (Set.contains? defined id)
+            (Array.push-back! &added-functions @function)
+            (when (Set.contains? builtins id) (Set.put! &taken-over id)))))
+      (for [i 0 (Array.length values)]
+        (let [value (Array.unsafe-nth values i)
+              id (CoreRef.id (CoreValue.reference value))]
+          (unless-do (Set.contains? defined id)
+            (Array.push-back! &added-values @value)
+            (when (Set.contains? builtins id) (Set.put! &taken-over id)))))
+      (when-do (Int.> (Set.length &taken-over) 0)
+        (for [i 0 (Array.length functions)]
+          (let [function (Array.unsafe-nth functions i)]
+            (when (and
+                (Set.contains? defined
+                               (CoreRef.id (CoreFunction.reference function)))
+                (refers-to-any? (Box.peek (CoreFunction.body function))
+                                &taken-over))
+              (set! inferred-again true))))
+        (for [i 0 (Array.length values)]
+          (let [value (Array.unsafe-nth values i)]
+            (when (and
+                (Set.contains? defined (CoreRef.id (CoreValue.reference value)))
+                (refers-to-any? (Box.peek (CoreValue.body value)) &taken-over))
+              (set! inferred-again true))))
+        (when (refers-to-any-of? (CoreModule.expressions core) &taken-over)
+          (set! inferred-again true))
+        (let [overloads (CoreModule.overloads core)]
+          (for [i 0 (Array.length overloads)]
+            (let [candidates (CoreOverload.candidates (Array.unsafe-nth overloads
+                                                                        i))]
+              (for [j 0 (Array.length candidates)]
+                (when (Set.contains? &taken-over
+                                     (CoreRef.id (Array.unsafe-nth candidates j)))
+                  (set! inferred-again true)))))))
+      (if inferred-again
+        (module core)
+        (infer-additions core base &added-functions &added-values &taken-over)))))

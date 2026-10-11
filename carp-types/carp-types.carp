@@ -53,7 +53,10 @@ leaves open. `overload` and `name` identify that name for diagnostics.")
   [overload Int
    name String
    type (Box MonoType)
-   candidates (Array Int)])
+   candidates (Array Int)
+   ;; the candidates are exactly those that fit `type`, which was applied
+   ;; through the solver when they were filtered
+   filtered Bool])
 
 (deftype TypeScheme
   [variables (Array Int)
@@ -62,7 +65,21 @@ leaves open. `overload` and `name` identify that name for diagnostics.")
    names (Array String)
    choices (Array TypeChoice)])
 
-(deftype TypeError [message String])
+(doc TypeError "is a failed unification. `Explained` carries the message a
+reader sees. `Unexplained` is what the substitution unifier answers: its
+callers mostly ask whether a candidate fits and drop the failure, so it
+renders nothing, and a caller that reports it renders the types it compared
+(see `Type.mismatch`).")
+(deftype TypeError
+  (Explained [String])
+  (Unexplained []))
+
+(defmodule TypeError
+  (doc message "the failure's message.")
+  (defn message [error]
+    (match-ref error
+      (TypeError.Explained text) @text
+      (TypeError.Unexplained) @"the types do not unify")))
 
 (defmodule Type
   (doc variable "creates an inference variable.")
@@ -450,7 +467,7 @@ instantiation freshens a whole signature's lifetimes one at a time.")
           (Result.Success (add-binding &substitution variable type)))
       _
         (if (occurs-under? variable type &substitution)
-          (Result.Error (TypeError.init @"occurs check failed"))
+          (Result.Error (TypeError.Explained @"occurs check failed"))
           (Result.Success (add-binding &substitution variable type)))))
 
   (doc extend-substitution "adds one variable-to-type mapping to a
@@ -485,7 +502,7 @@ wants it: one argument, two arguments.")
 answer. The counts are the whole of what went wrong, so they are what the
 message says.")
   (defn arity-mismatch [expected got]
-    (TypeError.init
+    (TypeError.Explained
       (String.concat
         &[@"expected " (argument-count expected) @", got " (Int.str got)])))
 
@@ -538,7 +555,7 @@ message says.")
                                right-result
                                substitution]
     (if (/= (Array.length left-arguments) (Array.length right-arguments))
-      (Result.Error (TypeError.init @"function arity mismatch"))
+      (Result.Error (TypeError.Explained @"function arity mismatch"))
       (match (unify-arguments-at left-arguments right-arguments 0 substitution)
         (Result.Success current) (unify-owned left-result right-result current)
         (Result.Error error) (Result.Error error))))
@@ -667,8 +684,6 @@ borrowing a name, which is what makes a stray one obvious.")
             (render-internal (Box.peek result))
             @")"])))
 
-  (private mismatch)
-  (hidden mismatch)
   (doc mismatch "the error a failed unification answers: both types, named
 together so a variable that appears in each reads as the same variable. What
 went wrong is that these two do not fit, and a reader cannot see that from
@@ -679,7 +694,7 @@ one of them.")
       (collect-variables! right &names)
       (set! *render-names* names)
       (set! *render-labels* (the (Array String) []))
-      (TypeError.init
+      (TypeError.Explained
         (String.concat
           &[@"cannot unify "
             (render-internal left)
@@ -695,55 +710,64 @@ one of them.")
       (MonoType.Integer)
         (match-ref right
           (MonoType.Integer) (Result.Success substitution)
-          _ (Result.Error (mismatch left right)))
+          _ (Result.Error (TypeError.Unexplained)))
       (MonoType.String)
         (match-ref right
           (MonoType.String) (Result.Success substitution)
-          _ (Result.Error (mismatch left right)))
+          _ (Result.Error (TypeError.Unexplained)))
       (MonoType.Boolean)
         (match-ref right
           (MonoType.Boolean) (Result.Success substitution)
-          _ (Result.Error (mismatch left right)))
+          _ (Result.Error (TypeError.Unexplained)))
       (MonoType.Unit)
         (match-ref right
           (MonoType.Unit) (Result.Success substitution)
-          _ (Result.Error (mismatch left right)))
+          _ (Result.Error (TypeError.Unexplained)))
       (MonoType.Named left-name left-arguments)
         (match-ref right
           (MonoType.Named right-name right-arguments)
           ;; a lowercase head is a constructor VARIABLE: `(f a)` unifies with
           ;; `(MyBox Int)` by binding f := MyBox (same arity), then the
-          ;; arguments. Heads resolve through earlier constructor bindings.
-          (let [l (resolve-constructor-in
-                  (TypeSubstitution.constructor-bindings &substitution)
-                  left-name)
-                r (resolve-constructor-in
-                  (TypeSubstitution.constructor-bindings &substitution)
-                  right-name)]
-            (cond
-              (String.= &l &r)
-                (unify-arguments-owned left-arguments
-                                       right-arguments
-                                       substitution)
-              (and (constructor-variable? &l)
-                   (Int.= (Array.length left-arguments)
-                          (Array.length right-arguments)))
-                (unify-arguments-owned left-arguments
-                                       right-arguments
-                                       (bind-constructor-owned substitution
-                                                               &l
-                                                               &r))
-              (and (constructor-variable? &r)
-                   (Int.= (Array.length left-arguments)
-                          (Array.length right-arguments)))
-                (unify-arguments-owned left-arguments
-                                       right-arguments
-                                       (bind-constructor-owned substitution
-                                                               &r
-                                                               &l))
-              (Result.Error (mismatch left right))))
+          ;; arguments. Heads resolve through earlier constructor bindings,
+          ;; which only ever bind constructor variables: equal heads resolve
+          ;; alike, and two concrete heads resolve to themselves.
+          (cond
+            (String.= left-name right-name)
+              (unify-arguments-owned left-arguments right-arguments substitution)
+            (not
+              (or (constructor-variable? left-name)
+                  (constructor-variable? right-name)))
+              (Result.Error (TypeError.Unexplained))
+            (let [l (resolve-constructor-in
+                    (TypeSubstitution.constructor-bindings &substitution)
+                    left-name)
+                  r (resolve-constructor-in
+                    (TypeSubstitution.constructor-bindings &substitution)
+                    right-name)]
+              (cond
+                (String.= &l &r)
+                  (unify-arguments-owned left-arguments
+                                         right-arguments
+                                         substitution)
+                (and (constructor-variable? &l)
+                     (Int.= (Array.length left-arguments)
+                            (Array.length right-arguments)))
+                  (unify-arguments-owned left-arguments
+                                         right-arguments
+                                         (bind-constructor-owned substitution
+                                                                 &l
+                                                                 &r))
+                (and (constructor-variable? &r)
+                     (Int.= (Array.length left-arguments)
+                            (Array.length right-arguments)))
+                  (unify-arguments-owned left-arguments
+                                         right-arguments
+                                         (bind-constructor-owned substitution
+                                                                 &r
+                                                                 &l))
+                (Result.Error (TypeError.Unexplained)))))
           _
-          (Result.Error (mismatch left right)))
+          (Result.Error (TypeError.Unexplained)))
       (MonoType.Reference left-inner left-lifetime)
         (match-ref right
           (MonoType.Reference right-inner right-lifetime)
@@ -755,7 +779,7 @@ one of them.")
                                        right-lifetime
                                        inner-substitution)
               (Result.Error error) (Result.Error error))
-          _ (Result.Error (mismatch left right)))
+          _ (Result.Error (TypeError.Unexplained)))
       (MonoType.Function left-arguments left-result)
         (match-ref right
           (MonoType.Function right-arguments right-result)
@@ -764,10 +788,10 @@ one of them.")
                                    right-arguments
                                    (Box.peek right-result)
                                    substitution)
-          _ (Result.Error (mismatch left right)))
+          _ (Result.Error (TypeError.Unexplained)))
       (MonoType.Variable _)
         (Result.Error
-          (TypeError.init @"internal error: unresolved left type variable"))))
+          (TypeError.Explained @"internal error: unresolved left type variable"))))
 
   (doc unify "unifies two types under a substitution, including an occurs
 check for recursive types.")
@@ -948,7 +972,7 @@ normalization can then look up inference variables in constant time.")
           (do (solver-add-binding! solver variable type) (Result.Success ())))
       _
         (if (solver-occurs? solver variable type)
-          (Result.Error (TypeError.init @"occurs check failed"))
+          (Result.Error (TypeError.Explained @"occurs check failed"))
           (do (solver-add-binding! solver variable type) (Result.Success ())))))
 
   (private solver-lifetime-binding-for)
@@ -1118,29 +1142,43 @@ normalization can then look up inference variables in constant time.")
         (match-ref right
           (MonoType.Named right-name right-arguments)
           ;; constructor variables (lowercase heads) bind to concrete heads
-          ;; of the same arity, mirroring the substitution engine.
-          (let [l (resolve-constructor-in (TypeSolver.constructor-bindings solver)
-                                          left-name)
-                r (resolve-constructor-in (TypeSolver.constructor-bindings solver)
-                                          right-name)]
-            (cond
-              (String.= &l &r)
-                (solver-unify-arguments! solver left-arguments right-arguments)
-              (and (constructor-variable? &l)
-                   (Int.= (Array.length left-arguments)
-                          (Array.length right-arguments)))
-                (do
-                  (Array.push-back! (TypeSolver.constructor-bindings solver)
-                                    (Pair.init (String.copy &l) (String.copy &r)))
-                  (solver-unify-arguments! solver left-arguments right-arguments))
-              (and (constructor-variable? &r)
-                   (Int.= (Array.length left-arguments)
-                          (Array.length right-arguments)))
-                (do
-                  (Array.push-back! (TypeSolver.constructor-bindings solver)
-                                    (Pair.init (String.copy &r) (String.copy &l)))
-                  (solver-unify-arguments! solver left-arguments right-arguments))
-              (Result.Error (mismatch left right))))
+          ;; of the same arity, mirroring the substitution engine. Equal heads
+          ;; resolve alike, and two concrete heads resolve to themselves.
+          (cond
+            (String.= left-name right-name)
+              (solver-unify-arguments! solver left-arguments right-arguments)
+            (not
+              (or (constructor-variable? left-name)
+                  (constructor-variable? right-name)))
+              (Result.Error (mismatch left right))
+            (let [l (resolve-constructor-in (TypeSolver.constructor-bindings solver)
+                                            left-name)
+                  r (resolve-constructor-in (TypeSolver.constructor-bindings solver)
+                                            right-name)]
+              (cond
+                (String.= &l &r)
+                  (solver-unify-arguments! solver left-arguments right-arguments)
+                (and (constructor-variable? &l)
+                     (Int.= (Array.length left-arguments)
+                            (Array.length right-arguments)))
+                  (do
+                    (Array.push-back! (TypeSolver.constructor-bindings solver)
+                                      (Pair.init (String.copy &l)
+                                                 (String.copy &r)))
+                    (solver-unify-arguments! solver
+                                             left-arguments
+                                             right-arguments))
+                (and (constructor-variable? &r)
+                     (Int.= (Array.length left-arguments)
+                            (Array.length right-arguments)))
+                  (do
+                    (Array.push-back! (TypeSolver.constructor-bindings solver)
+                                      (Pair.init (String.copy &r)
+                                                 (String.copy &l)))
+                    (solver-unify-arguments! solver
+                                             left-arguments
+                                             right-arguments))
+                (Result.Error (mismatch left right)))))
           _
           (Result.Error (mismatch left right)))
       (MonoType.Reference left-inner left-lifetime)
@@ -1164,7 +1202,7 @@ normalization can then look up inference variables in constant time.")
           _ (Result.Error (mismatch left right)))
       (MonoType.Variable _)
         (Result.Error
-          (TypeError.init @"internal error: unresolved left type variable"))))
+          (TypeError.Explained @"internal error: unresolved left type variable"))))
 
   (doc solver-unify! "adds expression-compatible constraints to a mutable
 solver without copying its accumulated substitution.")
@@ -1240,6 +1278,44 @@ The caller must keep the solver alive for the complete operation.")
   (sig solver-bound? (Fn [(Ptr TypeSolver) Int] Bool))
   (defn solver-bound? [solver variable]
     (Int.>= (solver-binding-index! (Pointer.to-ref solver) variable) 0))
+
+  (private solver-changes-any?)
+  (hidden solver-changes-any?)
+  (doc solver-changes? "whether applying `solver` would change `type`: it binds
+a type variable, a lifetime variable or a constructor-variable head in it. A
+caller holding a type it applied earlier learns whether that application is
+still current without applying again.")
+  (sig solver-changes? (Fn [(Ptr TypeSolver) (Ref MonoType)] Bool))
+  (defn solver-changes? [solver type]
+    (match-ref type
+      (MonoType.Variable variable) (solver-bound? solver @variable)
+      (MonoType.Named name arguments)
+        (or
+          (and (constructor-variable? name)
+               (Maybe.just?
+                 &(constructor-binding-in
+                   (TypeSolver.constructor-bindings (Pointer.to-ref solver))
+                   name)))
+          (solver-changes-any? solver arguments))
+      (MonoType.Reference inner lifetime)
+        (or
+          (solver-changes? solver (Box.peek inner))
+          (match-ref lifetime
+            (MonoLifetime.Variable variable)
+              (Maybe.just?
+                &(solver-lifetime-binding-for (Pointer.to-ref solver) @variable))
+            _ false))
+      (MonoType.Function arguments result)
+        (or (solver-changes-any? solver arguments)
+            (solver-changes? solver (Box.peek result)))
+      _ false))
+
+  (defn solver-changes-any? [solver types]
+    (let-do [changed false]
+      (for [i 0 (Array.length types)]
+        (when (solver-changes? solver (Box.peek (Array.unsafe-nth types i)))
+          (set! changed true)))
+      changed))
 
   (doc solver-apply-at "normalizes through a non-owning solver pointer.")
   (sig solver-apply-at (Fn [(Ptr TypeSolver) (Ref MonoType)] MonoType))

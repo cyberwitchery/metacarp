@@ -18,6 +18,17 @@ instantiation, unification, and the final solver snapshot.
 Local let-bound and top-level value lifetimes are not generalized, so repeated
 uses retain one borrow identity. String and pattern literals carry `static`.
 
+Two entries build on earlier inference. `Infer.module-against` infers a
+transient module against the schemes of a warm base, which the session uses
+for each cell. `Infer.module-resumable` and `Infer.module-from-base` instead
+continue one run: the first infers a module and keeps what the second needs,
+and the second infers a larger module that only adds definitions by inferring
+the additions alone, on the base's substitution and with fresh variables past
+the base's, so the result carries one substitution for both halves. When an
+addition takes over the id of a builtin that existing code or an overload
+refers to, it infers the whole module instead. The driver uses this for the
+module `close-generics` extends.
+
 Ownership constraints and full Carp type syntax remain later gates.
 
 ```bash

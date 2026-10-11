@@ -10,6 +10,14 @@ a read-only view that indexes the same bindings by variable id and answers in
 constant time. The indexed view is worth building whenever one substitution is
 applied many times, as specialization does with the module substitution.
 
+A failed unification is a `TypeError`: `Explained` carries a rendered
+message, `Unexplained` carries none. The substitution unifier, which
+specialization calls many times only to ask whether two types fit, fails
+`Unexplained`, so no message is rendered unless a caller reports it.
+`TypeError.message` gives the text either way, and `Type.mismatch` builds the
+explained error for two types. `Type.solver-changes?` answers whether applying
+a solver would change a type, without applying it.
+
 Reference types carry a separate `MonoLifetime` identity. Schemes quantify type
 and lifetime variables independently; immutable and mutable substitutions both
 preserve lifetime aliases. `Type.same?` includes lifetime identity, while

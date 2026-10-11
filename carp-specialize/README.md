@@ -17,12 +17,17 @@ An interface call is resolved to a matching registered implementation before
 an instance is emitted. Builtins are leaf instances; functions continue to
 contribute body dependencies.
 
-Two module-level caches carry data derived from one inferred module, and both
-are primed by `prime-trace!` at every public entry and dropped by
-`clear-caches!` afterwards: the normalized node types, and an indexed
-`Type.solver-from-substitution` view of the module substitution, which is what
-applies that substitution wherever a concrete type is needed. A public entry
-that does not prime them applies one module's substitution to another's types.
+Module-level caches carry data derived from one inferred module. `prime-trace!`
+primes them at every public entry and `clear-caches!` drops them afterwards:
+the normalized node types, an indexed `Type.solver-from-substitution` view of
+the module substitution (which applies that substitution wherever a concrete
+type is needed), and the node types and call sites grouped by owner. A public
+entry that does not prime them applies one module's substitution to another's
+types. `module-with-known` adds two that also depend on the core module and
+are only on while it runs: interface dispatch results, keyed by the interface
+id and an exact spelling of the call type (`Type.render` drops lifetimes and
+renames variables, so it cannot serve as the key), and the implementations
+grouped by interface.
 
 Call and expression ids repeat across owners, so nothing here may be memoized
 by id alone; `*trace-positions*` is rebuilt per owner for that reason.

@@ -31,7 +31,7 @@ backend lowering copies the node's id. Nodes synthesized after resolution use
 carp-backend.carp:26-31; `*hoist-serial*` is raised above every specialized
 global id, :1964).
 
-**Participants.** carp-ir (`IndexedCoreExpr`, `CoreIR.index-call-sites`,
+**Participants.** carp-ir (`CoreIR.renumber`, `CoreIR.index-call-sites`,
 `identify-generated`), carp-infer (node-types keyed by (owner, id)),
 carp-specialize (calls resolved by id), carp-ownership (`OwnershipAction`
 sites, duplicate-id rejection per context), carp-backend (`ScopeDelete.site`,
@@ -146,6 +146,13 @@ interleaved-query determinism) — held; see the history of `f61045a` and
 merge boundary; `inferred-environment-with-analysis`; `session-analysis`;
 `append-inferred-analysis` call sites in the four `finish-*-overlay`
 committers.
+
+`Infer.module-from-base` (see 39) is not a merge in this sense. It continues
+the base's run: the solver starts from the base's substitution and the
+variable counter from the base's next unused variable, so the traces of both
+halves live in one variable space and the result's substitution extends the
+base's. That is what lets it keep the base's traces raw. Joining two runs that
+each started at variable 0 is a merge, and goes through the path above.
 
 ### 6. The normalized-base memo is valid only because the base is immutable and `set-overlay!` is the sole overlay mutation point [implementation]
 
@@ -631,6 +638,21 @@ repeat across owners — that is why `*trace-positions*` is rebuilt per owner �
 so an id-keyed memo returns one function's type for another's call. The
 specialize suites catch it.
 
+`module-with-known` primes two more, valid only until its own `clear-caches!`:
+the interface dispatch memo (`*implementations*`, keyed by the interface id and
+an exact spelling of the call type) and the implementations grouped by
+interface (`*implementation-buckets*`). Both depend on the core module as well
+as the inferred one, which is why only `module-with-known` turns them on;
+`implementation-for` outside it searches without them. The memo key must tell
+apart every pair of types unification does. `Type.render` cannot serve: it
+drops lifetimes and renames variables by order of appearance.
+
+The worklist also records each new instance's dependencies, in instance
+order, and materialization reads them back by position instead of calling
+`dependencies-for` again. A new way to append an instance has to append its
+dependencies too, or materialization pairs every later instance with the wrong
+calls.
+
 
 ### 35. Resolve's per-resolution state resets in `module-inner`, not at the entries [implementation]
 
@@ -691,6 +713,49 @@ accounts for — classifies unmanaged, nothing frees it, and no gate catches it
 (the leak is in the compiled PROGRAM, not in the compiler).
 
 Enforcement: `deletes-generically-declared-owners?` (integration suite).
+
+### 39. The main inference builds on the one `close-generics` ran; that holds only while `close-generics` only adds [implementation]
+
+`close-generics` infers the module to discover the generic instances it needs,
+then adds per-instance copies, deletes and strs. It hands that inference back
+(`Infer.module-resumable`, an `InferenceBase`) beside the module, and
+`infer-derived!` infers only the additions on top of it with
+`Infer.module-from-base`, then drops the base. This is sound only while
+everything `close-generics` returns that was in its input is unchanged: same
+functions, values and top-level expressions, with the same expression ids. The
+ids hold because its `finish-indexing` renumbers owner-locally and its input
+is already numbered that way (see 1), so renumbering again changes nothing. A
+pass added after `close-generics`, or a change that makes it rewrite an
+existing definition, breaks this silently: the main pass would keep types
+inferred for a body that no longer exists.
+
+One change is allowed and checked: an addition can take over a builtin's id
+(`instance-copier!` replaces a generic `X.copy` builtin with a concrete
+function under the same reference). Code that refers to that builtin may then
+infer differently, so when an existing definition, a top-level expression or
+an overload candidate mentions a taken-over id, `module-from-base` infers the
+whole module instead. A source-mapped build gets no base: `identify-generated`
+renumbers generated nodes after `close-generics` inferred them.
+
+Enforcement: `infers-additions-on-a-base?` and
+`reinfers-what-a-taken-over-builtin-changes?` (infer suite); byte-identical
+self-compile output against a full second inference.
+
+### 40. An overload choice is re-filtered only when the solver has changed its type or a candidate's [implementation]
+
+`settle-open-choices!` keeps a choice's fitting candidates
+(`TypeChoice.filtered`) and skips filtering it again while
+`Type.solver-changes?` says the solver has touched neither the choice's type
+nor any kept candidate's (`candidates-unchanged?`). Both matter: a candidate
+inferred in the same recursive group as the call still has a placeholder type
+when the choice is first filtered, so it fits anything, and binding the
+placeholder later can make it stop fitting while the choice's own type stays
+put. Watching only the choice's type kept such a candidate, and an overload
+the reference resolves came out ambiguous. A fit check that starts reading
+anything else needs the skip widened to cover it.
+
+Enforcement: `overload-choice-refiltered-when-a-candidate-settles?`
+(integration suite).
 
 ## Five things that look fragile but are actually safe
 
