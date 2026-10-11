@@ -19,10 +19,10 @@ expansion, resolution, and inference snapshots.
 The LLVM host adds a second persistent layer: one ORC LLJIT and thread-safe
 LLVM context per compiler session. Each cell contributes an incremental module
 containing only symbols not already published, so compiled globals and their
-mutable storage survive later cells. `SessionJit.upsert` and
-`SessionJit.remove` conservatively invalidate published native code after a
-committed source change while retaining the context, target state, and C
-template shim.
+mutable storage survive later cells. `SessionJit.upsert`,
+`SessionJit.upsert-input` and `SessionJit.remove` conservatively invalidate
+published native code after a committed source change while retaining the
+context, target state, and C template shim.
 
 `SessionJit.compile-f32-function` is the deliberately narrow native-function
 entry point used by the audio experiment. It accepts a named Carp function of
