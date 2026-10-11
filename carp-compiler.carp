@@ -1505,20 +1505,28 @@ for every concrete managed generic instance the program uses (discovered from
 inference, then closed over nested instances). Discovery reads inferred node
 types rather than specialized ones so it runs before the derived implementations
 those instances need exist. Best-effort: if inference fails here, returns core
-unchanged and lets the driver report the error.")
+unchanged and lets the driver report the error.
+
+The inference it ran comes back with the module: everything here only adds
+definitions (the module's own are reindexed to the ids they already have), so
+`Infer.module-from-base` can infer the result from it without starting over.")
   (defn close-generics [core]
-    (match (Infer.module core)
-      (Result.Success inf)
-        (let [facts (OwnershipClassify.facts-from-module core)
+    (match (Infer.module-resumable core)
+      (Result.Success base)
+        (let [inf (InferenceBase.inferred &base)
+              facts (OwnershipClassify.facts-from-module core)
               base-managed (managed-keys core (OwnershipTypeFacts.owned &facts))]
-          (derive-instance-strs
-            &(worklist-generate core
-                                &(discover &inf
-                                           (CoreModule.constructors core)
-                                           &base-managed)
-                                base-managed)
-            &inf))
-      (Result.Error _) @core)))
+          (Pair.init
+            (derive-instance-strs
+              &(worklist-generate core
+                                  &(discover inf
+                                             (CoreModule.constructors core)
+                                             &base-managed)
+                                  base-managed)
+              inf)
+            (Maybe.Just base)))
+      (Result.Error _)
+        (Pair.init @core (the (Maybe InferenceBase) (Maybe.Nothing))))))
 
 (defmodule Derive
   (private copy-branch)
@@ -3891,6 +3899,17 @@ why it is not simply always on.")
              _ignored (phase-mark! "phase: close-generics")]
       next))
 
+  (doc infer-derived! "infers a module `derive-core-owned` answered, building
+on the inference its last pass already ran when there is one. That inference
+is dropped afterwards; nothing else needs it, and the rest of the pipeline
+should not carry it.")
+  (defn infer-derived! [derived]
+    (let-do [inferred (match-ref (Pair.b derived)
+               (Maybe.Just base) (Infer.module-from-base (Pair.a derived) base)
+               (Maybe.Nothing) (Infer.module (Pair.a derived)))]
+      (Pair.set-b! derived (Maybe.Nothing))
+      inferred))
+
   (private derive-core-owned)
   (hidden derive-core-owned)
   (doc derive-core-owned "runs every derivation pass over a resolved module.
@@ -3898,7 +3917,11 @@ why it is not simply always on.")
 A build that wants a source map keeps the identities resolution handed out
 through the passes, and then gives the nodes the passes generated identities
 from the same allocator. Without that the derived module is renumbered
-owner-locally, and the map describes a program that no longer exists.")
+owner-locally, and the map describes a program that no longer exists.
+
+Next to the module comes the inference `close-generics` ran, for
+`infer-derived!`. A source-mapped build gives generated nodes new identities
+after that inference, so it gets none.")
   (defn derive-core-owned [core]
     (match (typedefs-owned core)
       (Result.Success typed)
@@ -3913,7 +3936,7 @@ owner-locally, and the map describes a program that no longer exists.")
                              (pair-refs-owned (accessors-owned typed))))))
                      _ignored-restore (set! *derive-preserve-expression-ids*
                                             false)
-                     identified (CoreIR.identify-generated &derived
+                     identified (CoreIR.identify-generated (Pair.a &derived)
                                                            &*source-map*
                                                            &*source-map-allocator*
                                                            &(the (Maybe SourceSpan)
@@ -3921,7 +3944,9 @@ owner-locally, and the map describes a program that no longer exists.")
               (set! *source-map*
                     (CoreProvenance.copy
                       (ProvenancedCoreModule.provenance &identified)))
-              (CoreModule.copy (ProvenancedCoreModule.core &identified)))
+              (Pair.init
+                (CoreModule.copy (ProvenancedCoreModule.core &identified))
+                (the (Maybe InferenceBase) (Maybe.Nothing))))
             (close-generics-owned
               (strs-owned
                 (deletes-owned
@@ -3936,7 +3961,10 @@ generic declarations as the normal compiler before inference.")
     (match (Validate.type-declarations core)
       (Maybe.Just message)
         (Result.Error (CompileError.init (String.copy "validate") message))
-      (Maybe.Nothing) (derive-core-owned (CoreModule.copy core))))
+      (Maybe.Nothing)
+        (match (derive-core-owned (CoreModule.copy core))
+          (Result.Success derived) (Result.Success @(Pair.a &derived))
+          (Result.Error error) (Result.Error error))))
 
   (doc derive-module-for-inference-provenanced "derives a session module while
 preserving resolved user node identities, then gives every generated node a
@@ -4347,83 +4375,86 @@ pipeline up to but not including C rendering, for alternative backends.")
                 ;; for uncovered instances while per-instance strs (specific, so
                 ;; preferred by dispatch) render constructor name plus fields.
                 (match (derive-core-owned resolved)
-                  (Result.Success core)
-                    (match (CoreIR.duplicate-global-id &core)
-                      (Maybe.Just bad)
-                        (Result.Error
-                          (CompileError.init (String.copy "validate")
-                                             (fmt
-                                               "duplicate global reference id %d after derivation"
-                                               bad)))
-                      (Maybe.Nothing)
-                        (match (let-do [_ignored-phase-resolved (match (IO.getenv "CARP_DEBUG_PHASES")
-                                          (Maybe.Just _)
-                                            (IO.errorln "phase: resolved+derived")
-                                          (Maybe.Nothing) ())
-                                        _ignored-fdump (match (IO.getenv "CARP_DEBUG_RESOLVED")
-                                          (Maybe.Just _)
-                                            (let [functions (CoreModule.functions &core)]
-                                              (for [i 0 (Array.length functions)]
-                                                (let [f (Array.unsafe-nth functions
-                                                                          i)]
-                                                  (IO.errorln
-                                                    &(fmt "function %s params=%d"
-                                                          (CoreRef.name (CoreFunction.reference f))
-                                                          (Array.length (CoreFunction.parameters f)))))))
-                                          (Maybe.Nothing) ())]
-                            (Infer.module &core))
-                          (Result.Success inferred)
-                            (let-do [_ignored-p7 (phase-mark! "phase: inferred")
-                                     facts (OwnershipClassify.facts-from-module &core)
-                                     seeds (Specialize.named-requests &core
-                                                                      &inferred
-                                                                      check-names)]
-                              (match (specialize-closed &core
+                  (Result.Success derived)
+                    (let [core (Pair.a &derived)]
+                      (match (CoreIR.duplicate-global-id core)
+                        (Maybe.Just bad)
+                          (Result.Error
+                            (CompileError.init (String.copy "validate")
+                                               (fmt
+                                                 "duplicate global reference id %d after derivation"
+                                                 bad)))
+                        (Maybe.Nothing)
+                          (match (let-do [_ignored-phase-resolved (match (IO.getenv "CARP_DEBUG_PHASES")
+                                            (Maybe.Just _)
+                                              (IO.errorln "phase: resolved+derived")
+                                            (Maybe.Nothing) ())
+                                          _ignored-fdump (match (IO.getenv "CARP_DEBUG_RESOLVED")
+                                            (Maybe.Just _)
+                                              (let [functions (CoreModule.functions core)]
+                                                (for [i
+                                                      0
+                                                      (Array.length functions)]
+                                                  (let [f (Array.unsafe-nth functions
+                                                                            i)]
+                                                    (IO.errorln
+                                                      &(fmt "function %s params=%d"
+                                                            (CoreRef.name (CoreFunction.reference f))
+                                                            (Array.length (CoreFunction.parameters f)))))))
+                                            (Maybe.Nothing) ())]
+                              (infer-derived! &derived))
+                            (Result.Success inferred)
+                              (let-do [_ignored-p7 (phase-mark! "phase: inferred")
+                                       facts (OwnershipClassify.facts-from-module core)
+                                       seeds (Specialize.named-requests core
+                                                                        &inferred
+                                                                        check-names)]
+                                (match (specialize-closed core
+                                                          &inferred
+                                                          &facts
+                                                          &seeds)
+                                  (Result.Success closed)
+                                    (match (let-do [_ignored-p8 (phase-mark! "phase: specialized")]
+                                        (if echo
+                                          (echo-augment core
                                                         &inferred
                                                         &facts
-                                                        &seeds)
-                                (Result.Success closed)
-                                  (match (let-do [_ignored-p8 (phase-mark! "phase: specialized")]
-                                      (if echo
-                                        (echo-augment &core
-                                                      &inferred
-                                                      &facts
-                                                      &seeds
-                                                      &closed)
-                                        (Result.Success
-                                          (Pair.init (Pair.copy &closed)
-                                                     (the (Maybe EchoPlan)
-                                                          (Maybe.Nothing))))))
-                                    (Result.Success closed-with-echo)
-                                      (let [final (Pair.a &closed-with-echo)
-                                            delete-symbols (delete-symbols-for &core
-                                                                               (Pair.a final))
-                                            copy-symbols (copy-symbols-for &core
-                                                                           (Pair.a final))]
-                                        (match (lower-owned closed-with-echo
-                                                            delete-symbols
-                                                            copy-symbols)
-                                          (Result.Success backend)
+                                                        &seeds
+                                                        &closed)
+                                          (Result.Success
+                                            (Pair.init (Pair.copy &closed)
+                                                       (the (Maybe EchoPlan)
+                                                            (Maybe.Nothing))))))
+                                      (Result.Success closed-with-echo)
+                                        (let [final (Pair.a &closed-with-echo)
+                                              delete-symbols (delete-symbols-for core
+                                                                                 (Pair.a final))
+                                              copy-symbols (copy-symbols-for core
+                                                                             (Pair.a final))]
+                                          (match (lower-owned closed-with-echo
+                                                              delete-symbols
+                                                              copy-symbols)
                                             (Result.Success backend)
-                                          (Result.Error error)
-                                            (Result.Error
-                                              (CompileError.init (String.copy "backend")
-                                                                 @(BackendError.message &error)))))
-                                    (Result.Error error) (Result.Error error))
-                                (Result.Error error)
-                                  (do
-                                    (match (IO.getenv "CARP_DEBUG_FN")
-                                      (Maybe.Just fn-name)
-                                        (debug-dump-function &core
-                                                             &fn-name
-                                                             830
-                                                             985)
-                                      (Maybe.Nothing) ())
-                                    (Result.Error error))))
-                          (Result.Error error)
-                            (Result.Error
-                              (CompileError.init (String.copy "infer")
-                                                 @(InferError.message &error)))))
+                                              (Result.Success backend)
+                                            (Result.Error error)
+                                              (Result.Error
+                                                (CompileError.init (String.copy "backend")
+                                                                   @(BackendError.message &error)))))
+                                      (Result.Error error) (Result.Error error))
+                                  (Result.Error error)
+                                    (do
+                                      (match (IO.getenv "CARP_DEBUG_FN")
+                                        (Maybe.Just fn-name)
+                                          (debug-dump-function core
+                                                               &fn-name
+                                                               830
+                                                               985)
+                                        (Maybe.Nothing) ())
+                                      (Result.Error error))))
+                            (Result.Error error)
+                              (Result.Error
+                                (CompileError.init (String.copy "infer")
+                                                   @(InferError.message &error))))))
                   (Result.Error error) (Result.Error error))))
           (Result.Error error)
             (Result.Error
@@ -4603,20 +4634,18 @@ for ownership tooling.")
                   (CompileError.init (String.copy "validate") message))
               (Maybe.Nothing)
                 (match (derive-core-owned resolved)
-                  (Result.Success core)
-                    (match (Infer.module &core)
+                  (Result.Success derived)
+                    (match (infer-derived! &derived)
                       (Result.Success inferred)
-                        (let [facts (OwnershipClassify.facts-from-module &core)
-                              seeds (Specialize.named-requests &core
+                        (let [core (Pair.a &derived)
+                              facts (OwnershipClassify.facts-from-module core)
+                              seeds (Specialize.named-requests core
                                                                &inferred
                                                                check-names)]
-                          (match (specialize-closed &core
-                                                    &inferred
-                                                    &facts
-                                                    &seeds)
+                          (match (specialize-closed core &inferred &facts &seeds)
                             (Result.Success closed)
                               (Result.Success
-                                (PlannedModule.init core
+                                (PlannedModule.init @core
                                                     inferred
                                                     @(Pair.b &closed)))
                             (Result.Error error) (Result.Error error)))
@@ -4653,10 +4682,11 @@ types without emitting C.")
                   (CompileError.init (String.copy "validate") message))
               (Maybe.Nothing)
                 (match (derive-core-owned resolved)
-                  (Result.Success core)
-                    (match (Infer.module &core)
+                  (Result.Success derived)
+                    (match (infer-derived! &derived)
                       (Result.Success inferred)
-                        (Result.Success (AnnotatedModule.init core inferred))
+                        (Result.Success
+                          (AnnotatedModule.init @(Pair.a &derived) inferred))
                       (Result.Error error)
                         (Result.Error
                           (CompileError.init (String.copy "infer")
