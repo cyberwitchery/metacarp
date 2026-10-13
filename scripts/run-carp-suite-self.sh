@@ -203,6 +203,7 @@ run_output_tests() {
     ./test/produces-output/globals.carp \
     ./test/produces-output/lambdas.carp \
     ./test/produces-output/recursive_types.carp \
+    ./test/produces-output/recursive_types_user_box.carp \
     ./test/produces-output/recursive_type_decl_only.carp \
     ./test/produces-output/maybe_custom_member_decl_only.carp \
     ./test/produces-output/setting_variables.carp \
