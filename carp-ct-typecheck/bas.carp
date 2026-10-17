@@ -1,0 +1,833 @@
+;; Boolean-algebraic types and constraint solving for compile-time Carp, after
+;; Chau and Parreaux's Boolean-algebraic subtyping (POPL 2026) and MLstruct's
+;; solver (`ConstraintSolver.scala`, `NormalForms.scala`). See
+;; `docs/bas-prototype.md`.
+;;
+;; A type is a node in one store, hash-consed, referred to by index. Type
+;; variables carry a level and mutable lower and upper bounds, as in
+;; Simple-sub.
+
+(deftype BTy
+  (Top [])
+  (Bot [])
+  ;; a tag, by index in the tag tree
+  (Tag [Int])
+  ;; arguments, result
+  (Fn [Int Int])
+  ;; a single field: field index (0 `car`, 1 `cdr`), its type
+  (Fld [Int Int])
+  ;; a type variable, by index
+  (Var [Int])
+  (Or [Int Int])
+  (And [Int Int])
+  (Not [Int]))
+
+(def *bt-types* (the (Array BTy) []))
+(def *bt-keys* (the (Map Long Int) (Map.create)))
+(def *bt-levels* (the (Array Int) []))
+
+;; type variables
+(def *bv-level* (the (Array Int) []))
+(def *bv-lo* (the (Array (Array Int)) []))
+(def *bv-hi* (the (Array (Array Int)) []))
+;; the body a variable is defined as (a recursive type), or -1: a defined
+;; variable is a name for its body, not an unknown
+(def *bv-def* (the (Array Int) []))
+;; the bounds added since the last mark, as 2*var (lower) or 2*var+1 (upper)
+(def *bv-trail* (the (Array Int) []))
+
+;; the tag tree
+(def *tag-names* (the (Array String) []))
+(def *tag-parent* (the (Array Int) []))
+(def *tag-final* (the (Array Bool) []))
+(def *tag-by-name* (the (Map String Int) (Map.create)))
+
+;; the first failure of the current definition
+(def *bas-failure* @"")
+(def *bas-failed* false)
+
+(defmodule BTag
+  (defn add! [name parent final]
+    (let-do [i (Array.length &*tag-names*)]
+      (Array.push-back! &*tag-names* (String.copy name))
+      (Array.push-back! &*tag-parent* parent)
+      (Array.push-back! &*tag-final* final)
+      (Map.put! &*tag-by-name* name &i)
+      i))
+
+  (doc named "the tag called `name`. The names are the checker's own, so a
+missing one is a bug in it.")
+  (defn named [name]
+    (match (Map.get-maybe &*tag-by-name* name)
+      (Maybe.Just t) t
+      (Maybe.Nothing)
+        (do (IO.errorln &(fmt "bas: no tag named %s" name)) (System.abort) -1)))
+  (defn name [t] @(Array.unsafe-nth &*tag-names* t))
+  (defn parent [t] @(Array.unsafe-nth &*tag-parent* t))
+
+  (doc ancestor? "whether tag `a` is `t` or above it.")
+  (defn ancestor? [a t]
+    (let-do [x t
+             found false]
+      (while-do (and (not found) (Int.>= x 0))
+        (if (Int.= x a) (set! found true) (set! x (parent x))))
+      found))
+
+  (doc glb "the meet of two tags: the lower one when one is below the other,
+none when they are unrelated (disjoint).")
+  (defn glb [a b]
+    (cond
+      (ancestor? a b) (Maybe.Just b)
+      (ancestor? b a) (Maybe.Just a)
+      (Maybe.Nothing)))
+
+  (doc literal "the tag of a literal value `text` of kind tag `kind`, made
+on first use: final, below its kind.")
+  (defn literal [kind text]
+    (let [key (fmt "%s:%s" &(name kind) text)]
+      (match (Map.get-maybe &*tag-by-name* &key)
+        (Maybe.Just t) t
+        (Maybe.Nothing) (add! &key kind true))))
+
+  (doc reset! "the tag tree: a tag per kind of compile-time value, below
+`Obj`, and below the kinds with literals, a final tag per literal made on
+demand. Tags are open (a tag may gain subtags), so closed sets of values,
+`Bool`, `Number`, each sequence kind, are unions of tags (`BT.alias`), not
+tags of their own.")
+  (defn reset! []
+    (do
+      (set! *tag-names* [])
+      (set! *tag-parent* [])
+      (set! *tag-final* [])
+      (set! *tag-by-name* (Map.create))
+      (let-do [obj (add! "Obj" -1 false)]
+        (ignore (add! "Symbol" obj false))
+        (ignore (add! "String" obj false))
+        (ignore (add! "Char" obj false))
+        (ignore (add! "Int" obj false))
+        (ignore (add! "Long" obj false))
+        (ignore (add! "Byte" obj false))
+        (ignore (add! "Float" obj true))
+        (ignore (add! "Double" obj true))
+        (ignore (add! "True" obj true))
+        (ignore (add! "False" obj true))
+        (ignore (add! "Pattern" obj true))
+        (ignore (add! "Dictionary" obj true))
+        (ignore (add! "Comment" obj true))
+        (ignore (add! "ListNil" obj true))
+        (ignore (add! "ListCons" obj true))
+        (ignore (add! "ArrayNil" obj true))
+        (ignore (add! "ArrayCons" obj true))
+        (ignore (add! "StaticNil" obj true))
+        (ignore (add! "StaticCons" obj true))
+        (ignore (add! "CollNil" obj true))
+        (ignore (add! "CollCons" obj true))
+        (ignore (add! "ArgsNil" obj true))
+        (ignore (add! "ArgsCons" obj true))
+        (ignore (add! "Closure" obj true))
+        (ignore (add! "Builtin" obj true))
+        (ignore (add! "Macro" obj true))))))
+
+(defmodule BT
+  (defn reset! []
+    (do
+      (set! *bt-types* [])
+      (set! *bt-keys* (Map.create))
+      (set! *bas-cache* (Map.create))
+      (set! *bt-levels* [])
+      (set! *bv-level* [])
+      (set! *bv-lo* [])
+      (set! *bv-hi* [])
+      (set! *bv-trail* [])
+      (set! *bv-def* [])
+      (BTag.reset!)
+      ;; 0 and 1 are top and bottom
+      (ignore (intern (BTy.Top)))
+      (ignore (intern (BTy.Bot)))))
+
+  (defn get [t] @(Array.unsafe-nth &*bt-types* t))
+
+  (doc key "the hash-consing key of `ty`: its constructor in the low four
+bits and its components, each below 2^30, above them.")
+  (defn key [ty]
+    (match-ref ty
+      (BTy.Top) 0l
+      (BTy.Bot) 1l
+      (BTy.Tag t) (pack 2 @t 0)
+      (BTy.Fn a r) (pack 3 @a @r)
+      (BTy.Fld f t) (pack 4 @f @t)
+      (BTy.Var v) (pack 5 @v 0)
+      (BTy.Or a b) (pack 6 @a @b)
+      (BTy.And a b) (pack 7 @a @b)
+      (BTy.Not a) (pack 8 @a 0)))
+
+  (defn pack [tag a b] (pair (Int.+ (Int.* a 16) tag) b))
+
+  (doc pair "a 64-bit key unique for `x` below 2^31 and `y` below 2^32: `x`
+in the high half, and in the low half `x·K + y` mod 2^32, which with `x`
+determines `y`. Core's `Long.hash` keeps only the low half, so it has to mix
+both.")
+  (defn pair [x y]
+    (let [lx (Long.from-int x)]
+      (Long.+ (Long.* lx 4294967296l)
+              (Long.bit-and
+                (Long.+ (Long.* lx 2654435761l) (Long.from-int y))
+                4294967295l))))
+
+  (defn intern [ty]
+    (let [k (key &ty)]
+      (match (Map.get-maybe &*bt-keys* &k)
+        (Maybe.Just t) t
+        (Maybe.Nothing)
+          (let-do [t (Array.length &*bt-types*)
+                   lvl (level-of &ty)]
+            (Array.push-back! &*bt-types* ty)
+            (Array.push-back! &*bt-levels* lvl)
+            (Map.put! &*bt-keys* &k &t)
+            t))))
+
+  (defn level [t] @(Array.unsafe-nth &*bt-levels* t))
+
+  (doc level-of "the highest level of a variable in `ty`, 0 with none.")
+  (defn level-of [ty]
+    (match-ref ty
+      (BTy.Fn a r) (Int.max (level @a) (level @r))
+      (BTy.Fld _ t) (level @t)
+      (BTy.Var v) @(Array.unsafe-nth &*bv-level* @v)
+      (BTy.Or a b) (Int.max (level @a) (level @b))
+      (BTy.And a b) (Int.max (level @a) (level @b))
+      (BTy.Not a) (level @a)
+      _ 0))
+
+  (defn top [] 0)
+  (defn bot [] 1)
+  (defn tag [t] (intern (BTy.Tag t)))
+  (defn named [name]
+    (match (alias-parts name)
+      (Maybe.Just parts) (unions &(Array.copy-map &(fn [p] (named p)) &parts))
+      (Maybe.Nothing) (tag (BTag.named name))))
+
+  (doc alias-parts "the tags a closed set of values is the union of.")
+  (defn alias-parts [name]
+    (cond
+      (String.= name "Bool") (Maybe.Just [@"True" @"False"])
+      (String.= name "Number")
+        (Maybe.Just [@"Int" @"Long" @"Byte" @"Float" @"Double"])
+      (String.= name "List") (Maybe.Just [@"ListNil" @"ListCons"])
+      (String.= name "Array") (Maybe.Just [@"ArrayNil" @"ArrayCons"])
+      (String.= name "StaticArray") (Maybe.Just [@"StaticNil" @"StaticCons"])
+      (String.= name "Collection") (Maybe.Just [@"CollNil" @"CollCons"])
+      (String.= name "Nil")
+        (Maybe.Just [@"ListNil" @"ArrayNil" @"StaticNil" @"CollNil"])
+      (String.= name "Cons")
+        (Maybe.Just [@"ListCons" @"ArrayCons" @"StaticCons" @"CollCons"])
+      (String.= name "Function") (Maybe.Just [@"Closure" @"Builtin"])
+      (Maybe.Nothing)))
+  (defn fun [a r] (intern (BTy.Fn a r)))
+  (doc tup "the argument list of exactly `ts`: argument lists are cells
+like sequences, so a fixed arity is an exact chain and a variadic function
+takes a recursive one.")
+  (defn tup [ts] (tup-tail ts (named "ArgsNil")))
+
+  (doc tup-tail "the argument list of `ts` followed by the argument list
+`tail`.")
+  (defn tup-tail [ts tail]
+    (let-do [out tail
+             i (Array.length ts)]
+      (while-do (Int.> i 0)
+        (set! i (Int.dec i))
+        (set! out
+              (inters
+                &[(named "ArgsCons")
+                  (car-fld @(Array.unsafe-nth ts i))
+                  (cdr-fld out)])))
+      out))
+  (defn fld [f t] (intern (BTy.Fld f t)))
+  (defn car-fld [t] (fld 0 t))
+  (defn cdr-fld [t] (fld 1 t))
+
+  (defn union [a b]
+    (cond
+      (Int.= a b) a
+      (Int.= a (bot)) b
+      (Int.= b (bot)) a
+      (or (Int.= a (top)) (Int.= b (top))) (top)
+      (intern (BTy.Or a b))))
+
+  (defn inter [a b]
+    (cond
+      (Int.= a b) a
+      (Int.= a (top)) b
+      (Int.= b (top)) a
+      (or (Int.= a (bot)) (Int.= b (bot))) (bot)
+      (intern (BTy.And a b))))
+
+  (defn neg [a]
+    (cond
+      (Int.= a (top)) (bot)
+      (Int.= a (bot)) (top)
+      (match (get a) (BTy.Not x) x _ (intern (BTy.Not a)))))
+
+  (defn unions [ts] (Array.reduce &(fn [acc x] (union acc @x)) (bot) ts))
+  (defn inters [ts] (Array.reduce &(fn [acc x] (inter acc @x)) (top) ts))
+
+  (defn fresh-var [lvl]
+    (let-do [v (Array.length &*bv-level*)]
+      (Array.push-back! &*bv-level* lvl)
+      (Array.push-back! &*bv-lo* [])
+      (Array.push-back! &*bv-hi* [])
+      (Array.push-back! &*bv-def* -1)
+      (intern (BTy.Var v))))
+
+  (doc define! "makes the variable `v` a name for `body`: its bounds are the
+body on both sides, and the solver unfolds it rather than bounding it. No
+rollback removes the definition.")
+  (defn define! [v body]
+    (do
+      (Array.aset! &*bv-lo* v [body])
+      (Array.aset! &*bv-hi* v [body])
+      (Array.aset! &*bv-def* v body)))
+
+  (doc definition "the body the variable `v` is defined as, or -1.")
+  (defn definition [v] @(Array.unsafe-nth &*bv-def* v))
+
+  (defn var-level [v] @(Array.unsafe-nth &*bv-level* v))
+  (defn lower [v] @(Array.unsafe-nth &*bv-lo* v))
+  (defn upper [v] @(Array.unsafe-nth &*bv-hi* v))
+  (defn add-lower! [v t]
+    (let-do [bs (lower v)]
+      (Array.push-back! &*bv-trail* (Int.* v 2))
+      (Array.aset! &*bv-lo* v (Array.push-back bs t))))
+  (defn add-upper! [v t]
+    (let-do [bs (upper v)]
+      (Array.push-back! &*bv-trail* (Int.inc (Int.* v 2)))
+      (Array.aset! &*bv-hi* v (Array.push-back bs t))))
+
+  (doc fresh-var-from "a fresh variable at level `lvl` whose lower bound is
+`lo` from the start: no rollback removes it.")
+  (defn fresh-var-from [lvl lo]
+    (let-do [t (fresh-var lvl)]
+      (Array.aset! &*bv-lo* (Int.dec (Array.length &*bv-lo*)) [lo])
+      t))
+
+  (doc commit! "forgets the bounds added so far: no rollback removes them.")
+  (defn commit! [] (set! *bv-trail* []))
+
+  (doc rollback! "removes every bound added since the last `commit!`, latest
+first, so a failed definition leaves no constraints behind.")
+  (defn rollback! []
+    (while-do (Int.> (Array.length &*bv-trail*) 0)
+      (let [e (Array.pop-back! &*bv-trail*)
+            v (Int./ e 2)]
+        (if (Int.= (Int.mod e 2) 0)
+          (Array.aset! &*bv-lo* v (Array.pop-back (lower v)))
+          (Array.aset! &*bv-hi* v (Array.pop-back (upper v)))))))
+
+  (doc rec-type "a recursive type: a variable at level `lvl` equal to the
+body `build` makes of it, as the paper encodes them (§2.2.5).")
+  (defn rec-type [lvl build]
+    (let-do [v (fresh-var lvl)
+             vi (match (get v) (BTy.Var i) i _ -1)
+             body (~build v)]
+      (define! vi body)
+      v))
+
+  (defn str [t]
+    (match (get t)
+      (BTy.Top) @"Any"
+      (BTy.Bot) @"Nothing"
+      (BTy.Tag x) (BTag.name x)
+      (BTy.Fn a r) (fmt "(%s -> %s)" &(str a) &(str r))
+      (BTy.Fld f x) (fmt "{%s: %s}" (if (Int.= f 0) "car" "cdr") &(str x))
+      (BTy.Var v) (fmt "a%d" v)
+      (BTy.Or a b) (fmt "(%s | %s)" &(str a) &(str b))
+      (BTy.And a b) (fmt "(%s & %s)" &(str a) &(str b))
+      (BTy.Not a) (fmt "~%s" &(str a)))))
+
+;; ------------------------------------------------------------ normal forms
+
+;; MLstruct's `LhsNf`: a conjunction of at most one tag, one arrow and one
+;; type per field. `top` when nothing has been met yet.
+(deftype BLhs [top Bool
+               tag Int
+               fun-arg Int
+               fun-res Int
+               car Int
+               cdr Int])
+
+;; MLstruct's `RhsNf`: a disjunction of tags and at most one arrow or one
+;; field. `bot` when nothing has been met yet.
+(deftype BRhs [tags (Array Int)
+               fun-arg Int
+               fun-res Int
+               field Int
+               field-ty Int])
+
+(defmodule BLhs
+  (defn empty [] (BLhs.init true -1 -1 -1 -1 -1))
+
+  (doc meet "`l` and the constructor type `t`, or `Nothing` when the
+conjunction is empty.")
+  (defn meet [l t]
+    (let-do [out @l]
+      (BLhs.set-top! &out false)
+      (match (BT.get t)
+        (BTy.Tag x)
+          (if (Int.< @(BLhs.tag l) 0)
+            (do (BLhs.set-tag! &out x) (Maybe.Just out))
+            (match (BTag.glb @(BLhs.tag l) x)
+              (Maybe.Just g) (do (BLhs.set-tag! &out g) (Maybe.Just out))
+              (Maybe.Nothing) (Maybe.Nothing)))
+        (BTy.Fn a r)
+          (do
+            ;; the merge rule: (a1 -> r1) & (a2 -> r2) = (a1 | a2) -> (r1 & r2)
+            (if (Int.< @(BLhs.fun-arg l) 0)
+              (do (BLhs.set-fun-arg! &out a) (BLhs.set-fun-res! &out r))
+              (do
+                (BLhs.set-fun-arg! &out (BT.union @(BLhs.fun-arg l) a))
+                (BLhs.set-fun-res! &out (BT.inter @(BLhs.fun-res l) r))))
+            (Maybe.Just out))
+        (BTy.Fld f x)
+          (do
+            (if (Int.= f 0)
+              (BLhs.set-car! &out
+                             (if (Int.< @(BLhs.car l) 0)
+                               x
+                               (BT.inter @(BLhs.car l) x)))
+              (BLhs.set-cdr! &out
+                             (if (Int.< @(BLhs.cdr l) 0)
+                               x
+                               (BT.inter @(BLhs.cdr l) x))))
+            (Maybe.Just out))
+        _ (Maybe.Just out))))
+
+  (doc to-type "the conjunction `l` stands for.")
+  (defn to-type [l]
+    (if @(BLhs.top l)
+      (BT.top)
+      (let-do [t (BT.top)]
+        (when (Int.>= @(BLhs.tag l) 0)
+          (set! t (BT.inter t (BT.tag @(BLhs.tag l)))))
+        (when (Int.>= @(BLhs.fun-arg l) 0)
+          (set! t (BT.inter t (BT.fun @(BLhs.fun-arg l) @(BLhs.fun-res l)))))
+        (when (Int.>= @(BLhs.car l) 0)
+          (set! t (BT.inter t (BT.car-fld @(BLhs.car l)))))
+        (when (Int.>= @(BLhs.cdr l) 0)
+          (set! t (BT.inter t (BT.cdr-fld @(BLhs.cdr l)))))
+        t))))
+
+(defmodule BRhs
+  (defn empty [] (BRhs.init [] -1 -1 -1 -1))
+  (defn bot? [r]
+    (and (Array.empty? (BRhs.tags r))
+         (Int.< @(BRhs.fun-arg r) 0)
+         (Int.< @(BRhs.field r) 0)))
+
+  (doc join "`r` or the constructor type `t`, or `Nothing` when the
+disjunction is everything (a constraint with it on the right holds).")
+  (defn join [r t]
+    (let-do [out @r]
+      (match (BT.get t)
+        (BTy.Tag x)
+          (do
+            (unless (Array.contains? (BRhs.tags r) &x)
+              (BRhs.set-tags! &out (Array.push-back @(BRhs.tags r) x)))
+            (Maybe.Just out))
+        (BTy.Fn a res)
+          (cond
+            (Int.>= @(BRhs.field r) 0) (Maybe.Nothing)
+            (Int.< @(BRhs.fun-arg r) 0)
+              (do
+                (BRhs.set-fun-arg! &out a)
+                (BRhs.set-fun-res! &out res)
+                (Maybe.Just out))
+            (do
+              ;; (a1 -> r1) | (a2 -> r2) = (a1 & a2) -> (r1 | r2)
+              (BRhs.set-fun-arg! &out (BT.inter @(BRhs.fun-arg r) a))
+              (BRhs.set-fun-res! &out (BT.union @(BRhs.fun-res r) res))
+              (Maybe.Just out)))
+        (BTy.Fld f x)
+          (cond
+            (Int.>= @(BRhs.fun-arg r) 0)
+            (Maybe.Nothing)
+            (Int.< @(BRhs.field r) 0)
+            (do
+              (BRhs.set-field! &out f)
+              (BRhs.set-field-ty! &out x)
+              (Maybe.Just out))
+            (Int.= @(BRhs.field r) f)
+            (do
+              (BRhs.set-field-ty! &out (BT.union @(BRhs.field-ty r) x))
+              (Maybe.Just out))
+            ;; {a: s} | {b: t} = Any for distinct fields
+            (Maybe.Nothing))
+        _ (Maybe.Just out))))
+
+  (defn to-type [r]
+    (let-do [t (BT.bot)]
+      (for [i 0 (Array.length (BRhs.tags r))]
+        (set! t (BT.union t (BT.tag @(Array.unsafe-nth (BRhs.tags r) i)))))
+      (when (Int.>= @(BRhs.fun-arg r) 0)
+        (set! t (BT.union t (BT.fun @(BRhs.fun-arg r) @(BRhs.fun-res r)))))
+      (when (Int.>= @(BRhs.field r) 0)
+        (set! t (BT.union t (BT.fld @(BRhs.field r) @(BRhs.field-ty r)))))
+      t)))
+
+;; ------------------------------------------------------------ solving
+
+(def *bas-cache* (the (Map Long Int) (Map.create)))
+;; the current `constrain` call: an entry of an earlier one is stale
+(def *bas-gen* 0)
+
+(defmodule BSolve
+  (defn fail! [msg]
+    (unless-do *bas-failed*
+      (set! *bas-failed* true)
+      (set! *bas-failure* (String.copy msg))))
+
+  (doc constrain "MLstruct's `constrain`: makes `lhs ≤ rhs` hold by bounding
+variables, or records a failure.")
+  (defn constrain [lhs rhs]
+    (do (set! *bas-gen* (Int.inc *bas-gen*)) (rec lhs rhs)))
+
+  (defn rec [lhs rhs]
+    (unless (or *bas-failed* (Int.= lhs rhs))
+      (let [k (BT.pair lhs rhs)]
+        (unless-do (Int.= (Map.get-with-default &*bas-cache* &k &-1) *bas-gen*)
+          (Map.put! &*bas-cache* &k &*bas-gen*)
+          (rec-new lhs rhs)))))
+
+  (private rec-new)
+  (hidden rec-new)
+  (defn rec-new [lhs rhs]
+    (let [l (BT.get lhs)
+          r (BT.get rhs)
+          ld (match-ref &l (BTy.Var v) (BT.definition @v) _ -1)
+          rd (match-ref &r (BTy.Var v) (BT.definition @v) _ -1)]
+      (cond
+        (Int.= lhs (BT.bot))
+        ()
+        (Int.= rhs (BT.top))
+        ()
+        ;; a recursive type is its body
+        (Int.>= ld 0)
+        (rec ld rhs)
+        (Int.>= rd 0)
+        (rec lhs rd)
+        (match-ref &l
+          (BTy.Var v) (Int.<= (BT.level rhs) (BT.var-level @v))
+          _ false)
+        (let-do [v (match-ref &l (BTy.Var v) @v _ -1)]
+          (BT.add-upper! v rhs)
+          (let [lbs (BT.lower v)]
+            (for [i 0 (Array.length &lbs)] (rec @(Array.unsafe-nth &lbs i) rhs))))
+        (match-ref &r
+          (BTy.Var v) (Int.<= (BT.level lhs) (BT.var-level @v))
+          _ false)
+        (let-do [v (match-ref &r (BTy.Var v) @v _ -1)]
+          (BT.add-lower! v lhs)
+          (let [ubs (BT.upper v)]
+            (for [i 0 (Array.length &ubs)] (rec lhs @(Array.unsafe-nth &ubs i)))))
+        (match-ref &l (BTy.Var _) true _ false)
+        (let [v (match-ref &l (BTy.Var v) @v _ -1)]
+          (rec lhs (BExtrude.extrude rhs (BT.var-level v) false)))
+        (match-ref &r (BTy.Var _) true _ false)
+        (let [v (match-ref &r (BTy.Var v) @v _ -1)]
+          (rec (BExtrude.extrude lhs (BT.var-level v) true) rhs))
+        (structural lhs rhs &l &r))))
+
+  (private structural)
+  (hidden structural)
+  (defn structural [lhs rhs l r]
+    (match-ref l
+      (BTy.Or a b) (do (rec @a rhs) (rec @b rhs))
+      (BTy.Not a)
+        (match-ref r
+          (BTy.Not b) (rec @b @a)
+          _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty)))
+      _
+        (match-ref r
+          (BTy.And a b) (do (rec lhs @a) (rec lhs @b))
+          (BTy.Or _ _) (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty))
+          (BTy.Not _) (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty))
+          _
+            (match-ref l
+              (BTy.And _ _) (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty))
+              (BTy.Fn a1 r1)
+                (match-ref r
+                  (BTy.Fn a2 r2) (do (rec @a2 @a1) (rec @r1 @r2))
+                  _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty)))
+              (BTy.Fld f x)
+                (match-ref r
+                  (BTy.Fld g y)
+                    (if (Int.= @f @g) (rec @x @y) (mismatch lhs rhs))
+                  _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty)))
+              (BTy.Tag x)
+                (match-ref r
+                  (BTy.Tag y) (unless (BTag.ancestor? @y @x) (mismatch lhs rhs))
+                  _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty)))
+              _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty))))))
+
+  (defn mismatch [lhs rhs]
+    (fail! &(fmt "%s is not a %s" &(BT.str lhs) &(BT.str rhs))))
+
+  (doc annoying "MLstruct's `annoying`: `ls` (a conjunction, with `dl`
+already normalized) below `rs` (a disjunction, with `dr` already
+normalized). A variable met at the top takes the rest as a bound; a union on
+the left and an intersection on the right split into constraints that must
+all hold; everything else goes into the normal forms.")
+  (defn annoying [ls0 dl0 rs0 dr0]
+    (let-do [ls ls0
+             rs rs0
+             dl dl0
+             dr dr0
+             done false]
+      ;; the work lists are stacks: a part is popped, and what it is made of
+      ;; pushed; only a split copies them, for the branch that goes first
+      (while-do (and (not done) (not *bas-failed*))
+        (cond
+          (not (Array.empty? &ls))
+            (let [t (Array.pop-back! &ls)]
+              (match (BT.get t)
+                (BTy.Var v)
+                  (if (Int.>= (BT.definition v) 0)
+                    (Array.push-back! &ls (BT.definition v))
+                    (do (rec t (rhs-of &ls &dl &rs &dr)) (set! done true)))
+                (BTy.Or a b)
+                  (do
+                    (annoying (Array.push-back @&ls a) @&dl @&rs @&dr)
+                    (Array.push-back! &ls b))
+                (BTy.And a b)
+                  (do (Array.push-back! &ls a) (Array.push-back! &ls b))
+                (BTy.Not a) (Array.push-back! &rs a)
+                (BTy.Top) ()
+                (BTy.Bot) (set! done true)
+                _
+                  (match (BLhs.meet &dl t)
+                    (Maybe.Just d)
+                    (set! dl d)
+                    ;; the conjunction is empty: the constraint holds
+                    (Maybe.Nothing)
+                    (set! done true))))
+          (not (Array.empty? &rs))
+            (let [t (Array.pop-back! &rs)]
+              (match (BT.get t)
+                (BTy.Var v)
+                  (if (Int.>= (BT.definition v) 0)
+                    (Array.push-back! &rs (BT.definition v))
+                    (do (rec (lhs-of &ls &dl &rs &dr) t) (set! done true)))
+                (BTy.And a b)
+                  (do
+                    (annoying @&ls @&dl (Array.push-back @&rs a) @&dr)
+                    (Array.push-back! &rs b))
+                (BTy.Or a b)
+                  (do (Array.push-back! &rs a) (Array.push-back! &rs b))
+                (BTy.Not a) (Array.push-back! &ls a)
+                (BTy.Bot) ()
+                (BTy.Top) (set! done true)
+                _
+                  (match (BRhs.join &dr t)
+                    (Maybe.Just d)
+                    (set! dr d)
+                    ;; the disjunction is everything: the constraint holds
+                    (Maybe.Nothing)
+                    (set! done true))))
+          (do (finish &dl &dr) (set! done true))))))
+
+  (private rhs-of)
+  (hidden rhs-of)
+  (doc rhs-of "what a variable at the head of the left must be below: the
+negation of the rest of the left, or the right.")
+  (defn rhs-of [ls dl rs dr]
+    (let-do [t (BT.neg (BLhs.to-type dl))]
+      (for [i 0 (Array.length ls)]
+        (set! t (BT.union t (BT.neg @(Array.unsafe-nth ls i)))))
+      (for [i 0 (Array.length rs)]
+        (set! t (BT.union t @(Array.unsafe-nth rs i))))
+      (BT.union t (BRhs.to-type dr))))
+
+  (private lhs-of)
+  (hidden lhs-of)
+  (defn lhs-of [ls dl rs dr]
+    (let-do [t (BLhs.to-type dl)]
+      (for [i 0 (Array.length ls)]
+        (set! t (BT.inter t @(Array.unsafe-nth ls i))))
+      (for [i 0 (Array.length rs)]
+        (set! t (BT.inter t (BT.neg @(Array.unsafe-nth rs i)))))
+      (BT.inter t (BT.neg (BRhs.to-type dr)))))
+
+  (private finish)
+  (hidden finish)
+  (doc finish "the normalized conjunction `dl` below the normalized
+disjunction `dr`, as MLstruct's final case: tags by the tree, then arrows,
+then fields; a part of the left that cannot match is dropped and the
+rest tried.")
+  (defn finish [dl dr]
+    (cond
+      (or @(BLhs.top dl) (BRhs.bot? dr)) (fail-nf dl dr)
+      (and (Int.>= @(BLhs.tag dl) 0)
+           (Array.any?
+             &(fn [t] (BTag.ancestor? @t @(BLhs.tag dl)))
+             (BRhs.tags dr)))
+        ()
+      (and (Int.>= @(BLhs.fun-arg dl) 0) (Int.>= @(BRhs.fun-arg dr) 0))
+        (rec
+          (BT.fun @(BLhs.fun-arg dl) @(BLhs.fun-res dl))
+          (BT.fun @(BRhs.fun-arg dr) @(BRhs.fun-res dr)))
+      (Int.>= @(BLhs.fun-arg dl) 0)
+        (let-do [l2 @dl]
+          (BLhs.set-fun-arg! &l2 -1)
+          (BLhs.set-fun-res! &l2 -1)
+          (finish-rest &l2 dr))
+      (finish-rest dl dr)))
+
+  (private finish-rest)
+  (hidden finish-rest)
+  (defn finish-rest [dl dr]
+    (cond
+      (Int.>= @(BLhs.tag dl) 0)
+      ;; the tag matched none on the right: try without it
+      (let-do [l2 @dl
+               r2 @dr]
+        (BLhs.set-tag! &l2 -1)
+        (BRhs.set-tags! &r2 [])
+        (if (and (Int.< @(BLhs.fun-arg &l2) 0)
+                 (Int.< @(BLhs.car &l2) 0)
+                 (Int.< @(BLhs.cdr &l2) 0))
+          (fail-nf dl dr)
+          (finish &l2 &r2)))
+      (Int.>= @(BRhs.field dr) 0)
+      (let [f @(BRhs.field dr)
+            have (if (Int.= f 0) @(BLhs.car dl) @(BLhs.cdr dl))]
+        (if (Int.< have 0) (fail-nf dl dr) (rec have @(BRhs.field-ty dr))))
+      (fail-nf dl dr)))
+
+  (private fail-nf)
+  (hidden fail-nf)
+  (defn fail-nf [dl dr] (mismatch (BLhs.to-type dl) (BRhs.to-type dr))))
+
+;; ------------------------------------------------------------ copying
+
+(def *bx-cache* (the (Map Int Int) (Map.create)))
+
+(defmodule BExtrude
+  (doc extrude "Simple-sub's `extrude`: `t` with its variables above level
+`lvl` replaced by fresh ones at `lvl`, bounded by them on the side `pol`
+asks for (true: positive).")
+  (defn extrude [t lvl pol] (do (set! *bx-cache* (Map.create)) (go t lvl pol)))
+
+  (defn go [t lvl pol]
+    (if (Int.<= (BT.level t) lvl)
+      t
+      (match (BT.get t)
+        (BTy.Fn a r) (BT.fun (go a lvl (not pol)) (go r lvl pol))
+        (BTy.Fld f x) (BT.fld f (go x lvl pol))
+        (BTy.Or a b) (BT.union (go a lvl pol) (go b lvl pol))
+        (BTy.And a b) (BT.inter (go a lvl pol) (go b lvl pol))
+        (BTy.Not a) (BT.neg (go a lvl (not pol)))
+        (BTy.Var v)
+          (let [k (Int.+ (Int.* v 2) (if pol 1 0))]
+            (match (Map.get-maybe &*bx-cache* &k)
+              (Maybe.Just nv) nv
+              (Maybe.Nothing)
+                (let-do [nv (BT.fresh-var lvl)
+                         ni (match (BT.get nv) (BTy.Var i) i _ -1)]
+                  (Map.put! &*bx-cache* &k &nv)
+                  ;; a copy of a recursive type is the copy of its body
+                  (cond
+                    (Int.>= (BT.definition v) 0)
+                      (BT.define! ni (go (BT.definition v) lvl pol))
+                    pol
+                      (do
+                        (BT.add-upper! v nv)
+                        (let [lbs (BT.lower v)]
+                          (for [i 0 (Array.length &lbs)]
+                            (BT.add-lower! ni
+                                           (go @(Array.unsafe-nth &lbs i)
+                                               lvl
+                                               pol)))))
+                    (do
+                      (BT.add-lower! v nv)
+                      (let [ubs (BT.upper v)]
+                        (for [i 0 (Array.length &ubs)]
+                          (BT.add-upper! ni
+                                         (go @(Array.unsafe-nth &ubs i) lvl pol))))))
+                  nv)))
+        _ t)))
+
+  (doc freshen-above "Simple-sub's `freshenAbove`: `t` with every variable
+above level `lim` renamed apart to a fresh one at `lvl`, bounds copied.")
+  (defn freshen-above [lim t lvl]
+    (do (set! *bx-cache* (Map.create)) (fresh lim t lvl)))
+
+  (defn fresh [lim t lvl]
+    (if (Int.<= (BT.level t) lim)
+      t
+      (match (BT.get t)
+        (BTy.Fn a r) (BT.fun (fresh lim a lvl) (fresh lim r lvl))
+        (BTy.Fld f x) (BT.fld f (fresh lim x lvl))
+        (BTy.Or a b) (BT.union (fresh lim a lvl) (fresh lim b lvl))
+        (BTy.And a b) (BT.inter (fresh lim a lvl) (fresh lim b lvl))
+        (BTy.Not a) (BT.neg (fresh lim a lvl))
+        (BTy.Var v)
+          (let [k v]
+            (match (Map.get-maybe &*bx-cache* &k)
+              (Maybe.Just nv) nv
+              (Maybe.Nothing)
+                (let-do [nv (BT.fresh-var lvl)
+                         ni (match (BT.get nv) (BTy.Var i) i _ -1)]
+                  (Map.put! &*bx-cache* &k &nv)
+                  (if (Int.>= (BT.definition v) 0)
+                    (BT.define! ni (fresh lim (BT.definition v) lvl))
+                    (do
+                      (let [lbs (BT.lower v)]
+                        (for [i 0 (Array.length &lbs)]
+                          (BT.add-lower! ni
+                                         (fresh lim
+                                                @(Array.unsafe-nth &lbs i)
+                                                lvl))))
+                      (let [ubs (BT.upper v)]
+                        (for [i 0 (Array.length &ubs)]
+                          (BT.add-upper! ni
+                                         (fresh lim
+                                                @(Array.unsafe-nth &ubs i)
+                                                lvl))))))
+                  nv)))
+        _ t))))
+
+;; ------------------------------------------------------------ resolving
+
+(def *bz-progress* (the (Map String Int) (Map.create)))
+
+(defmodule BResolve
+  (doc ground "`t` without variables, as far as its bounds say: positively a
+variable is the union of its lower bounds, negatively the intersection of its
+upper bounds; one reached again inside itself becomes a recursive type. The
+type of everything the variables can produce or accept.")
+  (defn ground [t pol] (do (set! *bz-progress* (Map.create)) (go t pol)))
+
+  (defn go [t pol]
+    (match (BT.get t)
+      (BTy.Fn a r) (BT.fun (go a (not pol)) (go r pol))
+      (BTy.Fld f x) (BT.fld f (go x pol))
+      (BTy.Or a b) (BT.union (go a pol) (go b pol))
+      (BTy.And a b) (BT.inter (go a pol) (go b pol))
+      (BTy.Not a) (BT.neg (go a (not pol)))
+      (BTy.Var v)
+        (let [k (fmt "%d%s" v (if pol "+" "-"))]
+          (match (Map.get-maybe &*bz-progress* &k)
+            (Maybe.Just r) r
+            (Maybe.Nothing)
+              (let-do [r (BT.fresh-var 0)
+                       ri (match (BT.get r) (BTy.Var i) i _ -1)
+                       bs (if pol (BT.lower v) (BT.upper v))
+                       body (if pol (BT.bot) (BT.top))]
+                (Map.put! &*bz-progress* &k &r)
+                (for [i 0 (Array.length &bs)]
+                  (let [b (go @(Array.unsafe-nth &bs i) pol)]
+                    (set! body (if pol (BT.union body b) (BT.inter body b)))))
+                (BT.add-upper! ri body)
+                (BT.add-lower! ri body)
+                (Map.remove! &*bz-progress* &k)
+                r)))
+      _ t)))
