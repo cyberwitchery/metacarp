@@ -78,7 +78,7 @@ phase_tasks() {
   for directory in \
     carp-graph carp-c-abi carp-primitives carp-module carp-ct-env \
     carp-ct-eval carp-ir carp-resolve carp-types carp-infer carp-specialize \
-    carp-ownership carp-backend carp-expand
+    carp-ownership carp-backend carp-expand carp-ct-typecheck
   do
     for test_file in "$repo_root/$directory"/test/*.carp; do
       emit_task "$directory" "${test_file#"$repo_root/$directory/"}" normal
