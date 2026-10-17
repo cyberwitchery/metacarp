@@ -57,7 +57,9 @@ resolved exactly as written.
 `carp-module`, expands its complete transitive graph, and then expands the
 source form supplied as its first program argument. The driver supplies the
 three host bindings that Core expects before loading: `host-arch`, `host-os`,
-and `Project.get-config`.
+and `Project.get-config`. The last only makes it a compile-time function:
+`carp-ct-eval` answers `Project.config` and `Project.get-config` itself, from
+the project configuration it records.
 
 Core bootstrap preserves runtime declarations such as `defn`, `def`,
 `implements`, and `register` while registering compile-time definitions. This

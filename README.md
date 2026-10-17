@@ -40,24 +40,39 @@ can pass an explicit installation prefix to `LLVM.setup`.
 ```
 carp-compiler [options] <source.carp>
 
-  -b, --build           compile to an executable instead of C (needs --core)
-  -x, --execute         compile to an executable and run it (needs --core)
+  -b, --build           compile to an executable instead of C (needs Core)
+  -x, --execute         compile to an executable and run it (needs Core)
   -c, --core <dir>      compile against the Carp standard library in <dir>
+                        (default: $CARP_DIR/core)
   -o, --output <file>   output path — the C file, or the executable under -b
+                        (default under -b: <output-directory>/<title>
+                        from Project.config, out/Untitled unless set)
   --optimize            build -b/-x executables with clang -O3 -D NDEBUG
   --log-memory          build -b/-x executables with LOG_MEMORY, so
                         Debug.memory-balance counts allocations
-  --library             emit a translation unit without main (needs --core)
+  --library             emit a translation unit without main (needs Core)
   --no-core             skip the implicit Core load; the source's own
-                        (load "X.carp") directives still resolve in --core
+                        (load "X.carp") directives still resolve in Core
   -h, --help            show this help and exit
   -v, --version         show version and exit
 ```
 
 With no `-b`/`-x`, the C translation unit is written to standard output (or
 `-o`). Diagnostics go to standard error and name the rejecting compiler phase.
-`-b`/`-x` require `--core`, because linking needs the runtime headers the
+
+Core is found like the reference compiler finds it: `--core <dir>` when given,
+else `$CARP_DIR/core`. One of them is required unless `--no-core` is given.
+`-b`/`-x` need Core even then, because linking needs the runtime headers the
 standard library ships with.
+
+`Project.config` is recorded at compile time and `Project.get-config` reads it
+back, with the reference's keys and defaults. The driver acts on `title` and
+`output-directory` (`-b` writes `<output-directory>/<title>`, `out/Untitled`
+by default, unless `-o` is given; `-x` builds and runs the same path) and on
+`cflag`, `libflag` and `pkgconfigflag`, which reach clang along with what
+`add-cflag`, `add-lib` and `add-pkg` add. The other keys (`echo-c`, `target`,
+the `docs-*` keys, `prompt`, `cmod` and the rest) are accepted and read back
+but change nothing here.
 
 `--library` emits an entry-point-free translation unit for a shared or static
 library, rooted at the public definitions in the input source. A public
@@ -90,7 +105,7 @@ Carp repository (its `core/` is the standard library and runtime headers).
 Compile a standalone program (no standard library) to C:
 
 ```sh
-./out/carp-compiler examples/hello.carp \
+./out/carp-compiler --no-core examples/hello.carp \
   | clang -x c -I "$CARP_DIR/core" -o /tmp/carp-hello -
 /tmp/carp-hello        # prints: OK
 ```

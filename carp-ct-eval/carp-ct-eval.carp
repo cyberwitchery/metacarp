@@ -88,6 +88,14 @@ and width 3 or above means the floating field carries the value.")
 ;; the driver's compiler invocation.
 (def *ct-pending-includes* (the (Array SurfaceNode) []))
 (def *ct-collected-cflags* (the (Array String) []))
+(def *ct-collected-libflags* (the (Array String) []))
+
+;; the rest of the project configuration (`Project.config`), latest setting
+;; last. The reference keeps it in its context; the flag lists above are its
+;; "cflag" and "libflag", and the driver reads the rest of what it builds with
+;; (title, output-directory) from here once compile-time evaluation is done.
+(def *ct-project-config* (the (Array (Pair String (Box SurfaceNode))) []))
+(def *ct-pkgconfig-flags* (the (Array String) []))
 
 ;; where the FORMS BEING EVALUATED are written, innermost last. This is not
 ;; the load stack: `current-file` (and so `relative-include`) means the file
@@ -171,20 +179,131 @@ appends them to its output so resolution collects them like written ones.")
       drained))
 
   (doc collected-cflags "the deduplicated compiler flags (`add-cflag`,
-`add-lib`, `add-pkg`) compile-time evaluation has requested, in first-use
-order, for the driver's C compiler invocation.")
+`add-lib`, `add-pkg`, and the project's \"cflag\" and \"libflag\")
+compile-time evaluation has requested, for the driver's C compiler
+invocation: compiler flags before library flags, as the reference passes
+them, and each in first-use order.")
   (defn collected-cflags []
-    (let-do [flags (the (Array String) [])]
-      (for [i 0 (Array.length &*ct-collected-cflags*)]
-        (let-do [flag (Array.unsafe-nth &*ct-collected-cflags* i)
-                 seen false]
-          (for [j 0 (Array.length &flags)]
-            (when (String.= (Array.unsafe-nth &flags j) flag) (set! seen true)))
-          (unless seen (Array.push-back! &flags @flag))))
+    (let-do [flags (the (Array String) [])
+             requested (Array.concat
+               &[(Array.copy &*ct-collected-cflags*)
+                 (Array.copy &*ct-collected-libflags*)])]
+      (for [i 0 (Array.length &requested)]
+        (let [flag (Array.unsafe-nth &requested i)]
+          (unless (Array.contains? &flags flag) (Array.push-back! &flags @flag))))
       flags))
 
-  (doc record-cflag! "adds one flag to the collected compiler flags.")
-  (defn record-cflag! [flag] (Array.push-back! &*ct-collected-cflags* @flag))
+  (private pkg-config-query)
+  (hidden pkg-config-query)
+  (doc pkg-config-query "the start of the `pkg-config` command the
+reference's `add-pkg` adds for `package`, with the project's
+\"pkgconfigflag\" after it.")
+  (defn pkg-config-query [package]
+    (String.join " "
+                 &(Array.concat
+                   &[[@"`pkg-config" @package]
+                     (Array.copy &*ct-pkgconfig-flags*)])))
+
+  (doc record-build-command! "applies one build command (`add-cflag`,
+`add-lib` or `add-pkg`) to the project's flags. A package becomes the two
+`pkg-config` queries the reference adds for it, which the shell running the C
+compiler expands.")
+  (defn record-build-command! [command argument]
+    (cond
+      (String.= command "add-lib")
+        (Array.push-back! &*ct-collected-libflags* @argument)
+      (String.= command "add-pkg")
+        (let-do [query (pkg-config-query argument)]
+          (Array.push-back! &*ct-collected-cflags*
+                            (String.append &query " --cflags`"))
+          (Array.push-back! &*ct-collected-libflags*
+                            (String.append &query " --libs`")))
+      (Array.push-back! &*ct-collected-cflags* @argument)))
+
+  (private config-default-string)
+  (hidden config-default-string)
+  (doc config-default-string "the reference's default for a string-valued
+project key, or `Nothing` when `key` is not one.")
+  (defn config-default-string [key]
+    (cond
+      (String.= key "title") (Maybe.Just @"Untitled")
+      (String.= key "output-directory") (Maybe.Just @"out")
+      (String.= key "docs-directory") (Maybe.Just @"docs")
+      (String.= key "docs-logo") (Maybe.Just @"")
+      (String.= key "docs-prelude") (Maybe.Just @"")
+      (String.= key "docs-url") (Maybe.Just @"")
+      (String.= key "docs-styling") (Maybe.Just @"carp_style.css")
+      (String.= key "prompt") (Maybe.Just @"> ")
+      (String.= key "compiler") (Maybe.Just @"clang")
+      (String.= key "target") (Maybe.Just @"native")
+      (String.= key "file-path-print-length") (Maybe.Just @"FullPath")
+      (Maybe.Nothing)))
+
+  (private config-default-bool)
+  (hidden config-default-bool)
+  (doc config-default-bool "the reference's default for a bool-valued
+project key, or `Nothing` when `key` is not one.")
+  (defn config-default-bool [key]
+    (cond
+      (String.= key "echo-c") (Maybe.Just false)
+      (String.= key "docs-generate-index") (Maybe.Just true)
+      (String.= key "paren-balance-hints") (Maybe.Just true)
+      (String.= key "print-ast") (Maybe.Just false)
+      (String.= key "core") (Maybe.Just true)
+      (String.= key "echo-compiler-cmd") (Maybe.Just false)
+      (String.= key "generate-only") (Maybe.Just false)
+      (String.= key "force-reload") (Maybe.Just false)
+      (String.= key "line-directives") (Maybe.Just false)
+      (Maybe.Nothing)))
+
+  (private config-kind)
+  (hidden config-kind)
+  (doc config-kind "what a project key holds, after the reference's
+`projectKeyMap`: 0 a string, 1 a bool, 2 a list of strings set whole, 3 a
+list of strings set one string at a time, 4 a read-only value, and -1 for a
+key the reference does not know.")
+  (defn config-kind [key]
+    (cond
+      (or (String.= key "cflag")
+          (or (String.= key "libflag") (String.= key "pkgconfigflag")))
+        2
+      (or (String.= key "search-path") (String.= key "cmod")) 3
+      (or (String.= key "includes")
+          (or (String.= key "preproc") (String.= key "load-stack")))
+        4
+      (Maybe.just? &(config-default-string key)) 0
+      (Maybe.just? &(config-default-bool key)) 1
+      -1))
+
+  (private recorded-config)
+  (hidden recorded-config)
+  (doc recorded-config "the value `Project.config` last gave `key`.")
+  (defn recorded-config [key]
+    (let-do [result (the (Maybe SurfaceNode) (Maybe.Nothing))]
+      (for [i 0 (Array.length &*ct-project-config*)]
+        (let [entry (Array.unsafe-nth &*ct-project-config* i)]
+          (when (String.= (Pair.a entry) key)
+            (set! result
+                  (Maybe.Just (SurfaceNode.copy (Box.peek (Pair.b entry))))))))
+      result))
+
+  (private record-config!)
+  (hidden record-config!)
+  (defn record-config! [key value]
+    (Array.push-back! &*ct-project-config*
+                      (Pair.init @key (Box.init (SurfaceNode.copy value)))))
+
+  (doc project-string "the project's string setting `key` (\"title\",
+\"output-directory\", ...) as `Project.config` left it, or the reference's
+default.")
+  (defn project-string [key]
+    (let [default (Maybe.from (config-default-string key) @"")]
+      (match (recorded-config key)
+        (Maybe.Just node)
+          (match-ref (SurfaceNode.form &node)
+            (SurfaceForm.StringLit value) @value
+            _ default)
+        (Maybe.Nothing) default)))
 
   (doc push-step-file! "enters a file for the purpose of recording steps: the
 body about to run is written there. Push the empty string when the file is
@@ -1558,24 +1677,172 @@ list's tail is copied once, straight into the result.")
               (error-at call @"compile-time operation expects Char syntax")))
       (Result.Error error) (Result.Error error)))
 
+  (private load-stack-value)
+  (hidden load-stack-value)
+  (doc load-stack-value "the files being loaded, innermost first.")
+  (defn load-stack-value [call]
+    (let-do [items (the (Array (Box CtValue)) [])
+             n (Array.length &*ct-load-stack*)]
+      (for [i 0 n]
+        (Array.push-back! &items
+                          (Box.init
+                            (CtValue.Syntax
+                              (Box.init
+                                (SurfaceNode.init @(SurfaceNode.span call)
+                                                  (SurfaceForm.StringLit
+                                                    @(Array.unsafe-nth &*ct-load-stack*
+                                                                       (Int.- (Int.dec n)
+                                                                              i)))))))))
+      (CtValue.Collection items)))
+
+  (private string-list-syntax)
+  (hidden string-list-syntax)
+  (doc string-list-syntax "`strings` as a list of string literals, or an
+array of them when `array?`.")
+  (defn string-list-syntax [call strings array?]
+    (let-do [items (the (Array (Box SurfaceNode)) [])]
+      (for [i 0 (Array.length strings)]
+        (Array.push-back! &items
+                          (Box.init
+                            (SurfaceNode.init @(SurfaceNode.span call)
+                                              (SurfaceForm.StringLit @(Array.unsafe-nth strings
+                                                                                        i))))))
+      (CtValue.Syntax
+        (Box.init
+          (SurfaceNode.init @(SurfaceNode.span call)
+                            (if array?
+                              (SurfaceForm.Array items)
+                              (SurfaceForm.List items)))))))
+
+  (private config-strings)
+  (hidden config-strings)
+  (doc config-strings "the strings a list or array of string literals
+holds, or `Nothing` when `node` is anything else.")
+  (defn config-strings [node]
+    (let-do [items (match-ref (SurfaceNode.form node)
+               (SurfaceForm.List items) (Maybe.Just @items)
+               (SurfaceForm.Array items) (Maybe.Just @items)
+               _ (Maybe.Nothing))
+             result (the (Maybe (Array String)) (Maybe.Just []))]
+      (match items
+        (Maybe.Just nodes)
+          (for [i 0 (Array.length &nodes)]
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth &nodes i)))
+              (SurfaceForm.StringLit text)
+                (match-ref &result
+                  (Maybe.Just strings) (Array.push-back! strings @text)
+                  (Maybe.Nothing) ())
+              _ (set! result (Maybe.Nothing))))
+        (Maybe.Nothing) (set! result (Maybe.Nothing)))
+      result))
+
+  (private config-error)
+  (hidden config-error)
+  (defn config-error [call key message]
+    (Result.Error
+      (error-at call (fmt "Project.config: the key '%s' %s" key message))))
+
+  (private configure)
+  (hidden configure)
+  (doc configure "`(Project.config key value)`: records `value` for `key`
+with the reference's rules for what each key accepts.")
+  (defn configure [call key value]
+    (let [kind (config-kind key)
+          done (Result.Success (syntax-empty call))]
+      (cond
+        (Int.= kind -1) (config-error call key "is not a project setting")
+        (Int.= kind 4) (config-error call key "is read-only")
+        (Int.= kind 2)
+          (match (config-strings value)
+            (Maybe.Just strings)
+              (do
+                (cond
+                  (String.= key "cflag") (set! *ct-collected-cflags* strings)
+                  (String.= key "libflag")
+                    (set! *ct-collected-libflags* strings)
+                  (set! *ct-pkgconfig-flags* strings))
+                done)
+            (Maybe.Nothing) (config-error call key "takes a list of strings"))
+        (Int.= kind 1)
+          (match-ref (SurfaceNode.form value)
+            (SurfaceForm.BoolLit _) (do (record-config! key value) done)
+            _ (config-error call key "takes a bool"))
+        (match-ref (SurfaceNode.form value)
+          (SurfaceForm.StringLit text)
+            (cond
+              ;; search-path and cmod add one string, once
+              (Int.= kind 3)
+              (let-do [present (match (recorded-config key)
+                         (Maybe.Just node)
+                           (Maybe.from (config-strings &node) [])
+                         (Maybe.Nothing) [])]
+                (unless (Array.contains? &present text)
+                  (Array.push-back! &present @text))
+                (match (string-list-syntax call &present false)
+                  (CtValue.Syntax node) (record-config! key (Box.peek &node))
+                  _ ())
+                done)
+              (String.= key "file-path-print-length")
+              (if (or (String.= text "short") (String.= text "full"))
+                (do
+                  (record-config! key
+                                  &(SurfaceNode.init @(SurfaceNode.span value)
+                                                     (SurfaceForm.StringLit
+                                                       (if (String.= text
+                                                                     "short")
+                                                         @"ShortPath"
+                                                         @"FullPath"))))
+                  done)
+                (config-error call key "takes \"short\" or \"full\""))
+              (do (record-config! key value) done))
+          _ (config-error call key "takes a string")))))
+
+  (private configuration)
+  (hidden configuration)
+  (doc configuration "`(Project.get-config key)`: what `Project.config` last
+set for `key`, or the reference's default.")
+  (defn configuration [call key]
+    (let [kind (config-kind key)]
+      (cond
+        (Int.= kind -1)
+          (Result.Error
+            (error-at call
+                      (fmt
+                        "Project.get-config: the key '%s' is not a project setting"
+                        key)))
+        (String.= key "load-stack") (Result.Success (load-stack-value call))
+        (String.= key "cflag")
+          (Result.Success (string-list-syntax call &*ct-collected-cflags* false))
+        (String.= key "libflag")
+          (Result.Success
+            (string-list-syntax call &*ct-collected-libflags* false))
+        (String.= key "pkgconfigflag")
+          (Result.Success (string-list-syntax call &*ct-pkgconfig-flags* true))
+        (match (recorded-config key)
+          (Maybe.Just node)
+            (Result.Success
+              (CtValue.Syntax
+                (Box.init
+                  (SurfaceNode.init @(SurfaceNode.span call)
+                                    @(SurfaceNode.form &node)))))
+          (Maybe.Nothing)
+            (cond
+              (Int.= kind 0)
+              (Result.Success
+                (syntax-string call
+                               &(Maybe.from (config-default-string key) @"")))
+              (Int.= kind 1)
+              (Result.Success
+                (syntax-bool call (Maybe.from (config-default-bool key) false)))
+              ;; includes, preproc, search-path and cmod: nothing recorded
+              (Result.Success (string-list-syntax call &[] false)))))))
+
   (private apply-builtin)
   (hidden apply-builtin)
   (defn apply-builtin [call id values]
     (cond
       (Int.= id 0)
-      (let-do [items (the (Array (Box CtValue)) [])
-               n (Array.length &*ct-load-stack*)]
-        (for [i 0 n]
-          (Array.push-back! &items
-                            (Box.init
-                              (CtValue.Syntax
-                                (Box.init
-                                  (SurfaceNode.init @(SurfaceNode.span call)
-                                                    (SurfaceForm.StringLit
-                                                      @(Array.unsafe-nth &*ct-load-stack*
-                                                                         (Int.- (Int.dec n)
-                                                                                i)))))))))
-        (Maybe.Just (Result.Success (CtValue.Collection items))))
+      (Maybe.Just (Result.Success (load-stack-value call)))
       (Int.= id 1)
       (Maybe.Just (Result.Success (list-or-collection call values)))
       (Int.= id 2)
@@ -2184,7 +2451,12 @@ list's tail is copied once, straight into the result.")
           (match (string-argument call &value)
             (Result.Success flag)
               (do
-                (Array.push-back! &*ct-collected-cflags* flag)
+                (record-build-command!
+                  (cond
+                    (Int.= id 76) "add-lib"
+                    (Int.= id 77) "add-pkg"
+                    "add-cflag")
+                  &flag)
                 (Maybe.Just (Result.Success (syntax-empty call))))
             (Result.Error error) (Maybe.Just (Result.Error error)))
         (Result.Error error) (Maybe.Just (Result.Error error)))
@@ -2234,6 +2506,29 @@ list's tail is copied once, straight into the result.")
       (Int.= id 81)
       (match (value-at call values 0)
         (Result.Success value) (Maybe.Just (symbol-to-string call &value))
+        (Result.Error error) (Maybe.Just (Result.Error error)))
+      ;; the project configuration is compile-time state, not a definition a
+      ;; prelude could hold: setting a key is observable to every later read
+      (Int.= id 82)
+      (match (value-at call values 0)
+        (Result.Success key)
+          (match (string-argument call &key)
+            (Result.Success name)
+              (match (value-at call values 1)
+                (Result.Success value)
+                  (match (syntax-from-value call &value)
+                    (Result.Success node)
+                      (Maybe.Just (configure call &name &node))
+                    (Result.Error error) (Maybe.Just (Result.Error error)))
+                (Result.Error error) (Maybe.Just (Result.Error error)))
+            (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Result.Error error) (Maybe.Just (Result.Error error)))
+      (Int.= id 83)
+      (match (value-at call values 0)
+        (Result.Success key)
+          (match (string-argument call &key)
+            (Result.Success name) (Maybe.Just (configuration call &name))
+            (Result.Error error) (Maybe.Just (Result.Error error)))
         (Result.Error error) (Maybe.Just (Result.Error error)))
       (Maybe.Nothing)))
 
