@@ -36,14 +36,16 @@ covered, and §6 says what that means for the ones that pass.
 
 The values are those of `CtValue`: syntax (literals, lists, arrays, static
 arrays, dictionaries, comments, patterns), closures, builtins, macros, and
-collections (lists of values that are not syntax). Each value has one
+lists and arrays holding a value that is not syntax. Each value has one
 **constructed type**, `BVal.of-value`:
 
 - a literal: its kind's tag (`#Int`, `#String`, …); a symbol or bool: the
   final tag of that literal (`#Symbol:foo`, `#True`);
 - a sequence: a chain of cells `#KCons ⊓ {car : τ} ⊓ {cdr : π}` ending in
-  `#KNil`, for `K` in List, Array, Static, Coll; an array's tail is a list,
-  because that is what the evaluator's `cdr` of an array answers;
+  `#KNil`, for `K` in List, Array, Static; an array's tail is a list,
+  because that is what the evaluator's `cdr` of an array answers. A list or
+  array holding a non-form has the same type as the form would; its `car`
+  is simply not a form type;
 - a closure, a builtin, a macro: `#Closure`, `#Builtin`, `#Macro`. A
   builtin known by name gets its builtin type, `#Builtin ⊓ (A → R)`.
 
@@ -100,12 +102,12 @@ the variables as the context. The rules, as `BTyper.typeof` applies them:
 - **Lam**: fresh `ᾱ` for the parameters; `#Closure ⊓ (args(ᾱ) → τ)`.
   With a rest parameter, the domain ends in `args*(ε)` (any number of
   arguments of type `ε`) instead of `#ArgsNil`, and the rest parameter is
-  `List(ε) ⊔ Collection(ε)`: the evaluator binds the remaining arguments as a
-  list when they are all forms and as a collection otherwise.
+  `List(ε)`.
 - **Macro**: as Lam with the tag `#Macro`, each parameter's variable below
-  the type of forms, and a rest parameter `List(ε)` with `ε` below the type
-  of forms: a macro is a function from forms to forms, and the shapes it
-  needs are inferred like a function's parameter types.
+  the type of forms, a rest parameter `List(ε)` with `ε` below the type of
+  forms, and the body's type below the type of forms: a macro is a function
+  from forms to forms, and the shapes it needs are inferred like a
+  function's parameter types.
 - **App**: `τf ≤ args(τ̄) → β`, `β` fresh.
 - **If**: condition `≤ Bool`; result the union of the branches.
 - **IfIs** (MLstruct's T-If): `x : (#T ⊓ τ1) ⊔ (τ2 ⊓ ¬#T ⊓ #Obj)` with `τ1`,
@@ -142,8 +144,13 @@ in the scope of the call (O4).
 to a macro is typed as the macro's expansion, then a builtin of that name is
 applied even when the name is also bound, then the binding is called.
 
-**eval and apply.** `eval : ⊤ → ⊤`: the form is typed, the result is
-anything, and errors raised by the code it runs are intended errors.
+**eval and apply.** `eval : ⊤ → Value`, where `Value` is the type of every
+value (the forms, closures, builtins, macros, and lists and arrays of
+values): the form is typed, the result is whatever its code computes, and
+errors raised by that code are intended errors. Core's `eval-form` is
+`eval` followed by `as-form`, which rebuilds a form and raises
+`macro-error` on a function; it is ordinary Carp, checked like everything
+else, with type `⊤ → Form`.
 `(apply f xs)` follows `ct-semantics.md` §7 case by case, `xs` a sequence of
 `ε`:
 
@@ -307,6 +314,17 @@ splitting: Boolean-algebraic rules plus Simple-sub's variable bounds. The final 
 - a field against the same field: S-RcdDepth;
 - anything else fails.
 
+Unions and intersections are built as sets (`BT.union`, `BT.inter`):
+flattened, each part once, in the order of the parts' ids, and memoised by
+their operands. The same set of parts is then always the same hash-consed
+type, which is what lets the cache of pairs in progress recognise a
+constraint it has met; without it, the "rest" a variable is bounded by grows
+by repetition and solving need not terminate. In `annoying`, unknowns wait
+until everything else is in the normal forms, and none is bounded when the
+left's tag is already below one of the right's: that bound would be implied,
+and adding it costs (6.1 s against 0.9 s on `eval-form` before memoising,
+with the same outcomes on all of Core).
+
 A recursive type is a variable defined as its body (`BT.define!`), as the
 paper encodes recursive types by bounds. The solver unfolds such a variable
 instead of bounding it, which is the paper's S-Hyp read from the other side:
@@ -333,8 +351,7 @@ assuming the implementation matches the cases above. The solver tests
   against the evaluator, which has found wrong types for `cons`,
   `cons-last`, `String.head`, `String.to-list`, `String.to-array`, `line`,
   `column` and `file` (arity), twelve builtins typed as taking anything that
-  need forms, `list`, and the preimage of `array?` for collections; a missing
-  sample hides a wrong type, as §8 shows.
+  need forms, and `list`; a missing sample hides a wrong type.
 - **O4** A macro's expansion at check time is the expansion that runs. True
   when the macro's expansion depends only on its argument syntax and on
   state that does not change between the check and the run. A macro that
@@ -344,24 +361,25 @@ assuming the implementation matches the cases above. The solver tests
 
 ## 8. Known gaps
 
-- **Sequence builtins and values that are not forms.** The evaluator makes
-  a list form only when every element is a form, reading a collection
-  element as an array form, and a collection otherwise (`ct-semantics.md`
-  §1). One arrow cannot say "a form when the elements are forms", so `list`,
-  `cons`, `cons-last`, `append` and a closure's rest parameter answer the
-  union of both outcomes. This is sound and costs precision: Core went from
-  242 to 216 checked definitions and from about 110 to 265 ms. Requiring
-  forms instead is also sound, checks no more of Core, takes 3.4 s, and
-  rejects lists of closures the evaluator accepts.
-- A macro's expansion is not required to be a form. The evaluator requires
-  it (§6 of the semantics), but with the sequence builtins' single arrows
-  the constraint rejects 17 Core macros the evaluator expands.
+- **Dynamic maps used as records.** A dynamic map is ordinary Core code over
+  lists, so `(Map.get m "key")` has the type its code gives it: the union of
+  every value in the map, whatever the key. Code that keeps different kinds
+  of values under literal keys (`expand`'s syntax objects) fails where it
+  reads one back. This is a precision limit, not a gap to close by giving
+  the map functions declared types: they are library code, not builtins.
+- **Invariants held by user predicates.** `Dynamic.Map.get-with-default`
+  takes `cadr` of what `List.find` answers, which is safe only because
+  `Map.contains?` was asked first. Most failures in the carpentry-org
+  libraries cascade from it.
+- **`eval` answers any value.** A macro whose expansion is the value of an
+  `eval` (`unreachable` in Core, `log`'s macros, `orm`'s transaction macros)
+  fails the requirement that an expansion be a form: the code `eval` runs
+  could compute a function, and a function is not a form. The sound way to
+  expand to what code evaluates to is `eval-form`, which checks that it got a
+  form when it runs.
 - Definitions that fail to check (27 of 195 in Core) are not covered, and
   through O5 they weaken the claim for definitions that read globals they
   write.
-- Collections answer `'array` to `dynamic-type` in metacarp, where reference
-  Carp would answer `'list` for `(list car)`; `P_dynamic-type('array)` is
-  `Array ⊔ Collection` to follow the evaluator.
 - `set!` of a function binding is rejected rather than typed.
 - A closure stored in data (a list, a global) has the type `#Closure`
   without an arrow, so calling it is rejected; typing it from its code would
