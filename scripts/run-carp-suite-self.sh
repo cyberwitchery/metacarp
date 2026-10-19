@@ -2,7 +2,8 @@
 # Mirrors the reference scripts/run_carp_tests.sh section-by-section:
 #   examples + produces-output  build (--log-memory), run, diff vs .output.expected
 #   test/*.carp                 -x --log-memory (exit 0 = pass)
-#   test/test-for-errors        compilation must be rejected
+#   test/test-for-errors        compilation must be rejected, unless the
+#                               reference expects no output (empty.carp)
 #   bench + compile-only        -b builds
 # Known-gaps POLICY: tests named in known_gaps below exercise reference
 # semantics this compiler does not implement yet. They still run and are
@@ -150,6 +151,18 @@ expect_reject() {
   name=$(safe_name "$file")
   log="$out_root/log/$name.log"
 
+  # the reference's own oracle: an empty expected output means it accepts
+  # the file
+  expected_file="$carp_root/test/output/$file.output.expected"
+  if [ -f "$expected_file" ] && [ ! -s "$expected_file" ]; then
+    printf '[accept] %s\n' "$file"
+    if "$compiler" -c "$core_dir" -o "$out_root/c/$name.c" "$file" >"$log" 2>&1; then
+      passed=$((passed + 1))
+    else
+      fail "$file" rejected
+    fi
+    return
+  fi
   printf '[reject] %s\n' "$file"
   if "$compiler" -c "$core_dir" -o "$out_root/c/$name.c" "$file" >"$log" 2>&1; then
     fail "$file" accepted
@@ -157,7 +170,6 @@ expect_reject() {
     passed=$((passed + 1))
     if [ "${CARP_CHECK_ERRORS:-0}" = "1" ]; then
       ours=$(head -n1 "$log")
-      expected_file="$carp_root/test/output/$file.output.expected"
       theirs=$([ -f "$expected_file" ] && head -n1 "$expected_file" || echo "<no expected file>")
       printf '%s\n  ours:   %s\n  theirs: %s\n' "$file" "$ours" "$theirs" \
         >>"$out_root/error-text-report.txt"

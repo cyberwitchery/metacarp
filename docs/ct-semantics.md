@@ -18,27 +18,31 @@ below, not a second definition.
         | closure ⟨p, ρ, f⟩      prototype p, defining frame ρ, file f
         | macro ⟨p, ρ, f⟩        the same, called on forms
         | builtin b              a builtin, by name
-        | coll [v₁ … vₙ]         a collection of values
+        | list⟨v₁ … vₙ⟩ | array⟨v₁ … vₙ⟩
+                                 a list or an array holding a value that
+                                 is not a form
 
 Forms are what the reader makes: symbols, numbers of five kinds, strings,
 characters, bools, patterns, comments, lists, arrays, static arrays and
-dictionaries. A collection is the value of an array literal, and of a list
-whose elements are not all forms.
+dictionaries. Syntax cannot hold a closure, a builtin or a macro, so a list
+or an array that holds one is a value of its own, `list⟨…⟩` or `array⟨…⟩`
+(`CtValue.Collection`, with its kind). The evaluator makes one exactly when
+it would make a list or array form and an element is not a form, so it is
+always one or the other: a sequence of forms is a form. Reference Carp has
+no such split; there a list is a list whatever it holds, which is what the
+kind keeps.
 
 **Reading a value as a form**, `⌊v⌋` (`syntax-from-value`): `⌊form s⌋ = s`;
-`⌊coll [v₁ … vₙ]⌋` is the array form `[⌊v₁⌋ … ⌊vₙ⌋]` when every `vᵢ` is a
-form, and an error otherwise; any other value is the error "compile-time
-expression must evaluate to syntax". Most builtins read their arguments
-this way, so a collection of forms behaves as an array form almost
-everywhere. It does not under `car`, `cdr`, `length` and `empty?`, which
-read a collection's elements directly (`cdr` of a collection is a
-collection), and `dynamic-type` answers `array` for both.
+any other value is the error "compile-time expression must evaluate to
+syntax". Most builtins read their arguments this way. The sequence
+builtins (`car`, `cdr`, `cons`, `length`, `empty?`, …) read a `list⟨…⟩` or
+`array⟨…⟩` like the form it would be; `list?`, `array?` and `dynamic-type`
+answer by its kind.
 
 **Reading a value as a bool**: `if` takes a value that is the bool form
 itself (`strict-bool-at`); `when`, `while`, `cond`, `and` and `or` take any
-value whose `⌊v⌋` is a bool form (`bool-argument`). Since `⌊v⌋` of a
-collection is an array, the two accept the same values, with different
-messages.
+value whose `⌊v⌋` is a bool form (`bool-argument`). Only a bool form reads
+as a bool form, so the two accept the same values, with different messages.
 
 **Equality** of forms (`syntax-equal?`, used by `=` and `case`): numbers
 compare numerically across kinds, a string of one character equals that
@@ -97,7 +101,8 @@ otherwise.
   an error.
 - **ArgSym x**: as Sym, except that a name that resolves to nothing and is
   not a builtin answers the symbol form `x`.
-- **Coll e₁ … eₙ**: `coll [v₁ … vₙ]`, always a collection, even of forms.
+- **Coll e₁ … eₙ**: the array form `[v₁ … vₙ]` when every `vᵢ` is a form,
+  as in reference Carp; `array⟨v₁ … vₙ⟩` otherwise.
 - **If c t e**: `c` must be a bool form; the chosen branch.
 - **When c t**: `t` if `c` is true, otherwise the empty list form.
 - **And e₁ … eₙ**: each `eᵢ` but the last is read as a bool; the first that
@@ -142,7 +147,7 @@ otherwise.
 - a closure `⟨p, ρ', f⟩`: the number of arguments must be the number of
   fixed parameters, or at least that with a rest parameter; a fresh child of
   `ρ'` binds the parameters to the arguments and the rest parameter to the
-  remaining ones (a list form when they are all forms, a collection
+  remaining ones (a list form when they are all forms, `list⟨…⟩`
   otherwise); the body runs there;
 - a builtin: its implementation, which may raise errors of its own;
 - a macro: the arguments are read as forms, the macro is expanded from them,
@@ -150,7 +155,8 @@ otherwise.
 - a form: it is evaluated once, and its value applied; if that value is
   again a form, it is the error "compile-time application expects a
   function";
-- a collection: the error "compile-time application expects a function".
+- a `list⟨…⟩` or `array⟨…⟩`: the error "compile-time application expects a
+  function".
 
 ## 6. Macros
 
@@ -177,12 +183,14 @@ code can call it, pass it, and `apply` it.
   - any other form: evaluated, and its value applied.
 - **(eval e)**: the value `v` of `e`; when `v` is a symbol form that names
   nothing and is not a builtin, `v` itself; when `v` is another form, `v`
-  evaluated in `ρ`; any other value, `v` itself.
+  evaluated in `ρ`; any other value, `v` itself. Core's `eval-form` is
+  `eval` followed by a check that the result is a form (a `macro-error`
+  otherwise), for macros that expand to what they evaluate.
 - **(expand e)**: `⌊v⌋` of `e`'s value, with `(ignore* a …)` rewritten to
   `((ignore a) …)`.
 - **(use M)** imports module `M`'s frame into `ρ`; **members**, **managed?**,
   **type**, **meta** and **s-expr** read what the expander recorded about
-  types and bindings; **concat** joins two collections.
+  types and bindings; **concat** joins two sequences into an array.
 
 ## 8. Loading a file
 
@@ -199,10 +207,15 @@ frame of the module being defined (`carp-expand.carp`):
   the same way. The cell is mutable through `set!`.
 - **defmodule**, **deftype**, **use** and the load markers maintain module
   frames, recorded types and the load stack.
-- a top-level **eval**, **set!** or **Project.config** is evaluated for its
-  effect; so is a call of a pure string command with literal arguments, and
+- a top-level **eval**, **set!**, **Project.config** or **macro-log** is
+  evaluated for its effect; so is a call of a pure string command with literal arguments, and
   a call of a name bound to a closure. A call of a name bound to anything
   else is an error.
+- **build** and **run**, the REPL's commands, record that the driver should
+  build, and run, what it compiles once compilation is done; **quit** does
+  nothing, since a batch compile ends anyway. A macro that defines `main`
+  and then builds and runs expands to `(do (defn main …) (build) (run))`,
+  which works the same on both compilers.
 - a top-level **if** whose condition evaluates to a bool picks its branch
   now; otherwise it stays as code.
 - everything else is static code: macro calls in it are expanded until none
@@ -229,14 +242,17 @@ Found while writing this, by running both on the same input:
 | `(apply f '(1 2))`, `f` a `defndynamic` | the call form `(f 1 2)` | `f` called: `3` |
 | `(apply + '(1 2))` | `(Dynamic.+ 1 2)` | `(+ 1 2)` |
 | `(dynamic-type car)` | `list` | `fn` |
-| `(dynamic-type (list car))` | `list` | `array` |
 | `(s-expr f)`, `f` a `defndynamic` | a list form, `(dynamic f [a] …)` | not a form: `str` of it fails |
 | `(dynamic-type (car (s-expr f)))` | `dynamic` | fails, as above |
-| top-level `(macro-log "hi")` | prints at load | not evaluated |
 
 Each row was run through both compilers on the same file (the reference at
 the master revision this repository follows).
 
-Fixed in this work: `dynamic-type` answered `array` for static arrays and
-dictionaries (reference: `static-array`, `map`) and aborted the process on a
-macro (reference: `macro`).
+Fixed in this work: an array literal evaluated to a collection even when
+every element was a form (reference: an array); a list holding a non-form
+answered `array` to `dynamic-type` and `false` to `list?` (reference: `list`,
+`true`); `dynamic-type` answered
+`array` for static arrays and dictionaries (reference: `static-array`,
+`map`) and aborted the process on a macro (reference: `macro`); `macro-log`
+printed nothing, and a top-level one was not evaluated; `write-file`,
+`build`, `run` and `quit` did not exist.
