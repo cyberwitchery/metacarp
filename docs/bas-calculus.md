@@ -163,10 +163,10 @@ arrow was taken at the root.
 **eval and apply.** `eval : ⊤ → Value`, where `Value` is the type of every
 value (the forms, closures, builtins, macros, and lists and arrays of
 values): the form is typed, the result is whatever its code computes, and
-errors raised by that code are intended errors. Core's `eval-form` is
-`eval` followed by `as-form`, which rebuilds a form and raises
-`macro-error` on a function; it is ordinary Carp, checked like everything
-else, with type `⊤ → Form`.
+errors raised by that code are intended errors. `eval-form`, `eval`
+followed by `as-form`, which rebuilds a form and raises `macro-error` on a
+function, is ordinary Carp, checked like everything else, with type
+`⊤ → Form`.
 `(apply f xs)` follows `ct-semantics.md` §7 case by case, `xs` a sequence of
 `ε`:
 
@@ -350,9 +350,8 @@ type, which is what lets the cache of pairs in progress recognise a
 constraint it has met; without it, the "rest" a variable is bounded by grows
 by repetition and solving need not terminate. In `annoying`, unknowns wait
 until everything else is in the normal forms, and none is bounded when the
-left's tag is already below one of the right's: that bound would be implied,
-and adding it costs (6.1 s against 0.9 s on `eval-form` before memoising,
-with the same outcomes on all of Core).
+left's tag is already below one of the right's: that bound would be
+implied, and adding it only costs time.
 
 A disjunct of the right that the left's tag cannot meet is dropped before it
 is split: when `L ⊓ D ≡ ⊥`, `L ≤ D ⊔ R` holds exactly when `L ≤ R` does, so
@@ -438,17 +437,13 @@ assuming the implementation matches the cases above. The solver tests
   of values under literal keys (`expand`'s syntax objects) fails where it
   reads one back. This is a precision limit, not a gap to close by giving
   the map functions declared types: they are library code, not builtins.
-- **Invariants held by user predicates.** `Dynamic.Map.get-with-default`
-  takes `cadr` of what `List.find` answers, which is safe only because
-  `Map.contains?` was asked first. Most failures in the carpentry-org
-  libraries cascade from it.
 - **`eval` answers any value.** A macro whose expansion is the value of an
   `eval` (`unreachable` in Core, `log`'s macros, `orm`'s transaction macros)
   fails the requirement that an expansion be a form: the code `eval` runs
   could compute a function, and a function is not a form. The sound way to
   expand to what code evaluates to is `eval-form`, which checks that it got a
   form when it runs.
-- Definitions that fail to check (28 of 278 in Core) are not covered, and
+- Definitions that fail to check (28 of 276 in Core) are not covered, and
   through O5 they weaken the claim for definitions that read globals they
   write.
 - `set!` of a function binding is rejected rather than typed. No code in

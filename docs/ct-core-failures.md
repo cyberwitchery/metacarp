@@ -1,9 +1,8 @@
 # What the checker rejects in Core
 
 The compile-time checker (`carp-ct-typecheck`) run over every definition in
-Core, macros included: 250 of 278 check. This classifies the 28 that do
-not. Core is reference Core at the master revision this repository follows,
-plus the two Carp branches (`eval-form`, `map-get-single-lookup`).
+Core, macros included, at upstream master c6309d90: 248 of 276 check. This
+classifies the 28 that do not.
 
 12 of the 28 fail only because they use one that fails. The 16 direct
 failures were each read at their site. A failure counted as a real bug only
@@ -28,11 +27,12 @@ reachable: on a map of 4 entries in 16 buckets (25% load), reference fails
 `Dynamic.Map.remove` with "Can't find symbol 'dflt-len'". `Dynamic.Map.remove`
 fails as a cascade.
 
-Qualifying the name exposes two bugs the checker did not report: the same
-`remove` then never terminates (killed after 60 s), because `remove` shrinks
-when the load is *above* `min-load`, `shrink` hands a 16-bucket map back
-unchanged, and `remove` calls itself on it again. And `put` grows when the
-load passes `min-load` (20%), where `max-load` (80%) looks intended.
+Two more bugs sit behind it, which the checker does not report: `remove`
+shrinks when the load is *above* `min-load`, and when `shrink` hands a
+16-bucket map back unchanged, `remove` calls itself on it again; with the
+name qualified, that `remove` does not terminate (killed after 60 s). And
+`put` grows when the load passes `min-load` (20%), where `max-load` (80%)
+looks intended.
 
 **`thread-first-internal`, `thread-last-internal`**: `(-> 1)` and `(->)`
 fail on reference with "Applying 'last' to non-list or empty list". The
@@ -79,22 +79,6 @@ is not tracked.
 
 **Compiler state.** `current-file` takes `car` of the load stack, which is
 empty only when nothing is being loaded.
-
-## Fixed
-
-Narrowing on lengths other than 0 and "positive" (`cond`, `case`,
-`defproject`, `Introspect.struct?`, `Introspect.sumtype?`, `fmt`, and the
-helpers of `cond->` and `cond-->`): `(= (length x) k)`, `(> (length x) k)`
-and `(< (length x) k)`, either way round, now narrow (`bas-calculus.md` §5,
-and O6 for what that rests on).
-
-Closing it showed `last` typed as taking an empty sequence, which made
-`thread-first-internal` and `thread-last-internal` check although they
-crash. `last` and `all-but-last` now take a non-empty sequence, and
-metacarp's evaluator, which answered `()` for `cdr` past the end and for
-`all-but-last` of an empty sequence, now raises an error, as reference
-does (reference aborts on `(all-but-last '())` with "Prelude.init: empty
-list").
 
 ## Messages
 

@@ -183,9 +183,9 @@ code can call it, pass it, and `apply` it.
   - any other form: evaluated, and its value applied.
 - **(eval e)**: the value `v` of `e`; when `v` is a symbol form that names
   nothing and is not a builtin, `v` itself; when `v` is another form, `v`
-  evaluated in `ρ`; any other value, `v` itself. Core's `eval-form` is
-  `eval` followed by a check that the result is a form (a `macro-error`
-  otherwise), for macros that expand to what they evaluate.
+  evaluated in `ρ`; any other value, `v` itself. `eval-form`, defined in
+  Carp, is `eval` followed by a check that the result is a form (a
+  `macro-error` otherwise), for macros that expand to what they evaluate.
 - **(expand e)**: `⌊v⌋` of `e`'s value, with `(ignore* a …)` rewritten to
   `((ignore a) …)`.
 - **(use M)** imports module `M`'s frame into `ρ`; **members**, **managed?**,
