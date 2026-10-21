@@ -129,6 +129,8 @@ wrapped around the condition itself:
 so the call is still typed (its argument must be in `f`'s domain) and the
 branches are narrowed in addition. `(= (f x) l)` uses `P_f(l)`, and
 `(= x l)` the tag of `l` when `l` has one of its own (symbols and bools).
+`(> (f x) k)` and `(< k (f x))` use `P_f(> k)`, and `(< (f x) k)` and
+`(> k (f x))` use `P_f(< k)`, for an integer literal `k`.
 `not` swaps the branches. `case` on literal symbols and bools is a chain of
 such tests. A call of a user predicate does not narrow.
 
@@ -189,9 +191,22 @@ Accepted values matter: `length` accepts only sequences, so `P_length(0)` is
 `Nil` even though `""` has length zero in other languages. The domain itself
 is enforced by B1, because the tested call is typed (§4).
 
-Both are checked against the evaluator by `corpus/check-bas-builtins.carp`:
-B1 on 78 sample calls (result type below the declared result, and a call the
-evaluator rejects rejected by the type too), B2 on 22 preimages over 30
+`length`'s preimages are cell chains, for any kind of sequence:
+
+    exactly(0) = Nil          exactly(k) = Cons ⊓ {cdr : exactly(k-1)}
+    at-least(0) = ⊤           at-least(k) = Cons ⊓ {cdr : at-least(k-1)}
+
+    P_length(k) = exactly(k)
+    P_length(> k) = at-least(k+1)
+    P_length(< k) = exactly(0) ⊔ … ⊔ exactly(k-1)
+
+`P_length(< k)` is written as the lengths it allows, not as
+`¬at-least(k)`: a short sequence is not derivably below the negation (see
+O6).
+
+Both are checked against the evaluator by `test/bas-builtins.carp`: B1 on
+124 sample calls (result type below the declared result, and a call the
+evaluator rejects rejected by the type too), B2 on 31 preimages over 38
 sample values of every kind. Sampling is evidence, not proof (O3).
 
 ## 6. State
@@ -363,13 +378,26 @@ assuming the implementation matches the cases above. The solver tests
   against the evaluator, which has found wrong types for `cons`,
   `cons-last`, `String.head`, `String.to-list`, `String.to-array`, `line`,
   `column` and `file` (arity), twelve builtins typed as taking anything that
-  need forms, and `list`; a missing sample hides a wrong type.
+  need forms, `list`, and `last`, typed as taking an empty sequence; a
+  missing sample hides a wrong type (`last` had samples, none of them
+  empty).
 - **O4** A macro's expansion at check time is the expansion that runs. True
   when the macro's expansion depends only on its argument syntax and on
   state that does not change between the check and the run. A macro that
   reads a counter, a setting changed later, or a global set at run time can
   expand differently.
 - **O5** Every writer of a global a definition reads also checks.
+- **O6** The else branch of a narrowing test is typed with `x ⊓ ¬P`, so
+  preservation needs a value for which the test is false to be derivably
+  below `¬P`. B2 checks only that it is not below `P`. For a preimage made
+  of tags (`Nil`, `Cons`, the `dynamic-type` kinds) the two coincide. For
+  `exactly(k)` and `at-least(k)` with `k ≥ 1` they do not: `'(1 2)` is not
+  derivably below `¬exactly(1)`, because that needs
+  `{cdr : #ListCons} ⊓ {cdr : Nil}` to be empty, and `{cdr : ⊥}` is not
+  empty in MLstruct+ (S-RcdTop). In the evaluator's values every cell has
+  both fields, where the intersection is empty, so the narrowing holds in
+  that model; the claim rests on that model, not on MLstruct+'s
+  subtyping alone.
 
 ## 8. Known gaps
 
@@ -389,14 +417,12 @@ assuming the implementation matches the cases above. The solver tests
   could compute a function, and a function is not a form. The sound way to
   expand to what code evaluates to is `eval-form`, which checks that it got a
   form when it runs.
-- Definitions that fail to check (27 of 195 in Core) are not covered, and
+- Definitions that fail to check (28 of 278 in Core) are not covered, and
   through O5 they weaken the claim for definitions that read globals they
   write.
 - `set!` of a function binding is rejected rather than typed.
-- A closure stored in data (a list, a global) has the type `#Closure`
-  without an arrow, so calling it is rejected; typing it from its code would
-  fix this (`derive` fails on it).
 
 Precision losses that are not soundness gaps: no overloads; narrowing only
-on literal answers (`(= (length x) 1)` does not narrow); `cons` widens its
-tail to a list of the elements, so `cxr`-style length arithmetic is lost.
+on literal answers, and a length compared with a computed bound does not
+narrow; `cons` widens its tail to a list of the elements, so `cxr`-style
+length arithmetic is lost.

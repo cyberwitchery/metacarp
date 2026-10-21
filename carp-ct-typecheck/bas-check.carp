@@ -150,8 +150,10 @@ array's tail is a list.")
   (Boolean [Bool])
   (Integer [Int])
   (Sym [String])
-  ;; an answer above zero, the test `(> (f x) 0)`
-  (Positive []))
+  ;; an answer above `k`, the test `(> (f x) k)`
+  (Above [Int])
+  ;; an answer below `k`, the test `(< (f x) k)`
+  (Below [Int]))
 
 (defmodule BBuiltin
   (private n)
@@ -164,21 +166,46 @@ narrow by it, and test/bas-builtins.carp checks it against the evaluator.")
   (defn preimage [id lit]
     (match-ref lit
       (BLit.Boolean b)
-        (cond
-          (not @b) (Maybe.Nothing)
-          (or (Int.= id 36) (Int.= id 37)) (Maybe.Just (n "List"))
-          (or (Int.= id 38) (Int.= id 39)) (Maybe.Just (n "Array"))
-          (or (Int.= id 34) (Int.= id 35)) (Maybe.Just (n "Nil"))
-          (Maybe.Nothing))
+      (cond
+        (not @b) (Maybe.Nothing)
+        (or (Int.= id 36) (Int.= id 37)) (Maybe.Just (n "List"))
+        (or (Int.= id 38) (Int.= id 39)) (Maybe.Just (n "Array"))
+        (or (Int.= id 34) (Int.= id 35)) (Maybe.Just (n "Nil"))
+        (Maybe.Nothing))
       (BLit.Integer k)
-        (if (and (Int.= @k 0) (or (Int.= id 32) (Int.= id 33)))
-          (Maybe.Just (n "Nil"))
-          (Maybe.Nothing))
-      (BLit.Sym s) (if (Int.= id 41) (kind-of s) (Maybe.Nothing))
-      (BLit.Positive)
-        (if (or (Int.= id 32) (Int.= id 33))
-          (Maybe.Just (n "Cons"))
-          (Maybe.Nothing))))
+      (if (and (Int.>= @k 0) (or (Int.= id 32) (Int.= id 33)))
+        (Maybe.Just (exactly @k))
+        (Maybe.Nothing))
+      (BLit.Sym s)
+      (if (Int.= id 41) (kind-of s) (Maybe.Nothing))
+      (BLit.Above k)
+      (if (and (Int.>= @k 0) (or (Int.= id 32) (Int.= id 33)))
+        (Maybe.Just (at-least (Int.inc @k)))
+        (Maybe.Nothing))
+      ;; written as the lengths it allows, not as the negation of the ones
+      ;; it does not: a short sequence is below a union of exact lengths,
+      ;; but not provably below `~(at-least k)`, since `{cdr: ⊥}` is not
+      ;; empty
+      (BLit.Below k)
+      (if (and (Int.>= @k 1) (or (Int.= id 32) (Int.= id 33)))
+        (let-do [t (BT.bot)]
+          (for [i 0 @k] (set! t (BT.union t (exactly i))))
+          (Maybe.Just t))
+        (Maybe.Nothing))))
+
+  (doc exactly "the sequences of exactly `k` elements, of any kind: `k`
+cells, each with the next as its tail, then an empty one.")
+  (defn exactly [k]
+    (let-do [t (n "Nil")]
+      (for [_ 0 k] (set! t (BT.inter (n "Cons") (BT.cdr-fld t))))
+      t))
+
+  (doc at-least "the sequences of at least `k` elements: `k` cells, each
+with the next as its tail, then anything.")
+  (defn at-least [k]
+    (let-do [t (BT.top)]
+      (for [_ 0 k] (set! t (BT.inter (n "Cons") (BT.cdr-fld t))))
+      t))
 
   (doc kind-of "the values `dynamic-type` answers the symbol `name` for.")
   (defn kind-of [name]
@@ -289,11 +316,16 @@ variables fresh at level `lvl`, or `Nothing` when it is not typed.")
         (Maybe.Just (fun &[(BVal.seq-of syn lvl)] sym))
         (Int.= id 5)
         (Maybe.Just (fun &[sym sym] sym))
+        ;; last and all-but-last take a sequence that is not empty
         (or (Int.= id 22) (Int.= id 23))
-        (let [e (v lvl)] (Maybe.Just (fun &[(BVal.seq-of e lvl)] e)))
+        (let [e (v lvl)]
+          (Maybe.Just (fun &[(BT.inter (BVal.seq-of e lvl) (n "Cons"))] e)))
         (or (Int.= id 24) (Int.= id 25))
         (let [e (v lvl)]
-          (Maybe.Just (fun &[(BVal.seq-of e lvl)] (BVal.list-of e lvl))))
+          (Maybe.Just
+            (fun
+              &[(BT.inter (BVal.seq-of e lvl) (n "Cons"))]
+              (BVal.list-of e lvl))))
         ;; cons makes a list: an array or collection tail is converted, so
         ;; the tail is a list of the tail's elements. One arrow cannot keep a
         ;; list tail exactly and convert the others, so lengths are not kept.
@@ -811,15 +843,21 @@ tests and the type it tests for: a one-argument builtin answering `true`, or
             (match (compared a b)
               (Maybe.Just p) (Maybe.Just p)
               (Maybe.Nothing) (compared b a)))
-          ;; (> (f x) 0), or (< 0 (f x))
-          (and (Int.= @builtin 49)
-               (Int.= 2 (Array.length args))
-               (zero? (Box.peek (Array.unsafe-nth args 1))))
-          (call-preimage (Box.peek (Array.unsafe-nth args 0)) &(BLit.Positive))
-          (and (Int.= @builtin 50)
-               (Int.= 2 (Array.length args))
-               (zero? (Box.peek (Array.unsafe-nth args 0))))
-          (call-preimage (Box.peek (Array.unsafe-nth args 1)) &(BLit.Positive))
+          ;; (> (f x) k) or (< k (f x)), and (< (f x) k) or (> k (f x))
+          (and
+            (or (Int.= @builtin 49) (Int.= @builtin 50))
+            (Int.= 2 (Array.length args)))
+          (let [a (Box.peek (Array.unsafe-nth args 0))
+                b (Box.peek (Array.unsafe-nth args 1))
+                greater (Int.= @builtin 49)]
+            (match (integer-of b)
+              (Maybe.Just k)
+                (call-preimage a &(if greater (BLit.Above k) (BLit.Below k)))
+              (Maybe.Nothing)
+                (match (integer-of a)
+                  (Maybe.Just k)
+                    (call-preimage b &(if greater (BLit.Below k) (BLit.Above k)))
+                  (Maybe.Nothing) (Maybe.Nothing))))
           (Maybe.Nothing))
       _ (Maybe.Nothing)))
 
@@ -880,10 +918,12 @@ symbols and bools do, numbers do not.")
       (BLit.Sym s) (Maybe.Just (BT.tag (BTag.literal (BTag.named "Symbol") s)))
       _ (Maybe.Nothing)))
 
-  (private zero?)
-  (hidden zero?)
-  (defn zero? [ir]
-    (match (literal-of ir) (Maybe.Just (BLit.Integer k)) (Int.= k 0) _ false))
+  (private integer-of)
+  (hidden integer-of)
+  (defn integer-of [ir]
+    (match (literal-of ir)
+      (Maybe.Just (BLit.Integer k)) (Maybe.Just k)
+      _ (Maybe.Nothing)))
 
   (private literal-test)
   (hidden literal-test)

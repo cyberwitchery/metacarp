@@ -255,4 +255,6 @@ answered `array` to `dynamic-type` and `false` to `list?` (reference: `list`,
 `array` for static arrays and dictionaries (reference: `static-array`,
 `map`) and aborted the process on a macro (reference: `macro`); `macro-log`
 printed nothing, and a top-level one was not evaluated; `write-file`,
-`build`, `run` and `quit` did not exist.
+`build`, `run` and `quit` did not exist; `cdr` past the end of a sequence
+and `all-but-last` of an empty one answered `()` (reference: an error, and
+for `all-but-last` an abort of the compiler).
