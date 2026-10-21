@@ -165,32 +165,43 @@
 (defn form-load-target [node]
   (match-ref (SurfaceNode.form node)
     (SurfaceForm.List items)
-      (if (Int.= 2 (Array.length items))
-        (let [head (Box.peek (Array.unsafe-nth items 0))
-              arg (Box.peek (Array.unsafe-nth items 1))]
-          (cond
-            (load-symbol? head)
-              (match-ref (SurfaceNode.form arg)
-                ;; `(load "core/Foo.carp")` names a Core file relative to the Carp
-                ;; root; the core dir already IS core, so drop the prefix (this
-                ;; also dedups against the same file loaded plainly as "Foo.carp").
-                (SurfaceForm.StringLit path)
-                (Maybe.Just
-                  (if (String.starts-with? path "core/")
-                    (String.suffix path 5)
-                    @path))
-                _
-                (the (Maybe String) (Maybe.Nothing)))
-            (symbol-named? head "load-and-use")
-              (match-ref (SurfaceNode.form arg)
-                (SurfaceForm.Symbol segments)
-                  (if (Int.= 1 (Array.length segments))
-                    (Maybe.Just
-                      (String.concat &[@(Array.unsafe-nth segments 0) @".carp"]))
-                    (the (Maybe String) (Maybe.Nothing)))
-                _ (the (Maybe String) (Maybe.Nothing)))
-            (the (Maybe String) (Maybe.Nothing))))
-        (the (Maybe String) (Maybe.Nothing)))
+      (if (and (Int.= 3 (Array.length items))
+               (load-symbol? (Box.peek (Array.unsafe-nth items 0))))
+        ;; `(load "repo@tag" "file.carp")`: that file of the checkout
+        (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 1)))
+          (SurfaceForm.StringLit path)
+            (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items 2)))
+              (SurfaceForm.StringLit file)
+                (Maybe.Just (ModuleLoader.file-load-target path file))
+              _ (the (Maybe String) (Maybe.Nothing)))
+          _ (the (Maybe String) (Maybe.Nothing)))
+        (if (Int.= 2 (Array.length items))
+          (let [head (Box.peek (Array.unsafe-nth items 0))
+                arg (Box.peek (Array.unsafe-nth items 1))]
+            (cond
+              (load-symbol? head)
+                (match-ref (SurfaceNode.form arg)
+                  ;; `(load "core/Foo.carp")` names a Core file relative to the Carp
+                  ;; root; the core dir already IS core, so drop the prefix (this
+                  ;; also dedups against the same file loaded plainly as "Foo.carp").
+                  (SurfaceForm.StringLit path)
+                  (Maybe.Just
+                    (if (String.starts-with? path "core/")
+                      (String.suffix path 5)
+                      @path))
+                  _
+                  (the (Maybe String) (Maybe.Nothing)))
+              (symbol-named? head "load-and-use")
+                (match-ref (SurfaceNode.form arg)
+                  (SurfaceForm.Symbol segments)
+                    (if (Int.= 1 (Array.length segments))
+                      (Maybe.Just
+                        (String.concat
+                          &[@(Array.unsafe-nth segments 0) @".carp"]))
+                      (the (Maybe String) (Maybe.Nothing)))
+                  _ (the (Maybe String) (Maybe.Nothing)))
+              (the (Maybe String) (Maybe.Nothing))))
+          (the (Maybe String) (Maybe.Nothing))))
     _ (the (Maybe String) (Maybe.Nothing))))
 
 (defn collect-load-targets [forms]
@@ -439,8 +450,42 @@
         tag))))
 
 ; reads a git-referenced module out of the cache, installing the checkout
-; first when it is missing.
-(defn read-git-source [name]
+; first when it is missing. A target naming a file of the checkout
+; (`file-load-target`) reads that file, as the reference does.
+(defn read-git-source [target]
+  (let-do [space (String.index-of target \space)
+           name (if (Int.< space 0) @target (String.prefix target space))
+           file (if (Int.< space 0)
+             (the (Maybe String) (Maybe.Nothing))
+             (Maybe.Just (String.suffix target (Int.inc space))))]
+    (match file
+      (Maybe.Just f) (read-git-file &name &f)
+      (Maybe.Nothing) (read-git-default &name))))
+
+(defn git-checkout-dir [name]
+  (String.concat
+    &[(git-cache-root)
+      @"/"
+      (git-ref-cache-dir &(git-ref-url name))
+      @"/"
+      (git-ref-tag name)]))
+
+; reads the file `file` of the checkout `name` names, installing it first when
+; it is missing.
+(defn read-git-file [name file]
+  (let [dir (git-checkout-dir name)
+        path (String.concat &[(String.copy &dir) @"/" @file])]
+    (match (IO.read-file &path)
+      (Result.Success text) (Maybe.Just (Pair.init @&path text))
+      (Result.Error _)
+        (do
+          (git-install! &dir &(git-ref-url name) &(git-ref-tag name))
+          (match (IO.read-file &path)
+            (Result.Success text) (Maybe.Just (Pair.init @&path text))
+            (Result.Error _) (the (Maybe (Pair String String)) (Maybe.Nothing)))))))
+
+; reads the file a checkout's name implies: `<repo>.carp`, else `main.carp`.
+(defn read-git-default [name]
   (let [url (git-ref-url name)
         dir (String.concat
           &[(git-cache-root)
