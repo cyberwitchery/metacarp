@@ -1325,11 +1325,15 @@ indexed view when one has been built for this module.")
   (doc entry-request "seeds the `main` function as a specialization demand so it
 is emitted as the program entry point, the way the reference compiler treats
 `main`. Nullary and monomorphic, so its inferred scheme body is its concrete
-type. Empty when the program defines no `main`.")
+type. Empty when the program defines no `main`, and an error, worded as the
+reference words it, when `main` takes arguments or answers something other
+than an `Int` or `()`.")
   (private entry-request)
   (hidden entry-request)
   (defn entry-request [core inferred]
-    (let-do [result (the (Array SpecializationRequest) [])
+    (let-do [result (the
+               (Result (Array SpecializationRequest) SpecializeError)
+               (Result.Success []))
              functions (CoreModule.functions core)
              n (Array.length functions)]
       (for [i 0 n]
@@ -1337,32 +1341,66 @@ type. Empty when the program defines no `main`.")
           (when (String.= (CoreRef.name reference) "main")
             (match (scheme-for (InferredModule.environment inferred) reference)
               (Maybe.Just scheme)
-                (Array.push-back! &result
-                                  (SpecializationRequest.init
-                                    (CallSite.init -1
-                                                   (CoreRef.copy reference)
-                                                   (Box.init
-                                                     (Type.apply (InferredModule.substitution inferred)
-                                                                 (Box.peek (TypeScheme.body &scheme))))
-                                                   (Maybe.Nothing))
-                                    (String.copy "<entry>")))
+                (let [type (Type.apply (InferredModule.substitution inferred)
+                                       (Box.peek (TypeScheme.body &scheme)))]
+                  (set! result
+                        (match (entry-type-error &type)
+                          (Maybe.Just message)
+                            (Result.Error (SpecializeError.init message))
+                          (Maybe.Nothing)
+                            (Result.Success
+                              [(SpecializationRequest.init
+                                 (CallSite.init -1
+                                                (CoreRef.copy reference)
+                                                (Box.init type)
+                                                (Maybe.Nothing))
+                                 (String.copy "<entry>"))]))))
               (Maybe.Nothing) ()))))
       result))
+
+  (private entry-type-error)
+  (hidden entry-type-error)
+  (doc entry-type-error "why a `main` of `type` cannot be the entry point, if it
+cannot.")
+  (defn entry-type-error [type]
+    (match-ref type
+      (MonoType.Function arguments answer)
+        (cond
+          (not (Array.empty? arguments))
+            (Maybe.Just
+              (fmt
+                "The main function may not receive arguments, but it got %d"
+                (Array.length arguments)))
+          (not (Array.empty? &(Type.free-variables (Box.peek answer))))
+            (Maybe.Just
+              @"`main` was generic at build time, it must return either `Int` or `()`.")
+          (match-ref (Box.peek answer)
+            (MonoType.Integer) (Maybe.Nothing)
+            (MonoType.Unit) (Maybe.Nothing)
+            other
+              (Maybe.Just
+                (fmt
+                  "The main function can only return an `Int` or a unit type `()`, but it got `%s`"
+                  &(Type.render other)))))
+      _ (Maybe.Nothing)))
 
   (private root-requests)
   (hidden root-requests)
   (defn root-requests [core inferred]
     (let-do [result (the (Array SpecializationRequest) [])
              calls (root-calls core inferred)
-             n (Array.length &calls)]
+             n (Array.length &calls)
+             entry (entry-request core inferred)]
       (for [i 0 n]
         (Array.push-back! &result
                           (SpecializationRequest.init @(Array.unsafe-nth &calls
                                                                          i)
                                                       (String.copy "<root>"))))
-      (let-do [entries (entry-request core inferred)]
-        (for [i 0 (Array.length &entries)]
-          (Array.push-back! &result @(Array.unsafe-nth &entries i))))
+      (match-ref &entry
+        (Result.Success entries)
+          (for [i 0 (Array.length entries)]
+            (Array.push-back! &result @(Array.unsafe-nth entries i)))
+        _ ())
       ;; every top-level `def` is part of the program even when nothing reads
       ;; it: its initializer runs at startup, so it must be specialized.
       (let-do [values (CoreModule.values core)
@@ -1382,22 +1420,25 @@ type. Empty when the program defines no `main`.")
                                                    (Maybe.Nothing))
                                     (String.copy "<global>")))
               (Maybe.Nothing) ()))))
-      (let-do [sites (the (Array CallSite) [])
-               owner (the (Maybe CoreRef) (Maybe.Nothing))]
-        (match (collect-global-values-from-expressions! (CoreModule.expressions core)
-                                                        inferred
-                                                        &owner
-                                                        &sites)
-          (Result.Success _)
-            (do
-              (let [site-count (Array.length &sites)]
-                (for [i 0 site-count]
-                  (Array.push-back! &result
-                                    (SpecializationRequest.init @(Array.unsafe-nth &sites
-                                                                                   i)
-                                                                (String.copy "<root>")))))
-              (Result.Success result))
-          (Result.Error error) (Result.Error error)))))
+      (match entry
+        (Result.Error error) (Result.Error error)
+        _
+          (let-do [sites (the (Array CallSite) [])
+                   owner (the (Maybe CoreRef) (Maybe.Nothing))]
+            (match (collect-global-values-from-expressions! (CoreModule.expressions core)
+                                                            inferred
+                                                            &owner
+                                                            &sites)
+              (Result.Success _)
+                (do
+                  (let [site-count (Array.length &sites)]
+                    (for [i 0 site-count]
+                      (Array.push-back! &result
+                                        (SpecializationRequest.init @(Array.unsafe-nth &sites
+                                                                                       i)
+                                                                    (String.copy "<root>")))))
+                  (Result.Success result))
+              (Result.Error error) (Result.Error error))))))
 
   (private contextual-specialize-error)
   (hidden contextual-specialize-error)
