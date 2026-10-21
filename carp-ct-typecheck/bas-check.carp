@@ -569,6 +569,11 @@ one takes argument lists of any length, the others their usual arity.")
   (SetVar [Int Int])
   ;; condition, body
   (While [Int Int])
+  ;; a quoted symbol naming a function: its literal type, and the function
+  (CallableSym [Int Int])
+  ;; an expression whose value must not be of a type: what a call evaluates
+  ;; a callee that is a symbol in, where the locals named would shadow it
+  (Exclude [Int Int])
   (Fail [String]))
 
 (def *be-exprs* (the (Array BE) []))
@@ -653,7 +658,7 @@ came from (an inner form's span wins when both lower to one expression).")
   (defn translate-ir [state frame scopes deps ir]
     (match-ref ir
       (CtIR.Lit node) (BAst.lit (BVal.literal (Box.peek node)))
-      (CtIR.Quote node) (BAst.lit (BVal.literal (Box.peek node)))
+      (CtIR.Quote node) (quoted state deps (Box.peek node))
       (CtIR.Sym name _ _) (name-ref state frame scopes deps name false)
       (CtIR.ArgSym name _ _) (name-ref state frame scopes deps name true)
       (CtIR.Coll items _)
@@ -689,7 +694,7 @@ came from (an inner form's span wins when both lower to one expression).")
       (CtIR.CallExpr head args _ _)
         (let [hv (translate state frame scopes deps (Box.peek head))
               vs (translate-all state frame scopes deps args)]
-          (BAst.node! (BE.App hv vs)))
+          (BAst.node! (BE.App (unshadowed state frame scopes hv) vs)))
       (CtIR.Fail message _) (BAst.fail @message)
       (CtIR.While c body _)
         (let [cv (translate state frame scopes deps (Box.peek c))
@@ -1317,12 +1322,67 @@ over a binding, then the binding is called.")
               (builtin-call state frame scopes deps builtin args)
             (Int.>= local 0)
               (let [vs (translate-all state frame scopes deps args)]
-                (BAst.node! (BE.App (BAst.var local) vs)))
+                (BAst.node!
+                  (BE.App (unshadowed state frame scopes (BAst.var local)) vs)))
             (Int.< cell 0)
               (BAst.fail (fmt "unknown compile-time function: %s" name))
             (let [f (global-ref state deps cell)
                   vs (translate-all state frame scopes deps args)]
-              (BAst.node! (BE.App f vs)))))))
+              (BAst.node! (BE.App (unshadowed state frame scopes f) vs)))))))
+
+  (private quoted)
+  (hidden quoted)
+  (doc quoted "a quoted form. A symbol that names a builtin or a definition
+holding a closure is also callable as that function, since applying a symbol
+evaluates it (`ct-semantics.md` §5); it names the function the root frame
+binds it to, which `unshadowed` keeps true where it is called.")
+  (defn quoted [state deps node]
+    (let [lit (BVal.literal node)]
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.Symbol segs)
+          (match (callable-ref state deps &(String.join "." segs))
+            (Maybe.Just f) (BAst.node! (BE.CallableSym lit f))
+            (Maybe.Nothing) (BAst.lit lit))
+        _ (BAst.lit lit))))
+
+  (private callable-ref)
+  (hidden callable-ref)
+  (defn callable-ref [state deps name]
+    (let [cell (BSession.resolve state (CtState.root state) name)]
+      (if (Int.>= cell 0)
+        (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                    &(CtEnv.cell-at cell))
+          (CtValue.Closure _)
+            (if (Map.contains? &*bas-def-cells* &cell)
+              (Maybe.Just (global-ref state deps cell))
+              (Maybe.Nothing))
+          _ (Maybe.Nothing))
+        (let [id (CtLower.builtin-id name)]
+          (if (Int.>= id 0)
+            (Maybe.Just (BAst.node! (BE.Prim id -1)))
+            (Maybe.Nothing))))))
+
+  (private unshadowed)
+  (hidden unshadowed)
+  (doc unshadowed "the callee `f` of a call made where the locals `scopes`
+bind, in a definition whose frame is `frame`: a symbol it holds is evaluated
+there, so it must not be one of their names. A symbol's arrow is what the
+root binds it to, so under any other frame (a closure a module's
+`defdynamic` made) no symbol may be called.")
+  (defn unshadowed [state frame scopes f]
+    (let-do [t (if (Int.= @(FrameId.index frame)
+                          @(FrameId.index (CtState.root state)))
+               (BT.bot)
+               (BT.named "Symbol"))]
+      (for [i 0 (Array.length scopes)]
+        (let [names (BScope.names (Array.unsafe-nth scopes i))]
+          (for [j 0 (Array.length names)]
+            (set! t
+                  (BT.union t
+                            (BT.tag
+                              (BTag.literal (BTag.named "Symbol")
+                                            (Array.unsafe-nth names j))))))))
+      (if (Int.= t (BT.bot)) f (BAst.node! (BE.Exclude f t)))))
 
   (private macro-at)
   (hidden macro-at)
@@ -1486,6 +1546,19 @@ found while typing it is reported at, innermost first.")
         (let-do [tx (typeof env lvl @x)]
           (BSolve.constrain tx (var-type env lvl @v))
           tx)
+        (BE.CallableSym lit f)
+        (if (match-ref (BAst.get @f)
+            (BE.Var v) (Map.contains? &*bas-failed-defs* v)
+            _ false)
+          ;; a definition that does not check: a symbol, not callable
+          @lit
+          (let-do [tf (typeof env lvl @f)
+                   a (BT.fresh-var lvl)
+                   r (BT.fresh-var lvl)]
+            (BSolve.constrain tf (BT.fun a r))
+            (BT.inter @lit (BT.fun a r))))
+        (BE.Exclude x t)
+        (let-do [tx (typeof env lvl @x)] (BSolve.constrain tx (BT.neg @t)) tx)
         (BE.While c b)
         (do
           (BSolve.constrain (typeof env lvl @c) (BT.named "Bool"))

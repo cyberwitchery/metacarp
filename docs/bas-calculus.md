@@ -146,6 +146,20 @@ in the scope of the call (O4).
 to a macro is typed as the macro's expansion, then a builtin of that name is
 applied even when the name is also bound, then the binding is called.
 
+**Calling a symbol.** Applying a form evaluates it once and applies the
+value, so a symbol in head position calls whatever it names where it is
+applied. A quoted symbol `'x` that the root frame binds to a builtin or to a
+definition holding a closure has the type `#Symbol:x ⊓ (α → β)`, where the
+named function's type is below `α → β`; only its arrow is kept, since
+`#Builtin` and `#Closure` are disjoint from `#Symbol`. If that definition
+does not check, `'x` is a plain symbol. A call through a local, a global
+variable or a computed head requires its callee to be outside
+`#Symbol:y₁ ⊔ … ⊔ #Symbol:yₙ`, the names the locals in scope bind there,
+since those would resolve to the local. In a definition whose frame is not
+the root (a closure a module's `defdynamic` made), it requires the callee
+to be outside `#Symbol`: names resolve through the module there, and the
+arrow was taken at the root.
+
 **eval and apply.** `eval : ⊤ → Value`, where `Value` is the type of every
 value (the forms, closures, builtins, macros, and lists and arrays of
 values): the form is typed, the result is whatever its code computes, and
@@ -420,7 +434,13 @@ assuming the implementation matches the cases above. The solver tests
 - Definitions that fail to check (28 of 278 in Core) are not covered, and
   through O5 they weaken the claim for definitions that read globals they
   write.
-- `set!` of a function binding is rejected rather than typed.
+- `set!` of a function binding is rejected rather than typed. No code in
+  Core or the carpentry-org libraries does it. Typing it soundly needs every
+  reader of the binding to see the assignment (a pass over expanded code
+  before typing) or the assigned value checked against the binding's
+  polymorphic type; neither is built, since nothing exercises it.
+- A symbol whose name is not known statically (one read from data, or
+  passed into a macro) is not callable.
 
 Precision losses that are not soundness gaps: no overloads; narrowing only
 on literal answers, and a length compared with a computed bound does not
