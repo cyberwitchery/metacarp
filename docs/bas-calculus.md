@@ -325,6 +325,18 @@ left's tag is already below one of the right's: that bound would be implied,
 and adding it costs (6.1 s against 0.9 s on `eval-form` before memoising,
 with the same outcomes on all of Core).
 
+A disjunct of the right that the left's tag cannot meet is dropped before it
+is split: when `L ⊓ D ≡ ⊥`, `L ≤ D ⊔ R` holds exactly when `L ≤ R` does, so
+the step is an equivalence, not an approximation. "Cannot meet" is read off
+tags only, with the test `meet` already applies (`BTag.glb`): a conjunct
+whose tag has no common descendant with the left's, or a `¬T` whose `T`
+covers it. Each `cond` arm of type tests adds a T-If level
+`(T ⊓ t₁) ⊔ (t₂ ⊓ ¬T ⊓ Obj)` to a parameter's type, and splitting those
+levels is exponential in their number; for a left with a tag only one
+level's branch survives. On `eval-form`, whose parameter has six such
+levels and whose argument is every value, this takes the constraints solved
+from 161,793 to 933. A failure still names the dropped disjuncts.
+
 A recursive type is a variable defined as its body (`BT.define!`), as the
 paper encodes recursive types by bounds. The solver unfolds such a variable
 instead of bounding it, which is the paper's S-Hyp read from the other side:
