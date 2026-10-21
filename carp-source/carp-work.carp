@@ -1,0 +1,83 @@
+(doc WorkStop "is why an optional bounded compiler query stopped. It is not a
+language error and must not be painted as an error in the caller's source.")
+(deftype WorkStop
+  (Cancelled [])
+  (Limit [])
+  (Effect [String]))
+
+(def *work-remaining* -1)
+(def *work-preview* false)
+(def *work-polls* 0)
+(def *work-cancel* (the (Maybe (Fn [] Bool)) (Maybe.Nothing)))
+(def *work-stop* (the (Maybe WorkStop) (Maybe.Nothing)))
+
+(doc WorkBudget "bounds serialized compiler queries. Ordinary compilation has
+no budget. A caller must end the query on both success and returned failure;
+the callback checks cancellation or its own deadline without exposing UI state.")
+(defmodule WorkBudget
+  (doc begin!
+    "starts a bounded query and periodically polls its cancellation callback.")
+  (defn begin! [steps preview cancelled]
+    (do
+      (set! *work-remaining* (Int.max 0 (Int.min steps (Int.dec Int.MAX))))
+      (set! *work-polls* 0)
+      (set! *work-preview* preview)
+      (set! *work-cancel* (Maybe.Just cancelled))
+      (set! *work-stop* (Maybe.Nothing))))
+
+  (doc preview?
+    "whether the current query forbids external compile-time effects.")
+  (defn preview? [] *work-preview*)
+
+  (doc active? "whether this compiler invocation has an optional work limit.")
+  (defn active? [] (Int.>= *work-remaining* 0))
+
+  (doc remaining "the remaining allowance, or -1 during ordinary compilation.")
+  (defn remaining [] *work-remaining*)
+
+  (doc stopped? "whether the current bounded query has stopped.")
+  (defn stopped? [] (Maybe.just? &*work-stop*))
+
+  (doc forbid! "records the first disallowed effect in a preview.")
+  (defn forbid! [effect]
+    (when (Maybe.nothing? &*work-stop*)
+      (set! *work-stop* (Maybe.Just (WorkStop.Effect (String.copy effect))))))
+
+  (doc consume! "charges work before doing it, returning false once stopped.")
+  (defn consume! [cost]
+    (cond
+      (Int.< *work-remaining* 0) true
+      (Maybe.just? &*work-stop*) false
+      (or (Int.< cost 0) (Int.> cost *work-remaining*))
+        (do (set! *work-stop* (Maybe.Just (WorkStop.Limit))) false)
+      (do
+        (when (Int.= (Int.bit-and *work-polls* 63) 0)
+          (match-ref &*work-cancel*
+            (Maybe.Nothing) ()
+            (Maybe.Just cancelled)
+              (when (~cancelled)
+                (set! *work-stop* (Maybe.Just (WorkStop.Cancelled))))))
+        (set! *work-polls* (Int.inc *work-polls*))
+        (set! *work-remaining* (Int.- *work-remaining* cost))
+        (Maybe.nothing? &*work-stop*))))
+
+  (doc reason
+    "describes a stopped query independently of the language diagnostic.")
+  (defn reason []
+    (String.copy
+      (match-ref &*work-stop*
+        (Maybe.Just (WorkStop.Cancelled)) "analysis cancelled"
+        (Maybe.Just (WorkStop.Limit)) "analysis work limit reached"
+        (Maybe.Just (WorkStop.Effect _))
+          "compile-time effect requires an explicit query"
+        _ "analysis stopped")))
+
+  (doc end!
+    "ends the query and returns its stop reason, restoring ordinary compilation.")
+  (defn end! []
+    (let-do [stopped @(ref *work-stop*)]
+      (set! *work-cancel* (Maybe.Nothing))
+      (set! *work-stop* (Maybe.Nothing))
+      (set! *work-remaining* -1)
+      (set! *work-preview* false)
+      stopped)))

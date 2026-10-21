@@ -41,6 +41,7 @@ call it copies three words rather than a syntax tree.")
 (doc CtModuleFrame "records the compile-time frame for one module path.")
 (deftype CtModuleFrame [path String
                         frame FrameId])
+(load "carp-ct-lookup.carp")
 
 (doc CtState "owns the persistent frame-and-cell store for one compile-time
 evaluation session.")
@@ -62,6 +63,8 @@ and width 3 or above means the floating field carries the value.")
 (deftype CtNumber [width Int
                    integral Long
                    floating Double])
+
+(load "carp-ct-work.carp")
 
 ;; the compile-time load stack: the filesystem path of every file whose forms
 ;; are currently being expanded, innermost last. Maintained by the expander
@@ -133,6 +136,8 @@ say what a step in the middle saw.")
 (def *ct-tracing* false)
 (def *ct-trace* (the (Array CtStep) []))
 (def *ct-depth* 0)
+
+(load "carp-ct-checkpoint.carp")
 
 (defmodule CtEval
   (defn reset-load-stack! [] (set! *ct-load-stack* []))
@@ -538,17 +543,7 @@ be affected by one, so it leaves the binding epoch alone.")
 
   (doc module-frame "looks up the compile-time frame for a module path.")
   (defn module-frame [state path]
-    (let-do [result (the (Maybe FrameId) (Maybe.Nothing))
-             modules (CtState.modules state)
-             n (Array.length modules)]
-      (for [i 0 n]
-        (match-ref &result
-          (Maybe.Nothing)
-            (let [entry (Array.unsafe-nth modules i)]
-              (when (= (CtModuleFrame.path entry) path)
-                (set! result (Maybe.Just @(CtModuleFrame.frame entry)))))
-          (Maybe.Just _) ()))
-      result))
+    (CtLookup.module-frame (CtState.modules state) path))
 
   (doc lookup-value "looks up a compile-time binding by name.")
   (defn lookup-value [state frame name]
@@ -559,10 +554,10 @@ ambiguity.")
   (private module-member-lookup)
   (hidden module-member-lookup)
   (defn module-member-lookup [state path local]
-    (match (module-frame state path)
-      (Maybe.Just target)
-        (CtEnv.lookup-status (CtState.environment state) &target local)
-      (Maybe.Nothing) (CtEnvLookup.Missing)))
+    (CtLookup.module-member (CtState.environment state)
+                            (CtState.modules state)
+                            path
+                            local))
 
   (private static-definition-value?)
   (hidden static-definition-value?)
@@ -606,39 +601,11 @@ this runs on every name that resolves to a piece of list syntax.")
       _ false))
 
   (defn lookup-status [state frame name]
-    (match (CtEnv.lookup-status (CtState.environment state) frame name)
-      (CtEnvLookup.Found cell)
-      (if (and (not (String.contains? name \.))
-               (static-definition-value?
-                 (CtEnv.peek-cell (CtState.environment state) &cell)))
-        (match (module-member-lookup state "Dynamic" name)
-          (CtEnvLookup.Found dynamic-cell) (CtEnvLookup.Found dynamic-cell)
-          _ (CtEnvLookup.Found cell))
-        (CtEnvLookup.Found cell))
-      (CtEnvLookup.Ambiguous)
-      (CtEnvLookup.Ambiguous)
-      (CtEnvLookup.Missing)
-      ;; a qualified name reaches into the named module's frame. Compile-time
-      ;; code prefers the `Dynamic` module (the reference resolves `Map.len`
-      ;; in dynamic code to `Dynamic.Map.len`, never the static function).
-      (if (String.contains? name \.)
-        (let-do [segments (String.split-by name &[\.])
-                 segment-count (Array.length &segments)
-                 local (String.copy
-                   (Array.unsafe-nth &segments (Int.dec segment-count)))
-                 module-path (String.join "."
-                                          &(Array.prefix &segments
-                                                         (Int.dec segment-count)))
-                 found (module-member-lookup state
-                                             &(String.concat
-                                               &[@"Dynamic."
-                                                 (String.copy &module-path)])
-                                             &local)]
-          (match found
-            (CtEnvLookup.Missing)
-              (module-member-lookup state &module-path &local)
-            _ found))
-        (module-member-lookup state "Dynamic" name))))
+    (CtLookup.status (CtState.environment state)
+                     (CtState.modules state)
+                     frame
+                     name
+                     &static-definition-value?))
 
   (doc read-cell "copies a compile-time value from a resolved cell.")
   (defn read-cell [state cell]
@@ -721,8 +688,8 @@ that only need syntax parameters; closures and collections return `Nothing`.")
           (match result
             (Result.Success items)
               (Result.Success
-                (SurfaceNode.init @(SurfaceNode.span node)
-                                  (SurfaceForm.Array items)))
+                (SurfaceNode.generated @(SurfaceNode.span node)
+                                       (SurfaceForm.Array items)))
             (Result.Error error) (Result.Error error)))
       _
         (Result.Error
@@ -991,22 +958,24 @@ copying the whole node.")
   (defn syntax-int [call value]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.IntLit value)))))
+        (SurfaceNode.generated @(SurfaceNode.span call)
+                               (SurfaceForm.IntLit value)))))
 
   (private syntax-bool)
   (hidden syntax-bool)
   (defn syntax-bool [call value]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.BoolLit value)))))
+        (SurfaceNode.generated @(SurfaceNode.span call)
+                               (SurfaceForm.BoolLit value)))))
 
   (private syntax-string)
   (hidden syntax-string)
   (defn syntax-string [call value]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call)
-                          (SurfaceForm.StringLit (String.copy value))))))
+        (SurfaceNode.generated @(SurfaceNode.span call)
+                               (SurfaceForm.StringLit (String.copy value))))))
 
   (private syntax-string-collection)
   (hidden syntax-string-collection)
@@ -1018,36 +987,40 @@ copying the whole node.")
         (let [piece (String.from-chars &[@(Array.unsafe-nth &characters i)])]
           (Array.push-back! &items
                             (Box.init
-                              (SurfaceNode.init @(SurfaceNode.span call)
-                                                (SurfaceForm.StringLit piece))))))
+                              (SurfaceNode.generated @(SurfaceNode.span call)
+                                                     (SurfaceForm.StringLit piece))))))
       (if array?
         (CtValue.Syntax
           (Box.init
-            (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.Array items))))
+            (SurfaceNode.generated @(SurfaceNode.span call)
+                                   (SurfaceForm.Array items))))
         (CtValue.Syntax
           (Box.init
-            (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items)))))))
+            (SurfaceNode.generated @(SurfaceNode.span call)
+                                   (SurfaceForm.List items)))))))
 
   (private syntax-char)
   (hidden syntax-char)
   (defn syntax-char [call value]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.CharLit value)))))
+        (SurfaceNode.generated @(SurfaceNode.span call)
+                               (SurfaceForm.CharLit value)))))
 
   (private syntax-empty)
   (hidden syntax-empty)
   (defn syntax-empty [call]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List [])))))
+        (SurfaceNode.generated @(SurfaceNode.span call) (SurfaceForm.List [])))))
 
   (private syntax-symbol)
   (hidden syntax-symbol)
   (defn syntax-symbol [call segments]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.Symbol segments)))))
+        (SurfaceNode.generated @(SurfaceNode.span call)
+                               (SurfaceForm.Symbol segments)))))
 
   (private source-line)
   (hidden source-line)
@@ -1193,21 +1166,21 @@ would give it.")
     (let [width @(CtNumber.width number)]
       (CtValue.Syntax
         (Box.init
-          (SurfaceNode.init @(SurfaceNode.span call)
-                            (cond
-                              (Int.= width 0)
-                                (SurfaceForm.ByteLit
-                                  (Byte.from-int
-                                    (Long.to-int @(CtNumber.integral number))))
-                              (Int.= width 1)
-                                (SurfaceForm.IntLit
-                                  (Long.to-int @(CtNumber.integral number)))
-                              (Int.= width 2)
-                                (SurfaceForm.LongLit @(CtNumber.integral number))
-                              (Int.= width 3)
-                                (SurfaceForm.FloatLit
-                                  (Double.to-float @(CtNumber.floating number)))
-                              (SurfaceForm.DoubleLit @(CtNumber.floating number))))))))
+          (SurfaceNode.generated @(SurfaceNode.span call)
+                                 (cond
+                                   (Int.= width 0)
+                                     (SurfaceForm.ByteLit
+                                       (Byte.from-int
+                                         (Long.to-int @(CtNumber.integral number))))
+                                   (Int.= width 1)
+                                     (SurfaceForm.IntLit
+                                       (Long.to-int @(CtNumber.integral number)))
+                                   (Int.= width 2)
+                                     (SurfaceForm.LongLit @(CtNumber.integral number))
+                                   (Int.= width 3)
+                                     (SurfaceForm.FloatLit
+                                       (Double.to-float @(CtNumber.floating number)))
+                                   (SurfaceForm.DoubleLit @(CtNumber.floating number))))))))
 
   (private ct-arith)
   (hidden ct-arith)
@@ -1377,8 +1350,8 @@ depends on), anything floating divides in the floating domain.")
   (private symbol-node)
   (hidden symbol-node)
   (defn symbol-node [anchor name]
-    (SurfaceNode.init @(SurfaceNode.span anchor)
-                      (SurfaceForm.Symbol [(String.copy name)])))
+    (SurfaceNode.generated @(SurfaceNode.span anchor)
+                           (SurfaceForm.Symbol [(String.copy name)])))
 
   (private call-node)
   (hidden call-node)
@@ -1392,7 +1365,7 @@ depends on), anything floating divides in the floating domain.")
                           (Box.init
                             (SurfaceNode.copy
                               (Box.peek (Array.unsafe-nth arguments i))))))
-      (SurfaceNode.init @(SurfaceNode.span anchor) (SurfaceForm.List items))))
+      (SurfaceNode.generated @(SurfaceNode.span anchor) (SurfaceForm.List items))))
 
   (defn call-node-with-head [anchor head arguments]
     (let-do [items [(Box.init (SurfaceNode.copy head))]
@@ -1402,7 +1375,7 @@ depends on), anything floating divides in the floating domain.")
                           (Box.init
                             (SurfaceNode.copy
                               (Box.peek (Array.unsafe-nth arguments i))))))
-      (SurfaceNode.init @(SurfaceNode.span anchor) (SurfaceForm.List items))))
+      (SurfaceNode.generated @(SurfaceNode.span anchor) (SurfaceForm.List items))))
 
   (private ref-node)
   (hidden ref-node)
@@ -1426,7 +1399,7 @@ depends on), anything floating divides in the floating domain.")
   (defn list-with-items [call items]
     (CtValue.Syntax
       (Box.init
-        (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items)))))
+        (SurfaceNode.generated @(SurfaceNode.span call) (SurfaceForm.List items)))))
 
   (defn list-or-collection [call values]
     (match (syntax-arguments call values)
@@ -1443,16 +1416,16 @@ depends on), anything floating divides in the floating domain.")
               (Result.Success items)
                 (CtValue.Syntax
                   (Box.init
-                    (SurfaceNode.init @(SurfaceNode.span call)
-                                      (SurfaceForm.Array items))))
+                    (SurfaceNode.generated @(SurfaceNode.span call)
+                                           (SurfaceForm.Array items))))
               (Result.Error _) (CtValue.Collection @values))
           (SurfaceForm.StaticArray _)
             (match (syntax-arguments call values)
               (Result.Success items)
                 (CtValue.Syntax
                   (Box.init
-                    (SurfaceNode.init @(SurfaceNode.span call)
-                                      (SurfaceForm.StaticArray items))))
+                    (SurfaceNode.generated @(SurfaceNode.span call)
+                                           (SurfaceForm.StaticArray items))))
               (Result.Error _) (CtValue.Collection @values))
           _ (list-or-collection call values))
       _ (list-or-collection call values)))
@@ -1688,11 +1661,11 @@ list's tail is copied once, straight into the result.")
                           (Box.init
                             (CtValue.Syntax
                               (Box.init
-                                (SurfaceNode.init @(SurfaceNode.span call)
-                                                  (SurfaceForm.StringLit
-                                                    @(Array.unsafe-nth &*ct-load-stack*
-                                                                       (Int.- (Int.dec n)
-                                                                              i)))))))))
+                                (SurfaceNode.generated @(SurfaceNode.span call)
+                                                       (SurfaceForm.StringLit
+                                                         @(Array.unsafe-nth &*ct-load-stack*
+                                                                            (Int.- (Int.dec n)
+                                                                                   i)))))))))
       (CtValue.Collection items)))
 
   (private string-list-syntax)
@@ -1704,15 +1677,15 @@ array of them when `array?`.")
       (for [i 0 (Array.length strings)]
         (Array.push-back! &items
                           (Box.init
-                            (SurfaceNode.init @(SurfaceNode.span call)
-                                              (SurfaceForm.StringLit @(Array.unsafe-nth strings
-                                                                                        i))))))
+                            (SurfaceNode.generated @(SurfaceNode.span call)
+                                                   (SurfaceForm.StringLit @(Array.unsafe-nth strings
+                                                                                             i))))))
       (CtValue.Syntax
         (Box.init
-          (SurfaceNode.init @(SurfaceNode.span call)
-                            (if array?
-                              (SurfaceForm.Array items)
-                              (SurfaceForm.List items)))))))
+          (SurfaceNode.generated @(SurfaceNode.span call)
+                                 (if array?
+                                   (SurfaceForm.Array items)
+                                   (SurfaceForm.List items)))))))
 
   (private config-strings)
   (hidden config-strings)
@@ -1786,12 +1759,12 @@ with the reference's rules for what each key accepts.")
               (if (or (String.= text "short") (String.= text "full"))
                 (do
                   (record-config! key
-                                  &(SurfaceNode.init @(SurfaceNode.span value)
-                                                     (SurfaceForm.StringLit
-                                                       (if (String.= text
-                                                                     "short")
-                                                         @"ShortPath"
-                                                         @"FullPath"))))
+                                  &(SurfaceNode.generated @(SurfaceNode.span value)
+                                                          (SurfaceForm.StringLit
+                                                            (if (String.= text
+                                                                          "short")
+                                                              @"ShortPath"
+                                                              @"FullPath"))))
                   done)
                 (config-error call key "takes \"short\" or \"full\""))
               (do (record-config! key value) done))
@@ -1823,8 +1796,8 @@ set for `key`, or the reference's default.")
             (Result.Success
               (CtValue.Syntax
                 (Box.init
-                  (SurfaceNode.init @(SurfaceNode.span call)
-                                    @(SurfaceNode.form &node)))))
+                  (SurfaceNode.generated @(SurfaceNode.span call)
+                                         @(SurfaceNode.form &node)))))
           (Maybe.Nothing)
             (cond
               (Int.= kind 0)
@@ -1840,697 +1813,710 @@ set for `key`, or the reference's default.")
   (private apply-builtin)
   (hidden apply-builtin)
   (defn apply-builtin [call id values]
-    (cond
-      (Int.= id 0)
-      (Maybe.Just (Result.Success (load-stack-value call)))
-      (Int.= id 1)
-      (Maybe.Just (Result.Success (list-or-collection call values)))
-      (Int.= id 2)
-      (match (syntax-arguments call values)
-        (Result.Success items)
-          (Maybe.Just
-            (Result.Success
-              (CtValue.Syntax
-                (Box.init
-                  (SurfaceNode.init @(SurfaceNode.span call)
-                                    (SurfaceForm.Array items))))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 3)
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (symbol-from-value call &value))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 4)
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (concat-symbols call &value))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 5)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right)
-              (Maybe.Just (prefix-symbols call &left &right))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 6) (Int.= id 7))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (list-item call &value 0))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 8) (Int.= id 9))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (list-tail call &value 1))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 10) (Int.= id 11))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (list-item call &value 1))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 12) (Int.= id 13))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (list-item call &value 2))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 14) (Int.= id 15))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (list-item call &value 3))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 16) (Int.= id 17))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (list-tail call &value 2))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 18) (Int.= id 19))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (list-item call &value 1)
-            (Result.Success nested) (Maybe.Just (list-item call &nested 0))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 20) (Int.= id 21))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (list-item call &value 1)
-            (Result.Success nested) (Maybe.Just (list-tail call &nested 1))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 22) (Int.= id 23))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (let [items-result (collection-values call &value)]
-            (match-ref &items-result
-              (Result.Success items)
-                (Maybe.Just
-                  (list-item call &value (Int.dec (Array.length items))))
-              (Result.Error error) (Maybe.Just (Result.Error @error))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 24) (Int.= id 25))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (let [items-result (collection-values call &value)]
-            (match-ref &items-result
-              (Result.Success items)
-                (Maybe.Just
-                  (list-prefix call &value (Int.dec (Array.length items))))
-              (Result.Error error) (Maybe.Just (Result.Error @error))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 26) (Int.= id 27))
-      (match (value-at call values 0)
-        (Result.Success first)
-          (match (value-at call values 1)
-            (Result.Success rest)
-              (let [items-result (collection-values call &rest)]
-                (match-ref &items-result
-                  (Result.Success rest-items)
-                    (Maybe.Just
-                      (Result.Success
-                        (let [combined (append-values [(Box.init first)]
-                                                      rest-items)]
-                          (list-or-collection call &combined))))
-                  (Result.Error error) (Maybe.Just (Result.Error @error))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 28) (Int.= id 29))
-      (match (value-at call values 0)
-        (Result.Success last-value)
-          (match (value-at call values 1)
-            (Result.Success initial)
-              (let [items-result (collection-values call &initial)]
-                (match-ref &items-result
-                  (Result.Success initial-items)
-                    (Maybe.Just
-                      (Result.Success
-                        (let [combined (Array.push-back @initial-items
-                                                        (Box.init last-value))]
-                          (list-or-collection call &combined))))
-                  (Result.Error error) (Maybe.Just (Result.Error @error))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 30) (Int.= id 31))
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right)
-              (let [left-result (collection-values call &left)
-                    right-result (collection-values call &right)]
-                (match-ref &left-result
-                  (Result.Success left-items)
-                    (match-ref &right-result
-                      (Result.Success right-items)
-                        (Maybe.Just
-                          (Result.Success
-                            (let [combined (append-values @left-items
-                                                          right-items)]
-                              (collection-like call &left &combined))))
-                      (Result.Error error) (Maybe.Just (Result.Error @error)))
-                  (Result.Error error) (Maybe.Just (Result.Error @error))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 32) (Int.= id 33))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (let [items-result (collection-values call &value)]
-            (match-ref &items-result
-              (Result.Success items)
-                (Maybe.Just
-                  (Result.Success (syntax-int call (Array.length items))))
-              (Result.Error error) (Maybe.Just (Result.Error @error))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 34) (Int.= id 35))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (let [items-result (collection-values call &value)]
-            (match-ref &items-result
-              (Result.Success items)
-                (Maybe.Just
-                  (Result.Success
-                    (syntax-bool call (Int.= 0 (Array.length items)))))
-              (Result.Error error) (Maybe.Just (Result.Error @error))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 36) (Int.= id 37))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (syntax-from-value call &value)
-            (Result.Success node)
-              (match-ref (SurfaceNode.form &node)
-                (SurfaceForm.List _)
-                  (Maybe.Just (Result.Success (syntax-bool call true)))
-                _ (Maybe.Just (Result.Success (syntax-bool call false))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 38) (Int.= id 39))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (syntax-from-value call &value)
-            (Result.Success node)
-              (match-ref (SurfaceNode.form &node)
-                (SurfaceForm.Array _)
-                  (Maybe.Just (Result.Success (syntax-bool call true)))
-                _ (Maybe.Just (Result.Success (syntax-bool call false))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 40)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (bool-argument call &value)
-            (Result.Success boolean)
-              (Maybe.Just (Result.Success (syntax-bool call (not boolean))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 41)
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (dynamic-type call &value))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 42) (Int.= id 43))
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right)
-              (match (syntax-from-value call &left)
-                (Result.Success left-node)
-                  (match (syntax-from-value call &right)
-                    (Result.Success right-node)
+    (if (CtWork.charge-values! values)
+      (cond
+        (Int.= id 0)
+        (Maybe.Just (Result.Success (load-stack-value call)))
+        (Int.= id 1)
+        (Maybe.Just (Result.Success (list-or-collection call values)))
+        (Int.= id 2)
+        (match (syntax-arguments call values)
+          (Result.Success items)
+            (Maybe.Just
+              (Result.Success
+                (CtValue.Syntax
+                  (Box.init
+                    (SurfaceNode.generated @(SurfaceNode.span call)
+                                           (SurfaceForm.Array items))))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 3)
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (symbol-from-value call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 4)
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (concat-symbols call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 5)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (Maybe.Just (prefix-symbols call &left &right))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 6) (Int.= id 7))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 0))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 8) (Int.= id 9))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-tail call &value 1))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 10) (Int.= id 11))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 1))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 12) (Int.= id 13))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 2))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 14) (Int.= id 15))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-item call &value 3))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 16) (Int.= id 17))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (list-tail call &value 2))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 18) (Int.= id 19))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (list-item call &value 1)
+              (Result.Success nested) (Maybe.Just (list-item call &nested 0))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 20) (Int.= id 21))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (list-item call &value 1)
+              (Result.Success nested) (Maybe.Just (list-tail call &nested 1))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 22) (Int.= id 23))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (list-item call &value (Int.dec (Array.length items))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 24) (Int.= id 25))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (list-prefix call &value (Int.dec (Array.length items))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 26) (Int.= id 27))
+        (match (value-at call values 0)
+          (Result.Success first)
+            (match (value-at call values 1)
+              (Result.Success rest)
+                (let [items-result (collection-values call &rest)]
+                  (match-ref &items-result
+                    (Result.Success rest-items)
                       (Maybe.Just
                         (Result.Success
-                          (syntax-bool call
-                                       (syntax-equal? &left-node &right-node))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      ;; `mod`, `imod`, `neg`, `inc`, and `dec` are deliberately NOT builtins:
-      ;; the reference defines them as Core dynamic functions (Dynamic.carp)
-      ;; on top of these four commands, and a builtin here would shadow the
-      ;; real definitions (builtins win over same-named definitions, like the
-      ;; reference's command dispatch).
-      (Int.= id 44)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right) (Maybe.Just (ct-arith call 0 &left &right))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 45)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right) (Maybe.Just (ct-arith call 1 &left &right))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 46)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right) (Maybe.Just (ct-arith call 2 &left &right))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 47)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right) (Maybe.Just (ct-divide call &left &right))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 48)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (syntax-from-value call &value)
-            (Result.Success node)
-              (match (ct-number-from-node &node)
-                (Maybe.Just number)
-                ;; an integral number rounds to itself, width and all; a
-                ;; floating one rounds half-to-even to Int, both like the
-                ;; reference (Haskell `round`, commandRound).
-                (if (Int.< @(CtNumber.width &number) 3)
-                  (Maybe.Just (Result.Success (CtValue.Syntax (Box.init node))))
-                  (let-do [x @(CtNumber.floating &number)
-                           floored (Double.floor x)
-                           difference (Double.- x floored)
-                           base (Double.to-int floored)]
-                    (Maybe.Just
-                      (Result.Success
-                        (syntax-int call
-                                    (cond
-                                      (Double.< difference 0.5) base
-                                      (Double.> difference 0.5) (Int.inc base)
-                                      (Int.= 0 (Int.mod base 2)) base
-                                      (Int.inc base)))))))
-                (Maybe.Nothing)
-                (Maybe.Just
-                  (Result.Error
-                    (error-at call
-                              @"compile-time operation expects numeric syntax"))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 49)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right)
-              (match (number-argument call &left)
-                (Result.Success left-number)
-                  (match (number-argument call &right)
-                    (Result.Success right-number)
+                          (let [combined (append-values [(Box.init first)]
+                                                        rest-items)]
+                            (list-or-collection call &combined))))
+                    (Result.Error error) (Maybe.Just (Result.Error @error))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 28) (Int.= id 29))
+        (match (value-at call values 0)
+          (Result.Success last-value)
+            (match (value-at call values 1)
+              (Result.Success initial)
+                (let [items-result (collection-values call &initial)]
+                  (match-ref &items-result
+                    (Result.Success initial-items)
                       (Maybe.Just
                         (Result.Success
-                          (syntax-bool call (Double.> left-number right-number))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 50)
-      (match (value-at call values 0)
-        (Result.Success left)
-          (match (value-at call values 1)
-            (Result.Success right)
-              (match (number-argument call &left)
-                (Result.Success left-number)
-                  (match (number-argument call &right)
-                    (Result.Success right-number)
-                      (Maybe.Just
-                        (Result.Success
-                          (syntax-bool call (Double.< left-number right-number))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 51)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (let [characters (String.chars &source)]
-                (Maybe.Just
-                  (Result.Success (syntax-int call (Array.length &characters)))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 52)
-      (match (value-at call values 0)
-        (Result.Success source-value)
-          (match (value-at call values 1)
-            (Result.Success char-value)
-              (match (string-argument call &source-value)
-                (Result.Success source)
-                  (match (char-argument call &char-value)
-                    (Result.Success character)
-                      (let-do [characters (String.chars &source)
-                               index -1
-                               n (Array.length &characters)]
-                        (for [i 0 n]
-                          (when (and (Int.= index -1)
-                                     (Char.= @(Array.unsafe-nth &characters i)
-                                             character))
-                            (set! index i)))
-                        (Maybe.Just (Result.Success (syntax-int call index))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 53)
-      (match (value-at call values 0)
-        (Result.Success source-value)
-          (match (value-at call values 1)
-            (Result.Success index-value)
-              (match (string-argument call &source-value)
-                (Result.Success source)
-                  (match (int-argument call &index-value)
-                    (Result.Success index)
-                      (let [characters (String.chars &source)]
-                        ;; bounds-checked like the reference command
-                        ;; (Commands.hs commandCharAt), in Unicode character
-                        ;; indices rather than UTF-8 byte offsets.
-                        (if (or (Int.< index 0)
-                                (Int.>= index (Array.length &characters)))
-                          (Maybe.Just
-                            (Result.Error
-                              (error-at call
-                                        (String.concat
-                                          &[@"Can't call char-at with \""
-                                            (String.copy &source)
-                                            @"\" and "
-                                            (Int.str index)
-                                            @", index too large"]))))
+                          (let [combined (Array.push-back @initial-items
+                                                          (Box.init last-value))]
+                            (list-or-collection call &combined))))
+                    (Result.Error error) (Maybe.Just (Result.Error @error))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 30) (Int.= id 31))
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (let [left-result (collection-values call &left)
+                      right-result (collection-values call &right)]
+                  (match-ref &left-result
+                    (Result.Success left-items)
+                      (match-ref &right-result
+                        (Result.Success right-items)
                           (Maybe.Just
                             (Result.Success
-                              (syntax-char call
-                                           @(Array.unsafe-nth &characters index))))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 54)
-      (match (value-at call values 0)
-        (Result.Success source-value)
-          (match (value-at call values 1)
-            (Result.Success start-value)
-              (match (value-at call values 2)
-                (Result.Success end-value)
-                  (match (string-argument call &source-value)
-                    (Result.Success source)
-                      (match (int-argument call &start-value)
-                        (Result.Success start)
-                          (match (int-argument call &end-value)
-                            (Result.Success end)
-                              (if (Int.> start end)
-                                (Maybe.Just
-                                  (Result.Error
-                                    (error-at call
-                                              @"String.slice stop index must not precede start")))
-                                (let [characters (String.chars &source)
-                                      count (Array.length &characters)
-                                      lo (Int.max 0 start)
-                                      hi (Int.min count end)
-                                      slice (if (Int.>= lo hi)
-                                        @""
-                                        (String.from-chars &(Array.slice &characters
-                                                                         lo
-                                                                         hi)))]
-                                  (Maybe.Just
-                                    (Result.Success (syntax-string call &slice)))))
-                            (Result.Error error)
-                              (Maybe.Just (Result.Error error)))
-                        (Result.Error error) (Maybe.Just (Result.Error error)))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 55)
-      (match (value-at call values 0)
-        (Result.Success source-value)
-          (match (value-at call values 1)
-            (Result.Success end-value)
-              (match (string-argument call &source-value)
-                (Result.Success source)
-                  (match (int-argument call &end-value)
-                    (Result.Success end)
-                      (let [prefix (String.prefix &source end)]
+                              (let [combined (append-values @left-items
+                                                            right-items)]
+                                (collection-like call &left &combined))))
+                        (Result.Error error) (Maybe.Just (Result.Error @error)))
+                    (Result.Error error) (Maybe.Just (Result.Error @error))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 32) (Int.= id 33))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (Result.Success (syntax-int call (Array.length items))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 34) (Int.= id 35))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (let [items-result (collection-values call &value)]
+              (match-ref &items-result
+                (Result.Success items)
+                  (Maybe.Just
+                    (Result.Success
+                      (syntax-bool call (Int.= 0 (Array.length items)))))
+                (Result.Error error) (Maybe.Just (Result.Error @error))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 36) (Int.= id 37))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success node)
+                (match-ref (SurfaceNode.form &node)
+                  (SurfaceForm.List _)
+                    (Maybe.Just (Result.Success (syntax-bool call true)))
+                  _ (Maybe.Just (Result.Success (syntax-bool call false))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 38) (Int.= id 39))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success node)
+                (match-ref (SurfaceNode.form &node)
+                  (SurfaceForm.Array _)
+                    (Maybe.Just (Result.Success (syntax-bool call true)))
+                  _ (Maybe.Just (Result.Success (syntax-bool call false))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 40)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (bool-argument call &value)
+              (Result.Success boolean)
+                (Maybe.Just (Result.Success (syntax-bool call (not boolean))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 41)
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (dynamic-type call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 42) (Int.= id 43))
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (syntax-from-value call &left)
+                  (Result.Success left-node)
+                    (match (syntax-from-value call &right)
+                      (Result.Success right-node)
                         (Maybe.Just
-                          (Result.Success (syntax-string call &prefix))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 56)
-      (match (value-at call values 0)
-        (Result.Success source-value)
-          (match (value-at call values 1)
-            (Result.Success start-value)
-              (match (string-argument call &source-value)
-                (Result.Success source)
-                  (match (int-argument call &start-value)
-                    (Result.Success start)
-                      (let [suffix (String.suffix &source start)]
-                        (Maybe.Just
-                          (Result.Success (syntax-string call &suffix))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 57)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (Maybe.Just
-                ;; Compile-time String commands follow the reference
-                ;; evaluator's dynamic API, where `String.head` returns a
-                ;; one-character String. The runtime/static Core function
-                ;; returns Char, but leaking that type here breaks macros
-                ;; which immediately compose the result with String.concat.
-                (Result.Success (syntax-string call &(String.slice &source 0 1))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 58)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (let [tail (String.tail &source)]
-                (Maybe.Just (Result.Success (syntax-string call &tail))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 59)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (Maybe.Just
-                (Result.Success (syntax-bool call (String.empty? &source))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 60) (Int.= id 61))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (Maybe.Just
-                (Result.Success (syntax-string-collection call &source false)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 62) (Int.= id 63))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (Maybe.Just
-                (Result.Success (syntax-string-collection call &source true)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 64)
-      (match (value-at call values 0)
-        (Result.Success left-value)
-          (match (value-at call values 1)
-            (Result.Success right-value)
-              (match (string-argument call &left-value)
-                (Result.Success left)
-                  (match (string-argument call &right-value)
-                    (Result.Success right)
-                      (let [appended (String.append &left &right)]
-                        (Maybe.Just
-                          (Result.Success (syntax-string call &appended))))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
-                (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 65) (Int.= id 66))
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (concat-strings call &value))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 67)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success source)
-              (match (Surface.parse &source)
-                (Result.Success module)
-                  (let [forms (SurfaceModule.forms &module)]
-                    (if (Int.= (Array.length forms) 1)
+                          (Result.Success
+                            (syntax-bool call
+                                         (syntax-equal? &left-node &right-node))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        ;; `mod`, `imod`, `neg`, `inc`, and `dec` are deliberately NOT builtins:
+        ;; the reference defines them as Core dynamic functions (Dynamic.carp)
+        ;; on top of these four commands, and a builtin here would shadow the
+        ;; real definitions (builtins win over same-named definitions, like the
+        ;; reference's command dispatch).
+        (Int.= id 44)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right) (Maybe.Just (ct-arith call 0 &left &right))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 45)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right) (Maybe.Just (ct-arith call 1 &left &right))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 46)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right) (Maybe.Just (ct-arith call 2 &left &right))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 47)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right) (Maybe.Just (ct-divide call &left &right))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 48)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success node)
+                (match (ct-number-from-node &node)
+                  (Maybe.Just number)
+                  ;; an integral number rounds to itself, width and all; a
+                  ;; floating one rounds half-to-even to Int, both like the
+                  ;; reference (Haskell `round`, commandRound).
+                  (if (Int.< @(CtNumber.width &number) 3)
+                    (Maybe.Just
+                      (Result.Success (CtValue.Syntax (Box.init node))))
+                    (let-do [x @(CtNumber.floating &number)
+                             floored (Double.floor x)
+                             difference (Double.- x floored)
+                             base (Double.to-int floored)]
                       (Maybe.Just
                         (Result.Success
-                          (CtValue.Syntax
-                            (Box.init
-                              (SurfaceNode.copy (Box.peek (Array.unsafe-nth forms
-                                                                            0)))))))
-                      (Maybe.Just
-                        (Result.Error
-                          (error-at call @"parse expects exactly one form")))))
-                (Result.Error message)
-                  (Maybe.Just (Result.Error (error-at call (str &message)))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 68)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success path)
-              (let [directory (path-directory &path)]
-                (Maybe.Just (Result.Success (syntax-string call &directory))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 69)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success path)
-              (let [direct-result (IO.read-file &path)]
-                (match-ref &direct-result
-                  (Result.Success text)
-                  (Maybe.Just (Result.Success (syntax-string call text)))
-                  (Result.Error _)
-                  ;; a path that misses from the invocation directory is
-                  ;; retried against the reference checkout ($CARP_DIR,
-                  ;; falling back to the sibling layout), matching where
-                  ;; core sources resolve their own compile-time reads.
-                  (let [root (match (IO.getenv "CARP_DIR")
-                          (Maybe.Just dir) (String.append &dir "/")
-                          (Maybe.Nothing) @"../../carp/")
-                        fallback (String.concat &[root path])
-                        fallback-result (IO.read-file &fallback)]
-                    (match-ref &fallback-result
-                      (Result.Success text)
-                        (Maybe.Just (Result.Success (syntax-string call text)))
-                      (Result.Error error)
+                          (syntax-int call
+                                      (cond
+                                        (Double.< difference 0.5) base
+                                        (Double.> difference 0.5) (Int.inc base)
+                                        (Int.= 0 (Int.mod base 2)) base
+                                        (Int.inc base)))))))
+                  (Maybe.Nothing)
+                  (Maybe.Just
+                    (Result.Error
+                      (error-at call
+                                @"compile-time operation expects numeric syntax"))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 49)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (number-argument call &left)
+                  (Result.Success left-number)
+                    (match (number-argument call &right)
+                      (Result.Success right-number)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-bool call
+                                         (Double.> left-number right-number))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 50)
+        (match (value-at call values 0)
+          (Result.Success left)
+            (match (value-at call values 1)
+              (Result.Success right)
+                (match (number-argument call &left)
+                  (Result.Success left-number)
+                    (match (number-argument call &right)
+                      (Result.Success right-number)
+                        (Maybe.Just
+                          (Result.Success
+                            (syntax-bool call
+                                         (Double.< left-number right-number))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 51)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (let [characters (String.chars &source)]
+                  (Maybe.Just
+                    (Result.Success (syntax-int call (Array.length &characters)))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 52)
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success char-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (char-argument call &char-value)
+                      (Result.Success character)
+                        (let-do [characters (String.chars &source)
+                                 index -1
+                                 n (Array.length &characters)]
+                          (for [i 0 n]
+                            (when (and (Int.= index -1)
+                                       (Char.= @(Array.unsafe-nth &characters i)
+                                               character))
+                              (set! index i)))
+                          (Maybe.Just (Result.Success (syntax-int call index))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 53)
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success index-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (int-argument call &index-value)
+                      (Result.Success index)
+                        (let [characters (String.chars &source)]
+                          ;; bounds-checked like the reference command
+                          ;; (Commands.hs commandCharAt), in Unicode character
+                          ;; indices rather than UTF-8 byte offsets.
+                          (if (or (Int.< index 0)
+                                  (Int.>= index (Array.length &characters)))
+                            (Maybe.Just
+                              (Result.Error
+                                (error-at call
+                                          (String.concat
+                                            &[@"Can't call char-at with \""
+                                              (String.copy &source)
+                                              @"\" and "
+                                              (Int.str index)
+                                              @", index too large"]))))
+                            (Maybe.Just
+                              (Result.Success
+                                (syntax-char call
+                                             @(Array.unsafe-nth &characters
+                                                                index))))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 54)
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success start-value)
+                (match (value-at call values 2)
+                  (Result.Success end-value)
+                    (match (string-argument call &source-value)
+                      (Result.Success source)
+                        (match (int-argument call &start-value)
+                          (Result.Success start)
+                            (match (int-argument call &end-value)
+                              (Result.Success end)
+                                (if (Int.> start end)
+                                  (Maybe.Just
+                                    (Result.Error
+                                      (error-at call
+                                                @"String.slice stop index must not precede start")))
+                                  (let [characters (String.chars &source)
+                                        count (Array.length &characters)
+                                        lo (Int.max 0 start)
+                                        hi (Int.min count end)
+                                        slice (if (Int.>= lo hi)
+                                          @""
+                                          (String.from-chars &(Array.slice &characters
+                                                                           lo
+                                                                           hi)))]
+                                    (Maybe.Just
+                                      (Result.Success (syntax-string call &slice)))))
+                              (Result.Error error)
+                                (Maybe.Just (Result.Error error)))
+                          (Result.Error error) (Maybe.Just (Result.Error error)))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 55)
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success end-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (int-argument call &end-value)
+                      (Result.Success end)
+                        (let [prefix (String.prefix &source end)]
+                          (Maybe.Just
+                            (Result.Success (syntax-string call &prefix))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 56)
+        (match (value-at call values 0)
+          (Result.Success source-value)
+            (match (value-at call values 1)
+              (Result.Success start-value)
+                (match (string-argument call &source-value)
+                  (Result.Success source)
+                    (match (int-argument call &start-value)
+                      (Result.Success start)
+                        (let [suffix (String.suffix &source start)]
+                          (Maybe.Just
+                            (Result.Success (syntax-string call &suffix))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 57)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  ;; Compile-time String commands follow the reference
+                  ;; evaluator's dynamic API, where `String.head` returns a
+                  ;; one-character String. The runtime/static Core function
+                  ;; returns Char, but leaking that type here breaks macros
+                  ;; which immediately compose the result with String.concat.
+                  (Result.Success
+                    (syntax-string call &(String.slice &source 0 1))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 58)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (let [tail (String.tail &source)]
+                  (Maybe.Just (Result.Success (syntax-string call &tail))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 59)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-bool call (String.empty? &source))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 60) (Int.= id 61))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-string-collection call &source false)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 62) (Int.= id 63))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (Maybe.Just
+                  (Result.Success (syntax-string-collection call &source true)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 64)
+        (match (value-at call values 0)
+          (Result.Success left-value)
+            (match (value-at call values 1)
+              (Result.Success right-value)
+                (match (string-argument call &left-value)
+                  (Result.Success left)
+                    (match (string-argument call &right-value)
+                      (Result.Success right)
+                        (let [appended (String.append &left &right)]
+                          (Maybe.Just
+                            (Result.Success (syntax-string call &appended))))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 65) (Int.= id 66))
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (concat-strings call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 67)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success source)
+                (match (Surface.parse &source)
+                  (Result.Success module)
+                    (let [forms (SurfaceModule.forms &module)]
+                      (if (Int.= (Array.length forms) 1)
+                        (Maybe.Just
+                          (Result.Success
+                            (CtValue.Syntax
+                              (Box.init
+                                (SurfaceNode.copy (Box.peek (Array.unsafe-nth forms
+                                                                              0)))))))
                         (Maybe.Just
                           (Result.Error
-                            (error-at call
-                                      (String.append "read-file failed: " error))))))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 70)
-      (match (source-position-node call values)
-        (Result.Success node)
-          (Maybe.Just (Result.Success (syntax-int call (source-line &node))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 71)
-      (match (source-position-node call values)
-        (Result.Success node)
-          (Maybe.Just (Result.Success (syntax-int call (source-column &node))))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 72)
-      (Maybe.Just (Result.Success (syntax-string call "unknown")))
-      (Int.= id 73)
-      (Maybe.Just (Result.Success (syntax-empty call)))
-      ;; the build commands are dynamic functions in the reference; applying
-      ;; one at compile time records its effect for the pipeline
-      (Int.= id 74)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success path)
-              (do
-                (Array.push-back! &*ct-pending-includes*
-                                  (SurfaceNode.init @(SurfaceNode.span call)
-                                                    (SurfaceForm.List
-                                                      [(Box.init
-                                                         (SurfaceNode.init @(SurfaceNode.span call)
-                                                                           (SurfaceForm.Symbol [@"system-include"])))
-                                                       (Box.init
-                                                         (SurfaceNode.init @(SurfaceNode.span call)
-                                                                           (SurfaceForm.StringLit path)))])))
-                (Maybe.Just (Result.Success (syntax-empty call))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (or (Int.= id 75) (or (Int.= id 76) (Int.= id 77)))
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success flag)
-              (do
-                (record-build-command!
-                  (cond
-                    (Int.= id 76) "add-lib"
-                    (Int.= id 77) "add-pkg"
-                    "add-cflag")
-                  &flag)
-                (Maybe.Just (Result.Success (syntax-empty call))))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 78)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (syntax-from-value call &value)
-            (Result.Success syntax)
-            ;; `str` of a string is the string itself; quoting is `prn`'s job.
-            (match-ref (SurfaceNode.form &syntax)
-              (SurfaceForm.StringLit text)
-                (Maybe.Just (Result.Success (syntax-string call text)))
-              _
-                (let [rendered (str &syntax)]
-                  (Maybe.Just (Result.Success (syntax-string call &rendered)))))
-            (Result.Error error)
-            (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 79)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (syntax-from-value call &value)
-            (Result.Success syntax)
-            ;; any deterministic hash works: dynamic maps only need
-            ;; internal consistency, and the suite compares unordered.
-            (let-do [rendered (str &syntax)
-                     hashed 5381
-                     n (String.length &rendered)]
-              (for [i 0 n]
-                (set! hashed
-                      (Int.bit-and 1073741823
-                                   (Int.+ (Int.* hashed 33)
-                                          (Char.to-int (String.char-at &rendered
-                                                                       i))))))
-              (Maybe.Just (Result.Success (syntax-int call hashed))))
-            (Result.Error error)
-            (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 80)
-      (match (value-at call values 0)
-        (Result.Success value)
-          (match (string-argument call &value)
-            (Result.Success message)
-              (Maybe.Just (Result.Error (error-at call message)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 81)
-      (match (value-at call values 0)
-        (Result.Success value) (Maybe.Just (symbol-to-string call &value))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      ;; the project configuration is compile-time state, not a definition a
-      ;; prelude could hold: setting a key is observable to every later read
-      (Int.= id 82)
-      (match (value-at call values 0)
-        (Result.Success key)
-          (match (string-argument call &key)
-            (Result.Success name)
-              (match (value-at call values 1)
-                (Result.Success value)
-                  (match (syntax-from-value call &value)
-                    (Result.Success node)
-                      (Maybe.Just (configure call &name &node))
-                    (Result.Error error) (Maybe.Just (Result.Error error)))
+                            (error-at call @"parse expects exactly one form")))))
+                  (Result.Error message)
+                    (Maybe.Just (Result.Error (error-at call (str &message)))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 68)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success path)
+                (let [directory (path-directory &path)]
+                  (Maybe.Just (Result.Success (syntax-string call &directory))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 69)
+        (if (WorkBudget.preview?)
+          (do
+            (WorkBudget.forbid! "read-file")
+            (Maybe.Just (Result.Error (error-at call (WorkBudget.reason)))))
+          (match (value-at call values 0)
+            (Result.Success value)
+              (match (string-argument call &value)
+                (Result.Success path)
+                  (let [direct-result (IO.read-file &path)]
+                    (match-ref &direct-result
+                      (Result.Success text)
+                      (Maybe.Just (Result.Success (syntax-string call text)))
+                      (Result.Error _)
+                      ;; a path that misses from the invocation directory is
+                      ;; retried against the reference checkout ($CARP_DIR,
+                      ;; falling back to the sibling layout), matching where
+                      ;; core sources resolve their own compile-time reads.
+                      (let [root (match (IO.getenv "CARP_DIR")
+                              (Maybe.Just dir) (String.append &dir "/")
+                              (Maybe.Nothing) @"../../carp/")
+                            fallback (String.concat &[root path])
+                            fallback-result (IO.read-file &fallback)]
+                        (match-ref &fallback-result
+                          (Result.Success text)
+                            (Maybe.Just
+                              (Result.Success (syntax-string call text)))
+                          (Result.Error error)
+                            (Maybe.Just
+                              (Result.Error
+                                (error-at call
+                                          (String.append "read-file failed: "
+                                                         error))))))))
                 (Result.Error error) (Maybe.Just (Result.Error error)))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Int.= id 83)
-      (match (value-at call values 0)
-        (Result.Success key)
-          (match (string-argument call &key)
-            (Result.Success name) (Maybe.Just (configuration call &name))
-            (Result.Error error) (Maybe.Just (Result.Error error)))
-        (Result.Error error) (Maybe.Just (Result.Error error)))
-      (Maybe.Nothing)))
+            (Result.Error error) (Maybe.Just (Result.Error error))))
+        (Int.= id 70)
+        (match (source-position-node call values)
+          (Result.Success node)
+            (Maybe.Just (Result.Success (syntax-int call (source-line &node))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 71)
+        (match (source-position-node call values)
+          (Result.Success node)
+            (Maybe.Just (Result.Success (syntax-int call (source-column &node))))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 72)
+        (Maybe.Just (Result.Success (syntax-string call "unknown")))
+        (Int.= id 73)
+        (Maybe.Just (Result.Success (syntax-empty call)))
+        ;; the build commands are dynamic functions in the reference; applying
+        ;; one at compile time records its effect for the pipeline
+        (Int.= id 74)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success path)
+                (do
+                  (Array.push-back! &*ct-pending-includes*
+                                    (SurfaceNode.generated @(SurfaceNode.span call)
+                                                           (SurfaceForm.List
+                                                             [(Box.init
+                                                                (SurfaceNode.generated @(SurfaceNode.span call)
+                                                                                       (SurfaceForm.Symbol [@"system-include"])))
+                                                              (Box.init
+                                                                (SurfaceNode.generated @(SurfaceNode.span call)
+                                                                                       (SurfaceForm.StringLit path)))])))
+                  (Maybe.Just (Result.Success (syntax-empty call))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (or (Int.= id 75) (or (Int.= id 76) (Int.= id 77)))
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success flag)
+                (do
+                  (record-build-command!
+                    (cond
+                      (Int.= id 76) "add-lib"
+                      (Int.= id 77) "add-pkg"
+                      "add-cflag")
+                    &flag)
+                  (Maybe.Just (Result.Success (syntax-empty call))))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 78)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success syntax)
+              ;; `str` of a string is the string itself; quoting is `prn`'s job.
+              (match-ref (SurfaceNode.form &syntax)
+                (SurfaceForm.StringLit text)
+                  (Maybe.Just (Result.Success (syntax-string call text)))
+                _
+                  (let [rendered (str &syntax)]
+                    (Maybe.Just (Result.Success (syntax-string call &rendered)))))
+              (Result.Error error)
+              (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 79)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (syntax-from-value call &value)
+              (Result.Success syntax)
+              ;; any deterministic hash works: dynamic maps only need
+              ;; internal consistency, and the suite compares unordered.
+              (let-do [rendered (str &syntax)
+                       hashed 5381
+                       n (String.length &rendered)]
+                (for [i 0 n]
+                  (set! hashed
+                        (Int.bit-and 1073741823
+                                     (Int.+ (Int.* hashed 33)
+                                            (Char.to-int (String.char-at &rendered
+                                                                         i))))))
+                (Maybe.Just (Result.Success (syntax-int call hashed))))
+              (Result.Error error)
+              (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 80)
+        (match (value-at call values 0)
+          (Result.Success value)
+            (match (string-argument call &value)
+              (Result.Success message)
+                (Maybe.Just (Result.Error (error-at call message)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 81)
+        (match (value-at call values 0)
+          (Result.Success value) (Maybe.Just (symbol-to-string call &value))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        ;; the project configuration is compile-time state, not a definition a
+        ;; prelude could hold: setting a key is observable to every later read
+        (Int.= id 82)
+        (match (value-at call values 0)
+          (Result.Success key)
+            (match (string-argument call &key)
+              (Result.Success name)
+                (match (value-at call values 1)
+                  (Result.Success value)
+                    (match (syntax-from-value call &value)
+                      (Result.Success node)
+                        (Maybe.Just (configure call &name &node))
+                      (Result.Error error) (Maybe.Just (Result.Error error)))
+                  (Result.Error error) (Maybe.Just (Result.Error error)))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Int.= id 83)
+        (match (value-at call values 0)
+          (Result.Success key)
+            (match (string-argument call &key)
+              (Result.Success name) (Maybe.Just (configuration call &name))
+              (Result.Error error) (Maybe.Just (Result.Error error)))
+          (Result.Error error) (Maybe.Just (Result.Error error)))
+        (Maybe.Nothing))
+      (Maybe.Just (Result.Error (error-at call (WorkBudget.reason))))))
 
   (private apply-builtin-name)
   (hidden apply-builtin-name)
@@ -2607,17 +2593,17 @@ function is `(Fn [args] result)`.")
 
   (sig symbol-syntax (Fn [(Ref SurfaceSpan) (Ref String)] SurfaceNode))
   (defn symbol-syntax [span name]
-    (SurfaceNode.init @span (SurfaceForm.Symbol [(String.copy name)])))
+    (SurfaceNode.generated @span (SurfaceForm.Symbol [(String.copy name)])))
 
   (sig list-syntax
        (Fn [(Ref SurfaceSpan) (Array (Box SurfaceNode))] SurfaceNode))
   (defn list-syntax [span items]
-    (SurfaceNode.init @span (SurfaceForm.List items)))
+    (SurfaceNode.generated @span (SurfaceForm.List items)))
 
   (sig array-syntax
        (Fn [(Ref SurfaceSpan) (Array (Box SurfaceNode))] SurfaceNode))
   (defn array-syntax [span items]
-    (SurfaceNode.init @span (SurfaceForm.Array items)))
+    (SurfaceNode.generated @span (SurfaceForm.Array items)))
 
   (private special-type)
   (hidden special-type)
@@ -2694,8 +2680,8 @@ unqualified, so a module's own annotation is found from inside and outside it.")
               (Result.Success
                 (CtValue.Syntax
                   (Box.init
-                    (SurfaceNode.init @(SurfaceNode.span call)
-                                      (SurfaceForm.List []))))))
+                    (SurfaceNode.generated @(SurfaceNode.span call)
+                                           (SurfaceForm.List []))))))
           (Result.Error error) (Result.Error error))
       (Maybe.Nothing) (Result.Error (error-at call @"meta expects a symbol"))))
 
@@ -2903,8 +2889,8 @@ than inheriting the caller's.")
           (Result.Success
             (CtValue.Syntax
               (Box.init
-                (SurfaceNode.init @(SurfaceNode.span call)
-                                  (SurfaceForm.List items)))))
+                (SurfaceNode.generated @(SurfaceNode.span call)
+                                       (SurfaceForm.List items)))))
         (Result.Error error) (Result.Error error))))
 
   (defn expand-known-syntax [call node]
@@ -2941,7 +2927,7 @@ collections internally; a macro must still return syntax to the expander.")
                                (Box.init
                                  (SurfaceNode.copy
                                    (Box.peek (Array.unsafe-nth arguments i)))))))
-      (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items))))
+      (SurfaceNode.generated @(SurfaceNode.span call) (SurfaceForm.List items))))
 
   (private expand-ct-macro)
   (hidden expand-ct-macro)
@@ -3059,7 +3045,7 @@ the file it is defined in, the same way a compile-time function does.")
   (doc span-anchor "a node carrying only a span, for the helpers that build
 syntax or errors relative to the form they came from. Lowered code keeps
 spans rather than whole forms, so an anchor is made where one is needed.")
-  (defn span-anchor [span] (SurfaceNode.init @span (SurfaceForm.List [])))
+  (defn span-anchor [span] (SurfaceNode.generated @span (SurfaceForm.List [])))
 
   (defn error-at-span [span message] (CtError.init message @span))
 
@@ -3173,11 +3159,13 @@ that only exists at run time — the expansion of a macro, the argument of
 `eval`, a top-level compile-time call — is evaluated: through the same
 compiler as everything else, so there is one description of the language.")
   (defn eval-node [node state frame]
-    (run-code
-      (CtCompile.compile &(CtLower.lower node &(CtLower.empty-scope)))
-      state
-      frame
-      @(FrameId.index frame)))
+    (do
+      (observe-environment! node state frame)
+      (run-code
+        (CtCompile.compile &(CtLower.lower node &(CtLower.empty-scope)))
+        state
+        frame
+        @(FrameId.index frame))))
 
   (private special-apply)
   (hidden special-apply)
@@ -3445,295 +3433,310 @@ come back: a call, and the `Raw` escape to the tree walker.")
              failure (the (Maybe CtError) (Maybe.Nothing))
              answer (the (Maybe CtValue) (Maybe.Nothing))]
       (while-do (and (Maybe.nothing? &failure) (Maybe.nothing? &answer))
-        (let [code (Box.peek (Array.unsafe-nth &*ct-codes* code-id))]
-          (match-ref (Array.unsafe-nth (CtCode.instructions code) pc)
-            (CtInstr.Push index)
-              (do
-                (Array.push-back! &stack
-                                  (CtValue.Syntax
-                                    (Box.init
-                                      (SurfaceNode.copy
-                                        (Box.peek
-                                          (Array.unsafe-nth (CtCode.constants code)
-                                                            @index))))))
-                (set! pc (Int.inc pc)))
-            (CtInstr.PushEmpty index)
-              (do
-                (Array.push-back! &stack
-                                  (syntax-empty
-                                    &(span-anchor
-                                      (Array.unsafe-nth (CtCode.spans code)
-                                                        @index))))
-                (set! pc (Int.inc pc)))
-            (CtInstr.PushBool index value)
-              (do
-                (Array.push-back! &stack
-                                  (syntax-bool
-                                    &(span-anchor
-                                      (Array.unsafe-nth (CtCode.spans code)
-                                                        @index))
-                                    @value))
-                (set! pc (Int.inc pc)))
-            (CtInstr.Resolve index)
-              (let [entry (Array.unsafe-nth (CtCode.symbols code) @index)]
-                (let [resolved (resolve-ref state
-                                            &current
-                                            base
-                                            (CtSymbol.reference entry)
-                                            (CtSymbol.name entry))]
-                  (cond
-                    (Int.>= resolved 0)
-                      (match (cell-value state resolved)
-                        (Maybe.Just value)
-                          (do
-                            (Array.push-back! &stack value)
-                            (set! pc (Int.inc pc)))
-                        (Maybe.Nothing)
-                          (set! failure
-                                (Maybe.Just
-                                  (error-at-span (CtSymbol.span entry)
-                                                 @"invalid compile-time cell"))))
-                    (Int.= resolved (CtCacheCode.ambiguous))
+        (if (WorkBudget.consume! 1)
+          (let [code (Box.peek (Array.unsafe-nth &*ct-codes* code-id))]
+            (match-ref (Array.unsafe-nth (CtCode.instructions code) pc)
+              (CtInstr.Push index)
+                (do
+                  (Array.push-back! &stack
+                                    (CtValue.Syntax
+                                      (Box.init
+                                        (SurfaceNode.copy
+                                          (Box.peek
+                                            (Array.unsafe-nth (CtCode.constants code)
+                                                              @index))))))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.PushEmpty index)
+                (do
+                  (Array.push-back! &stack
+                                    (syntax-empty
+                                      &(span-anchor
+                                        (Array.unsafe-nth (CtCode.spans code)
+                                                          @index))))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.PushBool index value)
+                (do
+                  (Array.push-back! &stack
+                                    (syntax-bool
+                                      &(span-anchor
+                                        (Array.unsafe-nth (CtCode.spans code)
+                                                          @index))
+                                      @value))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.Resolve index)
+                (let [entry (Array.unsafe-nth (CtCode.symbols code) @index)]
+                  (let [resolved (resolve-ref state
+                                              &current
+                                              base
+                                              (CtSymbol.reference entry)
+                                              (CtSymbol.name entry))]
+                    (cond
+                      (Int.>= resolved 0)
+                        (match (cell-value state resolved)
+                          (Maybe.Just value)
+                            (do
+                              (Array.push-back! &stack value)
+                              (set! pc (Int.inc pc)))
+                          (Maybe.Nothing)
+                            (set! failure
+                                  (Maybe.Just
+                                    (error-at-span (CtSymbol.span entry)
+                                                   @"invalid compile-time cell"))))
+                      (Int.= resolved (CtCacheCode.ambiguous))
+                        (set! failure
+                              (Maybe.Just
+                                (error-at-span (CtSymbol.span entry)
+                                               (String.append "ambiguous compile-time binding: "
+                                                              (CtSymbol.name entry)))))
+                      (builtin-name? (CtSymbol.name entry))
+                        (do
+                          (Array.push-back! &stack
+                                            (CtValue.Builtin @(CtSymbol.name entry)))
+                          (set! pc (Int.inc pc)))
                       (set! failure
                             (Maybe.Just
                               (error-at-span (CtSymbol.span entry)
-                                             (String.append "ambiguous compile-time binding: "
-                                                            (CtSymbol.name entry)))))
-                    (builtin-name? (CtSymbol.name entry))
+                                             (String.append "unknown compile-time symbol: "
+                                                            (CtSymbol.name entry))))))))
+              (CtInstr.ArgResolve index node-index)
+                (let [entry (Array.unsafe-nth (CtCode.symbols code) @index)]
+                  (let [resolved (resolve-ref state
+                                              &current
+                                              base
+                                              (CtSymbol.reference entry)
+                                              (CtSymbol.name entry))]
+                    (cond
+                      (Int.>= resolved 0)
+                        (match (cell-value state resolved)
+                          (Maybe.Just value)
+                            (do
+                              (Array.push-back! &stack value)
+                              (set! pc (Int.inc pc)))
+                          (Maybe.Nothing)
+                            (set! failure
+                                  (Maybe.Just
+                                    (error-at-span (CtSymbol.span entry)
+                                                   @"invalid compile-time cell"))))
+                      (Int.= resolved (CtCacheCode.ambiguous))
+                        (set! failure
+                              (Maybe.Just
+                                (error-at-span (CtSymbol.span entry)
+                                               (String.append "ambiguous compile-time binding: "
+                                                              (CtSymbol.name entry)))))
+                      (builtin-name? (CtSymbol.name entry))
+                        (do
+                          (Array.push-back! &stack
+                                            (CtValue.Builtin @(CtSymbol.name entry)))
+                          (set! pc (Int.inc pc)))
                       (do
                         (Array.push-back! &stack
-                                          (CtValue.Builtin @(CtSymbol.name entry)))
-                        (set! pc (Int.inc pc)))
-                    (set! failure
-                          (Maybe.Just
-                            (error-at-span (CtSymbol.span entry)
-                                           (String.append "unknown compile-time symbol: "
-                                                          (CtSymbol.name entry))))))))
-            (CtInstr.ArgResolve index node-index)
-              (let [entry (Array.unsafe-nth (CtCode.symbols code) @index)]
-                (let [resolved (resolve-ref state
-                                            &current
-                                            base
-                                            (CtSymbol.reference entry)
-                                            (CtSymbol.name entry))]
-                  (cond
-                    (Int.>= resolved 0)
-                      (match (cell-value state resolved)
-                        (Maybe.Just value)
-                          (do
-                            (Array.push-back! &stack value)
-                            (set! pc (Int.inc pc)))
-                        (Maybe.Nothing)
-                          (set! failure
-                                (Maybe.Just
-                                  (error-at-span (CtSymbol.span entry)
-                                                 @"invalid compile-time cell"))))
-                    (Int.= resolved (CtCacheCode.ambiguous))
-                      (set! failure
-                            (Maybe.Just
-                              (error-at-span (CtSymbol.span entry)
-                                             (String.append "ambiguous compile-time binding: "
-                                                            (CtSymbol.name entry)))))
-                    (builtin-name? (CtSymbol.name entry))
-                      (do
-                        (Array.push-back! &stack
-                                          (CtValue.Builtin @(CtSymbol.name entry)))
-                        (set! pc (Int.inc pc)))
-                    (do
-                      (Array.push-back! &stack
-                                        (CtValue.Syntax
-                                          (Box.init
-                                            (SurfaceNode.copy
-                                              (Box.peek
-                                                (Array.unsafe-nth (CtCode.nodes code)
-                                                                  @node-index))))))
-                      (set! pc (Int.inc pc))))))
-            (CtInstr.MakeColl count)
-              (do
-                (Array.push-back! &stack
-                                  (CtValue.Collection (pop-arguments! &stack
-                                                                      @count)))
-                (set! pc (Int.inc pc)))
-            (CtInstr.MakeClosure proto)
-              (do
-                (Array.push-back! &stack
-                                  (CtValue.Closure
-                                    (Box.init
-                                      (CtClosure.init @proto
-                                                      @&current
-                                                      (definition-file)))))
-                (set! pc (Int.inc pc)))
-            (CtInstr.CallMacroTest index after)
-              (let [site (Array.unsafe-nth (CtCode.sites code) @index)]
-                (let [resolved (resolve-ref state
-                                            &current
-                                            base
-                                            (CtCallSite.reference site)
-                                            (CtCallSite.name site))]
-                  (match (if (Int.>= resolved 0)
-                      (macro-in-cell state resolved)
-                      (the (Maybe CtClosure) (Maybe.Nothing)))
-                    (Maybe.Just macro-closure)
-                      (match (expand-ct-macro-args (Box.peek (CtCallSite.node site))
-                                                   &macro-closure
-                                                   (CtCallSite.raws site)
-                                                   state)
-                        (Result.Success expansion)
-                          (match (eval-node &expansion state &current)
-                            (Result.Success value)
-                              (do
-                                (Array.push-back! &stack value)
-                                (set! pc @after))
-                            (Result.Error error)
-                              (set! failure (Maybe.Just error)))
-                        (Result.Error error) (set! failure (Maybe.Just error)))
-                    (Maybe.Nothing) (set! pc (Int.inc pc)))))
-            (CtInstr.CallApply index count)
-              (let-do [site (Array.unsafe-nth (CtCode.sites code) @index)
-                       values (pop-arguments! &stack @count)
-                       resolved (resolve-ref state
-                                             &current
-                                             base
-                                             (CtCallSite.reference site)
-                                             (CtCallSite.name site))]
-                (match (run-call-values (Box.peek (CtCallSite.node site))
-                                        @(CtCallSite.builtin site)
-                                        resolved
-                                        state
-                                        &current
-                                        &values)
-                  (Result.Success value)
-                    (do (Array.push-back! &stack value) (set! pc (Int.inc pc)))
-                  (Result.Error error) (set! failure (Maybe.Just error))))
-            (CtInstr.CallApplyValue node-index count)
-              (let-do [callee (Array.pop-back! &stack)
-                       values (pop-arguments! &stack @count)
-                       call (Box.peek
-                         (Array.unsafe-nth (CtCode.nodes code) @node-index))]
-                (match (apply-function-value call &callee &values state &current)
-                  (Result.Success value)
-                    (do (Array.push-back! &stack value) (set! pc (Int.inc pc)))
-                  (Result.Error error) (set! failure (Maybe.Just error))))
-            (CtInstr.EnterFrame)
-              (do
-                (Array.push-back! &saved @&current)
-                (set! current (child! state &current))
-                (set! pc (Int.inc pc)))
-            (CtInstr.LeaveFrame)
-              (do (set! current (Array.pop-back! &saved)) (set! pc (Int.inc pc)))
-            (CtInstr.Bind index)
-              (do
-                (ignore
-                  (CtEnv.define-local! (CtState.environment state)
-                                       &current
-                                       (Array.unsafe-nth (CtCode.names code)
-                                                         @index)
-                                       (Array.pop-back! &stack)))
-                (set! pc (Int.inc pc)))
-            (CtInstr.Assign index span-index)
-              (let [target (Array.unsafe-nth (CtCode.names code) @index)]
-                (if (CtEnv.set! (CtState.environment state)
-                                &current
-                                target
-                                (CtValue.copy
-                                  (Array.unsafe-nth &stack
-                                                    (Int.dec (Array.length &stack)))))
-                  (set! pc (Int.inc pc))
-                  (set! failure
-                        (Maybe.Just
-                          (error-at-span
-                            (Array.unsafe-nth (CtCode.spans code) @span-index)
-                            (String.append "unknown compile-time set! target: "
-                                           target))))))
-            (CtInstr.Jump target) (set! pc @target)
-            (CtInstr.JumpUnlessBool target span-index)
-              (match (bool-at &(Array.pop-back! &stack)
-                              (Array.unsafe-nth (CtCode.spans code) @span-index))
-                (Result.Success value)
-                  (if value (set! pc (Int.inc pc)) (set! pc @target))
-                (Result.Error error) (set! failure (Maybe.Just error)))
-            (CtInstr.JumpUnlessStrict target span-index)
-              (match (strict-bool-at &(Array.pop-back! &stack)
-                                     (Array.unsafe-nth (CtCode.spans code)
-                                                       @span-index))
-                (Result.Success value)
-                  (if value (set! pc (Int.inc pc)) (set! pc @target))
-                (Result.Error error) (set! failure (Maybe.Just error)))
-            (CtInstr.JumpUnlessKeep target span-index)
-              (match (bool-at
-                  (Array.unsafe-nth &stack (Int.dec (Array.length &stack)))
-                  (Array.unsafe-nth (CtCode.spans code) @span-index))
-                (Result.Success value)
-                  (if value
-                    (do (ignore (Array.pop-back! &stack)) (set! pc (Int.inc pc)))
-                    (set! pc @target))
-                (Result.Error error) (set! failure (Maybe.Just error)))
-            (CtInstr.JumpIfKeep target span-index)
-              (match (bool-at
-                  (Array.unsafe-nth &stack (Int.dec (Array.length &stack)))
-                  (Array.unsafe-nth (CtCode.spans code) @span-index))
-                (Result.Success value)
-                  (if value
-                    (set! pc @target)
-                    (do (ignore (Array.pop-back! &stack)) (set! pc (Int.inc pc))))
-                (Result.Error error) (set! failure (Maybe.Just error)))
-            (CtInstr.Drop)
-              (do (ignore (Array.pop-back! &stack)) (set! pc (Int.inc pc)))
-            (CtInstr.Special opcode index count)
-              (let-do [site (Array.unsafe-nth (CtCode.sites code) @index)
-                       values (pop-arguments! &stack @count)]
-                (match (run-special @opcode
-                                    (Box.peek (CtCallSite.node site))
-                                    (CtCallSite.raws site)
-                                    &values
-                                    state
-                                    &current)
-                  (Result.Success value)
-                    (do (Array.push-back! &stack value) (set! pc (Int.inc pc)))
-                  (Result.Error error) (set! failure (Maybe.Just error))))
-            (CtInstr.Fail index span-index)
-              (set! failure
-                    (Maybe.Just
-                      (error-at-span
-                        (Array.unsafe-nth (CtCode.spans code) @span-index)
-                        @(Array.unsafe-nth (CtCode.names code) @index))))
-            (CtInstr.Dup)
-              (do
-                (Array.push-back! &stack
+                                          (CtValue.Syntax
+                                            (Box.init
+                                              (SurfaceNode.copy
+                                                (Box.peek
+                                                  (Array.unsafe-nth (CtCode.nodes code)
+                                                                    @node-index))))))
+                        (set! pc (Int.inc pc))))))
+              (CtInstr.MakeColl count)
+                (do
+                  (Array.push-back! &stack
+                                    (CtValue.Collection (pop-arguments! &stack
+                                                                        @count)))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.MakeClosure proto)
+                (do
+                  (Array.push-back! &stack
+                                    (CtValue.Closure
+                                      (Box.init
+                                        (CtClosure.init @proto
+                                                        @&current
+                                                        (definition-file)))))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.CallMacroTest index after)
+                (let [site (Array.unsafe-nth (CtCode.sites code) @index)]
+                  (let [resolved (resolve-ref state
+                                              &current
+                                              base
+                                              (CtCallSite.reference site)
+                                              (CtCallSite.name site))]
+                    (match (if (Int.>= resolved 0)
+                        (macro-in-cell state resolved)
+                        (the (Maybe CtClosure) (Maybe.Nothing)))
+                      (Maybe.Just macro-closure)
+                        (match (expand-ct-macro-args (Box.peek (CtCallSite.node site))
+                                                     &macro-closure
+                                                     (CtCallSite.raws site)
+                                                     state)
+                          (Result.Success expansion)
+                            (match (eval-node &expansion state &current)
+                              (Result.Success value)
+                                (do
+                                  (Array.push-back! &stack value)
+                                  (set! pc @after))
+                              (Result.Error error)
+                                (set! failure (Maybe.Just error)))
+                          (Result.Error error) (set! failure (Maybe.Just error)))
+                      (Maybe.Nothing) (set! pc (Int.inc pc)))))
+              (CtInstr.CallApply index count)
+                (let-do [site (Array.unsafe-nth (CtCode.sites code) @index)
+                         values (pop-arguments! &stack @count)
+                         resolved (resolve-ref state
+                                               &current
+                                               base
+                                               (CtCallSite.reference site)
+                                               (CtCallSite.name site))]
+                  (match (run-call-values (Box.peek (CtCallSite.node site))
+                                          @(CtCallSite.builtin site)
+                                          resolved
+                                          state
+                                          &current
+                                          &values)
+                    (Result.Success value)
+                      (do (Array.push-back! &stack value) (set! pc (Int.inc pc)))
+                    (Result.Error error) (set! failure (Maybe.Just error))))
+              (CtInstr.CallApplyValue node-index count)
+                (let-do [callee (Array.pop-back! &stack)
+                         values (pop-arguments! &stack @count)
+                         call (Box.peek
+                           (Array.unsafe-nth (CtCode.nodes code) @node-index))]
+                  (match (apply-function-value call
+                                               &callee
+                                               &values
+                                               state
+                                               &current)
+                    (Result.Success value)
+                      (do (Array.push-back! &stack value) (set! pc (Int.inc pc)))
+                    (Result.Error error) (set! failure (Maybe.Just error))))
+              (CtInstr.EnterFrame)
+                (do
+                  (Array.push-back! &saved @&current)
+                  (set! current (child! state &current))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.LeaveFrame)
+                (do
+                  (set! current (Array.pop-back! &saved))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.Bind index)
+                (do
+                  (ignore
+                    (CtEnv.define-local! (CtState.environment state)
+                                         &current
+                                         (Array.unsafe-nth (CtCode.names code)
+                                                           @index)
+                                         (Array.pop-back! &stack)))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.Assign index span-index)
+                (let [target (Array.unsafe-nth (CtCode.names code) @index)]
+                  (if (CtEnv.set! (CtState.environment state)
+                                  &current
+                                  target
                                   (CtValue.copy
                                     (Array.unsafe-nth &stack
                                                       (Int.dec (Array.length &stack)))))
-                (set! pc (Int.inc pc)))
-            (CtInstr.JumpUnlessEqual target span-index)
-              (let-do [pattern (Array.pop-back! &stack)
-                       matched (Array.pop-back! &stack)
-                       anchor (span-anchor
-                         (Array.unsafe-nth (CtCode.spans code) @span-index))]
-                (match (syntax-from-value &anchor &matched)
-                  (Result.Success left)
-                    (match (syntax-from-value &anchor &pattern)
-                      (Result.Success right)
-                        (if (syntax-equal? &left &right)
-                          (set! pc (Int.inc pc))
-                          (set! pc @target))
-                      (Result.Error error) (set! failure (Maybe.Just error)))
-                  (Result.Error error) (set! failure (Maybe.Just error))))
-            (CtInstr.SexprResolve index target)
-              (let [source (Box.peek
-                      (Array.unsafe-nth (CtCode.nodes code) @index))]
-                (match (symbol-key source)
-                  (Maybe.Just binding)
-                    (match (sexpr-for-binding state &current source &binding)
-                      (Result.Success value)
-                        (do (Array.push-back! &stack value) (set! pc @target))
-                      (Result.Error _) (set! pc (Int.inc pc)))
-                  (Maybe.Nothing) (set! pc (Int.inc pc))))
-            (CtInstr.Halt)
-              (set! answer
-                    (Maybe.Just
-                      (if (Int.= 0 (Array.length &stack))
-                        (syntax-empty &(span-anchor &(SurfaceSpan.anywhere)))
-                        (Array.pop-back! &stack)))))))
+                    (set! pc (Int.inc pc))
+                    (set! failure
+                          (Maybe.Just
+                            (error-at-span
+                              (Array.unsafe-nth (CtCode.spans code) @span-index)
+                              (String.append "unknown compile-time set! target: "
+                                             target))))))
+              (CtInstr.Jump target) (set! pc @target)
+              (CtInstr.JumpUnlessBool target span-index)
+                (match (bool-at &(Array.pop-back! &stack)
+                                (Array.unsafe-nth (CtCode.spans code)
+                                                  @span-index))
+                  (Result.Success value)
+                    (if value (set! pc (Int.inc pc)) (set! pc @target))
+                  (Result.Error error) (set! failure (Maybe.Just error)))
+              (CtInstr.JumpUnlessStrict target span-index)
+                (match (strict-bool-at &(Array.pop-back! &stack)
+                                       (Array.unsafe-nth (CtCode.spans code)
+                                                         @span-index))
+                  (Result.Success value)
+                    (if value (set! pc (Int.inc pc)) (set! pc @target))
+                  (Result.Error error) (set! failure (Maybe.Just error)))
+              (CtInstr.JumpUnlessKeep target span-index)
+                (match (bool-at
+                    (Array.unsafe-nth &stack (Int.dec (Array.length &stack)))
+                    (Array.unsafe-nth (CtCode.spans code) @span-index))
+                  (Result.Success value)
+                    (if value
+                      (do
+                        (ignore (Array.pop-back! &stack))
+                        (set! pc (Int.inc pc)))
+                      (set! pc @target))
+                  (Result.Error error) (set! failure (Maybe.Just error)))
+              (CtInstr.JumpIfKeep target span-index)
+                (match (bool-at
+                    (Array.unsafe-nth &stack (Int.dec (Array.length &stack)))
+                    (Array.unsafe-nth (CtCode.spans code) @span-index))
+                  (Result.Success value)
+                    (if value
+                      (set! pc @target)
+                      (do
+                        (ignore (Array.pop-back! &stack))
+                        (set! pc (Int.inc pc))))
+                  (Result.Error error) (set! failure (Maybe.Just error)))
+              (CtInstr.Drop)
+                (do (ignore (Array.pop-back! &stack)) (set! pc (Int.inc pc)))
+              (CtInstr.Special opcode index count)
+                (let-do [site (Array.unsafe-nth (CtCode.sites code) @index)
+                         values (pop-arguments! &stack @count)]
+                  (match (run-special @opcode
+                                      (Box.peek (CtCallSite.node site))
+                                      (CtCallSite.raws site)
+                                      &values
+                                      state
+                                      &current)
+                    (Result.Success value)
+                      (do (Array.push-back! &stack value) (set! pc (Int.inc pc)))
+                    (Result.Error error) (set! failure (Maybe.Just error))))
+              (CtInstr.Fail index span-index)
+                (set! failure
+                      (Maybe.Just
+                        (error-at-span
+                          (Array.unsafe-nth (CtCode.spans code) @span-index)
+                          @(Array.unsafe-nth (CtCode.names code) @index))))
+              (CtInstr.Dup)
+                (do
+                  (Array.push-back! &stack
+                                    (CtValue.copy
+                                      (Array.unsafe-nth &stack
+                                                        (Int.dec (Array.length &stack)))))
+                  (set! pc (Int.inc pc)))
+              (CtInstr.JumpUnlessEqual target span-index)
+                (let-do [pattern (Array.pop-back! &stack)
+                         matched (Array.pop-back! &stack)
+                         anchor (span-anchor
+                           (Array.unsafe-nth (CtCode.spans code) @span-index))]
+                  (match (syntax-from-value &anchor &matched)
+                    (Result.Success left)
+                      (match (syntax-from-value &anchor &pattern)
+                        (Result.Success right)
+                          (if (syntax-equal? &left &right)
+                            (set! pc (Int.inc pc))
+                            (set! pc @target))
+                        (Result.Error error) (set! failure (Maybe.Just error)))
+                    (Result.Error error) (set! failure (Maybe.Just error))))
+              (CtInstr.SexprResolve index target)
+                (let [source (Box.peek
+                        (Array.unsafe-nth (CtCode.nodes code) @index))]
+                  (match (symbol-key source)
+                    (Maybe.Just binding)
+                      (match (sexpr-for-binding state &current source &binding)
+                        (Result.Success value)
+                          (do (Array.push-back! &stack value) (set! pc @target))
+                        (Result.Error _) (set! pc (Int.inc pc)))
+                    (Maybe.Nothing) (set! pc (Int.inc pc))))
+              (CtInstr.Halt)
+                (set! answer
+                      (Maybe.Just
+                        (if (Int.= 0 (Array.length &stack))
+                          (syntax-empty &(span-anchor &(SurfaceSpan.anywhere)))
+                          (Array.pop-back! &stack))))))
+          (set! failure
+                (Maybe.Just
+                  (CtError.init (WorkBudget.reason) (SurfaceSpan.anywhere))))))
       (match failure
         (Maybe.Just error) (Result.Error error)
         (Maybe.Nothing)
@@ -3761,3 +3764,5 @@ the body's inline caches are keyed by.")
     (match (eval-node body state frame)
       (Result.Success value) (syntax-from-value body &value)
       (Result.Error error) (Result.Error error))))
+
+(load "carp-ct-editing.carp")

@@ -1,0 +1,400 @@
+(deftype JitArtifactOrigin [reference CoreRef
+                            input SourceInput
+                            revision Int])
+
+; Native support and its artifacts belong to the same ORC generation.
+(deftype JitCArtifact
+  [name String
+   context-id Int
+   serial Int
+   generation Int
+   input SourceInput
+   revision Int
+   emission CTranslationUnit
+   symbols (Array String)
+   bindings (Array LLVMArtifactBinding)
+   origins (Array JitArtifactOrigin)])
+
+(def *jit-context-serial* 0)
+
+(deftype JitArtifact
+  [name String
+   serial Int
+   generation Int
+   input SourceInput
+   revision Int
+   entities (Array LLVMArtifactEntity)
+   module-ir String
+   roots String
+   address Long
+   origins (Array JitArtifactOrigin)])
+(deftype JitArtifactSelection [publication Int
+                               entity Int])
+
+(defmodule SessionJit
+  (doc describe-artifacts! "attaches the host's exact source revisions after its
+semantic transaction succeeds. Published IR and compiler identities stay unchanged.")
+  (defn describe-artifacts! [js input revision origins]
+    (do
+      (let [artifacts (JitSession.artifacts js)]
+        (for [i 0 (Array.length artifacts)]
+          (let [artifact (Array.unsafe-nth artifacts i)]
+            (when-do (and
+                (Int.= @(JitArtifact.revision artifact) 0)
+                (String.=
+                  (SourceInput.id (JitArtifact.input artifact))
+                  (SourceInput.id input)))
+              (JitArtifact.set-input! artifact (SourceInput.copy input))
+              (JitArtifact.set-revision! artifact revision)
+              (JitArtifact.set-origins! artifact (Array.copy origins))))))
+      (let [support (JitSession.c-artifacts js)]
+        (for [i 0 (Array.length support)]
+          (let [artifact (Array.unsafe-nth support i)]
+            (when-do (and
+                (and
+                  (Int.= @(JitCArtifact.revision artifact) 0)
+                  (Int.= @(JitCArtifact.context-id artifact)
+                         @(JitSession.context-id js)))
+                (String.=
+                  (SourceInput.id (JitCArtifact.input artifact))
+                  (SourceInput.id input)))
+              (JitCArtifact.set-input! artifact (SourceInput.copy input))
+              (JitCArtifact.set-revision! artifact revision)
+              (JitCArtifact.set-origins! artifact (Array.copy origins))))))))
+
+  (doc executed! "records which published roots actually finished execution.
+Publishing an inspection helper does not change the last evaluated cell.")
+  (defn executed! [js address] (JitSession.set-last-executed! js address))
+
+  (private artifact-entity)
+  (hidden artifact-entity)
+  (defn artifact-entity [js selection]
+    (Array.unsafe-nth
+      (JitArtifact.entities
+        (Array.unsafe-nth (JitSession.artifacts js)
+                          @(JitArtifactSelection.publication selection)))
+      @(JitArtifactSelection.entity selection)))
+
+  (private find-entity)
+  (hidden find-entity)
+  (defn find-entity [js symbol]
+    (let-do [found (the (Maybe JitArtifactSelection) (Maybe.Nothing))
+             defined false
+             artifacts (JitSession.artifacts js)]
+      (for [i 0 (Array.length artifacts)]
+        (let [entities (JitArtifact.entities (Array.unsafe-nth artifacts i))]
+          (for [j 0 (Array.length entities)]
+            (let [entity (Array.unsafe-nth entities j)]
+              (when-do (and
+                  (String.= symbol (LLVMArtifactEntity.symbol entity))
+                  (and (not defined)
+                       (or @(LLVMArtifactEntity.definition entity)
+                           (Maybe.nothing? &found))))
+                (set! found (Maybe.Just (JitArtifactSelection.init i j)))
+                (set! defined @(LLVMArtifactEntity.definition entity)))))))
+      found))
+
+  (private has-reference?)
+  (hidden has-reference?)
+  (defn has-reference? [entity reference]
+    (let-do [found false
+             bindings (LLVMArtifactEntity.bindings entity)]
+      (for [i 0 (Array.length bindings)]
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when (and @(LLVMArtifactBinding.resident binding)
+                     (CoreIR.same-ref? reference
+                                       (Specialization.reference (LLVMArtifactBinding.instance binding))))
+            (set! found true))))
+      found))
+
+  (private add-symbol!)
+  (hidden add-symbol!)
+  (defn add-symbol! [js symbol seen selected]
+    (unless (Set.contains? seen symbol)
+      (match (find-entity js symbol)
+        (Maybe.Nothing) ()
+        (Maybe.Just location)
+          (do (Set.put! seen symbol) (Array.push-back! selected location)))))
+
+  (private add-related!)
+  (hidden add-related!)
+  (defn add-related! [js binding seen selected]
+    (let [artifacts (JitSession.artifacts js)]
+      (for [i 0 (Array.length artifacts)]
+        (let [entities (JitArtifact.entities (Array.unsafe-nth artifacts i))]
+          (for [j 0 (Array.length entities)]
+            (let [entity (Array.unsafe-nth entities j)
+                  bindings (LLVMArtifactEntity.bindings entity)]
+              (for [b 0 (Array.length bindings)]
+                (when (String.= (LLVMArtifactBinding.symbol binding)
+                                (LLVMArtifactBinding.symbol (Array.unsafe-nth bindings
+                                                                              b)))
+                  (add-symbol! js
+                               (LLVMArtifactEntity.symbol entity)
+                               seen
+                               selected)))))))))
+
+  (private render-artifacts)
+  (hidden render-artifacts)
+  (defn render-artifacts [js selected full]
+    (let-do [parts (the (Array String) [])
+             publications (the (Set Int) (Set.create))
+             sources (the (Set String) (Set.create))]
+      (for [i 0 (Array.length selected)]
+        (let-do [location (Array.unsafe-nth selected i)
+                 publication @(JitArtifactSelection.publication location)
+                 artifact (Array.unsafe-nth (JitSession.artifacts js)
+                                            publication)
+                 entity (artifact-entity js location)]
+          (unless-do (Set.contains? &publications &publication)
+            (Set.put! &publications &publication)
+            (Array.push-back! &parts
+                              (fmt
+                                "; LLVM artifact %s generation %d publication %d
+; cell %s revision %d"
+                                (JitArtifact.name artifact)
+                                @(JitArtifact.generation artifact)
+                                @(JitArtifact.serial artifact)
+                                (SourceInput.id (JitArtifact.input artifact))
+                                @(JitArtifact.revision artifact)))
+            (when full
+              (Array.push-back! &parts @(JitArtifact.module-ir artifact))))
+          (let [bindings (LLVMArtifactEntity.bindings entity)]
+            (for [b 0 (Array.length bindings)]
+              (let [binding (LLVMArtifactBinding.instance (Array.unsafe-nth bindings
+                                                                            b))
+                    key (fmt "%d:%s"
+                             @(CoreRef.id (Specialization.reference binding))
+                             &(CAbi.type-key
+                               (Box.peek (Specialization.signature binding))))]
+                (unless-do (Set.contains? &sources &key)
+                  (Set.put! &sources &key)
+                  (Array.push-back! &parts
+                                    (fmt "; %s : %s"
+                                         (CoreRef.name (Specialization.reference binding))
+                                         &(Type.render
+                                           (Box.peek (Specialization.signature binding)))))
+                  (let [origins (JitArtifact.origins artifact)]
+                    (for [o 0 (Array.length origins)]
+                      (let [origin (Array.unsafe-nth origins o)]
+                        (when (CoreIR.same-ref? (Specialization.reference binding)
+                                                (JitArtifactOrigin.reference origin))
+                          (Array.push-back! &parts
+                                            (fmt "; source %s revision %d"
+                                                 (SourceInput.id (JitArtifactOrigin.input origin))
+                                                 @(JitArtifactOrigin.revision origin)))))))))))
+          (unless-do full
+            (unless @(LLVMArtifactEntity.definition entity)
+              (Array.push-back! &parts
+                                @"; external declaration in this publication"))
+            (Array.push-back! &parts @(LLVMArtifactEntity.ir entity)))))
+      (String.join "
+" &parts)))
+
+  (doc inspect-artifacts "selects retained publication entities by compiler
+identity, or the last executed roots. Dependencies follow LLVM operand edges;
+global storage and its initializer share the emitter's binding identity.")
+  (private select-artifacts)
+  (hidden select-artifacts)
+  (defn select-artifacts [js reference dependencies]
+    (let-do [selected (the (Array JitArtifactSelection) [])
+             seen (the (Set String) (Set.create))
+             artifacts (JitSession.artifacts js)]
+      (match-ref reference
+        (Maybe.Just binding)
+          (for [i 0 (Array.length artifacts)]
+            (let [entities (JitArtifact.entities (Array.unsafe-nth artifacts i))]
+              (for [j 0 (Array.length entities)]
+                (let [entity (Array.unsafe-nth entities j)]
+                  (when (has-reference? entity binding)
+                    (add-symbol! js
+                                 (LLVMArtifactEntity.symbol entity)
+                                 &seen
+                                 &selected))))))
+        (Maybe.Nothing)
+          (for [i 0 (Array.length artifacts)]
+            (let [artifact (Array.unsafe-nth artifacts i)]
+              (when (Long.= @(JitArtifact.address artifact)
+                            @(JitSession.last-executed js))
+                (add-symbol! js (JitArtifact.roots artifact) &seen &selected)))))
+      (when dependencies
+        (let-do [cursor 0]
+          (while-do (Int.< cursor (Array.length &selected))
+            (let [entity (LLVMArtifactEntity.copy
+                    (artifact-entity js (Array.unsafe-nth &selected cursor)))
+                  edges (LLVMArtifactEntity.dependencies &entity)]
+              (for [e 0 (Array.length edges)]
+                (match (find-entity js (Array.unsafe-nth edges e))
+                  (Maybe.Nothing) ()
+                  (Maybe.Just location)
+                    (let-do [dependency (LLVMArtifactEntity.copy (artifact-entity js
+                                                                                  &location))
+                             bindings (LLVMArtifactEntity.bindings &dependency)]
+                      (add-symbol! js
+                                   (LLVMArtifactEntity.symbol &dependency)
+                                   &seen
+                                   &selected)
+                      (for [b 0 (Array.length bindings)]
+                        (add-related! js
+                                      (Array.unsafe-nth bindings b)
+                                      &seen
+                                      &selected))))))
+            (set! cursor (Int.inc cursor)))))
+      selected))
+
+  (private empty-artifact-selection)
+  (hidden empty-artifact-selection)
+  (defn empty-artifact-selection [js reference]
+    (match-ref reference
+      (Maybe.Just binding)
+        (fmt "%s: not compiled yet in generation %d"
+             (CoreRef.name binding)
+             @(JitSession.generation js))
+      (Maybe.Nothing) @"no evaluated cell in the current JIT generation"))
+
+  (defn inspect-artifacts [js reference dependencies full]
+    (let [selected (select-artifacts js reference dependencies)]
+      (if (Array.empty? &selected)
+        (empty-artifact-selection js reference)
+        (render-artifacts js &selected full)))))
+
+(defmodule SessionJit
+  (private c-entity)
+  (hidden c-entity)
+  (defn c-entity [js selection]
+    (Array.unsafe-nth
+      (CTranslationUnit.entities
+        (JitCArtifact.emission
+          (Array.unsafe-nth (JitSession.c-artifacts js)
+                            @(JitArtifactSelection.publication selection))))
+      @(JitArtifactSelection.entity selection)))
+
+  (private find-c-entity)
+  (hidden find-c-entity)
+  (defn find-c-entity [js symbol]
+    (let-do [found (the (Maybe JitArtifactSelection) (Maybe.Nothing))
+             support (JitSession.c-artifacts js)]
+      ; A generation publishes each strong native symbol once.
+      (for [i 0 (Array.length support)]
+        (let [entities (CTranslationUnit.entities
+                (JitCArtifact.emission (Array.unsafe-nth support i)))]
+          (for [j 0 (Array.length entities)]
+            (when (and (Maybe.nothing? &found)
+                       (String.= symbol
+                                 (CArtifactEntity.symbol (Array.unsafe-nth entities
+                                                                           j))))
+              (set! found (Maybe.Just (JitArtifactSelection.init i j)))))))
+      found))
+
+  (private render-c-artifacts)
+  (hidden render-c-artifacts)
+  (defn render-c-artifacts [js selected full]
+    (let-do [parts (the (Array String) [])
+             publications (the (Set Int) (Set.create))]
+      (for [i 0 (Array.length selected)]
+        (let-do [location (Array.unsafe-nth selected i)
+                 publication @(JitArtifactSelection.publication location)
+                 artifact (Array.unsafe-nth (JitSession.c-artifacts js)
+                                            publication)
+                 entity (c-entity js location)]
+          (unless-do (Set.contains? &publications &publication)
+            (Set.put! &publications &publication)
+            (Array.push-back! &parts (fmt "// C support artifact %s
+// published in generation %d; current generation %d; support %d
+// input %s revision %d" (JitCArtifact.name artifact) @(JitCArtifact.generation artifact) @(JitSession.generation js) @(JitCArtifact.serial artifact) (SourceInput.id (JitCArtifact.input artifact)) @(JitCArtifact.revision artifact)))
+            (Array.push-back! &parts
+                              (fmt "// session %d"
+                                   @(JitCArtifact.context-id artifact)))
+            (when full
+              (Array.push-back! &parts
+                                @(CTranslationUnit.source (JitCArtifact.emission artifact)))))
+          (unless full
+            (Array.push-back! &parts
+                              (fmt "// symbol %s"
+                                   (CArtifactEntity.symbol entity))))
+          (let [bindings (JitCArtifact.bindings artifact)]
+            (for [b 0 (Array.length bindings)]
+              (let [scoped (Array.unsafe-nth bindings b)
+                    binding (LLVMArtifactBinding.instance (Array.unsafe-nth bindings
+                                                                            b))]
+                (when-do (String.= (CArtifactEntity.symbol entity)
+                                   (Specialization.symbol binding))
+                  (Array.push-back! &parts
+                                    (fmt "// %s : %s"
+                                         (CoreRef.name (Specialization.reference binding))
+                                         &(Type.render
+                                           (Box.peek (Specialization.signature binding)))))
+                  (when @(LLVMArtifactBinding.resident scoped)
+                    (let [origins (JitCArtifact.origins artifact)]
+                      (for [o 0 (Array.length origins)]
+                        (let [origin (Array.unsafe-nth origins o)]
+                          (when (CoreIR.same-ref? (Specialization.reference binding)
+                                                  (JitArtifactOrigin.reference origin))
+                            (Array.push-back! &parts
+                                              (fmt "// source %s revision %d"
+                                                   (SourceInput.id (JitArtifactOrigin.input origin))
+                                                   @(JitArtifactOrigin.revision origin))))))))))))
+          (unless full
+            (Array.push-back! &parts @(CArtifactEntity.source entity)))))
+      (String.join "
+" &parts)))
+
+  (doc inspect-c-artifacts "selects published C support reachable from the same
+published identities as LLVM inspection. Traversal uses LLVM operands, explicit
+initializer ownership, template dependencies, and ABI helper edges. It never
+parses C or enters the compiler. Full mode returns the exact published units.")
+  (defn inspect-c-artifacts [js reference full]
+    (let-do [initial (select-artifacts js reference false)
+             selected (the (Array JitArtifactSelection) [])
+             pending (the (Array String) [])
+             seen (the (Set String) (Set.create))
+             cursor 0]
+      (for [i 0 (Array.length &initial)]
+        (Array.push-back! &pending
+                          @(LLVMArtifactEntity.symbol
+                            (artifact-entity js (Array.unsafe-nth &initial i)))))
+      (while-do (Int.< cursor (Array.length &pending))
+        (let [symbol @(Array.unsafe-nth &pending cursor)]
+          (unless-do (Set.contains? &seen &symbol)
+            (Set.put! &seen &symbol)
+            (match (find-entity js &symbol)
+              (Maybe.Nothing) ()
+              (Maybe.Just location)
+                (let-do [entity (artifact-entity js &location)
+                         edges (LLVMArtifactEntity.dependencies entity)
+                         related (the (Array JitArtifactSelection) [])
+                         related-seen (the (Set String) (Set.create))
+                         bindings (LLVMArtifactEntity.bindings entity)]
+                  (for [e 0 (Array.length edges)]
+                    (Array.push-back! &pending @(Array.unsafe-nth edges e)))
+                  (for [b 0 (Array.length bindings)]
+                    (add-related! js
+                                  (Array.unsafe-nth bindings b)
+                                  &related-seen
+                                  &related))
+                  (for [r 0 (Array.length &related)]
+                    (Array.push-back! &pending
+                                      @(LLVMArtifactEntity.symbol
+                                        (artifact-entity js
+                                                         (Array.unsafe-nth &related
+                                                                           r)))))))
+            (match (find-c-entity js &symbol)
+              (Maybe.Nothing) ()
+              (Maybe.Just location)
+                (let [edges (CArtifactEntity.dependencies (c-entity js &location))]
+                  (Array.push-back! &selected @&location)
+                  (for [e 0 (Array.length edges)]
+                    (Array.push-back! &pending @(Array.unsafe-nth edges e)))))))
+        (set! cursor (Int.inc cursor)))
+      (cond
+        (Array.empty? &initial) (empty-artifact-selection js reference)
+        (Array.empty? &selected)
+          (match-ref reference
+            (Maybe.Just binding)
+              (fmt
+                "no generated C support for %s; inspect LLVM with :llvm %s"
+                (CoreRef.name binding)
+                (CoreRef.name binding))
+            (Maybe.Nothing)
+              @"no generated C support for the last evaluated cell; inspect LLVM with :llvm")
+        (render-c-artifacts js &selected full)))))

@@ -12,7 +12,8 @@
    body (Box SurfaceNode)
    span SurfaceSpan
    stamp Int
-   withs (Array String)])
+   withs (Array String)
+   parameters-span SurfaceSpan])
 
 (deftype ValueShape
   [name String
@@ -92,11 +93,15 @@ references can resolve to all globals and imports visible in the base.")
 (deftype ResolveSnapshot [globals (Array CoreRef)
                           imports (Array ScopedImport)])
 
+(load "tooling.carp")
+
 ;; per-resolution serial for local binder identity; see `local-reference`.
 ;; Reset in `module-inner` so local ids -- and the C symbols derived from
 ;; them -- depend only on the module being resolved, never on how many
 ;; resolutions this process ran before.
 (def *local-binder-serial* 0)
+(def *resolve-type-depth* 0)
+(def *resolve-type-parameters* (the (Array SourceLexicalBinding) []))
 
 ;; callable-name → arity table for the current module, used by
 ;; `resolve-call-head` to pick among same-named candidates the way the
@@ -373,20 +378,28 @@ contract for a caller-identified source.")
   (defn function-shape [node scope]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.List raw-items)
-        (let [items (semantic-items raw-items)]
+        (let [written (semantic-items raw-items)
+              items (if (and *resolve-observing*
+                             (Int.< (Array.length &written) 4))
+                (editing-tail node &written 4)
+                written)]
           (if (Int.= (Array.length &items) 4)
             (let [head (Box.peek (Array.unsafe-nth &items 0))
                   name-node (Box.peek (Array.unsafe-nth &items 1))
                   parameters (Box.peek (Array.unsafe-nth &items 2))
                   body (Box.peek (Array.unsafe-nth &items 3))]
-              (if (or (named? head @"defn") (named? head @"defn-"))
+              (if (or (operator? head @"defn") (operator? head @"defn-"))
                 (match (symbol-name name-node)
                   (Maybe.Just name)
                     (match-ref (SurfaceNode.form parameters)
                       (SurfaceForm.Array names)
-                        (let [plain (qualify-name scope &name)
-                              qualified (generation-qualify &plain
-                                                            *type-decl-stamp*)]
+                        (let-do [plain (qualify-name scope &name)
+                                 qualified (generation-qualify &plain
+                                                               *type-decl-stamp*)]
+                          (observe-name! (SurfaceNode.span name-node)
+                                         &qualified
+                                         "function-declaration"
+                                         (Maybe.Nothing))
                           (Result.Success
                             (FunctionShape.init qualified
                                                 (String.copy scope)
@@ -394,7 +407,8 @@ contract for a caller-identified source.")
                                                 (Box.init (SurfaceNode.copy body))
                                                 @(SurfaceNode.span node)
                                                 *type-decl-stamp*
-                                                (Array.copy &*collect-withs*))))
+                                                (Array.copy &*collect-withs*)
+                                                @(SurfaceNode.span parameters))))
                       _
                         (Result.Error
                           (let [rendered (str parameters)]
@@ -430,11 +444,16 @@ contract for a caller-identified source.")
             (let [head (Box.peek (Array.unsafe-nth &items 0))
                   name-node (Box.peek (Array.unsafe-nth &items 1))
                   body (Box.peek (Array.unsafe-nth &items 2))]
-              (if (or (named? head @"def") (named? head @"def-"))
+              (if (or (operator? head @"def") (operator? head @"def-"))
                 (match (symbol-name name-node)
                   (Maybe.Just name)
-                    (let [plain (qualify-name scope &name)
-                          qualified (generation-qualify &plain *type-decl-stamp*)]
+                    (let-do [plain (qualify-name scope &name)
+                             qualified (generation-qualify &plain
+                                                           *type-decl-stamp*)]
+                      (observe-name! (SurfaceNode.span name-node)
+                                     &qualified
+                                     "value-declaration"
+                                     (Maybe.Nothing))
                       (Result.Success
                         (ValueShape.init qualified
                                          (String.copy scope)
@@ -456,7 +475,7 @@ contract for a caller-identified source.")
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.List items)
         (and (Int.> (Array.length items) 0)
-             (named? (Box.peek (Array.unsafe-nth items 0)) name))
+             (operator? (Box.peek (Array.unsafe-nth items 0)) name))
       _ false))
 
   (private type-head-name)
@@ -1680,7 +1699,7 @@ no-redefinition case pays no second walk.")
   ;; every local binder gets a fresh id: position-derived ids collide when a
   ;; macro synthesizes several bindings that share one source span (e.g. the
   ;; repeated `_` bindings `ignore-do` expands to).
-  (defn local-reference [node name]
+  (defn local-reference [node name role]
     (let-do [position @(Info.pos (SurfaceSpan.start (SurfaceNode.span node)))
              serial (do
                (set! *local-binder-serial* (Int.inc *local-binder-serial*))
@@ -1690,6 +1709,7 @@ no-redefinition case pays no second walk.")
                (String.copy name)
                false)]
       (record-binding! &reference (SurfaceNode.span node) false)
+      (observe-binding! &reference (SurfaceNode.span node) role)
       reference))
 
   (private scoped-global-by-name)
@@ -2089,7 +2109,12 @@ as a written-out qualified one.")
                       (String.concat
                         &[@(CoreRef.name &reference)
                           @" is private; it may only be used inside the module that defines it"])))
-          (Result.Success reference))
+          (do
+            (observe-name! (SurfaceNode.span node)
+                           name
+                           "reference"
+                           (Maybe.Just (CoreRef.copy &reference)))
+            (Result.Success reference)))
       (Result.Error error) (Result.Error error)))
 
   (defn resolve-reference [node locals globals imports scope]
@@ -2149,6 +2174,20 @@ as a written-out qualified one.")
           (Result.Error _) ()))
       result))
 
+  (private remember-type-parameter!)
+  (hidden remember-type-parameter!)
+  (defn remember-type-parameter! [node name]
+    (when *resolve-observing*
+      (let-do [found false]
+        (for [i 0 (Array.length &*resolve-type-parameters*)]
+          (when (String.= name
+                          (SourceLexicalBinding.name
+                            (Array.unsafe-nth &*resolve-type-parameters* i)))
+            (set! found true)))
+        (unless found
+          (Array.push-back! &*resolve-type-parameters*
+                            (SourceObservations.binding node name "type"))))))
+
   (defn resolve-type-name [node name]
     (cond
       (reference-shorthand? name)
@@ -2163,80 +2202,117 @@ as a written-out qualified one.")
       (String.= name "Bool") (Result.Success (CoreType.Boolean))
       (String.= name "Unit") (Result.Success (CoreType.Unit))
       (lowercase-start? name)
-        (Result.Success (CoreType.Variable (String.copy name)))
+        (do
+          (remember-type-parameter! node name)
+          (Result.Success (CoreType.Variable (String.copy name))))
       (Result.Success
         (CoreType.Named (generation-type-name name *resolve-stamp*) []))))
 
   (defn resolve-type [node]
+    (do
+      (SourceObservations.type-context! node)
+      (if *resolve-observing*
+        (let-do [outer (Int.= *resolve-type-depth* 0)
+                 _begin (when outer (set! *resolve-type-parameters* []))
+                 _enter (set! *resolve-type-depth*
+                              (Int.inc *resolve-type-depth*))
+                 result (resolve-type-raw node)
+                 _leave (set! *resolve-type-depth*
+                              (Int.dec *resolve-type-depth*))]
+          (when-do outer
+            (SourceObservations.type-bindings! node &*resolve-type-parameters*)
+            (set! *resolve-type-parameters* []))
+          result)
+        (resolve-type-raw node))))
+
+  (private resolve-type-raw)
+  (hidden resolve-type-raw)
+  (defn resolve-type-raw [node]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.Symbol _)
         (match (symbol-key node)
-          (Maybe.Just name) (resolve-type-name node &name)
+          (Maybe.Just name)
+            (do
+              (SourceObservations.record! node &name "type")
+              (resolve-type-name node &name))
           (Maybe.Nothing)
             (Result.Error (error-at node @"unknown annotation type")))
       (SurfaceForm.List raw-items)
         (let [items (semantic-items raw-items)]
-          (cond
-            (Int.= (Array.length &items) 0) (Result.Success (CoreType.Unit))
+          (if (and *resolve-observing*
+                   (and (Int.> (Array.length &items) 0)
+                        (and (Int.< (Array.length &items) 3)
+                             (or
+                               (named? (Box.peek (Array.unsafe-nth &items 0))
+                                       @"Fn")
+                               (named? (Box.peek (Array.unsafe-nth &items 0))
+                                       @"λ")))))
+            (let [completed (editing-tail node &items 3)
+                  partial (SurfaceNode.init @(SurfaceNode.span node)
+                                            (SurfaceForm.List completed))]
+              (resolve-type-raw &partial))
+            (cond
+              (Int.= (Array.length &items) 0) (Result.Success (CoreType.Unit))
 
-            (and (Int.>= (Array.length &items) 3)
-                 (or
-                   (named? (Box.peek (Array.unsafe-nth &items 0)) @"Fn")
-                   (named? (Box.peek (Array.unsafe-nth &items 0)) @"λ")))
-              (let [arguments (Box.peek (Array.unsafe-nth &items 1))
-                    result (Box.peek (Array.unsafe-nth &items 2))]
-                (match-ref (SurfaceNode.form arguments)
-                  (SurfaceForm.Array argument-nodes)
-                    (match (resolve-type-arguments argument-nodes)
-                      (Result.Success argument-types)
-                        (match (resolve-type result)
-                          (Result.Success result-type)
-                            (Result.Success
-                              (CoreType.Function argument-types
-                                                 (Box.init result-type)))
-                          (Result.Error error) (Result.Error error))
-                      (Result.Error error) (Result.Error error))
-                  _
-                    (Result.Error
-                      (error-at arguments
-                                @"Fn annotation arguments must be an array"))))
-
-            (and (Int.>= (Array.length &items) 2)
-                 (or
-                   (named? (Box.peek (Array.unsafe-nth &items 0)) @"Ref")
+              (and (Int.>= (Array.length &items) 3)
                    (or
-                     (named? (Box.peek (Array.unsafe-nth &items 0)) @"&")
-                     (named? (Box.peek (Array.unsafe-nth &items 0)) @"ref"))))
-              (if (Int.<= (Array.length &items) 3)
-                (match (resolve-type (Box.peek (Array.unsafe-nth &items 1)))
-                  (Result.Success inner)
-                    (if (Int.= (Array.length &items) 3)
-                      (match (resolve-lifetime (Box.peek (Array.unsafe-nth &items
-                                                                           2)))
-                        (Result.Success lifetime)
-                          (Result.Success
-                            (CoreType.Reference (Box.init inner) lifetime))
+                     (named? (Box.peek (Array.unsafe-nth &items 0)) @"Fn")
+                     (named? (Box.peek (Array.unsafe-nth &items 0)) @"λ")))
+                (let [arguments (Box.peek (Array.unsafe-nth &items 1))
+                      result (Box.peek (Array.unsafe-nth &items 2))]
+                  (match-ref (SurfaceNode.form arguments)
+                    (SurfaceForm.Array argument-nodes)
+                      (match (resolve-type-arguments argument-nodes)
+                        (Result.Success argument-types)
+                          (match (resolve-type result)
+                            (Result.Success result-type)
+                              (Result.Success
+                                (CoreType.Function argument-types
+                                                   (Box.init result-type)))
+                            (Result.Error error) (Result.Error error))
                         (Result.Error error) (Result.Error error))
-                      (Result.Success
-                        (CoreType.Reference (Box.init inner)
-                                            (inferred-lifetime node))))
-                  (Result.Error error) (Result.Error error))
-                (Result.Error
-                  (error-at node @"Ref type expects an inner type and lifetime")))
+                    _
+                      (Result.Error
+                        (error-at arguments
+                                  @"Fn annotation arguments must be an array"))))
 
-            (let [head (Box.peek (Array.unsafe-nth &items 0))]
-              (match (symbol-key head)
-                (Maybe.Just name)
-                  (match (resolve-type-items &items 1)
-                    (Result.Success arguments)
-                      (Result.Success
-                        (CoreType.Named
-                          (generation-type-name &name *resolve-stamp*)
-                          arguments))
+              (and (Int.>= (Array.length &items) 2)
+                   (or
+                     (named? (Box.peek (Array.unsafe-nth &items 0)) @"Ref")
+                     (or
+                       (named? (Box.peek (Array.unsafe-nth &items 0)) @"&")
+                       (named? (Box.peek (Array.unsafe-nth &items 0)) @"ref"))))
+                (if (Int.<= (Array.length &items) 3)
+                  (match (resolve-type (Box.peek (Array.unsafe-nth &items 1)))
+                    (Result.Success inner)
+                      (if (Int.= (Array.length &items) 3)
+                        (match (resolve-lifetime (Box.peek (Array.unsafe-nth &items
+                                                                             2)))
+                          (Result.Success lifetime)
+                            (Result.Success
+                              (CoreType.Reference (Box.init inner) lifetime))
+                          (Result.Error error) (Result.Error error))
+                        (Result.Success
+                          (CoreType.Reference (Box.init inner)
+                                              (inferred-lifetime node))))
                     (Result.Error error) (Result.Error error))
-                (Maybe.Nothing)
                   (Result.Error
-                    (error-at head @"type application head must be a symbol"))))))
+                    (error-at node
+                              @"Ref type expects an inner type and lifetime")))
+
+              (let [head (Box.peek (Array.unsafe-nth &items 0))]
+                (match (symbol-key head)
+                  (Maybe.Just name)
+                    (match (resolve-type-items &items 1)
+                      (Result.Success arguments)
+                        (Result.Success
+                          (CoreType.Named
+                            (generation-type-name &name *resolve-stamp*)
+                            arguments))
+                      (Result.Error error) (Result.Error error))
+                  (Maybe.Nothing)
+                    (Result.Error
+                      (error-at head @"type application head must be a symbol")))))))
       _
         (Result.Error
           (error-at node
@@ -2313,7 +2389,8 @@ as a written-out qualified one.")
                               (Result.Success
                                 (Array.push-back current
                                                  (local-reference node
-                                                                  &parameter-name))))))
+                                                                  &parameter-name
+                                                                  "parameter"))))))
                 (Maybe.Nothing)
                   (set! result
                         (Result.Error
@@ -2322,60 +2399,63 @@ as a written-out qualified one.")
       result))
 
   (defn resolve-if [node items locals globals imports scope]
-    (cond
-      (Int.= (Array.length items) 3)
-        (match (resolve-expression (Box.peek (Array.unsafe-nth items 1))
-                                   locals
-                                   globals
-                                   imports
-                                   scope)
-          (Result.Success condition)
-            (match (resolve-expression (Box.peek (Array.unsafe-nth items 2))
-                                       locals
-                                       globals
-                                       imports
-                                       scope)
-              (Result.Success then-branch)
-                (Result.Success
-                  (CoreExpr.If -1
-                               (Box.init condition)
-                               (Box.init then-branch)
-                               (Box.init (CoreExpr.UnitLit -1))))
-              (Result.Error error) (Result.Error error))
-          (Result.Error error) (Result.Error error))
-      (Int.= (Array.length items) 4)
-        (match (resolve-expression (Box.peek (Array.unsafe-nth items 1))
-                                   locals
-                                   globals
-                                   imports
-                                   scope)
-          (Result.Success condition)
-            (match (resolve-expression (Box.peek (Array.unsafe-nth items 2))
-                                       locals
-                                       globals
-                                       imports
-                                       scope)
-              (Result.Success then-branch)
-                (match (resolve-expression (Box.peek (Array.unsafe-nth items 3))
-                                           locals
-                                           globals
-                                           imports
-                                           scope)
-                  (Result.Success else-branch)
-                    (Result.Success
-                      (CoreExpr.If -1
-                                   (Box.init condition)
-                                   (Box.init then-branch)
-                                   (Box.init else-branch)))
-                  (Result.Error error) (Result.Error error))
-              (Result.Error error) (Result.Error error))
-          (Result.Error error) (Result.Error error))
-      (Result.Error
-        (error-at node
-                  (String.concat
-                    &[@"if expects condition, then, and optional else expressions; got "
-                      (Int.str (Array.length items))
-                      @" items"])))))
+    (if (and *resolve-observing* (Int.< (Array.length items) 4))
+      (let [completed (editing-tail node items 4)]
+        (resolve-if node &completed locals globals imports scope))
+      (cond
+        (Int.= (Array.length items) 3)
+          (match (resolve-expression (Box.peek (Array.unsafe-nth items 1))
+                                     locals
+                                     globals
+                                     imports
+                                     scope)
+            (Result.Success condition)
+              (match (resolve-expression (Box.peek (Array.unsafe-nth items 2))
+                                         locals
+                                         globals
+                                         imports
+                                         scope)
+                (Result.Success then-branch)
+                  (Result.Success
+                    (CoreExpr.If -1
+                                 (Box.init condition)
+                                 (Box.init then-branch)
+                                 (Box.init (CoreExpr.UnitLit -1))))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+        (Int.= (Array.length items) 4)
+          (match (resolve-expression (Box.peek (Array.unsafe-nth items 1))
+                                     locals
+                                     globals
+                                     imports
+                                     scope)
+            (Result.Success condition)
+              (match (resolve-expression (Box.peek (Array.unsafe-nth items 2))
+                                         locals
+                                         globals
+                                         imports
+                                         scope)
+                (Result.Success then-branch)
+                  (match (resolve-expression (Box.peek (Array.unsafe-nth items 3))
+                                             locals
+                                             globals
+                                             imports
+                                             scope)
+                    (Result.Success else-branch)
+                      (Result.Success
+                        (CoreExpr.If -1
+                                     (Box.init condition)
+                                     (Box.init then-branch)
+                                     (Box.init else-branch)))
+                    (Result.Error error) (Result.Error error))
+                (Result.Error error) (Result.Error error))
+            (Result.Error error) (Result.Error error))
+        (Result.Error
+          (error-at node
+                    (String.concat
+                      &[@"if expects condition, then, and optional else expressions; got "
+                        (Int.str (Array.length items))
+                        @" items"]))))))
 
   (defn resolve-do [-node items locals globals imports scope]
     (match (resolve-arguments items 1 locals globals imports scope)
@@ -2459,8 +2539,12 @@ the second binding silently shadow the first within a single scope.")
       found))
 
   (defn resolve-let [node items locals globals imports scope]
-    ;; extra body forms are an implicit do, matching the reference.
-    (if (Int.>= (Array.length items) 3)
+    (cond
+      (and *resolve-observing* (Int.< (Array.length items) 3))
+      (let [completed (editing-tail node items 3)]
+        (resolve-let node &completed locals globals imports scope))
+      ;; extra body forms are an implicit do, matching the reference.
+      (Int.>= (Array.length items) 3)
       (let [bindings (Box.peek (Array.unsafe-nth items 1))
             body-start 2]
         (match-ref (SurfaceNode.form bindings)
@@ -2510,29 +2594,38 @@ the second binding silently shadow the first within a single scope.")
              (named? (Box.peek (Array.unsafe-nth items 0)) @"fn"))
       _ false))
 
-  (defn resolve-let-bindings [node
-                              binding-items
-                              index
-                              body-items
-                              body-start
-                              locals
-                              globals
-                              imports
-                              scope]
+  (private resolve-bindings)
+  (hidden resolve-bindings)
+  (sig resolve-bindings
+       (Fn
+         [(Ref SurfaceNode)
+          (Ref (Array (Box SurfaceNode)))
+          Int
+          (Ref (Array CoreRef))
+          (Ref (Array CoreRef))
+          (Ref (Array ScopedImport))
+          (Ref String)
+          (Ref String)
+          (Ref (Fn [(Ref (Array CoreRef))] (Result CoreExpr ResolveError)))]
+         (Result CoreExpr ResolveError)))
+  (defn resolve-bindings [node
+                          binding-items
+                          index
+                          locals
+                          globals
+                          imports
+                          scope
+                          role
+                          body]
     (cond
-      (Int.= index (Array.length binding-items))
-        (resolve-body body-items body-start locals globals imports scope)
+      (Int.= index (Array.length binding-items)) (~body locals)
       (Int.< (Int.inc index) (Array.length binding-items))
         (let [name-node (Box.peek (Array.unsafe-nth binding-items index))
               value-node (Box.peek
                 (Array.unsafe-nth binding-items (Int.inc index)))]
           (match (symbol-key name-node)
             (Maybe.Just name)
-              (let [binding-name (String.copy &name)
-                    reference (local-reference name-node &binding-name)
-                    ;; a `fn`-valued binding may reference itself (recursive let,
-                    ;; issue #402); bring it into scope for its own value. Other
-                    ;; values must not, so `(let [x (+ x 1)])` still sees the outer x.
+              (let [reference (local-reference name-node &name role)
                     value-locals (if (fn-value? value-node)
                       (Array.push-back (Array.copy locals)
                                        (CoreRef.copy &reference))
@@ -2542,60 +2635,96 @@ the second binding silently shadow the first within a single scope.")
                                            globals
                                            imports
                                            scope)
+                  (Result.Error error) (Result.Error error)
                   (Result.Success value)
                     (let [extended (Array.push-back (Array.copy locals)
                                                     (CoreRef.copy &reference))]
-                      (match (resolve-let-bindings node
-                                                   binding-items
-                                                   (Int.+ index 2)
-                                                   body-items
-                                                   body-start
-                                                   &extended
-                                                   globals
-                                                   imports
-                                                   scope)
-                        (Result.Success body)
+                      (match (resolve-bindings node
+                                               binding-items
+                                               (Int.+ index 2)
+                                               &extended
+                                               globals
+                                               imports
+                                               scope
+                                               role
+                                               body)
+                        (Result.Error error) (Result.Error error)
+                        (Result.Success resolved-body)
                           (Result.Success
                             (CoreExpr.Let -1
                                           reference
                                           (Box.init value)
-                                          (Box.init body)))
-                        (Result.Error error) (Result.Error error)))
-                  (Result.Error error) (Result.Error error)))
+                                          (Box.init resolved-body)))))))
             (Maybe.Nothing)
-              (Result.Error
-                (error-at name-node
-                          (String.concat
-                            &[@"let binding must be a symbol: " (str name-node)])))))
+              (Result.Error (error-at name-node @"let binding must be a symbol"))))
       (Result.Error (error-at node @"let bindings must be name/value pairs"))))
 
+  (defn resolve-let-bindings [node
+                              binding-items
+                              index
+                              body-items
+                              body-start
+                              locals
+                              globals
+                              imports
+                              scope]
+    (let [body (fn [extended]
+            (do
+              (observe-region! (SurfaceNode.span node)
+                               (SurfaceNode.span
+                                 (Box.peek (Array.unsafe-nth body-items 1)))
+                               extended
+                               imports
+                               scope)
+              (resolve-body body-items body-start extended globals imports scope)))]
+      (resolve-bindings node
+                        binding-items
+                        index
+                        locals
+                        globals
+                        imports
+                        scope
+                        "local"
+                        &body)))
+
   (defn resolve-lambda [node items locals globals imports scope]
-    (if (Int.= (Array.length items) 3)
-      (let [parameters-node (Box.peek (Array.unsafe-nth items 1))
-            body (Box.peek (Array.unsafe-nth items 2))]
-        (match-ref (SurfaceNode.form parameters-node)
-          (SurfaceForm.Array parameter-nodes)
-            (match (resolve-lambda-parameters parameter-nodes)
-              (Result.Success parameters)
-                (let-do [extended (Array.copy locals)
-                         n (Array.length &parameters)]
-                  (for [i 0 n]
-                    (set! extended
-                          (Array.push-back extended
-                                           @(Array.unsafe-nth &parameters i))))
-                  (match (resolve-expression body
-                                             &extended
-                                             globals
-                                             imports
-                                             scope)
-                    (Result.Success resolved-body)
-                      (Result.Success
-                        (CoreExpr.Lambda -1 parameters (Box.init resolved-body)))
-                    (Result.Error error) (Result.Error error)))
-              (Result.Error error) (Result.Error error))
-          _
-            (Result.Error
-              (error-at parameters-node @"fn parameters must be an array"))))
+    (cond
+      (and *resolve-observing* (Int.< (Array.length items) 3))
+        (let [completed (editing-tail node items 3)]
+          (resolve-lambda node &completed locals globals imports scope))
+      (Int.= (Array.length items) 3)
+        (let [parameters-node (Box.peek (Array.unsafe-nth items 1))
+              body (Box.peek (Array.unsafe-nth items 2))]
+          (match-ref (SurfaceNode.form parameters-node)
+            (SurfaceForm.Array parameter-nodes)
+              (match (resolve-lambda-parameters parameter-nodes)
+                (Result.Success parameters)
+                  (let-do [extended (Array.copy locals)
+                           n (Array.length &parameters)]
+                    (for [i 0 n]
+                      (set! extended
+                            (Array.push-back extended
+                                             @(Array.unsafe-nth &parameters i))))
+                    (observe-region! (SurfaceNode.span node)
+                                     (SurfaceNode.span parameters-node)
+                                     &extended
+                                     imports
+                                     scope)
+                    (match (resolve-expression body
+                                               &extended
+                                               globals
+                                               imports
+                                               scope)
+                      (Result.Success resolved-body)
+                        (Result.Success
+                          (CoreExpr.Lambda -1
+                                           parameters
+                                           (Box.init resolved-body)))
+                      (Result.Error error) (Result.Error error)))
+                (Result.Error error) (Result.Error error))
+            _
+              (Result.Error
+                (error-at parameters-node @"fn parameters must be an array"))))
       (Result.Error (error-at node @"fn expects a parameter array and body"))))
 
   (defn append-pattern-bindings [left right]
@@ -2671,7 +2800,8 @@ the second binding silently shadow the first within a single scope.")
             (cond
               (= &name "_") (Result.Success (CorePattern.Ignore))
               (lowercase-start? &name)
-                (Result.Success (CorePattern.Bind (local-reference node &name)))
+                (Result.Success
+                  (CorePattern.Bind (local-reference node &name "pattern")))
               (match (resolve-reference-name node
                                              &name
                                              &[]
@@ -2739,21 +2869,25 @@ the second binding silently shadow the first within a single scope.")
         (error-at node @"match expects a scrutinee and pattern/body pairs"))))
 
   (defn resolve-annotation [node items locals globals imports scope]
-    (if (Int.= (Array.length items) 3)
-      (match (resolve-type (Box.peek (Array.unsafe-nth items 1)))
-        (Result.Success annotation)
-          (match (resolve-expression (Box.peek (Array.unsafe-nth items 2))
-                                     locals
-                                     globals
-                                     imports
-                                     scope)
-            (Result.Success expression)
-              (Result.Success
-                (CoreExpr.Annotation -1
-                                     (Box.init expression)
-                                     (Box.init annotation)))
-            (Result.Error error) (Result.Error error))
-        (Result.Error error) (Result.Error error))
+    (cond
+      (and *resolve-observing* (Int.< (Array.length items) 3))
+        (let [completed (editing-tail node items 3)]
+          (resolve-annotation node &completed locals globals imports scope))
+      (Int.= (Array.length items) 3)
+        (match (resolve-type (Box.peek (Array.unsafe-nth items 1)))
+          (Result.Success annotation)
+            (match (resolve-expression (Box.peek (Array.unsafe-nth items 2))
+                                       locals
+                                       globals
+                                       imports
+                                       scope)
+              (Result.Success expression)
+                (Result.Success
+                  (CoreExpr.Annotation -1
+                                       (Box.init expression)
+                                       (Box.init annotation)))
+              (Result.Error error) (Result.Error error))
+          (Result.Error error) (Result.Error error))
       (Result.Error (error-at node @"the expects a type and expression"))))
 
   (private arity-of)
@@ -2931,6 +3065,8 @@ resolution.")
 
   (defn resolve-expression-raw [node locals globals imports scope]
     (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Invalid _)
+      (Result.Error (error-at node @"incomplete or invalid source"))
       (SurfaceForm.IntLit value)
       (Result.Success (CoreExpr.IntLit -1 @value))
       (SurfaceForm.ByteLit value)
@@ -2978,24 +3114,24 @@ resolution.")
                       (or (= &key "Unsafe.preproc") (= &key "Unsafe.emit-c"))
                     (Maybe.Nothing) false))
                 (Result.Success (CoreExpr.UnitLit -1))
-              (named? head @"do")
+              (operator? head @"do")
                 (resolve-do node &items locals globals imports scope)
-              (named? head @"if")
+              (operator? head @"if")
                 (resolve-if node &items locals globals imports scope)
-              (named? head @"set!")
+              (operator? head @"set!")
                 (resolve-set node &items locals globals imports scope)
-              (named? head @"while")
+              (operator? head @"while")
                 (resolve-while node &items locals globals imports scope)
-              (named? head @"break") (resolve-break node &items)
-              (named? head @"let")
+              (operator? head @"break") (resolve-break node &items)
+              (operator? head @"let")
                 (resolve-let node &items locals globals imports scope)
-              (named? head @"fn")
+              (operator? head @"fn")
                 (resolve-lambda node &items locals globals imports scope)
-              (or (named? head @"match") (named? head @"match-ref"))
+              (or (operator? head @"match") (operator? head @"match-ref"))
                 (resolve-match node &items locals globals imports scope)
-              (named? head @"the")
+              (operator? head @"the")
                 (resolve-annotation node &items locals globals imports scope)
-              (named? head @"unquote")
+              (operator? head @"unquote")
                 (resolve-unquote-call node &items locals globals imports scope)
               (resolve-call node &items locals globals imports scope)))))
       (SurfaceForm.Array items)
@@ -3022,21 +3158,22 @@ resolution.")
             (let [k @(Array.unsafe-nth entries (Int.* i 2))
                   v @(Array.unsafe-nth entries (Int.+ (Int.* i 2) 1))
                   pair-sym (Box.init
-                    (SurfaceNode.init @&span
-                                      (SurfaceForm.Symbol [@"Pair" @"init"])))]
+                    (SurfaceNode.generated @&span
+                                           (SurfaceForm.Symbol [@"Pair" @"init"])))]
               (Array.push-back! &pairs
                                 (Box.init
-                                  (SurfaceNode.init @&span
-                                                    (SurfaceForm.List [pair-sym
-                                                                       k
-                                                                       v]))))))
+                                  (SurfaceNode.generated @&span
+                                                         (SurfaceForm.List [pair-sym
+                                                                            k
+                                                                            v]))))))
           (resolve-call node
                         &[(Box.init
-                            (SurfaceNode.init @&span
-                                              (SurfaceForm.Symbol [@"Map"
-                                                                   @"from-array"])))
+                            (SurfaceNode.generated @&span
+                                                   (SurfaceForm.Symbol [@"Map"
+                                                                        @"from-array"])))
                           (Box.init
-                            (SurfaceNode.init @&span (SurfaceForm.Array pairs)))]
+                            (SurfaceNode.generated @&span
+                                                   (SurfaceForm.Array pairs)))]
                         locals
                         globals
                         imports
@@ -3056,10 +3193,14 @@ resolution.")
       (CoreExpr.copy expression)))
 
   (defn resolve-expression [node locals globals imports scope]
-    (match (resolve-expression-raw node locals globals imports scope)
-      (Result.Success expression)
-        (Result.Success (identify-expression node &expression))
-      (Result.Error error) (Result.Error error)))
+    (if (WorkBudget.consume! 1)
+      (do
+        (observe-scope! node locals globals imports scope)
+        (match (resolve-expression-raw node locals globals imports scope)
+          (Result.Success expression)
+            (Result.Success (identify-expression node &expression))
+          (Result.Error error) (Result.Error error)))
+      (Result.Error (error-at node (WorkBudget.reason)))))
 
   (defn resolve-parameters [nodes -start]
     (let-do [result (the (Result (Array CoreRef) ResolveError)
@@ -3083,7 +3224,8 @@ resolution.")
                               (Result.Success
                                 (Array.push-back current
                                                  (local-reference node
-                                                                  &parameter-name))))))
+                                                                  &parameter-name
+                                                                  "parameter"))))))
                 (Maybe.Nothing)
                   (set! result
                         (Result.Error
@@ -3135,43 +3277,49 @@ resolution.")
              interfaces (interface-references globals interface-shapes)
              n (Array.length shapes)]
       (for [i 0 n]
-        (match-ref &failure
-          (Maybe.Nothing)
-            (let [shape (Array.unsafe-nth shapes i)
-                  name (FunctionShape.name shape)
-                  first-local-id next-local-id
-                  _ignored-next (set! next-local-id
-                                      (Int.+ next-local-id
-                                             (Array.length (FunctionShape.parameters shape))))
-                  _ignored-stamp (set! *resolve-stamp*
-                                       @(FunctionShape.stamp shape))]
-              (match (global-by-name globals name)
-                (Maybe.Just reference)
-                  (match (resolve-parameters (FunctionShape.parameters shape)
-                                             first-local-id)
-                    (Result.Success parameters)
-                      (let [resolution-locals (append-core-refs &interfaces
-                                                                &parameters)]
-                        (match (resolve-expression (Box.peek (FunctionShape.body shape))
-                                                   &resolution-locals
-                                                   globals
-                                                   &(imports-with imports
-                                                                  (FunctionShape.scope shape)
-                                                                  (FunctionShape.withs shape))
-                                                   (FunctionShape.scope shape))
-                          (Result.Success body)
-                            (Array.push-back! &functions
-                                              (CoreFunction.init reference
-                                                                 parameters
-                                                                 (Box.init body)))
-                          (Result.Error error) (set! failure (Maybe.Just error))))
-                    (Result.Error error) (set! failure (Maybe.Just error)))
-                (Maybe.Nothing)
-                  (set! failure
-                        (Maybe.Just
-                          (ResolveError.init @"missing function reference"
-                                             @(FunctionShape.span shape))))))
-          (Maybe.Just _) ()))
+        (when (or (Maybe.nothing? &failure)
+                  (and *resolve-observing* (not (WorkBudget.stopped?))))
+          (let [shape (Array.unsafe-nth shapes i)
+                name (FunctionShape.name shape)
+                first-local-id next-local-id
+                _ignored-next (set! next-local-id
+                                    (Int.+ next-local-id
+                                           (Array.length (FunctionShape.parameters shape))))
+                _ignored-stamp (set! *resolve-stamp*
+                                     @(FunctionShape.stamp shape))]
+            (match (global-by-name globals name)
+              (Maybe.Just reference)
+                (match (resolve-parameters (FunctionShape.parameters shape)
+                                           first-local-id)
+                  (Result.Success parameters)
+                    (let-do [resolution-locals (append-core-refs &interfaces
+                                                                 &parameters)]
+                      (observe-region! (FunctionShape.span shape)
+                                       (FunctionShape.parameters-span shape)
+                                       &resolution-locals
+                                       &(imports-with imports
+                                                      (FunctionShape.scope shape)
+                                                      (FunctionShape.withs shape))
+                                       (FunctionShape.scope shape))
+                      (match (resolve-expression (Box.peek (FunctionShape.body shape))
+                                                 &resolution-locals
+                                                 globals
+                                                 &(imports-with imports
+                                                                (FunctionShape.scope shape)
+                                                                (FunctionShape.withs shape))
+                                                 (FunctionShape.scope shape))
+                        (Result.Success body)
+                          (Array.push-back! &functions
+                                            (CoreFunction.init reference
+                                                               parameters
+                                                               (Box.init body)))
+                        (Result.Error error) (set! failure (Maybe.Just error))))
+                  (Result.Error error) (set! failure (Maybe.Just error)))
+              (Maybe.Nothing)
+                (set! failure
+                      (Maybe.Just
+                        (ResolveError.init @"missing function reference"
+                                           @(FunctionShape.span shape))))))))
       (match failure
         (Maybe.Just error) (Result.Error error)
         (Maybe.Nothing) (Result.Success functions))))
@@ -3296,7 +3444,8 @@ resolution.")
                 ;; a sig naming nothing is inert metadata in the reference
                 ;; (the definition may have moved or never existed); skip it.
                 (Maybe.Nothing)
-                ()))
+                (when *resolve-observing*
+                  (ignore (resolve-type (Box.peek (TypedShape.signature shape)))))))
           (Result.Error _) ()))
       result))
 
@@ -4049,69 +4198,102 @@ name-matched function that does not fit the interface is never selected.")
 
   (private resolve-top-level-expressions)
   (hidden resolve-top-level-expressions)
+  (private resolve-scoped-expressions)
+  (hidden resolve-scoped-expressions)
+  (defn resolve-scoped-expressions [nodes locals globals imports]
+    (let-do [expressions (the (Array (Box CoreExpr)) [])
+             failure (the (Maybe ResolveError) (Maybe.Nothing))]
+      (for [i 0 (Array.length nodes)]
+        (when (or (Maybe.nothing? &failure)
+                  (and *resolve-observing* (not (WorkBudget.stopped?))))
+          (let [scoped (Array.unsafe-nth nodes i)
+                _stamp (set! *resolve-stamp* @(ScopedExpression.stamp scoped))]
+            (match (resolve-expression
+                (Box.peek (ScopedExpression.node scoped))
+                locals
+                globals
+                &(imports-with imports
+                               (ScopedExpression.scope scoped)
+                               (ScopedExpression.withs scoped))
+                (ScopedExpression.scope scoped))
+              (Result.Success expression)
+                (Array.push-back! &expressions (Box.init expression))
+              (Result.Error error)
+                (when (Maybe.nothing? &failure)
+                  (set! failure (Maybe.Just error)))))))
+      (match failure
+        (Maybe.Just error) (Result.Error error)
+        (Maybe.Nothing) (Result.Success expressions))))
+
   (defn resolve-top-level-expressions [nodes globals imports]
-    (let-do [result (the
-               (Result (Array (Box CoreExpr)) ResolveError)
-               (Result.Success []))
-             locals (the (Array CoreRef) [])
-             n (Array.length nodes)]
-      (for [i 0 n]
-        (match-ref &result
-          (Result.Success expressions)
-            (let [scoped (Array.unsafe-nth nodes i)
-                  _ignored-stamp (set! *resolve-stamp*
-                                       @(ScopedExpression.stamp scoped))]
-              (match (resolve-expression
-                  (Box.peek (ScopedExpression.node scoped))
-                  &locals
-                  globals
-                  &(imports-with imports
-                                 (ScopedExpression.scope scoped)
-                                 (ScopedExpression.withs scoped))
-                  (ScopedExpression.scope scoped))
-                (Result.Success expression)
-                  (Array.push-back! expressions (Box.init expression))
-                (Result.Error error) (set! result (Result.Error error))))
-          (Result.Error _) ()))
-      result))
+    (let [locals (the (Array CoreRef) [])]
+      (if (and *resolve-observing* (not (Array.empty? &*resolve-root-bindings*)))
+        (let [anchor (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                            (SurfaceForm.List []))
+              body (fn [visible]
+                (do
+                  (observe-root-scope! visible globals imports)
+                  (match (resolve-scoped-expressions nodes
+                                                     visible
+                                                     globals
+                                                     imports)
+                    (Result.Error error) (Result.Error error)
+                    (Result.Success expressions)
+                      (Result.Success (CoreExpr.Do -1 expressions)))))]
+          (match (resolve-bindings &anchor
+                                   &*resolve-root-bindings*
+                                   0
+                                   &locals
+                                   globals
+                                   imports
+                                   ""
+                                   &*resolve-root-role*
+                                   &body)
+            (Result.Error error) (Result.Error error)
+            (Result.Success expression)
+              (Result.Success
+                [(Box.init (identify-expression &anchor &expression))])))
+        (resolve-scoped-expressions nodes &locals globals imports))))
 
   (private record-collected-definitions!)
   (hidden record-collected-definitions!)
   (defn record-collected-definitions! [collected globals]
-    (when-do *provenance-enabled*
-      (let [functions (CollectedForms.functions collected)]
-        (for [i 0 (Array.length functions)]
-          (let [shape (Array.unsafe-nth functions i)
-                _ignored-stamp (set! *resolve-stamp*
-                                     @(FunctionShape.stamp shape))]
-            (match (global-by-name globals (FunctionShape.name shape))
-              (Maybe.Just reference)
-                (record-binding! &reference (FunctionShape.span shape) true)
-              (Maybe.Nothing) ()))))
-      (let [values (CollectedForms.values collected)]
-        (for [i 0 (Array.length values)]
-          (let [shape (Array.unsafe-nth values i)
-                _ignored-stamp (set! *resolve-stamp* @(ValueShape.stamp shape))]
-            (match (global-by-name globals (ValueShape.name shape))
-              (Maybe.Just reference)
-                (record-binding! &reference (ValueShape.span shape) true)
-              (Maybe.Nothing) ()))))
-      (let [builtins (CollectedForms.builtins collected)]
-        (for [i 0 (Array.length builtins)]
-          (let [shape (Array.unsafe-nth builtins i)
-                _ignored-stamp (set! *resolve-stamp* @(TypedShape.stamp shape))]
-            (match (global-by-name globals (TypedShape.name shape))
-              (Maybe.Just reference)
-                (record-binding! &reference (TypedShape.span shape) true)
-              (Maybe.Nothing) ()))))
-      (let [interfaces (CollectedForms.interfaces collected)]
-        (for [i 0 (Array.length interfaces)]
-          (let [shape (Array.unsafe-nth interfaces i)
-                _ignored-stamp (set! *resolve-stamp* @(TypedShape.stamp shape))]
-            (match (first-global-by-name globals (TypedShape.name shape))
-              (Maybe.Just reference)
-                (record-binding! &reference (TypedShape.span shape) true)
-              (Maybe.Nothing) ()))))))
+    (do
+      (observe-declarations! collected globals)
+      (when-do *provenance-enabled*
+        (let [functions (CollectedForms.functions collected)]
+          (for [i 0 (Array.length functions)]
+            (let [shape (Array.unsafe-nth functions i)
+                  _ignored-stamp (set! *resolve-stamp*
+                                       @(FunctionShape.stamp shape))]
+              (match (global-by-name globals (FunctionShape.name shape))
+                (Maybe.Just reference)
+                  (record-binding! &reference (FunctionShape.span shape) true)
+                (Maybe.Nothing) ()))))
+        (let [values (CollectedForms.values collected)]
+          (for [i 0 (Array.length values)]
+            (let [shape (Array.unsafe-nth values i)
+                  _ignored-stamp (set! *resolve-stamp* @(ValueShape.stamp shape))]
+              (match (global-by-name globals (ValueShape.name shape))
+                (Maybe.Just reference)
+                  (record-binding! &reference (ValueShape.span shape) true)
+                (Maybe.Nothing) ()))))
+        (let [builtins (CollectedForms.builtins collected)]
+          (for [i 0 (Array.length builtins)]
+            (let [shape (Array.unsafe-nth builtins i)
+                  _ignored-stamp (set! *resolve-stamp* @(TypedShape.stamp shape))]
+              (match (global-by-name globals (TypedShape.name shape))
+                (Maybe.Just reference)
+                  (record-binding! &reference (TypedShape.span shape) true)
+                (Maybe.Nothing) ()))))
+        (let [interfaces (CollectedForms.interfaces collected)]
+          (for [i 0 (Array.length interfaces)]
+            (let [shape (Array.unsafe-nth interfaces i)
+                  _ignored-stamp (set! *resolve-stamp* @(TypedShape.stamp shape))]
+              (match (first-global-by-name globals (TypedShape.name shape))
+                (Maybe.Just reference)
+                  (record-binding! &reference (TypedShape.span shape) true)
+                (Maybe.Nothing) ())))))))
 
   (private module-inner)
   (hidden module-inner)
@@ -4322,7 +4504,9 @@ guessed at.")
                        type-declarations (resolve-type-declarations
                          (CollectedForms.type-declarations &collected))
                        constructor-declarations (Array.copy
-                         (ResolvedConstructors.declarations &constructor-state))]
+                         (ResolvedConstructors.declarations &constructor-state))
+                       _observed-types (observe-type-heads! &collected
+                                                            &constructor-declarations)]
                 (match (resolve-functions (CollectedForms.functions &collected)
                                           &all-globals
                                           (CollectedForms.imports &collected)

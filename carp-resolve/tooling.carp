@@ -1,0 +1,293 @@
+(load "type-catalogue.carp")
+
+(doc ResolvedSourceUse "is a fact observed while the compiler resolves written
+source. Introduced syntax does not impersonate an occurrence in the caller.")
+(deftype ResolvedSourceUse
+  [name String
+   role String
+   reference (Maybe CoreRef)
+   span SourceSpan])
+
+(deftype ResolvedSourceScope
+  [span SourceSpan
+   locals (Array CoreRef)
+   imports (Array ScopedImport)
+   namespace String
+   stamp Int
+   priority Int])
+
+(deftype ResolveEditingEnvironment
+  [private-names (Set String)
+   generations (Array (Pair String (Array Int)))])
+(deftype ResolvedSourceCandidate [name String
+                                  reference CoreRef])
+
+(deftype ResolvedSourceBinding
+  [reference CoreRef
+   role String
+   span (Maybe SourceSpan)])
+
+(deftype ResolutionObservations
+  [uses (Array ResolvedSourceUse)
+   scopes (Array ResolvedSourceScope)
+   globals (Array CoreRef)
+   bindings (Array ResolvedSourceBinding)
+   environment ResolveEditingEnvironment
+   type-heads (Array ResolvedTypeHead)])
+
+(deftype ObservedResolution
+  [result (Result ProvenancedCoreModule ResolveError)
+   observations ResolutionObservations])
+
+(def *resolve-observing* false)
+(def *resolve-observation-source* @"")
+(def *resolve-observation-range* (SourceSpan.init @"" 0 0))
+(def *resolve-source-uses* (the (Array ResolvedSourceUse) []))
+(def *resolve-source-scopes* (the (Array ResolvedSourceScope) []))
+(def *resolve-observation-globals* (the (Array CoreRef) []))
+(def *resolve-source-bindings* (the (Array ResolvedSourceBinding) []))
+(def *resolve-root-bindings* (the (Array (Box SurfaceNode)) []))
+(def *resolve-root-role* @"ambient")
+(def *resolve-type-heads* (the (Array ResolvedTypeHead) []))
+
+(defmodule Resolve
+  (private observe-region!)
+  (hidden observe-region!)
+  (defn observe-region! [container boundary locals imports namespace]
+    (when (and *resolve-observing*
+               (WorkBudget.consume! (Int.inc (Array.length locals))))
+      (match (SurfaceSpan.written-region container
+                                         boundary
+                                         &*resolve-observation-source*)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (Array.push-back! &*resolve-source-scopes*
+                            (ResolvedSourceScope.init span
+                                                      (Array.copy locals)
+                                                      (Array.copy imports)
+                                                      (String.copy namespace)
+                                                      *resolve-stamp*
+                                                      2)))))
+  (private visible-reference)
+  (hidden visible-reference)
+  (defn visible-reference [scope globals name]
+    (let [node (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                      (SurfaceForm.Symbol [(String.copy name)]))]
+      (match (resolve-reference-name &node
+                                     name
+                                     (ResolvedSourceScope.locals scope)
+                                     globals
+                                     (ResolvedSourceScope.imports scope)
+                                     (ResolvedSourceScope.namespace scope))
+        (Result.Success reference) (Maybe.Just reference)
+        (Result.Error _) (Maybe.Nothing))))
+
+  (private observe-declarations!)
+  (hidden observe-declarations!)
+  (defn observe-declarations! [collected globals]
+    (when-do *resolve-observing*
+      (set! *resolve-observation-globals* (Array.copy globals))
+      (observe-root-scope! &[] globals (CollectedForms.imports collected))
+      (for [i 0 (Array.length &*resolve-source-uses*)]
+        (let [fact (Array.unsafe-nth &*resolve-source-uses* i)]
+          (when (String.ends-with? (ResolvedSourceUse.role fact) "-declaration")
+            (match (global-by-name globals (ResolvedSourceUse.name fact))
+              (Maybe.Nothing) ()
+              (Maybe.Just reference)
+                (ResolvedSourceUse.set-reference! fact (Maybe.Just reference))))))
+      (let [functions (CollectedForms.functions collected)]
+        (for [i 0 (Array.length functions)]
+          (let [shape (Array.unsafe-nth functions i)]
+            (match (SurfaceSpan.original-in-source (FunctionShape.span shape)
+                                                   &*resolve-observation-source*)
+              (Maybe.Nothing) ()
+              (Maybe.Just span)
+                (Array.push-back! &*resolve-source-scopes*
+                                  (ResolvedSourceScope.init span
+                                                            []
+                                                            (Array.copy (CollectedForms.imports collected))
+                                                            @(FunctionShape.scope shape)
+                                                            @(FunctionShape.stamp shape)
+                                                            1))))))))
+
+  (private observe-type-heads!)
+  (hidden observe-type-heads!)
+  (defn observe-type-heads! [collected constructors]
+    (when-do *resolve-observing*
+      (let [declarations (CollectedForms.type-declarations collected)]
+        (for [i 0 (Array.length declarations)]
+          (let [declaration (Array.unsafe-nth declarations i)]
+            (TypeCatalogue.add! &*resolve-type-heads*
+                                &(generation-type-name (TypeDeclarationShape.name declaration)
+                                                       @(TypeDeclarationShape.stamp declaration))
+                                0))))
+      (TypeCatalogue.constructors! &*resolve-type-heads* constructors)))
+
+  (private observe-name!)
+  (hidden observe-name!)
+  (defn observe-name! [span name role reference]
+    (when *resolve-observing*
+      (match (SurfaceSpan.original-in-source span &*resolve-observation-source*)
+        (Maybe.Nothing) ()
+        (Maybe.Just original)
+          (Array.push-back! &*resolve-source-uses*
+                            (ResolvedSourceUse.init (String.copy name)
+                                                    (String.copy role)
+                                                    reference
+                                                    original)))))
+
+  (private observe-binding!)
+  (hidden observe-binding!)
+  (defn observe-binding! [reference span role]
+    (when-do *resolve-observing*
+      (Array.push-back! &*resolve-source-bindings*
+                        (ResolvedSourceBinding.init (CoreRef.copy reference)
+                                                    (String.copy role)
+                                                    (SurfaceSpan.original-in-source span
+                                                                                    &*resolve-observation-source*)))
+      (observe-name! span
+                     (CoreRef.name reference)
+                     role
+                     (Maybe.Just (CoreRef.copy reference)))))
+
+  (private observe-scope!)
+  (hidden observe-scope!)
+  (defn observe-scope! [node locals globals imports namespace]
+    (when (and *resolve-observing*
+               (WorkBudget.consume! (Int.inc (Array.length locals))))
+      (match (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                             &*resolve-observation-source*)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (do
+            (when (Array.empty? &*resolve-observation-globals*)
+              (set! *resolve-observation-globals* (Array.copy globals)))
+            (Array.push-back! &*resolve-source-scopes*
+                              (ResolvedSourceScope.init span
+                                                        (Array.copy locals)
+                                                        (Array.copy imports)
+                                                        (String.copy namespace)
+                                                        *resolve-stamp*
+                                                        2))))))
+
+  (private observe-root-scope!)
+  (hidden observe-root-scope!)
+  (defn observe-root-scope! [locals globals imports]
+    (when-do *resolve-observing*
+      (set! *resolve-observation-globals* (Array.copy globals))
+      (Array.push-back! &*resolve-source-scopes*
+                        (ResolvedSourceScope.init
+                          (SourceSpan.copy &*resolve-observation-range*)
+                          (Array.copy locals)
+                          (Array.copy imports)
+                          @""
+                          *resolve-stamp*
+                          0))))
+
+  (private operator?)
+  (hidden operator?)
+  (defn operator? [head name]
+    (if *resolve-observing*
+      (let-do [matches (named? head (String.copy &name))]
+        (when matches
+          (observe-name! (SurfaceNode.span head) &name "syntax" (Maybe.Nothing)))
+        matches)
+      (named? head name)))
+
+  (private editing-tail)
+  (hidden editing-tail)
+  (defn editing-tail [node items count]
+    (let-do [completed (Array.copy items)]
+      (while-do (Int.< (Array.length &completed) count)
+        (Array.push-back! &completed
+                          (Box.init
+                            (SurfaceNode.init
+                              (SurfaceSpan.missing-at-end (SurfaceNode.span node))
+                              (SurfaceForm.Invalid @"missing expression")))))
+      completed))
+
+  (doc observe-against "runs the real resolver while collecting source uses and
+lexical environments. Facts survive a resolution error. The caller supplies
+an independent allocator; observations never commit a session update.")
+  (defn observe-against [sourced allocator snapshot roots role]
+    (let-do [_enabled (set! *resolve-observing* true)
+             _source (set! *resolve-observation-source*
+                           (String.copy
+                             (SourceInput.id (SourcedSurfaceModule.input sourced))))
+             _range (set! *resolve-observation-range*
+                          (SourceSpan.init
+                            (String.copy
+                              (SourceInput.id (SourcedSurfaceModule.input sourced)))
+                            0
+                            (String.length
+                              (SourceInput.source (SourcedSurfaceModule.input sourced)))))
+             _types (set! *resolve-type-heads* [])
+             _uses (set! *resolve-source-uses* [])
+             _scopes (set! *resolve-source-scopes* [])
+             _globals (set! *resolve-observation-globals* [])
+             _bindings (set! *resolve-source-bindings* [])
+             _roots (set! *resolve-root-bindings* (Array.copy roots))
+             _role (set! *resolve-root-role* (String.copy role))
+             result (module-with-provenance-against sourced allocator snapshot)
+             _disabled (set! *resolve-observing* false)
+             observations (ResolutionObservations.init (Array.copy &*resolve-source-uses*)
+                                                       (Array.copy &*resolve-source-scopes*)
+                                                       (if (Array.empty? &*resolve-observation-globals*)
+                                                         (Array.copy (ResolveSnapshot.globals snapshot))
+                                                         (Array.copy &*resolve-observation-globals*))
+                                                       (Array.copy &*resolve-source-bindings*)
+                                                       (ResolveEditingEnvironment.init (Set.copy &*private-names*)
+                                                                                       (Array.copy &*type-redefinitions*))
+                                                       (Array.copy &*resolve-type-heads*))
+             _release-types (set! *resolve-type-heads* [])
+             _release-uses (set! *resolve-source-uses* [])
+             _release-scopes (set! *resolve-source-scopes* [])
+             _release-globals (set! *resolve-observation-globals* [])
+             _release-bindings (set! *resolve-source-bindings* [])
+             _release-roots (set! *resolve-root-bindings* [])]
+      (ObservedResolution.init result observations)))
+
+  (doc visible-names "enumerates names using the exact resolution environment
+captured for this source revision. The normal resolver decides visibility,
+imports, qualification, and shadowing; no editor reproduces those rules.")
+  (defn visible-names [observations scope prefix]
+    (let-do [environment (ResolutionObservations.environment observations)
+             saved-private (Set.copy &*private-names*)
+             saved-generations (Array.copy &*type-redefinitions*)
+             saved-stamp *resolve-stamp*
+             _private (set! *private-names*
+                            @(ResolveEditingEnvironment.private-names environment))
+             _generations (set! *type-redefinitions*
+                                @(ResolveEditingEnvironment.generations environment))
+             _stamp (set! *resolve-stamp* @(ResolvedSourceScope.stamp scope))
+             _index (reset-global-index!)
+             globals (ResolutionObservations.globals observations)
+             candidates (append-core-refs (ResolvedSourceScope.locals scope)
+                                          globals)
+             seen (the (Set String) (Set.create))
+             results (the (Array ResolvedSourceCandidate) [])]
+      (for [i 0 (Array.length &candidates)]
+        (when (WorkBudget.consume! 1)
+          (let [reference (Array.unsafe-nth &candidates i)
+                canonical (CoreRef.name reference)
+                segments (String.split-by canonical &[\.])
+                names [(String.copy canonical)
+                       @(Array.unsafe-nth &segments
+                                          (Int.dec (Array.length &segments)))]]
+            (for [j 0 2]
+              (let [name (Array.unsafe-nth &names j)]
+                (when (and (String.starts-with? name prefix)
+                           (not (Set.contains? &seen name)))
+                  (match (visible-reference scope globals name)
+                    (Maybe.Nothing) ()
+                    (Maybe.Just resolved)
+                      (when-do (CoreIR.same-ref? reference &resolved)
+                        (Set.put! &seen name)
+                        (Array.push-back! &results
+                                          (ResolvedSourceCandidate.init @name
+                                                                        resolved))))))))))
+      (set! *private-names* saved-private)
+      (set! *type-redefinitions* saved-generations)
+      (set! *resolve-stamp* saved-stamp)
+      (reset-global-index!)
+      results)))

@@ -17,6 +17,9 @@ compiler_args=()
 if [[ -n "$core_dir" ]]; then
   compiler_args=(-c "$core_dir")
 fi
+if [[ -n "${CARP_READER_SOURCE:-}" ]]; then
+  compiler_args+=(--package-override "git@github.com:carpentry-org/carp-reader@0.4.3=$CARP_READER_SOURCE")
+fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   ulimit -s 524288
@@ -74,11 +77,13 @@ phase_tasks() {
   emit_task . carp-session/test/carp-session.carp normal
   emit_task . carp-session/test/core.carp normal
   emit_task . carp-session/test/memory.carp memory
+  emit_task . carp-session/test/editing.carp normal
+  emit_task . test/driver-load.carp normal
 
   for directory in \
     carp-graph carp-c-abi carp-primitives carp-module carp-ct-env \
     carp-ct-eval carp-ir carp-resolve carp-types carp-infer carp-specialize \
-    carp-ownership carp-backend carp-expand
+    carp-ownership carp-backend carp-expand carp-source carp-repl carp-views
   do
     for test_file in "$repo_root/$directory"/test/*.carp; do
       emit_task "$directory" "${test_file#"$repo_root/$directory/"}" normal

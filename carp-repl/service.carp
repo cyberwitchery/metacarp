@@ -1,0 +1,407 @@
+(load "protocol.carp")
+(load "native.carp")
+
+(doc ReplLanguageWorker "serializes a backend on one compiler thread. One
+pending request replaces superseded work. Replies have separate bounded slots
+for analysis and explicit editing operations. A pipe wakes the editor.")
+(deftype ReplLanguageWorker
+  [mutex (Ptr ReplNativeMutex)
+   condition (Ptr ReplNativeCondition)
+   thread (Ptr ReplNativeThread)
+   wake-read Int
+   wake-write Int
+   backend (Fn
+     [(Ref ReplLanguageRequest) (Fn [] Bool) (Fn [ReplLanguageUpdate] ())]
+     ())
+   pending (Array ReplLanguageRequest)
+   analysis (Array ReplAnalysis)
+   editing (Array ReplEditingResult)
+   document String
+   revision Long
+   session Long
+   latest-request Long
+   running Bool
+   paused Bool
+   alive Bool])
+
+(defmodule ReplService
+  (private allocate)
+  (hidden allocate)
+  (defn allocate [type] (ReplNative.allocate (Pointer.width type)))
+
+  (private lock!)
+  (hidden lock!)
+  (defn lock! [worker]
+    (ignore
+      (ReplNative.mutex-lock @(ReplLanguageWorker.mutex (Pointer.to-ref worker)))))
+
+  (private unlock!)
+  (hidden unlock!)
+  (defn unlock! [worker]
+    (ignore
+      (ReplNative.mutex-unlock
+        @(ReplLanguageWorker.mutex (Pointer.to-ref worker)))))
+
+  (private wake!)
+  (hidden wake!)
+  (defn wake! [worker]
+    (ignore
+      (ReplNative.condition-broadcast
+        @(ReplLanguageWorker.condition (Pointer.to-ref worker)))))
+
+  (private current?)
+  (hidden current?)
+  (defn current? [worker document revision session]
+    (let [state (Pointer.to-ref worker)]
+      (and @(ReplLanguageWorker.alive state)
+           (and (not @(ReplLanguageWorker.paused state))
+                (and
+                  (String.= (ReplLanguageWorker.document state) document)
+                  (and
+                    (Long.= @(ReplLanguageWorker.revision state) revision)
+                    (Long.= @(ReplLanguageWorker.session state) session)))))))
+
+  (private cancelled?)
+  (hidden cancelled?)
+  (defn cancelled? [worker document revision session]
+    (let-do [_lock (lock! worker)
+             cancelled (not (current? worker document revision session))]
+      (unlock! worker)
+      cancelled))
+
+  (private publish!)
+  (hidden publish!)
+  (defn publish! [worker update]
+    (let-do [state (Pointer.to-ref worker)
+             accepted false]
+      (lock! worker)
+      (match update
+        (ReplLanguageUpdate.Analysis analysis)
+          (when-do (current? worker
+                             (ReplAnalysis.document &analysis)
+                             @(ReplAnalysis.revision &analysis)
+                             @(ReplAnalysis.session &analysis))
+            (unless (Array.empty? (ReplLanguageWorker.analysis state))
+              (ignore (Array.pop-back! (ReplLanguageWorker.analysis state))))
+            (Array.push-back! (ReplLanguageWorker.analysis state) analysis)
+            (set! accepted true))
+        (ReplLanguageUpdate.Editing editing)
+          (when-do (and
+              (current? worker
+                        (ReplEditingResult.document &editing)
+                        @(ReplEditingResult.revision &editing)
+                        @(ReplEditingResult.session &editing))
+              (Long.= @(ReplEditingResult.request &editing)
+                      @(ReplLanguageWorker.latest-request state)))
+            (unless (Array.empty? (ReplLanguageWorker.editing state))
+              (ignore (Array.pop-back! (ReplLanguageWorker.editing state))))
+            (Array.push-back! (ReplLanguageWorker.editing state) editing)
+            (set! accepted true)))
+      (unlock! worker)
+      (when accepted
+        (let [byte 1b]
+          (ignore
+            (ReplNative.write @(ReplLanguageWorker.wake-write state)
+                              (Pointer.address &byte)
+                              1l))))))
+
+  (private run)
+  (hidden run)
+  (sig run (Fn [(Ptr ())] (Ptr ())))
+  (defn run [context]
+    (let-do [worker (the (Ptr ReplLanguageWorker)
+                         (Pointer.from-long (Pointer.to-long context)))
+             state (Pointer.to-ref worker)
+             alive true]
+      (while-do alive
+        (lock! worker)
+        (while-do (and @(ReplLanguageWorker.alive state)
+                       (or @(ReplLanguageWorker.paused state)
+                           (Array.empty? (ReplLanguageWorker.pending state))))
+          (ignore
+            (ReplNative.condition-wait @(ReplLanguageWorker.condition state)
+                                       @(ReplLanguageWorker.mutex state))))
+        (if (not @(ReplLanguageWorker.alive state))
+          (do (set! alive false) (unlock! worker))
+          (let-do [request (Array.pop-back! (ReplLanguageWorker.pending state))
+                   document (String.copy (ReplLanguageRequest.document &request))
+                   revision @(ReplLanguageRequest.revision &request)
+                   session @(ReplLanguageRequest.session &request)
+                   _running (ReplLanguageWorker.set-running! state true)]
+            (unlock! worker)
+            (let [backend @(ReplLanguageWorker.backend state)
+                  cancelled (fn []
+                    (cancelled? worker &document revision session))
+                  publish (fn [update] (publish! worker update))]
+              (backend &request cancelled publish))
+            (lock! worker)
+            (ReplLanguageWorker.set-running! state false)
+            (wake! worker)
+            (unlock! worker))))
+      (Pointer.from-long 0l)))
+
+  (private release-native!)
+  (hidden release-native!)
+  (defn release-native! [mutex
+                         condition
+                         thread
+                         attributes
+                         mutex-ready
+                         condition-ready
+                         attributes-ready
+                         reader
+                         writer]
+    (do
+      (when attributes-ready (ignore (ReplNative.attributes-destroy attributes)))
+      (when condition-ready (ignore (ReplNative.condition-destroy condition)))
+      (when mutex-ready (ignore (ReplNative.mutex-destroy mutex)))
+      (ReplNative.release mutex)
+      (ReplNative.release condition)
+      (ReplNative.release thread)
+      (ReplNative.release attributes)
+      (ignore (ReplNative.close reader))
+      (ignore (ReplNative.close writer))))
+
+  (private create-thread)
+  (hidden create-thread)
+  (defn create-thread [backend reader writer]
+    (let-do [mutex (allocate (the (Ptr ReplNativeMutex) (Pointer.from-long 0l)))
+             condition (allocate
+               (the (Ptr ReplNativeCondition) (Pointer.from-long 0l)))
+             thread (allocate
+               (the (Ptr ReplNativeThread) (Pointer.from-long 0l)))
+             attributes (allocate
+               (the (Ptr ReplNativeAttributes) (Pointer.from-long 0l)))]
+      (if (or (null? mutex)
+              (or (null? condition) (or (null? thread) (null? attributes))))
+        (do
+          (release-native! mutex
+                           condition
+                           thread
+                           attributes
+                           false
+                           false
+                           false
+                           reader
+                           writer)
+          (Result.Error @"cannot allocate language-worker resources"))
+        (let-do [mutex-status (ReplNative.mutex-init mutex
+                                                     (Pointer.from-long 0l))
+                 condition-status (ReplNative.condition-init condition
+                                                             (Pointer.from-long 0l))
+                 attributes-status (ReplNative.attributes-init attributes)
+                 stack-status (if (Int.= attributes-status 0)
+                   (ReplNative.attributes-stack attributes 536870912l)
+                   attributes-status)]
+          (if (or (Int./= mutex-status 0)
+                  (or (Int./= condition-status 0) (Int./= stack-status 0)))
+            (do
+              (release-native! mutex
+                               condition
+                               thread
+                               attributes
+                               (Int.= mutex-status 0)
+                               (Int.= condition-status 0)
+                               (Int.= attributes-status 0)
+                               reader
+                               writer)
+              (Result.Error
+                (fmt
+                  "cannot initialize language worker (%d, %d, %d)"
+                  mutex-status
+                  condition-status
+                  stack-status)))
+            (let-do [worker (Pointer.unsafe-alloc
+                       (ReplLanguageWorker.init mutex
+                                                condition
+                                                thread
+                                                reader
+                                                writer
+                                                backend
+                                                []
+                                                []
+                                                []
+                                                @""
+                                                -1l
+                                                0l
+                                                -1l
+                                                false
+                                                false
+                                                true))
+                     status (ReplNative.thread-create thread
+                                                      attributes
+                                                      (Function.unsafe-ptr &run)
+                                                      (Pointer.from-long (Pointer.to-long worker)))]
+              (ignore (ReplNative.attributes-destroy attributes))
+              (ReplNative.release attributes)
+              (if (Int.= status 0)
+                (Result.Success worker)
+                (do
+                  (Pointer.free worker)
+                  (release-native! mutex
+                                   condition
+                                   thread
+                                   (Pointer.from-long 0l)
+                                   true
+                                   true
+                                   false
+                                   reader
+                                   writer)
+                  (Result.Error (fmt "cannot start language worker (%d)" status))))))))))
+
+  (doc create "starts a worker with the compiler's 512 MiB stack reservation.
+Its backend and compiler state are accessed only by that worker or while paused.")
+  (defn create [backend]
+    (let-do [descriptors [0 0]
+             status (ReplNative.pipe
+               (Pointer.address (Array.unsafe-nth &descriptors 0)))]
+      (if (Int./= status 0)
+        (Result.Error @"cannot create language-worker notification pipe")
+        (let-do [reader @(Array.unsafe-nth &descriptors 0)
+                 writer @(Array.unsafe-nth &descriptors 1)
+                 configured true]
+          (for [i 0 2]
+            (let [descriptor @(Array.unsafe-nth &descriptors i)
+                  flags (ReplNative.flags descriptor ReplNative.GET-FLAGS 0)]
+              (when (or (Int.< flags 0)
+                        (Int.<
+                          (ReplNative.flags descriptor
+                                            ReplNative.SET-FLAGS
+                                            (Int.bit-or flags
+                                                        ReplNative.NONBLOCK))
+                          0))
+                (set! configured false))))
+          (if (and configured
+                   (and (Int.< reader ReplNative.FD-LIMIT)
+                        (Int.< writer ReplNative.FD-LIMIT)))
+            (create-thread backend reader writer)
+            (do
+              (ignore (ReplNative.close reader))
+              (ignore (ReplNative.close writer))
+              (Result.Error @"cannot configure language-worker notifications")))))))
+
+  (doc submit! "replaces pending work and cancels work from superseded source.")
+  (defn submit! [worker request]
+    (let-do [state (Pointer.to-ref worker)]
+      (lock! worker)
+      (when (and @(ReplLanguageWorker.alive state)
+                 (and (not @(ReplLanguageWorker.paused state))
+                      (Long.= @(ReplLanguageRequest.session &request)
+                              @(ReplLanguageWorker.session state))))
+        (when-do (or
+            (String./= (ReplLanguageWorker.document state)
+                       (ReplLanguageRequest.document &request))
+            (Long.>= @(ReplLanguageRequest.revision &request)
+                     @(ReplLanguageWorker.revision state)))
+          (ReplLanguageWorker.set-document! state
+                                            (String.copy (ReplLanguageRequest.document &request)))
+          (ReplLanguageWorker.set-revision! state
+                                            @(ReplLanguageRequest.revision &request))
+          (ReplLanguageWorker.set-latest-request! state
+                                                  @(ReplLanguageRequest.request &request))
+          (unless (Array.empty? (ReplLanguageWorker.pending state))
+            (ignore (Array.pop-back! (ReplLanguageWorker.pending state))))
+          (unless (Array.empty? (ReplLanguageWorker.analysis state))
+            (ignore (Array.pop-back! (ReplLanguageWorker.analysis state))))
+          (unless (Array.empty? (ReplLanguageWorker.editing state))
+            (ignore (Array.pop-back! (ReplLanguageWorker.editing state))))
+          (Array.push-back! (ReplLanguageWorker.pending state) request)
+          (wake! worker)))
+      (unlock! worker)))
+
+  (doc poll! "transfers a reply and drains coalesced wake notifications.")
+  (defn poll! [worker]
+    (let-do [state (Pointer.to-ref worker)
+             byte 0b
+             result (the (Maybe ReplLanguageUpdate) (Maybe.Nothing))]
+      (while-do (Long.>
+          (ReplNative.read @(ReplLanguageWorker.wake-read state)
+                           (Pointer.address &byte)
+                           1l)
+          0l)
+        ())
+      (lock! worker)
+      (cond
+        (not (Array.empty? (ReplLanguageWorker.analysis state)))
+          (set! result
+                (Maybe.Just
+                  (ReplLanguageUpdate.Analysis
+                    (Array.pop-back! (ReplLanguageWorker.analysis state)))))
+        (not (Array.empty? (ReplLanguageWorker.editing state)))
+          (set! result
+                (Maybe.Just
+                  (ReplLanguageUpdate.Editing
+                    (Array.pop-back! (ReplLanguageWorker.editing state)))))
+        ())
+      (unlock! worker)
+      result))
+
+  (doc session "returns the session revision used to tag requests.")
+  (defn session [worker]
+    (let-do [_lock (lock! worker)
+             revision @(ReplLanguageWorker.session (Pointer.to-ref worker))]
+      (unlock! worker)
+      revision))
+
+  (doc pause!
+    "cancels and joins the current query before the host accesses compiler state.")
+  (defn pause! [worker]
+    (let-do [state (Pointer.to-ref worker)]
+      (lock! worker)
+      (ReplLanguageWorker.set-paused! state true)
+      (unless (Array.empty? (ReplLanguageWorker.pending state))
+        (ignore (Array.pop-back! (ReplLanguageWorker.pending state))))
+      (while-do @(ReplLanguageWorker.running state)
+        (ignore
+          (ReplNative.condition-wait @(ReplLanguageWorker.condition state)
+                                     @(ReplLanguageWorker.mutex state))))
+      (unlock! worker)))
+
+  (doc resume! "publishes a new session revision after host operations.")
+  (defn resume! [worker]
+    (let-do [state (Pointer.to-ref worker)]
+      (lock! worker)
+      (ReplLanguageWorker.set-session! state
+                                       (Long.inc @(ReplLanguageWorker.session state)))
+      (ReplLanguageWorker.set-revision! state -1l)
+      (ReplLanguageWorker.set-paused! state false)
+      (unless (Array.empty? (ReplLanguageWorker.analysis state))
+        (ignore (Array.pop-back! (ReplLanguageWorker.analysis state))))
+      (unless (Array.empty? (ReplLanguageWorker.editing state))
+        (ignore (Array.pop-back! (ReplLanguageWorker.editing state))))
+      (unlock! worker)))
+
+  (doc client
+    "returns callbacks and a borrowed notification descriptor for the terminal.")
+  (defn client [worker]
+    (ReplLanguageClient.init (fn [request] (submit! worker request))
+                             (fn [] (poll! worker))
+                             (fn [] (session worker))
+                             @(ReplLanguageWorker.wake-read (Pointer.to-ref worker))))
+
+  (doc close!
+    "stops the worker before releasing its callbacks and native resources.")
+  (defn close! [worker]
+    (let-do [state (Pointer.to-ref worker)
+             mutex @(ReplLanguageWorker.mutex state)
+             condition @(ReplLanguageWorker.condition state)
+             thread @(ReplLanguageWorker.thread state)
+             reader @(ReplLanguageWorker.wake-read state)
+             writer @(ReplLanguageWorker.wake-write state)]
+      (lock! worker)
+      (ReplLanguageWorker.set-alive! state false)
+      (ReplLanguageWorker.set-paused! state true)
+      (wake! worker)
+      (unlock! worker)
+      (ignore
+        (ReplNative.thread-join (Pointer.to-value thread) (Pointer.from-long 0l)))
+      (Pointer.free worker)
+      (release-native! mutex
+                       condition
+                       thread
+                       (Pointer.from-long 0l)
+                       true
+                       true
+                       false
+                       reader
+                       writer))))

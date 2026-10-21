@@ -51,7 +51,26 @@ compile-time snapshot produced while expanding it.")
   (Found [ExpandMacro])
   (Ambiguous []))
 
+(def *expand-recovering* false)
+(def *expand-recovery-errors* (the (Array CtError) []))
+(deftype ObservedExpansion
+  [result (Result SurfaceModule CtError)
+   errors (Array CtError)])
+
 (defmodule MacroExpand
+  (private editing-items)
+  (hidden editing-items)
+  (defn editing-items [node items count]
+    (do
+      (when *source-observing*
+        (while-do (Int.< (Array.length &items) count)
+          (Array.push-back! &items
+                            (Box.init
+                              (SurfaceNode.init
+                                (SurfaceSpan.missing-at-end (SurfaceNode.span node))
+                                (SurfaceForm.Invalid @"missing expression"))))))
+      items))
+
   (private symbol-name)
   (hidden symbol-name)
   (defn symbol-name [node]
@@ -80,9 +99,11 @@ compile-time snapshot produced while expanding it.")
   (private named?)
   (hidden named?)
   (defn named? [node name]
-    (match (symbol-name node)
-      (Maybe.Just found) (= found name)
-      (Maybe.Nothing) false))
+    (let-do [matches (match (symbol-name node)
+               (Maybe.Just found) (String.= &found &name)
+               (Maybe.Nothing) false)]
+      (when matches (SourceObservations.record! node &name "syntax"))
+      matches))
 
   (private error-at)
   (hidden error-at)
@@ -150,73 +171,89 @@ compile-time snapshot produced while expanding it.")
 
   (private parse-definition)
   (hidden parse-definition)
-  (defn parse-definition [node frame]
-    (match-ref (SurfaceNode.form node)
-      (SurfaceForm.List raw-items)
-        (let [items (semantic-items raw-items)]
-          (if (Int.= 4 (Array.length &items))
-            (let [head (Box.peek (Array.unsafe-nth &items 0))
-                  name-node (Box.peek (Array.unsafe-nth &items 1))
-                  parameters (Box.peek (Array.unsafe-nth &items 2))
-                  body (Box.peek (Array.unsafe-nth &items 3))]
-              (if (named? head @"defmacro")
-                (match (symbol-name name-node)
-                  (Maybe.Just name)
-                    (match (parameter-names parameters)
-                      (Result.Success macro-parameters)
-                        (Result.Success
-                          ;; the file is only knowable now: when the macro is
-                          ;; called, the file being loaded is the caller's.
-                          ;; The body is lowered here too, once, so that every
-                          ;; call runs code instead of walking syntax.
-                          (ExpandMacro.init name
-                                            @&macro-parameters
-                                            (Box.init (SurfaceNode.copy body))
-                                            (CtLower.lower-macro-proto
-                                              @(MacroParameters.fixed &macro-parameters)
-                                              @(MacroParameters.rest &macro-parameters)
-                                              (Box.init (SurfaceNode.copy body)))
-                                            @frame
-                                            (CtEval.definition-file)))
-                      (Result.Error error) (Result.Error error))
-                  (Maybe.Nothing)
-                    (Result.Error
-                      (error-at name-node
-                                @"defmacro name must be an unqualified symbol")))
-                (Result.Error (error-at node @"expected defmacro"))))
-            (Result.Error
-              (error-at node
-                        @"defmacro expects a name, parameter array, and body"))))
-      _ (Result.Error (error-at node @"defmacro must be a list"))))
+  (defn parse-definition [node frame state]
+    (do
+      (CtEval.observe-environment! node state frame)
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List raw-items)
+          (let [written (semantic-items raw-items)
+                written-count (Array.length &written)
+                items (editing-items node written 4)]
+            (if (Int.= 4 (Array.length &items))
+              (let [head (Box.peek (Array.unsafe-nth &items 0))
+                    name-node (Box.peek (Array.unsafe-nth &items 1))
+                    parameters (Box.peek (Array.unsafe-nth &items 2))
+                    body (Box.peek (Array.unsafe-nth &items 3))]
+                (if (named? head @"defmacro")
+                  (match (symbol-name name-node)
+                    (Maybe.Just name)
+                      (match (parameter-names parameters)
+                        (Result.Success macro-parameters)
+                          (let [partial (ExpandMacro.init name
+                                                          @&macro-parameters
+                                                          (Box.init (SurfaceNode.copy body))
+                                                          (CtLower.lower-macro-proto-at
+                                                            @(MacroParameters.fixed &macro-parameters)
+                                                            @(MacroParameters.rest &macro-parameters)
+                                                            (Box.init (SurfaceNode.copy body))
+                                                            parameters)
+                                                          @frame
+                                                          (CtEval.definition-file))]
+                            (if (Int.< written-count 4)
+                              (Result.Error
+                                (error-at node
+                                          @"defmacro expects a name, parameter array, and body"))
+                              (Result.Success partial)))
+                        (Result.Error error) (Result.Error error))
+                    (Maybe.Nothing)
+                      (Result.Error
+                        (error-at name-node
+                                  @"defmacro name must be an unqualified symbol")))
+                  (Result.Error (error-at node @"expected defmacro"))))
+              (Result.Error
+                (error-at node
+                          @"defmacro expects a name, parameter array, and body"))))
+        _ (Result.Error (error-at node @"defmacro must be a list")))))
 
   (private parse-dynamic-definition)
   (hidden parse-dynamic-definition)
-  (defn parse-dynamic-definition [node frame]
-    (match-ref (SurfaceNode.form node)
-      (SurfaceForm.List raw-items)
-        (let [items (semantic-items raw-items)]
-          (if (Int.= 4 (Array.length &items))
-            (let [head (Box.peek (Array.unsafe-nth &items 0))
-                  name-node (Box.peek (Array.unsafe-nth &items 1))
-                  parameters (Box.peek (Array.unsafe-nth &items 2))
-                  body (Box.peek (Array.unsafe-nth &items 3))]
-              (if (named? head @"defndynamic")
-                (match (symbol-name name-node)
-                  (Maybe.Just name)
-                    (match (CtEval.define-dynamic-function parameters body frame)
-                      (Result.Success function)
-                        (Result.Success
-                          (ExpandDynamic.init name (Box.init function)))
-                      (Result.Error error) (Result.Error error))
-                  (Maybe.Nothing)
-                    (Result.Error
-                      (error-at name-node
-                                @"defndynamic name must be an unqualified symbol")))
-                (Result.Error (error-at node @"expected defndynamic"))))
-            (Result.Error
-              (error-at node
-                        @"defndynamic expects a name, parameter array, and body"))))
-      _ (Result.Error (error-at node @"defndynamic must be a list"))))
+  (defn parse-dynamic-definition [node frame state]
+    (do
+      (CtEval.observe-environment! node state frame)
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List raw-items)
+          (let [written (semantic-items raw-items)
+                written-count (Array.length &written)
+                items (editing-items node written 4)]
+            (if (Int.= 4 (Array.length &items))
+              (let [head (Box.peek (Array.unsafe-nth &items 0))
+                    name-node (Box.peek (Array.unsafe-nth &items 1))
+                    parameters (Box.peek (Array.unsafe-nth &items 2))
+                    body (Box.peek (Array.unsafe-nth &items 3))]
+                (if (named? head @"defndynamic")
+                  (match (symbol-name name-node)
+                    (Maybe.Just name)
+                      (match (CtEval.define-dynamic-function parameters
+                                                             body
+                                                             frame)
+                        (Result.Success function)
+                          (let [partial (ExpandDynamic.init name
+                                                            (Box.init function))]
+                            (if (Int.< written-count 4)
+                              (Result.Error
+                                (error-at node
+                                          @"defndynamic expects a name, parameter array, and body"))
+                              (Result.Success partial)))
+                        (Result.Error error) (Result.Error error))
+                    (Maybe.Nothing)
+                      (Result.Error
+                        (error-at name-node
+                                  @"defndynamic name must be an unqualified symbol")))
+                  (Result.Error (error-at node @"expected defndynamic"))))
+              (Result.Error
+                (error-at node
+                          @"defndynamic expects a name, parameter array, and body"))))
+        _ (Result.Error (error-at node @"defndynamic must be a list")))))
 
   (private parse-dynamic-value)
   (hidden parse-dynamic-value)
@@ -356,7 +393,7 @@ compile-time snapshot produced while expanding it.")
                                (Box.init
                                  (SurfaceNode.copy
                                    (Box.peek (Array.unsafe-nth arguments i)))))))
-      (SurfaceNode.init @(SurfaceNode.span call) (SurfaceForm.List items))))
+      (SurfaceNode.generated @(SurfaceNode.span call) (SurfaceForm.List items))))
 
   (private expand-macro-template)
   (hidden expand-macro-template)
@@ -425,186 +462,27 @@ what asked for the expansion.")
   (doc expand-node "expands macro calls in one node, recursively. Quoted forms
 are intentionally opaque: code represented as data must not be expanded until
 a macro explicitly returns it.")
-  (defn expand-node [node macros state modules preludes scope]
-    (match-ref (SurfaceNode.form node)
-      (SurfaceForm.List items)
-        (if (Int.= 0 (Array.length items))
-          (Result.Success (SurfaceNode.copy node))
-          (let [head (Box.peek (Array.unsafe-nth items 0))]
-            (if (named? head @"quote")
-              (Result.Success (SurfaceNode.copy node))
-              (match (symbol-key head)
-                (Maybe.Just name)
-                  (match (macro-by-name macros modules preludes scope head)
-                    (MacroLookup.Found macro)
-                    (let [arguments (call-arguments items)]
-                      (match (bindings-for node &macro state &arguments)
-                        (Result.Success frame)
-                          (match (expand-macro-template node &macro state &frame)
-                            (Result.Success generated)
-                              (let-do [next (SurfaceNode.copy &generated)
-                                       _ignored-anchor (Surface.reanchor! &next
-                                                                          (SurfaceNode.span node))]
-                                (expand-node &next
-                                             macros
-                                             state
-                                             modules
-                                             preludes
-                                             scope))
-                            (Result.Error error)
-                              (Result.Error
-                                (CtError.init
-                                  (String.concat
-                                    &[@"while expanding macro "
-                                      (String.copy (ExpandMacro.name &macro))
-                                      @": "
-                                      (String.copy (CtError.message &error))])
-                                  @(SurfaceNode.span node))))
-                        (Result.Error error) (Result.Error error)))
-                    (MacroLookup.Ambiguous)
-                    (Result.Error
-                      (error-at head
-                                (String.append "ambiguous imported macro: "
-                                               &name)))
-                    (MacroLookup.Missing)
-                    ;; a `Dynamic.`-qualified call in static code is dynamic
-                    ;; by construction: the reference evaluates it at compile
-                    ;; time and splices the result.
-                    (if (String.starts-with? &name "Dynamic.")
-                      (CtEval.eval-template node state (ExpandScope.frame scope))
-                      (let-do [result (the
-                                 (Result (Array (Box SurfaceNode)) CtError)
-                                 (Result.Success []))
-                               n (Array.length items)]
-                        (for [i 0 n]
-                          (match-ref &result
-                            (Result.Success children)
-                              (let [child (Box.peek (Array.unsafe-nth items i))]
-                                (match (expand-node child
-                                                    macros
-                                                    state
-                                                    modules
-                                                    preludes
-                                                    scope)
-                                  (Result.Success expanded)
-                                    (Array.push-back! children
-                                                      (Box.init expanded))
-                                  (Result.Error error)
-                                    (set! result (Result.Error error))))
-                            (Result.Error error)
-                              (set! result (Result.Error @error))))
-                        (match result
-                          (Result.Success children)
-                            (Result.Success
-                              (SurfaceNode.init @(SurfaceNode.span node)
-                                                (SurfaceForm.List children)))
-                          (Result.Error error) (Result.Error error)))))
-                (Maybe.Nothing)
-                  (let-do [result (the
-                             (Result (Array (Box SurfaceNode)) CtError)
-                             (Result.Success []))
-                           n (Array.length items)]
-                    (for [i 0 n]
-                      (match-ref &result
-                        (Result.Success children)
-                          (let [child (Box.peek (Array.unsafe-nth items i))]
-                            (match (expand-node child
-                                                macros
-                                                state
-                                                modules
-                                                preludes
-                                                scope)
-                              (Result.Success expanded)
-                                (Array.push-back! children (Box.init expanded))
-                              (Result.Error error)
-                                (set! result (Result.Error error))))
-                        (Result.Error error) (set! result (Result.Error @error))))
-                    (match result
-                      (Result.Success children)
-                        (Result.Success
-                          (SurfaceNode.init @(SurfaceNode.span node)
-                                            (SurfaceForm.List children)))
-                      (Result.Error error) (Result.Error error)))))))
-      (SurfaceForm.Array items)
-        (let-do [result (the
-                   (Result (Array (Box SurfaceNode)) CtError)
-                   (Result.Success []))
-                 n (Array.length items)]
-          (for [i 0 n]
-            (match-ref &result
-              (Result.Success children)
-                (let [child (Box.peek (Array.unsafe-nth items i))]
-                  (match (expand-node child macros state modules preludes scope)
-                    (Result.Success expanded)
-                      (Array.push-back! children (Box.init expanded))
-                    (Result.Error error) (set! result (Result.Error error))))
-              (Result.Error error) (set! result (Result.Error @error))))
-          (match result
-            (Result.Success children)
-              (Result.Success
-                (SurfaceNode.init @(SurfaceNode.span node)
-                                  (SurfaceForm.Array children)))
-            (Result.Error error) (Result.Error error)))
-      (SurfaceForm.StaticArray items)
-        (let-do [result (the
-                   (Result (Array (Box SurfaceNode)) CtError)
-                   (Result.Success []))
-                 n (Array.length items)]
-          (for [i 0 n]
-            (match-ref &result
-              (Result.Success children)
-                (let [child (Box.peek (Array.unsafe-nth items i))]
-                  (match (expand-node child macros state modules preludes scope)
-                    (Result.Success expanded)
-                      (Array.push-back! children (Box.init expanded))
-                    (Result.Error error) (set! result (Result.Error error))))
-              (Result.Error error) (set! result (Result.Error @error))))
-          (match result
-            (Result.Success children)
-              (Result.Success
-                (SurfaceNode.init @(SurfaceNode.span node)
-                                  (SurfaceForm.StaticArray children)))
-            (Result.Error error) (Result.Error error)))
-      (SurfaceForm.Dictionary items)
-        (let-do [result (the
-                   (Result (Array (Box SurfaceNode)) CtError)
-                   (Result.Success []))
-                 n (Array.length items)]
-          (for [i 0 n]
-            (match-ref &result
-              (Result.Success children)
-                (let [child (Box.peek (Array.unsafe-nth items i))]
-                  (match (expand-node child macros state modules preludes scope)
-                    (Result.Success expanded)
-                      (Array.push-back! children (Box.init expanded))
-                    (Result.Error error) (set! result (Result.Error error))))
-              (Result.Error error) (set! result (Result.Error @error))))
-          (match result
-            (Result.Success children)
-              (Result.Success
-                (SurfaceNode.init @(SurfaceNode.span node)
-                                  (SurfaceForm.Dictionary children)))
-            (Result.Error error) (Result.Error error)))
-      _ (Result.Success (SurfaceNode.copy node))))
-
-  (private expand-node-1)
-  (hidden expand-node-1)
-  (doc expand-node-1 "expands only an outermost macro call. The returned
-`Nothing` distinguishes a form with no outer macro from a macro whose result
-happens to render identically.")
-  (defn expand-node-1 [node macros state modules preludes scope]
-    (match-ref (SurfaceNode.form node)
-      (SurfaceForm.List items)
-        (if (Int.= 0 (Array.length items))
-          (Result.Success (Maybe.Nothing))
-          (let [head (Box.peek (Array.unsafe-nth items 0))]
-            (if (named? head @"quote")
-              (Result.Success (Maybe.Nothing))
-              (match (symbol-key head)
-                (Maybe.Just name)
-                  (match (macro-by-name macros modules preludes scope head)
-                    (MacroLookup.Found macro)
-                      (let [arguments (call-arguments items)]
+  (defn expand-node-strict [node macros state modules preludes scope]
+    (if (WorkBudget.consume! 1)
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List items)
+          (if (Int.= 0 (Array.length items))
+            (Result.Success (SurfaceNode.copy node))
+            (let [head (Box.peek (Array.unsafe-nth items 0))]
+              (if (named? head @"quote")
+                (do
+                  (when (Int.> (Array.length items) 1)
+                    (SourceObservations.opaque! (Box.peek (Array.unsafe-nth items
+                                                                            1))))
+                  (Result.Success (SurfaceNode.copy node)))
+                (match (symbol-key head)
+                  (Maybe.Just name)
+                    (match (macro-by-name macros modules preludes scope head)
+                      (MacroLookup.Found macro)
+                      (let [arguments (call-arguments items)
+                            _observed (SourceObservations.record! head
+                                                                  (ExpandMacro.name &macro)
+                                                                  "macro")]
                         (match (bindings-for node &macro state &arguments)
                           (Result.Success frame)
                             (match (expand-macro-template node
@@ -615,7 +493,12 @@ happens to render identically.")
                                 (let-do [next (SurfaceNode.copy &generated)
                                          _ignored-anchor (Surface.reanchor! &next
                                                                             (SurfaceNode.span node))]
-                                  (Result.Success (Maybe.Just next)))
+                                  (expand-node &next
+                                               macros
+                                               state
+                                               modules
+                                               preludes
+                                               scope))
                               (Result.Error error)
                                 (Result.Error
                                   (CtError.init
@@ -626,14 +509,224 @@ happens to render identically.")
                                         (String.copy (CtError.message &error))])
                                     @(SurfaceNode.span node))))
                           (Result.Error error) (Result.Error error)))
-                    (MacroLookup.Ambiguous)
+                      (MacroLookup.Ambiguous)
                       (Result.Error
                         (error-at head
                                   (String.append "ambiguous imported macro: "
                                                  &name)))
-                    (MacroLookup.Missing) (Result.Success (Maybe.Nothing)))
-                (Maybe.Nothing) (Result.Success (Maybe.Nothing))))))
-      _ (Result.Success (Maybe.Nothing))))
+                      (MacroLookup.Missing)
+                      ;; a `Dynamic.`-qualified call in static code is dynamic
+                      ;; by construction: the reference evaluates it at compile
+                      ;; time and splices the result.
+                      (if (String.starts-with? &name "Dynamic.")
+                        (CtEval.eval-template node
+                                              state
+                                              (ExpandScope.frame scope))
+                        (let-do [result (the
+                                   (Result (Array (Box SurfaceNode)) CtError)
+                                   (Result.Success []))
+                                 n (Array.length items)]
+                          (for [i 0 n]
+                            (match-ref &result
+                              (Result.Success children)
+                                (let [child (Box.peek (Array.unsafe-nth items i))]
+                                  (match (expand-node child
+                                                      macros
+                                                      state
+                                                      modules
+                                                      preludes
+                                                      scope)
+                                    (Result.Success expanded)
+                                      (Array.push-back! children
+                                                        (Box.init expanded))
+                                    (Result.Error error)
+                                      (set! result (Result.Error error))))
+                              (Result.Error error)
+                                (set! result (Result.Error @error))))
+                          (match result
+                            (Result.Success children)
+                              (Result.Success
+                                (SurfaceNode.init @(SurfaceNode.span node)
+                                                  (SurfaceForm.List children)))
+                            (Result.Error error) (Result.Error error)))))
+                  (Maybe.Nothing)
+                    (let-do [result (the
+                               (Result (Array (Box SurfaceNode)) CtError)
+                               (Result.Success []))
+                             n (Array.length items)]
+                      (for [i 0 n]
+                        (match-ref &result
+                          (Result.Success children)
+                            (let [child (Box.peek (Array.unsafe-nth items i))]
+                              (match (expand-node child
+                                                  macros
+                                                  state
+                                                  modules
+                                                  preludes
+                                                  scope)
+                                (Result.Success expanded)
+                                  (Array.push-back! children (Box.init expanded))
+                                (Result.Error error)
+                                  (set! result (Result.Error error))))
+                          (Result.Error error)
+                            (set! result (Result.Error @error))))
+                      (match result
+                        (Result.Success children)
+                          (Result.Success
+                            (SurfaceNode.init @(SurfaceNode.span node)
+                                              (SurfaceForm.List children)))
+                        (Result.Error error) (Result.Error error)))))))
+        (SurfaceForm.Array items)
+          (let-do [result (the
+                     (Result (Array (Box SurfaceNode)) CtError)
+                     (Result.Success []))
+                   n (Array.length items)]
+            (for [i 0 n]
+              (match-ref &result
+                (Result.Success children)
+                  (let [child (Box.peek (Array.unsafe-nth items i))]
+                    (match (expand-node child
+                                        macros
+                                        state
+                                        modules
+                                        preludes
+                                        scope)
+                      (Result.Success expanded)
+                        (Array.push-back! children (Box.init expanded))
+                      (Result.Error error) (set! result (Result.Error error))))
+                (Result.Error error) (set! result (Result.Error @error))))
+            (match result
+              (Result.Success children)
+                (Result.Success
+                  (SurfaceNode.init @(SurfaceNode.span node)
+                                    (SurfaceForm.Array children)))
+              (Result.Error error) (Result.Error error)))
+        (SurfaceForm.StaticArray items)
+          (let-do [result (the
+                     (Result (Array (Box SurfaceNode)) CtError)
+                     (Result.Success []))
+                   n (Array.length items)]
+            (for [i 0 n]
+              (match-ref &result
+                (Result.Success children)
+                  (let [child (Box.peek (Array.unsafe-nth items i))]
+                    (match (expand-node child
+                                        macros
+                                        state
+                                        modules
+                                        preludes
+                                        scope)
+                      (Result.Success expanded)
+                        (Array.push-back! children (Box.init expanded))
+                      (Result.Error error) (set! result (Result.Error error))))
+                (Result.Error error) (set! result (Result.Error @error))))
+            (match result
+              (Result.Success children)
+                (Result.Success
+                  (SurfaceNode.init @(SurfaceNode.span node)
+                                    (SurfaceForm.StaticArray children)))
+              (Result.Error error) (Result.Error error)))
+        (SurfaceForm.Dictionary items)
+          (let-do [result (the
+                     (Result (Array (Box SurfaceNode)) CtError)
+                     (Result.Success []))
+                   n (Array.length items)]
+            (for [i 0 n]
+              (match-ref &result
+                (Result.Success children)
+                  (let [child (Box.peek (Array.unsafe-nth items i))]
+                    (match (expand-node child
+                                        macros
+                                        state
+                                        modules
+                                        preludes
+                                        scope)
+                      (Result.Success expanded)
+                        (Array.push-back! children (Box.init expanded))
+                      (Result.Error error) (set! result (Result.Error error))))
+                (Result.Error error) (set! result (Result.Error @error))))
+            (match result
+              (Result.Success children)
+                (Result.Success
+                  (SurfaceNode.init @(SurfaceNode.span node)
+                                    (SurfaceForm.Dictionary children)))
+              (Result.Error error) (Result.Error error)))
+        _ (Result.Success (SurfaceNode.copy node)))
+      (Result.Error (error-at node (WorkBudget.reason)))))
+  (private expand-node-strict)
+  (hidden expand-node-strict)
+  (defn expand-node [node macros state modules preludes scope]
+    (if (and *expand-recovering* (not (Array.empty? &*expand-recovery-errors*)))
+      (Result.Success
+        (SurfaceNode.init @(SurfaceNode.span node)
+                          (SurfaceForm.Invalid @"unexpanded after failure")))
+      (match (expand-node-strict node macros state modules preludes scope)
+        (Result.Success expanded) (Result.Success expanded)
+        (Result.Error error)
+          (if *expand-recovering*
+            (do
+              (Array.push-back! &*expand-recovery-errors* error)
+              (Result.Success
+                (SurfaceNode.init @(SurfaceNode.span node)
+                                  (SurfaceForm.Invalid @"failed expansion"))))
+            (Result.Error error)))))
+
+  (private expand-node-1)
+  (hidden expand-node-1)
+  (doc expand-node-1 "expands only an outermost macro call. The returned
+`Nothing` distinguishes a form with no outer macro from a macro whose result
+happens to render identically.")
+  (defn expand-node-1 [node macros state modules preludes scope]
+    (if (WorkBudget.consume! 1)
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.List items)
+          (if (Int.= 0 (Array.length items))
+            (Result.Success (Maybe.Nothing))
+            (let [head (Box.peek (Array.unsafe-nth items 0))]
+              (if (named? head @"quote")
+                (do
+                  (when (Int.> (Array.length items) 1)
+                    (SourceObservations.opaque! (Box.peek (Array.unsafe-nth items
+                                                                            1))))
+                  (Result.Success (Maybe.Nothing)))
+                (match (symbol-key head)
+                  (Maybe.Just name)
+                    (match (macro-by-name macros modules preludes scope head)
+                      (MacroLookup.Found macro)
+                        (let [arguments (call-arguments items)
+                              _observed (SourceObservations.record! head
+                                                                    (ExpandMacro.name &macro)
+                                                                    "macro")]
+                          (match (bindings-for node &macro state &arguments)
+                            (Result.Success frame)
+                              (match (expand-macro-template node
+                                                            &macro
+                                                            state
+                                                            &frame)
+                                (Result.Success generated)
+                                  (let-do [next (SurfaceNode.copy &generated)
+                                           _ignored-anchor (Surface.reanchor! &next
+                                                                              (SurfaceNode.span node))]
+                                    (Result.Success (Maybe.Just next)))
+                                (Result.Error error)
+                                  (Result.Error
+                                    (CtError.init
+                                      (String.concat
+                                        &[@"while expanding macro "
+                                          (String.copy (ExpandMacro.name &macro))
+                                          @": "
+                                          (String.copy (CtError.message &error))])
+                                      @(SurfaceNode.span node))))
+                            (Result.Error error) (Result.Error error)))
+                      (MacroLookup.Ambiguous)
+                        (Result.Error
+                          (error-at head
+                                    (String.append "ambiguous imported macro: "
+                                                   &name)))
+                      (MacroLookup.Missing) (Result.Success (Maybe.Nothing)))
+                  (Maybe.Nothing) (Result.Success (Maybe.Nothing))))))
+        _ (Result.Success (Maybe.Nothing)))
+      (Result.Error (error-at node (WorkBudget.reason)))))
 
   (private expand-top-level)
   (hidden expand-top-level)
@@ -694,7 +787,7 @@ happens to render identically.")
                                                  (ExpandScope.frame scope))
                           (Result.Success _) (Result.Success (Maybe.Nothing))
                           (Result.Error error) (Result.Error error))
-                        (String.= &name "if")
+                        (named? head @"if")
                         ;; the reference evaluates top-level forms in the REPL, so a
                         ;; top-level `if` picks its branch at compile time when the
                         ;; condition is evaluable (e.g. `(= target-arch "aarch64")`).
@@ -1074,7 +1167,7 @@ has to be the one the reference stored.")
           _ ()))
       (record-metadata-named! (Box.peek (Array.unsafe-nth items 1))
                               "doc"
-                              &(SurfaceNode.init
+                              &(SurfaceNode.generated
                                 @(SurfaceNode.span (Box.peek (Array.unsafe-nth items
                                                                                1)))
                                 (SurfaceForm.StringLit (StringBuf.into-string text)))
@@ -1215,14 +1308,14 @@ name.")
                                type-copy (SurfaceNode.copy
                                  (Box.peek
                                    (Array.unsafe-nth field-items (Int.inc k))))
-                               pair (SurfaceNode.init @&span
-                                                      (SurfaceForm.List
-                                                        [(Box.init name-copy)
-                                                         (Box.init type-copy)]))]
+                               pair (SurfaceNode.generated @&span
+                                                           (SurfaceForm.List
+                                                             [(Box.init name-copy)
+                                                              (Box.init type-copy)]))]
                         (Array.push-back! &pairs (Box.init pair))
                         (set! k (Int.+ k 2))))
-                    (let [members-node (SurfaceNode.init @&span
-                                                         (SurfaceForm.Array pairs))
+                    (let [members-node (SurfaceNode.generated @&span
+                                                              (SurfaceForm.Array pairs))
                           binding-name (String.concat
                             &[@"__members_" (String.copy &type-name)])
                           root (CtEval.root state)]
@@ -1318,23 +1411,21 @@ see the definition.")
       (defmacro? form)
         (do
           (register-source-expressions! state form scope)
-          (match (parse-definition form (ExpandScope.frame scope))
+          (match (parse-definition form (ExpandScope.frame scope) state)
             (Result.Success macro)
               (do
-                (CtEval.register-macro! state
-                                        (ExpandScope.frame scope)
-                                        (ExpandMacro.name &macro)
-                                        @(MacroParameters.fixed (ExpandMacro.parameters &macro))
-                                        @(MacroParameters.rest (ExpandMacro.parameters &macro))
-                                        @(ExpandMacro.body &macro)
-                                        @(ExpandMacro.defining-frame &macro))
+                (CtEval.register-compiled-macro! state
+                                                 (ExpandScope.frame scope)
+                                                 (ExpandMacro.name &macro)
+                                                 @(ExpandMacro.code &macro)
+                                                 @(ExpandMacro.defining-frame &macro))
                 (Array.push-back! macros macro)
                 (Result.Success ()))
             (Result.Error error) (Result.Error error)))
       (defndynamic? form)
         (do
           (register-source-expressions! state form scope)
-          (match (parse-dynamic-definition form &(CtEval.root state))
+          (match (parse-dynamic-definition form &(CtEval.root state) state)
             (Result.Success dynamic)
               (do (register-dynamic! state scope &dynamic) (Result.Success ()))
             (Result.Error error) (Result.Error error)))
@@ -1430,7 +1521,8 @@ form is a macro call.")
                 (match (delete-implementation-type-name implementation)
                   (Maybe.Just type-name)
                     (let [span @(SurfaceNode.span form)
-                          node (SurfaceNode.init span (SurfaceForm.BoolLit true))
+                          node (SurfaceNode.generated span
+                                                      (SurfaceForm.BoolLit true))
                           root (CtEval.root state)
                           binding-name (String.concat
                             &[@"__managed_" (String.copy &type-name)])]
@@ -1491,157 +1583,168 @@ command. The head can only change so often, so this terminates.")
              failure (the (Maybe CtError) (Maybe.Nothing))
              n (Array.length forms)]
       (for [i start n]
-        (match-ref &failure
-          (Maybe.Nothing)
-            (let [form (Box.peek (Array.unsafe-nth forms i))]
-              (cond
-                (defmacro? form)
-                  (do
-                    (register-source-expressions! state form &current-scope)
-                    (match (parse-definition form
-                                             (ExpandScope.frame &current-scope))
-                      (Result.Success macro)
+        (when (or (not *expand-recovering*)
+                  (Array.empty? &*expand-recovery-errors*))
+          (match-ref &failure
+            (Maybe.Nothing)
+              (let [form (Box.peek (Array.unsafe-nth forms i))]
+                (cond
+                  (defmacro? form)
+                    (do
+                      (register-source-expressions! state form &current-scope)
+                      (match (parse-definition form
+                                               (ExpandScope.frame &current-scope)
+                                               state)
+                        (Result.Success macro)
+                          (do
+                            ;; macros are also environment citizens, so the
+                            ;; evaluator can expand one it meets mid-evaluation
+                            ;; (a macro invoked inside another macro's body).
+                            (CtEval.register-compiled-macro! state
+                                                             (ExpandScope.frame &current-scope)
+                                                             (ExpandMacro.name &macro)
+                                                             @(ExpandMacro.code &macro)
+                                                             @(ExpandMacro.defining-frame &macro))
+                            (Array.push-back! macros macro))
+                        (Result.Error error) (set! failure (Maybe.Just error))))
+                  (defndynamic? form)
+                    (do
+                      (register-source-expressions! state form &current-scope)
+                      ;; a dynamic function's body resolves bare names globally
+                      ;; (the reference cannot see unqualified module siblings
+                      ;; from dynamic code — probe: `(defndynamic bb [] (aa))`
+                      ;; next to `aa` errors, and `map` inside `Dynamic.Map`
+                      ;; means the generic map, not the sibling `Map.map`), so
+                      ;; the closure captures the root frame; registration still
+                      ;; targets the module scope for qualified access.
+                      (match (parse-dynamic-definition form
+                                                       &(CtEval.root state)
+                                                       state)
+                        (Result.Success dynamic)
+                          (register-dynamic! state &current-scope &dynamic)
+                        (Result.Error error) (set! failure (Maybe.Just error))))
+                  (defdynamic? form)
+                    (do
+                      (register-source-expressions! state form &current-scope)
+                      (match (parse-dynamic-value form
+                                                  state
+                                                  (ExpandScope.frame &current-scope))
+                        (Result.Success dynamic)
+                          (register-dynamic! state &current-scope &dynamic)
+                        (Result.Error error) (set! failure (Maybe.Just error))))
+                  (defmodule? form)
+                    (do
+                      (register-source-expressions! state form &current-scope)
+                      (match (expand-module-form form
+                                                 &current-scope
+                                                 macros
+                                                 state
+                                                 modules
+                                                 config
+                                                 preludes)
+                        (Result.Success expanded)
+                          (do
+                            (record-typing-form! &expanded &current-scope)
+                            (set! expanded-forms
+                                  (Array.push-back expanded-forms
+                                                   (Box.init expanded))))
+                        (Result.Error error) (set! failure (Maybe.Just error))))
+                  (deftype? form)
+                    (do
+                      ;; record members for `(members T)`, then pass the deftype on
+                      ;; unchanged so resolution still sees it.
+                      (register-source-expressions! state form &current-scope)
+                      (register-deftype-members! state form)
+                      (record-typing-form! form &current-scope)
+                      (set! expanded-forms
+                            (Array.push-back expanded-forms
+                                             (Box.init (SurfaceNode.copy form)))))
+                  (load-stack-marker-head? form "Unsafe.load-stack-push!")
+                    (match (load-stack-marker-file form)
+                      (Maybe.Just file) (CtEval.push-load-file! &file)
+                      (Maybe.Nothing) ())
+                  (load-stack-marker-head? form "Unsafe.load-stack-pop!")
+                    (CtEval.pop-load-file!)
+                  (compile-time-command? form) (record-command-flag! form)
+                  (let [imports (use-targets form)]
+                    (cond
+                      (Int.> (Array.length &imports) 0)
                         (do
-                          ;; macros are also environment citizens, so the
-                          ;; evaluator can expand one it meets mid-evaluation
-                          ;; (a macro invoked inside another macro's body).
-                          (CtEval.register-macro! state
-                                                  (ExpandScope.frame &current-scope)
-                                                  (ExpandMacro.name &macro)
-                                                  @(MacroParameters.fixed (ExpandMacro.parameters &macro))
-                                                  @(MacroParameters.rest (ExpandMacro.parameters &macro))
-                                                  @(ExpandMacro.body &macro)
-                                                  @(ExpandMacro.defining-frame &macro))
-                          (Array.push-back! macros macro))
-                      (Result.Error error) (set! failure (Maybe.Just error))))
-                (defndynamic? form)
-                  (do
-                    (register-source-expressions! state form &current-scope)
-                    ;; a dynamic function's body resolves bare names globally
-                    ;; (the reference cannot see unqualified module siblings
-                    ;; from dynamic code — probe: `(defndynamic bb [] (aa))`
-                    ;; next to `aa` errors, and `map` inside `Dynamic.Map`
-                    ;; means the generic map, not the sibling `Map.map`), so
-                    ;; the closure captures the root frame; registration still
-                    ;; targets the module scope for qualified access.
-                    (match (parse-dynamic-definition form &(CtEval.root state))
-                      (Result.Success dynamic)
-                        (register-dynamic! state &current-scope &dynamic)
-                      (Result.Error error) (set! failure (Maybe.Just error))))
-                (defdynamic? form)
-                  (do
-                    (register-source-expressions! state form &current-scope)
-                    (match (parse-dynamic-value form
-                                                state
-                                                (ExpandScope.frame &current-scope))
-                      (Result.Success dynamic)
-                        (register-dynamic! state &current-scope &dynamic)
-                      (Result.Error error) (set! failure (Maybe.Just error))))
-                (defmodule? form)
-                  (do
-                    (register-source-expressions! state form &current-scope)
-                    (match (expand-module-form form
-                                               &current-scope
+                          (for [ii 0 (Array.length &imports)]
+                            (match (module-frame modules
+                                                 (Array.unsafe-nth &imports ii))
+                              (Maybe.Just imported)
+                                (do
+                                  (ignore
+                                    (CtEval.import! state
+                                                    (ExpandScope.frame &current-scope)
+                                                    &imported))
+                                  (Array.push-back! (ExpandScope.imports &current-scope)
+                                                    imported))
+                              (Maybe.Nothing) ()))
+                          (record-typing-form! form &current-scope)
+                          (set! expanded-forms
+                                (Array.push-back expanded-forms
+                                                 (Box.init (SurfaceNode.copy form)))))
+                      (opaque-top-level? form)
+                        (do
+                          (register-source-expressions! state
+                                                        form
+                                                        &current-scope)
+                          (register-managed-implementation! state form)
+                          (record-metadata! form &current-scope)
+                          (record-typing-form! form &current-scope)
+                          (set! expanded-forms
+                                (Array.push-back expanded-forms
+                                                 (Box.init (SurfaceNode.copy form)))))
+                      (match (expand-top-level form
                                                macros
                                                state
                                                modules
-                                               config
-                                               preludes)
-                      (Result.Success expanded)
-                        (do
-                          (record-typing-form! &expanded &current-scope)
-                          (set! expanded-forms
-                                (Array.push-back expanded-forms
-                                                 (Box.init expanded))))
-                      (Result.Error error) (set! failure (Maybe.Just error))))
-                (deftype? form)
-                  (do
-                    ;; record members for `(members T)`, then pass the deftype on
-                    ;; unchanged so resolution still sees it.
-                    (register-source-expressions! state form &current-scope)
-                    (register-deftype-members! state form)
-                    (record-typing-form! form &current-scope)
-                    (set! expanded-forms
-                          (Array.push-back expanded-forms
-                                           (Box.init (SurfaceNode.copy form)))))
-                (load-stack-marker-head? form "Unsafe.load-stack-push!")
-                  (match (load-stack-marker-file form)
-                    (Maybe.Just file) (CtEval.push-load-file! &file)
-                    (Maybe.Nothing) ())
-                (load-stack-marker-head? form "Unsafe.load-stack-pop!")
-                  (CtEval.pop-load-file!)
-                (compile-time-command? form) (record-command-flag! form)
-                (let [imports (use-targets form)]
-                  (cond
-                    (Int.> (Array.length &imports) 0)
-                      (do
-                        (for [ii 0 (Array.length &imports)]
-                          (match (module-frame modules
-                                               (Array.unsafe-nth &imports ii))
-                            (Maybe.Just imported)
-                              (do
-                                (ignore
-                                  (CtEval.import! state
-                                                  (ExpandScope.frame &current-scope)
-                                                  &imported))
-                                (Array.push-back! (ExpandScope.imports &current-scope)
-                                                  imported))
-                            (Maybe.Nothing) ()))
-                        (record-typing-form! form &current-scope)
-                        (set! expanded-forms
-                              (Array.push-back expanded-forms
-                                               (Box.init (SurfaceNode.copy form)))))
-                    (opaque-top-level? form)
-                      (do
-                        (register-source-expressions! state form &current-scope)
-                        (register-managed-implementation! state form)
-                        (record-metadata! form &current-scope)
-                        (record-typing-form! form &current-scope)
-                        (set! expanded-forms
-                              (Array.push-back expanded-forms
-                                               (Box.init (SurfaceNode.copy form)))))
-                    (match (expand-top-level form
-                                             macros
-                                             state
-                                             modules
-                                             preludes
-                                             &current-scope)
-                      (Result.Success maybe-expanded)
-                        (match maybe-expanded
-                          (Maybe.Just expanded)
-                            (if (top-level-again? form &expanded)
-                              (match (expand-body &(top-level-forms &expanded)
-                                                  0
-                                                  @&current-scope
-                                                  macros
-                                                  state
-                                                  modules
-                                                  config
-                                                  preludes)
-                                (Result.Success more)
-                                  (for [k 0 (Array.length &more)]
-                                    (set! expanded-forms
-                                          (Array.push-back expanded-forms
-                                                           @(Array.unsafe-nth &more
-                                                                              k))))
-                                (Result.Error error)
-                                  (set! failure (Maybe.Just error)))
-                              (set! expanded-forms
-                                    (do
-                                      (register-source-expressions! state
-                                                                    &expanded
-                                                                    &current-scope)
-                                      (record-metadata! &expanded &current-scope)
-                                      (record-typing-form! &expanded
-                                                           &current-scope)
-                                      (Array.push-back expanded-forms
-                                                       (Box.init expanded)))))
-                          (Maybe.Nothing) ())
-                      (Result.Error error) (set! failure (Maybe.Just error)))))))
-          (Maybe.Just _) ()))
+                                               preludes
+                                               &current-scope)
+                        (Result.Success maybe-expanded)
+                          (match maybe-expanded
+                            (Maybe.Just expanded)
+                              (if (top-level-again? form &expanded)
+                                (match (expand-body &(top-level-forms &expanded)
+                                                    0
+                                                    @&current-scope
+                                                    macros
+                                                    state
+                                                    modules
+                                                    config
+                                                    preludes)
+                                  (Result.Success more)
+                                    (for [k 0 (Array.length &more)]
+                                      (set! expanded-forms
+                                            (Array.push-back expanded-forms
+                                                             @(Array.unsafe-nth &more
+                                                                                k))))
+                                  (Result.Error error)
+                                    (set! failure (Maybe.Just error)))
+                                (set! expanded-forms
+                                      (do
+                                        (register-source-expressions! state
+                                                                      &expanded
+                                                                      &current-scope)
+                                        (record-metadata! &expanded
+                                                          &current-scope)
+                                        (record-typing-form! &expanded
+                                                             &current-scope)
+                                        (Array.push-back expanded-forms
+                                                         (Box.init expanded)))))
+                            (Maybe.Nothing) ())
+                        (Result.Error error) (set! failure (Maybe.Just error)))))))
+            (Maybe.Just _) ())))
       (match failure
         (Maybe.Nothing) (Result.Success expanded-forms)
-        (Maybe.Just error) (Result.Error error))))
+        (Maybe.Just error)
+          (if *expand-recovering*
+            (do
+              (Array.push-back! &*expand-recovery-errors* error)
+              (Result.Success expanded-forms))
+            (Result.Error error)))))
 
   (doc prepare-module-with "expands a base module once and retains its
 compile-time environment for subsequent transient expansions.")
@@ -1768,3 +1871,19 @@ frames; each macro retains its lexical defining frame. Compile-time
 definitions are omitted from returned module bodies.")
   (defn expand-module [module]
     (let [config (ExpandConfig.init [])] (expand-module-with module &config))))
+
+(defmodule MacroExpand
+  (doc observe-module-against "expands with the ordinary expander, retaining
+verified parents and expanded prefixes after a failure. Failed and unvisited
+nodes are Invalid; no subsequent compile-time evaluation is attempted. This
+recovered tree is for observations only and never enters a session commit.")
+  (defn observe-module-against [module snapshot]
+    (let-do [saved *expand-recovering*
+             saved-errors (Array.copy &*expand-recovery-errors*)
+             _begin (set! *expand-recovering* true)
+             _clear (set! *expand-recovery-errors* [])
+             result (expand-module-against module snapshot)
+             errors (Array.copy &*expand-recovery-errors*)
+             _restore (set! *expand-recovering* saved)
+             _errors (set! *expand-recovery-errors* saved-errors)]
+      (ObservedExpansion.init result errors))))

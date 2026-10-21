@@ -1,0 +1,882 @@
+; Declarative views shared by terminal and notebook hosts. Callbacks receive
+; their source as an argument: a view never has to copy a collection to keep
+; its item provider alive. Hosts own sources, not view declarations.
+
+(deftype ViewRequest [selector String
+                      offset Int
+                      count Int
+                      depth Int
+                      bytes Int])
+
+(deftype (ViewColumn a)
+  [title String
+   cell (Fn [(Ref a) Int (Ref ViewRequest)] String)])
+(deftype (ViewSpec a)
+  [kind String
+   title String
+   selector String
+   priority Int
+   content (Fn [(Ref a) (Ref ViewRequest)] String)
+   count (Fn [(Ref a)] Int)
+   item-text (Fn [(Ref a) Int (Ref ViewRequest)] String)
+   item-send (Fn [(Ref a) Int Int] Int)
+   columns (Array (ViewColumn a))
+   width Int
+   height Int
+   pixels (Array Byte)
+   children (Fn [(Ref a) (Ref ViewRequest)] (Array Int))
+   source String])
+
+(definterface views (Fn [(Ref a)] (Array (ViewSpec a))))
+(definterface view-summary (Fn [(Ref a) (Ref ViewRequest)] String))
+(definterface view-type-name (Fn [(Ref a)] String))
+; Registration owns a value or retains an immutable parent lease. Item providers
+; register children only when the host requests their rows.
+(definterface view-register (Fn [a] Int))
+
+(defmodule View
+  (doc request "constructs a bounded request. Offsets and counts name items;
+text providers interpret offsets as UTF-8 byte positions.")
+  (defn request [selector offset count depth bytes]
+    (ViewRequest.init selector
+                      (Int.max 0 (Int.min offset 1048576))
+                      (Int.max 0 (Int.min count 1024))
+                      (Int.max 0 (Int.min depth 32))
+                      (Int.max 0 (Int.min bytes 65536))))
+
+  (defn defaults [] (request @"" 0 32 6 4096))
+
+  (defn- empty-view [kind]
+    (ViewSpec.init kind
+                   @"Unknown"
+                   @"gtViewFor"
+                   1
+                   (fn [value request] (do (ignore value) (ignore request) @""))
+                   (fn [value] (do (ignore value) 0))
+                   (fn [value i request]
+                     (do (ignore value) (ignore i) (ignore request) @""))
+                   (fn [value i owner]
+                     (do (ignore value) (ignore i) (ignore owner) -1))
+                   []
+                   0
+                   0
+                   []
+                   (fn [value request]
+                     (do (ignore value) (ignore request) (the (Array Int) [])))
+                   @""))
+
+  (defn empty [] (empty-view @"empty"))
+  (defn text [] (empty-view @"text"))
+  (defn list [] (empty-view @"list"))
+  (defn columned [] (empty-view @"columned"))
+  (defn tree [] (empty-view @"tree"))
+  (defn bitmap [] (empty-view @"bitmap"))
+  (defn title [view title] (ViewSpec.set-title view title))
+  (defn priority [view priority] (ViewSpec.set-priority view priority))
+  (defn selector [view selector] (ViewSpec.set-selector view selector))
+  (defn with-source [view source] (ViewSpec.set-source view source))
+
+  ; The familiar combinators accept closed callbacks. Source-aware variants
+  ; are useful for reusable providers without captured copies of the source.
+  (defn content [view text]
+    (ViewSpec.set-content view
+                          (fn [value request]
+                            (do (ignore value) (ignore request) @&text))))
+  (defn value-content [view provider] (ViewSpec.set-content view provider))
+  (defn items [view count]
+    (ViewSpec.set-count view (fn [value] (do (ignore value) (count)))))
+  (defn value-items [view count] (ViewSpec.set-count view count))
+  (defn item-format [view format]
+    (ViewSpec.set-item-text view
+                            (fn [value i request]
+                              (do (ignore value) (ignore request) (format i)))))
+  (defn value-format [view format] (ViewSpec.set-item-text view format))
+  (defn send [view send]
+    (ViewSpec.set-item-send view
+                            (fn [value i owner]
+                              (do (ignore value) (ignore owner) (send i)))))
+  (defn value-send [view send] (ViewSpec.set-item-send view send))
+  (defn column [title cell]
+    (ViewColumn.init title
+                     (fn [value i request]
+                       (do (ignore value) (ignore request) (cell i)))))
+  (defn value-column [title cell] (ViewColumn.init title cell))
+  (defn with-columns [view columns] (ViewSpec.set-columns view columns))
+  (defn extent [view width height]
+    (ViewSpec.set-height (ViewSpec.set-width view width) height))
+  (defn pixels [view pixels] (ViewSpec.set-pixels view pixels))
+  (defn children [view children]
+    (ViewSpec.set-children view
+                           (fn [value request]
+                             (do (ignore value) (ignore request) (children)))))
+  (defn value-children [view children] (ViewSpec.set-children view children))
+
+  (defn print-view []
+    (=> (text)
+        (title @"Print")
+        (selector @"gtPrintFor")
+        (priority 100)
+        (value-content (fn [value request] (view-summary value request)))))
+
+  (defn- byte-at [text index]
+    (Byte.to-int
+      (Pointer.to-value
+        (the (Ptr Byte)
+             (Pointer.from-long
+               (+ (Pointer.to-long (String.cstr text)) (Long.from-int index)))))))
+
+  (defn- continuation? [byte] (and (>= byte 128) (< byte 192)))
+
+  (doc slice "copies a bounded UTF-8 slice without measuring or copying the
+whole string. It scans only as far as the requested window.")
+  (defn slice [text offset bytes]
+    (let-do [start 0
+             end 0
+             output (the (Array Byte) [])]
+      (while (and (< start offset) (/= (byte-at text start) 0))
+        (set! start (Int.inc start)))
+      (while (continuation? (byte-at text start)) (set! start (Int.inc start)))
+      (set! end start)
+      (while (and (< (- end start) bytes) (/= (byte-at text end) 0))
+        (set! end (Int.inc end)))
+      (when (continuation? (byte-at text end))
+        (while (and (> end start) (continuation? (byte-at text end)))
+          (set! end (Int.dec end))))
+      (for [i start end]
+        (Array.push-back! &output (Byte.from-int (byte-at text i))))
+      (String.from-bytes &output)))
+
+  (doc cap "clips a completed user formatter result. Source-aware content
+providers should use the request to bound their own work before allocation.")
+  (defn cap [text] (View.slice &text 0 200))
+
+  (doc view-index "selects an applicable view by selector, or the lowest
+priority applicable view when the selector is empty. Declaration order breaks ties.")
+  (defn view-index [views selector]
+    (let-do [answer -1
+             priority 2147483647]
+      (for [i 0 (Array.length views)]
+        (let [view (Array.unsafe-nth views i)]
+          (unless (String.= (ViewSpec.kind view) "empty")
+            (if (String.empty? selector)
+              (when-do (or (< answer 0) (< @(ViewSpec.priority view) priority))
+                (set! answer i)
+                (set! priority @(ViewSpec.priority view)))
+              (when (String.= selector (ViewSpec.selector view)) (set! answer i))))))
+      answer))
+
+  (doc end-index "the exclusive end of a bounded listing request.")
+  (defn end-index [total request]
+    (Int.min (Int.max total 0)
+             (+ @(ViewRequest.offset request) @(ViewRequest.count request))))
+
+  (doc cell "evaluates one checked row and column. No other row is visited.")
+  (defn cell [value view row column request]
+    (cond
+      (or (< row 0) (>= row (~(ViewSpec.count view) value))) @""
+      (String.= (ViewSpec.kind view) "columned")
+        (if (or (< column 0) (>= column (Array.length (ViewSpec.columns view))))
+          @""
+          (~(ViewColumn.cell (Array.unsafe-nth (ViewSpec.columns view) column)) value
+                                                                                row
+                                                                                request))
+      (~(ViewSpec.item-text view) value row request)))
+
+  (doc render "renders one declarative view as bounded terminal text. Empty
+means no applicable view; the host may then supply its native Raw view.")
+  (defn render [value views request]
+    (let [index (view-index views (ViewRequest.selector request))]
+      (if (or (< index 0) (<= @(ViewRequest.bytes request) 0))
+        @""
+        (let [view (Array.unsafe-nth views index)]
+          (cond
+            (String.= (ViewSpec.kind view) "text")
+              (let [text (~(ViewSpec.content view) value request)]
+                (View.slice &text 0 @(ViewRequest.bytes request)))
+            (String.= (ViewSpec.kind view) "bitmap")
+              (fmt "[%s: %d × %d bitmap]"
+                   (ViewSpec.title view)
+                   @(ViewSpec.width view)
+                   @(ViewSpec.height view))
+            (let-do [output @""
+                     remaining @(ViewRequest.bytes request)
+                     end (end-index (~(ViewSpec.count view) value) request)
+                     row @(ViewRequest.offset request)]
+              (while (and (< row end) (> remaining 0))
+                (let-do [columns (if (String.= (ViewSpec.kind view) "columned")
+                           (Array.length (ViewSpec.columns view))
+                           1)
+                         column 0]
+                  (when-do (> row @(ViewRequest.offset request))
+                    (set! output (String.append &output "
+"))
+                    (set! remaining (Int.dec remaining)))
+                  (while (and (< column columns) (> remaining 0))
+                    (let-do [separator (if (> column 0) @" | " @"")
+                             _separator (when-do (<= (String.length &separator)
+                                                     remaining)
+                               (set! output (String.append &output &separator))
+                               (set! remaining
+                                     (- remaining (String.length &separator))))
+                             text (if (> remaining 0)
+                               (cell value
+                                     view
+                                     row
+                                     column
+                                     &(ViewRequest.set-bytes @request remaining))
+                               @"")
+                             clipped (View.slice &text 0 remaining)]
+                      (set! output (String.append &output &clipped))
+                      (set! remaining (- remaining (String.length &clipped)))
+                      (set! column (Int.inc column))))
+                  (set! row (Int.inc row))))
+              output))))))
+
+  (doc describe
+    "lists applicable view selectors, titles, kinds, and priorities.")
+  (defn describe [views]
+    (let-do [lines (the (Array String) [])]
+      (for [i 0 (Array.length views)]
+        (let [view (Array.unsafe-nth views i)]
+          (unless (String.= (ViewSpec.kind view) "empty")
+            (Array.push-back! &lines
+                              (fmt "%s : %s (%s, %d)"
+                                   (ViewSpec.selector view)
+                                   (ViewSpec.title view)
+                                   (ViewSpec.kind view)
+                                   @(ViewSpec.priority view))))))
+      (String.join "
+" &lines))))
+
+(defmodule ViewAny
+  (sig views (Fn [(Ref a)] (Array (ViewSpec a))))
+  (defn views [value] (do (ignore value) [(View.print-view)]))
+  (implements views ViewAny.views)
+  (sig summary (Fn [(Ref a) (Ref ViewRequest)] String))
+  (defn summary [value request] (do (ignore value) (ignore request) @"<value>"))
+  (implements view-summary ViewAny.summary)
+  (sig type-name (Fn [(Ref a)] String))
+  (defn type-name [value] (do (ignore value) @""))
+  (implements view-type-name ViewAny.type-name))
+
+; Type erasure is confined to owned object registration. The pointer and every
+; callback borrowing it share one registry entry; release runs exactly once.
+; Entries are never reused, so an old id cannot identify a new value.
+(deftype ViewObject
+  [type-name String
+   print (Fn [] String)
+   views (Array (ViewSpec Long))
+   release (Fn [] ())])
+(def *view-objects* (the (Array ViewObject) []))
+(def *view-refs* (the (Array Int) []))
+
+(defmodule View
+  (defn object-count [] (Array.length &*view-objects*))
+  (defn valid-id? [id]
+    (and (>= id 0)
+         (< id (object-count))
+         (> @(Array.unsafe-nth &*view-refs* id) 0)))
+  (defn bump-ref! [id]
+    (when (valid-id? id)
+      (Array.aset! &*view-refs* id (Int.inc @(Array.unsafe-nth &*view-refs* id)))))
+  (defn- release-object [id]
+    (let-do [release @(ViewObject.release (Array.unsafe-nth &*view-objects* id))]
+      (release)
+      (Array.aset! &*view-objects*
+                   id
+                   (ViewObject.init @"" (fn [] @"") [] (fn [] ())))))
+  (defn drop-ref! [id]
+    (when (valid-id? id)
+      (let-do [remaining (Int.dec @(Array.unsafe-nth &*view-refs* id))]
+        (Array.aset! &*view-refs* id remaining)
+        (when (= remaining 0) (release-object id)))))
+  (defn clear! []
+    (for [i 0 (object-count)]
+      (when-do (valid-id? i) (Array.aset! &*view-refs* i 0) (release-object i))))
+  (defn- bind-column [pointer column]
+    (let [cell @(ViewColumn.cell column)]
+      (ViewColumn.init @(ViewColumn.title column)
+                       (fn [unused row request]
+                         (do
+                           (ignore (the (Ref Long) unused))
+                           (cell (Pointer.to-ref pointer) row request))))))
+  (defn- bind-view [pointer view]
+    (let-do [columns (the (Array (ViewColumn Long)) [])
+             content @(ViewSpec.content view)
+             count @(ViewSpec.count view)
+             item-text @(ViewSpec.item-text view)
+             item-send @(ViewSpec.item-send view)
+             children @(ViewSpec.children view)]
+      (for [i 0 (Array.length (ViewSpec.columns view))]
+        (Array.push-back! &columns
+                          (bind-column pointer
+                                       (Array.unsafe-nth (ViewSpec.columns view)
+                                                         i))))
+      (ViewSpec.init @(ViewSpec.kind view)
+                     @(ViewSpec.title view)
+                     @(ViewSpec.selector view)
+                     @(ViewSpec.priority view)
+                     (fn [unused request]
+                       (do
+                         (ignore (the (Ref Long) unused))
+                         (content (Pointer.to-ref pointer) request)))
+                     (fn [unused]
+                       (do
+                         (ignore (the (Ref Long) unused))
+                         (count (Pointer.to-ref pointer))))
+                     (fn [unused row request]
+                       (do
+                         (ignore (the (Ref Long) unused))
+                         (item-text (Pointer.to-ref pointer) row request)))
+                     (fn [unused row owner]
+                       (do
+                         (ignore (the (Ref Long) unused))
+                         (item-send (Pointer.to-ref pointer) row owner)))
+                     columns
+                     @(ViewSpec.width view)
+                     @(ViewSpec.height view)
+                     @(ViewSpec.pixels view)
+                     (fn [unused request]
+                       (do
+                         (ignore (the (Ref Long) unused))
+                         (children (Pointer.to-ref pointer) request)))
+                     @(ViewSpec.source view))))
+
+  (sig register (Fn [a] Int))
+  (defn register [value]
+    (let-do [pointer (Pointer.unsafe-alloc value)
+             views (views (Pointer.to-ref pointer))
+             bound (the (Array (ViewSpec Long)) [])]
+      (for [i 0 (Array.length &views)]
+        (Array.push-back! &bound (bind-view pointer (Array.unsafe-nth &views i))))
+      (let-do [object (ViewObject.init
+                 (view-type-name (Pointer.to-ref pointer))
+                 (fn [] (view-summary (Pointer.to-ref pointer) &(defaults)))
+                 bound
+                 (fn []
+                   (let-do [owned (Pointer.to-value pointer)]
+                     (Pointer.free pointer)
+                     (ignore owned))))]
+        (Array.push-back! &*view-objects* object)
+        (Array.push-back! &*view-refs* 1)
+        (Int.dec (object-count)))))
+  (implements view-register View.register))
+
+(defmodule View
+  (hidden unsafe-borrow-register)
+  (doc unsafe-borrow-register "registers a view of storage owned by parent.
+The caller must ensure value is a stable subvalue of that immutable owner.
+Built-in item providers use this at the type-erasure boundary; normal user
+selection callbacks can transfer an owned value with view-register instead.")
+  (defn unsafe-borrow-register [value parent]
+    (if (not (valid-id? parent))
+      -1
+      (let-do [pointer (Pointer.address value)
+               views (views value)
+               bound (the (Array (ViewSpec Long)) [])]
+        (for [i 0 (Array.length &views)]
+          (Array.push-back! &bound
+                            (bind-view pointer (Array.unsafe-nth &views i))))
+        (bump-ref! parent)
+        (let-do [object (ViewObject.init (view-type-name value)
+                                         (fn []
+                                           (view-summary (Pointer.to-ref pointer)
+                                                         &(defaults)))
+                                         bound
+                                         (fn [] (View.drop-ref! parent)))]
+          (Array.push-back! &*view-objects* object)
+          (Array.push-back! &*view-refs* 1)
+          (Int.dec (object-count)))))))
+
+(defmodule View
+  (doc leaf "registers an already formatted leaf with an explicit type name.")
+  (defn leaf [type-name print]
+    (let-do [id (view-register print)]
+      (ViewObject.set-type-name! (Array.unsafe-nth &*view-objects* id) type-name)
+      id))
+
+  (doc send-item "selects one checked item from a live registered owner.
+Built-in providers register a borrowed child with a lease on its parent.")
+  (defn send-item [id selector row]
+    (if (not (valid-id? id))
+      -1
+      (let [views (ViewObject.views (Array.unsafe-nth &*view-objects* id))
+            index (view-index views selector)]
+        (if (< index 0)
+          -1
+          (let [view (Array.unsafe-nth views index)]
+            (if (or (< row 0) (>= row (~(ViewSpec.count view) &0l)))
+              -1
+              (let [send @(ViewSpec.item-send view)] (send &0l row id)))))))))
+
+(defmodule ViewMacro
+  (defndynamic raw-view-form [type-name fields]
+    (let [n (length fields)
+          names (cons 'cond
+                      (ViewMacro.cond-over-fields fields
+                                                  0
+                                                  (fn [m] `(copy %(str (car m))))
+                                                  '(copy "")))
+          values (cons 'cond
+                       (ViewMacro.cond-over-fields fields
+                                                   0
+                                                   (fn [m]
+                                                     `(view-summary
+                                                       (%(Symbol.prefix type-name
+                                                                        (car m)) value)
+                                                       request))
+                                                   '(copy "")))
+          send (cons 'cond
+                     (ViewMacro.cond-over-fields fields
+                                                 0
+                                                 (fn [m]
+                                                   `(View.unsafe-borrow-register
+                                                     (%(Symbol.prefix type-name
+                                                                      (car m)) value)
+                                                     owner))
+                                                 -1))]
+      `(=> (View.columned)
+           (View.title (copy "Raw"))
+           (View.selector (copy "gtRawFor"))
+           (View.priority 90)
+           (View.with-columns
+             [(View.value-column (copy "Variable") (fn [value i request] %names))
+              (View.value-column (copy "Value") (fn [value i request] %values))])
+           (View.value-items (fn [value] (do (ignore value) %n)))
+           (View.value-send (fn [value i owner] %send)))))
+
+  (defndynamic expand-view [name binder body]
+    (let-do [b (map (fn [x] x) binder)
+             param (car b)
+             type-form (cadr b)
+             type-name (if (list? type-form) (car type-form) type-form)
+             known (ViewMacro.reg-lookup *view-registry* type-form)
+             fns (if (List.in? name known) known (append known (list name)))
+             provider (Symbol.concat ['views- (car fns)])
+             type-provider (Symbol.concat ['view-type-name- (car fns)])
+             src (String.concat
+               ["(defview " (str name) " " (ViewMacro.form-str binder) "
+  " (ViewMacro.form-str body) ")"])
+             fields (if (list? type-form)
+               '()
+               (ViewMacro.record-fields type-name))
+             base (append
+               (map
+                 (fn [vf] `(View.selector (%vf view-value) (copy %(str vf))))
+                 fns)
+               (list '(View.print-view)))
+             views (collect-into
+               (if (= (length fields) 0)
+                 base
+                 (append base (list (ViewMacro.raw-view-form type-name fields))))
+               array)]
+      (set! *view-registry* (ViewMacro.reg-store *view-registry* type-form fns))
+      `(do
+        (sig %name (Fn [(Ref %type-form)] (ViewSpec %type-form)))
+        (defn %name [%param] (View.with-source %body (copy %src)))
+        (sig %provider (Fn [(Ref %type-form)] (Array (ViewSpec %type-form))))
+        (defn %provider [view-value] %views)
+        (implements views %provider)
+        (sig %type-provider (Fn [(Ref %type-form)] String))
+        (defn %type-provider [value] (do (ignore value) (copy %(str type-name))))
+        (implements view-type-name %type-provider)))))
+
+(defmacro defview [name binder body] (ViewMacro.expand-view name binder body))
+
+(defdynamic *view-registry* '())
+
+(defmodule ViewMacro
+  (defndynamic escape-str [s]
+    (if (= (String.length s) 0)
+      ""
+      (let [c (String.slice s 0 1)
+            rest (ViewMacro.escape-str (String.suffix s 1))]
+        (cond (= c "\"") (String.concat ["\\\"" rest]) (= c "
+") (String.concat ["\\n" rest]) (= c "\\") (String.concat ["\\\\" rest]) (String.concat [c
+                                                                                         rest])))))
+
+  (defndynamic join-forms [forms]
+    (cond
+      (= (length forms) 0) ""
+      (= (length forms) 1) (ViewMacro.form-str (car forms))
+      (String.concat
+        [(ViewMacro.form-str (car forms)) " " (ViewMacro.join-forms (cdr forms))])))
+
+  (defndynamic form-str [form]
+    (cond
+      (string? form) (String.concat ["\"" (ViewMacro.escape-str form) "\""])
+      (array? form) (String.concat ["[" (ViewMacro.join-forms form) "]"])
+      (list? form)
+        (cond
+          (and (= (length form) 2) (= (car form) 'copy))
+            (String.concat ["@" (ViewMacro.form-str (cadr form))])
+          (and (= (length form) 2) (= (car form) 'ref))
+            (String.concat ["&" (ViewMacro.form-str (cadr form))])
+          (and (= (length form) 2) (= (car form) 'deref))
+            (String.concat ["~" (ViewMacro.form-str (cadr form))])
+          (String.concat ["(" (ViewMacro.join-forms form) ")"]))
+      (str form)))
+
+  (defndynamic reg-lookup [reg t]
+    (cond
+      (= (length reg) 0) '()
+      (= (car (car reg)) t) (cadr (car reg))
+      (ViewMacro.reg-lookup (cdr reg) t)))
+
+  (defndynamic reg-store [reg t fns]
+    (cond
+      (= (length reg) 0) (list (list t fns))
+      (= (car (car reg)) t) (cons (list t fns) (cdr reg))
+      (cons (car reg) (ViewMacro.reg-store (cdr reg) t fns))))
+
+  (defndynamic cond-over-fields [fields idx make-case default]
+    (if (= (length fields) 0)
+      (list default)
+      (append
+        (list `(= i %idx) (make-case (car fields)))
+        (ViewMacro.cond-over-fields (cdr fields) (+ idx 1) make-case default))))
+
+  (defndynamic record-fields [type-key]
+    (let [probe (eval (Symbol.concat ['__members_ type-key]))]
+      (if (array? probe) (map (fn [x] x) probe) '()))))
+
+(defmacro view-scalar-summary [type]
+  (let [name (Symbol.concat ['view-summary- type])
+        type-name (Symbol.concat ['view-type-name- type])]
+    `(do
+      (sig %name (Fn [(Ref %type) (Ref ViewRequest)] String))
+      (defn %name [value request] (do (ignore request) (str value)))
+      (implements view-summary %name)
+      (sig %type-name (Fn [(Ref %type)] String))
+      (defn %type-name [value] (do (ignore value) (copy %(str type))))
+      (implements view-type-name %type-name))))
+
+(view-scalar-summary Int)
+
+(view-scalar-summary Long)
+
+(view-scalar-summary Double)
+
+(view-scalar-summary Float)
+
+(view-scalar-summary Bool)
+
+(view-scalar-summary Char)
+
+(view-scalar-summary Byte)
+
+(view-scalar-summary Int8)
+
+(view-scalar-summary Int16)
+
+(view-scalar-summary Int32)
+
+(view-scalar-summary Int64)
+
+(view-scalar-summary Uint8)
+
+(view-scalar-summary Uint16)
+
+(view-scalar-summary Uint32)
+
+(view-scalar-summary Uint64)
+
+(defmodule View
+  (defn child-request [request]
+    (View.request @""
+                  0
+                  (Int.min 8 @(ViewRequest.count request))
+                  (Int.max 0 (Int.dec @(ViewRequest.depth request)))
+                  (Int.min 200 @(ViewRequest.bytes request))))
+  (defn string-summary [text request]
+    (View.slice text @(ViewRequest.offset request) @(ViewRequest.bytes request)))
+  (implements view-summary View.string-summary)
+
+  (sig array-summary (Fn [(Ref (Array a)) (Ref ViewRequest)] String))
+  (defn array-summary [array request]
+    (if (= @(ViewRequest.depth request) 0)
+      @"[…]"
+      (let-do [output @"["
+               remaining (Int.max 0 (- @(ViewRequest.bytes request) 2))
+               end (end-index (Array.length array) request)
+               i @(ViewRequest.offset request)]
+        (while (and (< i end) (> remaining 0))
+          (let-do [_separator (when-do (> i @(ViewRequest.offset request))
+                     (set! output (String.append &output " "))
+                     (set! remaining (Int.dec remaining)))
+                   child (ViewRequest.set-bytes (child-request request)
+                                                remaining)
+                   text (if (> remaining 0)
+                     (view-summary (Array.unsafe-nth array i) &child)
+                     @"")
+                   clipped (View.slice &text 0 remaining)]
+            (set! output (String.append &output &clipped))
+            (set! remaining (- remaining (String.length &clipped)))
+            (set! i (Int.inc i))))
+        (String.append &output "]"))))
+  (implements view-summary View.array-summary))
+
+(defview string-value
+         [s String]
+         (=> (View.text)
+             (View.title @"String")
+             (View.priority 100)
+             (View.value-content
+               (fn [value request] (View.string-summary value request)))))
+
+(defview string-bytes
+         [s String]
+         (=> (View.columned)
+             (View.title @"Bytes")
+             (View.priority 101)
+             (View.with-columns
+               [(View.value-column @"#"
+                                   (fn [value i request]
+                                     (do (ignore value) (str i))))
+                (View.value-column @"Byte"
+                                   (fn [value i request]
+                                     (str (Char.to-int (String.char-at value i)))))
+                (View.value-column @"Char"
+                                   (fn [value i request]
+                                     (let [byte (Char.to-int (String.char-at value
+                                                                             i))]
+                                       (if (and (> byte 31) (< byte 127))
+                                         (String.from-bytes &[(Byte.from-int byte)])
+                                         @"·"))))])
+             (View.value-items (fn [value] (String.length value)))
+             (View.value-send
+               (fn [value i owner]
+                 (view-register
+                   (Byte.from-int (Char.to-int (String.char-at value i))))))))
+
+(defview array-items
+         [xs (Array a)]
+         (=> (View.columned)
+             (View.title @"Items")
+             (View.priority 100)
+             (View.with-columns
+               [(View.value-column @"#"
+                                   (fn [value i request]
+                                     (do (ignore value) (str i))))
+                (View.value-column @"Value"
+                                   (fn [value i request]
+                                     (view-summary (Array.unsafe-nth value i)
+                                                   &(View.child-request request))))])
+             (View.value-items (fn [value] (Array.length value)))
+             (View.value-send
+               (fn [value i owner]
+                 (View.unsafe-borrow-register (Array.unsafe-nth value i) owner)))))
+
+(defview maybe-just
+         [m (Maybe a)]
+         (match-ref m
+           (Maybe.Just _)
+             (=> (View.list)
+                 (View.title @"Just")
+                 (View.priority 100)
+                 (View.value-items (fn [value] (do (ignore value) 1)))
+                 (View.value-format
+                   (fn [value i request]
+                     (do
+                       (ignore i)
+                       (match-ref value
+                         (Maybe.Just x) (view-summary x request)
+                         (Maybe.Nothing) @""))))
+                 (View.value-send
+                   (fn [value i owner]
+                     (do
+                       (ignore i)
+                       (match-ref value
+                         (Maybe.Just x) (View.unsafe-borrow-register x owner)
+                         (Maybe.Nothing) -1)))))
+           (Maybe.Nothing) (View.empty)))
+
+(defview result-success
+         [r (Result a b)]
+         (match-ref r
+           (Result.Success _)
+             (=> (View.list)
+                 (View.title @"Success")
+                 (View.priority 100)
+                 (View.value-items (fn [value] (do (ignore value) 1)))
+                 (View.value-format
+                   (fn [value i request]
+                     (do
+                       (ignore i)
+                       (match-ref value
+                         (Result.Success x) (view-summary x request)
+                         (Result.Error _) @""))))
+                 (View.value-send
+                   (fn [value i owner]
+                     (do
+                       (ignore i)
+                       (match-ref value
+                         (Result.Success x)
+                           (View.unsafe-borrow-register x owner)
+                         (Result.Error _) -1)))))
+           (Result.Error _) (View.empty)))
+
+(defview result-error
+         [r (Result a b)]
+         (match-ref r
+           (Result.Error _)
+             (=> (View.list)
+                 (View.title @"Error")
+                 (View.priority 100)
+                 (View.value-items (fn [value] (do (ignore value) 1)))
+                 (View.value-format
+                   (fn [value i request]
+                     (do
+                       (ignore i)
+                       (match-ref value
+                         (Result.Error x) (view-summary x request)
+                         (Result.Success _) @""))))
+                 (View.value-send
+                   (fn [value i owner]
+                     (do
+                       (ignore i)
+                       (match-ref value
+                         (Result.Error x) (View.unsafe-borrow-register x owner)
+                         (Result.Success _) -1)))))
+           (Result.Success _) (View.empty)))
+
+(defview pair-values
+         [p (Pair a b)]
+         (=> (View.list)
+             (View.title @"Items")
+             (View.priority 100)
+             (View.value-items (fn [value] (do (ignore value) 2)))
+             (View.value-format
+               (fn [value i request]
+                 (if (= i 0)
+                   (view-summary (Pair.a value) request)
+                   (view-summary (Pair.b value) request))))
+             (View.value-send
+               (fn [value i owner]
+                 (if (= i 0)
+                   (View.unsafe-borrow-register (Pair.a value) owner)
+                   (View.unsafe-borrow-register (Pair.b value) owner))))))
+
+(defview box-value
+         [b (Box a)]
+         (=> (View.list)
+             (View.title @"Boxed")
+             (View.priority 100)
+             (View.value-items (fn [value] (do (ignore value) 1)))
+             (View.value-format
+               (fn [value i request]
+                 (do (ignore i) (view-summary (Box.peek value) request))))
+             (View.value-send
+               (fn [value i owner]
+                 (do
+                   (ignore i)
+                   (View.unsafe-borrow-register (Box.peek value) owner))))))
+
+(defmodule View
+  (defn- slot-index [entries ordinal]
+    (let-do [slot 0
+             seen 0
+             answer -1]
+      (while-do (and (< slot (Array.length entries)) (< answer 0))
+        (when-do (Maybe.just? (Array.unsafe-nth entries slot))
+          (when (= seen ordinal) (set! answer slot))
+          (set! seen (Int.inc seen)))
+        (set! slot (Int.inc slot)))
+      answer))
+
+  (defn map-key [map ordinal request]
+    (let [slot (slot-index (Map.entries map) ordinal)]
+      (if (< slot 0)
+        @""
+        (match-ref (Array.unsafe-nth (Map.entries map) slot)
+          (Maybe.Just pair) (view-summary (Pair.a pair) request)
+          (Maybe.Nothing) @""))))
+  (defn map-value [map ordinal request]
+    (let [slot (slot-index (Map.entries map) ordinal)]
+      (if (< slot 0)
+        @""
+        (match-ref (Array.unsafe-nth (Map.entries map) slot)
+          (Maybe.Just pair) (view-summary (Pair.b pair) request)
+          (Maybe.Nothing) @""))))
+  (defn map-send [map ordinal owner]
+    (let [slot (slot-index (Map.entries map) ordinal)]
+      (if (< slot 0)
+        -1
+        (match-ref (Array.unsafe-nth (Map.entries map) slot)
+          (Maybe.Just pair) (View.unsafe-borrow-register (Pair.b pair) owner)
+          (Maybe.Nothing) -1))))
+  (defn set-value [set ordinal request]
+    (let [slot (slot-index (Set.entries set) ordinal)]
+      (if (< slot 0)
+        @""
+        (match-ref (Array.unsafe-nth (Set.entries set) slot)
+          (Maybe.Just value) (view-summary value request)
+          (Maybe.Nothing) @""))))
+  (defn set-send [set ordinal owner]
+    (let [slot (slot-index (Set.entries set) ordinal)]
+      (if (< slot 0)
+        -1
+        (match-ref (Array.unsafe-nth (Set.entries set) slot)
+          (Maybe.Just value) (View.unsafe-borrow-register value owner)
+          (Maybe.Nothing) -1)))))
+
+(defview map-entries
+         [m (Map a b)]
+         (=> (View.columned)
+             (View.title @"Entries")
+             (View.priority 100)
+             (View.with-columns
+               [(View.value-column @"Key" View.map-key)
+                (View.value-column @"Value" View.map-value)])
+             (View.value-items (fn [value] @(Map.len value)))
+             (View.value-send View.map-send)))
+
+(defview set-items
+         [s (Set a)]
+         (=> (View.columned)
+             (View.title @"Items")
+             (View.priority 100)
+             (View.with-columns [(View.value-column @"Value" View.set-value)])
+             (View.value-items (fn [value] @(Set.len value)))
+             (View.value-send View.set-send)))
+
+; Bag's storage remains private. Its provider walks counts to find the requested
+; logical element instead of expanding multiplicities into an intermediate array.
+(defmodule Bag
+  (defn- view-slot [bag ordinal]
+    (let-do [entries (Map.entries (internal bag))
+             slot 0
+             seen 0
+             answer -1]
+      (while-do (and (< slot (Array.length entries)) (< answer 0))
+        (match-ref (Array.unsafe-nth entries slot)
+          (Maybe.Nothing) ()
+          (Maybe.Just pair)
+            (do
+              (set! seen (+ seen @(Pair.b pair)))
+              (when (< ordinal seen) (set! answer slot))))
+        (set! slot (Int.inc slot)))
+      answer))
+  (defn view-value [bag ordinal request]
+    (let [slot (view-slot bag ordinal)]
+      (if (< slot 0)
+        @""
+        (match-ref (Array.unsafe-nth (Map.entries (internal bag)) slot)
+          (Maybe.Just pair) (view-summary (Pair.a pair) request)
+          (Maybe.Nothing) @""))))
+  (defn view-send [bag ordinal owner]
+    (let [slot (view-slot bag ordinal)]
+      (if (< slot 0)
+        -1
+        (match-ref (Array.unsafe-nth (Map.entries (internal bag)) slot)
+          (Maybe.Just pair) (View.unsafe-borrow-register (Pair.a pair) owner)
+          (Maybe.Nothing) -1)))))
+
+(defview bag-items
+         [b (Bag a)]
+         (=> (View.columned)
+             (View.title @"Items")
+             (View.priority 100)
+             (View.with-columns [(View.value-column @"Value" Bag.view-value)])
+             (View.value-items Bag.length)
+             (View.value-send Bag.view-send)))

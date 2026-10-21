@@ -133,6 +133,40 @@ the backend-neutral line map. See
 [`carp-llvm-backend`](carp-llvm-backend/README.md) for supported lowering,
 native linking, the persistent ORC session JIT, and its test commands.
 
+### Terminal REPL
+
+`metacarp` combines the compiler and terminal REPL in one executable. With no
+arguments it opens the REPL; `metacarp repl` accepts REPL options. File arguments
+use the C compiler, for example `metacarp -x program.carp`. `metacarp --help`
+describes both modes, and `metacarp repl --help` lists REPL commands and keys.
+
+The [terminal REPL](carp-repl/README.md) uses the warm session and LLVM JIT on
+macOS. It provides persistent definitions and typed results, mixed-input
+transactions, editable source history, completion, docs, highlighting,
+ownership and generated-code queries, and array/record inspection. Build it
+with a compiler rebuilt from current source. The current reader editing API
+also requires the sibling reader checkout:
+
+```sh
+export CARP_PACKAGE_OVERRIDES="git@github.com:carpentry-org/carp-reader@0.4.3=$PWD/../carp-reader/carp-reader.carp"
+./out/carp-compiler -c "$CARP_DIR/core" --optimize -b \
+  -o out/carp-compiler-next main.carp
+./out/carp-compiler-next -c "$CARP_DIR/core" --optimize -b \
+  -o out/metacarp main-metacarp.carp
+./out/metacarp
+# or: ./out/metacarp repl --core "$CARP_DIR/core" --no-history
+```
+
+The combined executable requires the REPL's LLVM and libedit dependencies.
+`main.carp` still builds the C-only `carp-compiler` for bootstrapping;
+`main-repl.carp` builds the standalone `metacarp-repl` using the same REPL driver.
+
+The [umbrella RFC](docs/metacarp-repl.md) records the editor, introspection,
+editable-history, and inspection milestones. The Carp editor uses system libedit
+for editing and persistent recall, with bounded language feedback. Unrelated
+runtime additions preserve globals; replacements and compile-time declarations
+release results and reset native state.
+
 ## Self-hosting
 
 The bootstrap chain, from the repository root:

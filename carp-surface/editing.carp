@@ -1,0 +1,95 @@
+(load "carp-surface.carp")
+
+(doc EditingSurfaceModule "is an analysis-only surface view of a reader
+document. Missing delimiters remain in syntax; rejected or absent expressions
+become Invalid nodes. It is not an accepted SourceInput or a compiler report.")
+(deftype EditingSurfaceModule
+  [input SourceInput
+   syntax ReaderDocument
+   module SurfaceModule])
+
+(defmodule Surface
+  (private editing-node)
+  (hidden editing-node)
+  (sig editing-node (Fn [(Ref ReaderNode) (Ref String)] (Maybe SurfaceNode)))
+
+  (private editing-children)
+  (hidden editing-children)
+  (defn editing-children [children source container]
+    (let-do [nodes (the (Array (Box SurfaceNode)) [])]
+      (for [i 0 (Array.length children)]
+        (let [child (Box.peek (Array.unsafe-nth children i))
+              missing-close (and container
+                                 (match-ref (ReaderNode.kind child)
+                                   (ReaderNodeKind.Missing _) true
+                                   _ false))]
+          (unless missing-close
+            (match (editing-node child source)
+              (Maybe.Just node) (Array.push-back! &nodes (Box.init node))
+              (Maybe.Nothing) ()))))
+      nodes))
+
+  (defn editing-node [node source]
+    (let [span (SurfaceSpan.from-reader (ReaderNode.start node)
+                                        (ReaderNode.end node))
+          children (ReaderNode.children node)]
+      (match-ref (ReaderNode.kind node)
+        (ReaderNodeKind.Whitespace) (the (Maybe SurfaceNode) (Maybe.Nothing))
+        (ReaderNodeKind.Punctuation _) (Maybe.Nothing)
+        (ReaderNodeKind.Atom form)
+          (Maybe.Just
+            (lower-located
+              &(Located.init (Form.copy form)
+                             @(ReaderNode.start node)
+                             @(ReaderNode.end node))))
+        (ReaderNodeKind.Invalid _)
+          (Maybe.Just
+            (SurfaceNode.init span
+                              (SurfaceForm.Invalid
+                                (String.byte-slice source
+                                                   @(Info.pos (ReaderNode.start node))
+                                                   @(Info.pos (ReaderNode.end node))))))
+        (ReaderNodeKind.Missing expected)
+          (Maybe.Just
+            (SurfaceNode.init span (SurfaceForm.Invalid (String.copy expected))))
+        (ReaderNodeKind.Group group)
+          (let [items (editing-children children source true)
+                last (Box.peek
+                  (Array.unsafe-nth children (Int.dec (Array.length children))))
+                point (match-ref (ReaderNode.kind last)
+                  (ReaderNodeKind.Punctuation (ReaderCategory.Close))
+                    @(ReaderNode.start last)
+                  _ @(ReaderNode.end node))
+                bounded (SurfaceSpan.with-content-end &span &point)]
+            (Maybe.Just
+              (SurfaceNode.init bounded
+                                (match-ref group
+                                  (ReaderGroup.List) (SurfaceForm.List items)
+                                  (ReaderGroup.Array) (SurfaceForm.Array items)
+                                  (ReaderGroup.StaticArray)
+                                    (SurfaceForm.StaticArray items)
+                                  (ReaderGroup.Dictionary)
+                                    (SurfaceForm.Dictionary items)))))
+        (ReaderNodeKind.ReaderMacro name)
+          (let-do [items [(Box.init
+                            (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                                   (SurfaceForm.Symbol [(String.copy name)])))]
+                   operands (editing-children children source false)]
+            (for [i 0 (Array.length &operands)]
+              (Array.push-back! &items @(Array.unsafe-nth &operands i)))
+            (Maybe.Just (SurfaceNode.init span (SurfaceForm.List items)))))))
+
+  (doc editing-input "reads one exact caller buffer for analysis, retaining the
+reader document and its issues. This never repairs source for compilation.")
+  (defn editing-input [input]
+    (let-do [previous *surface-source-index*
+             _source (set! *surface-source-index*
+                           (intern-source! (SourceInput.id input)))
+             syntax (Reader.read-syntax (SourceInput.source input))
+             nodes (editing-children (ReaderDocument.nodes &syntax)
+                                     (SourceInput.source input)
+                                     false)
+             _restore (set! *surface-source-index* previous)]
+      (EditingSurfaceModule.init (SourceInput.copy input)
+                                 syntax
+                                 (SurfaceModule.init nodes)))))

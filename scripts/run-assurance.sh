@@ -29,6 +29,12 @@ carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 compiler="$repo_root/out/carp-compiler"
 
+# Keep the same development package source through every compiler generation.
+if [[ -n "${CARP_READER_SOURCE:-}" ]]; then
+  export CARP_PACKAGE_OVERRIDES="git@github.com:carpentry-org/carp-reader@0.4.3=$CARP_READER_SOURCE${CARP_PACKAGE_OVERRIDES:+
+$CARP_PACKAGE_OVERRIDES}"
+fi
+
 if [[ "$(uname -s)" == "Linux" ]]; then
   ulimit -s 524288
 fi
@@ -77,9 +83,10 @@ bootstrap() {
   seed=${CARP_SEED_COMPILER:-}
   seed_copy=
   if [[ -z "$seed" && -x "$compiler" ]]; then
-    # the build replaces out/carp-compiler, so the seed runs from a copy
+    # The build replaces out/carp-compiler, so the seed runs from a copy.
+    # Preserve its mode over the existing, non-executable mktemp file.
     seed_copy=$(mktemp "${TMPDIR:-/tmp}/carp-seed.XXXXXX")
-    cp "$compiler" "$seed_copy"
+    cp -p "$compiler" "$seed_copy"
     seed=$seed_copy
   fi
   if [[ -n "$seed" && -x "$seed" ]] \
@@ -168,6 +175,9 @@ run_llvm() {
   (
     cd carp-llvm-backend
     "$compiler" -c "$core_dir" -x test/carp-llvm-backend.carp
+    CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/carp-session-jit.carp
+    CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/artifacts.carp
+    CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/inspection-layout.carp
   )
   "$script_dir/check-llvm-memory.sh"
 }

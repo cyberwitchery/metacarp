@@ -1,0 +1,173 @@
+(deftype CtBindingSummary [role String
+                           static Bool])
+(deftype CtEditingSnapshot
+  [environment (CtEnvStore CtBindingSummary)
+   modules (Array CtModuleFrame)
+   frame FrameId])
+
+(defmodule CtEval
+  (doc register-compiled-macro!
+    "registers the prototype already used by expansion.")
+  (defn register-compiled-macro! [state frame name prototype defining-frame]
+    (ignore
+      (define! state
+               frame
+               name
+               (CtValue.Macro
+                 (Box.init
+                   (CtClosure.init prototype defining-frame (definition-file)))))))
+
+  (private editing-static?)
+  (hidden editing-static?)
+  (defn editing-static? [summary] @(CtBindingSummary.static summary))
+
+  (private editing-role)
+  (hidden editing-role)
+  (defn editing-role [value]
+    (String.copy
+      (match-ref value
+        (CtValue.Closure _) "compile-time-function"
+        (CtValue.Macro _) "macro"
+        (CtValue.Builtin _) "compile-time-function"
+        _ "compile-time-value")))
+
+  (private editing-snapshot)
+  (hidden editing-snapshot)
+  (defn editing-snapshot [state frame]
+    (let-do [environment (CtState.environment state)
+             raw (CtEnvStore.cells environment)
+             cells (the (Array (CtEnvCell CtBindingSummary)) [])]
+      (when (WorkBudget.consume! (Array.length raw))
+        (for [i 0 (Array.length raw)]
+          (when (WorkBudget.consume! 1)
+            (let [value (Box.peek (CtEnvCell.value (Array.unsafe-nth raw i)))]
+              (Array.push-back! &cells
+                                (CtEnvCell.init
+                                  (Box.init
+                                    (CtBindingSummary.init (editing-role value)
+                                                           (static-definition-value? value)))))))))
+      (if (WorkBudget.stopped?)
+        (the (Maybe CtEditingSnapshot) (Maybe.Nothing))
+        (Maybe.Just
+          (CtEditingSnapshot.init
+            (CtEnvStore.init @(CtEnvStore.frames environment)
+                             cells
+                             (CtEnv.epoch environment))
+            @(CtState.modules state)
+            @frame)))))
+
+  (private editing-public-name?)
+  (hidden editing-public-name?)
+  (defn editing-public-name? [name]
+    (not
+      (or (String.starts-with? name "__sexpr_")
+          (String.starts-with? name "__members_"))))
+
+  (private editing-frame-names!)
+  (hidden editing-frame-names!)
+  (defn editing-frame-names! [environment frame names]
+    (let-do [current (Maybe.Just @frame)
+             remaining (Array.length (CtEnvStore.frames environment))]
+      (while-do (and (WorkBudget.consume! 1)
+                     (and (Maybe.just? &current) (Int.> remaining 0)))
+        (match current
+          (Maybe.Nothing) ()
+          (Maybe.Just here)
+            (let [bindings (CtEnv.local-bindings environment &here)
+                  imports (CtEnv.imports environment &here)]
+              (for [i 0 (Array.length &bindings)]
+                (when (WorkBudget.consume! 1)
+                  (Set.put! names
+                            (CtEnvBinding.name (Array.unsafe-nth &bindings i)))))
+              (for [i 0 (Array.length &imports)]
+                (let [imported (CtEnv.local-bindings environment
+                                                     (Array.unsafe-nth &imports
+                                                                       i))]
+                  (for [j 0 (Array.length &imported)]
+                    (when (WorkBudget.consume! 1)
+                      (Set.put! names
+                                (CtEnvBinding.name (Array.unsafe-nth &imported j)))))))
+              (set! current (CtEnv.parent-frame environment &here))))
+        (set! remaining (Int.dec remaining)))))
+
+  (private editing-add!)
+  (hidden editing-add!)
+  (defn editing-add! [view name results]
+    (when (WorkBudget.consume! 1)
+      (match (CtLookup.status (CtEditingSnapshot.environment view)
+                              (CtEditingSnapshot.modules view)
+                              (CtEditingSnapshot.frame view)
+                              name
+                              &editing-static?)
+        (CtEnvLookup.Found cell)
+          (let [summary (CtEnv.peek-cell (CtEditingSnapshot.environment view)
+                                         &cell)]
+            (Array.push-back! results
+                              (SourceLexicalBinding.init (String.copy name)
+                                                         @(CtBindingSummary.role summary)
+                                                         (SourceLexicalIdentity.Cell @(CellId.index &cell))
+                                                         (Maybe.Nothing))))
+        _ ())))
+
+  (private editing-query)
+  (hidden editing-query)
+  (defn editing-query [view prefix exact]
+    (let-do [results (the (Array SourceLexicalBinding) [])]
+      (if exact
+        (editing-add! view prefix &results)
+        (let-do [names (the (Set String) (Set.create))
+                 environment (CtEditingSnapshot.environment view)
+                 modules (CtEditingSnapshot.modules view)]
+          (editing-frame-names! environment
+                                (CtEditingSnapshot.frame view)
+                                &names)
+          (for [i 0 (Array.length modules)]
+            (when (WorkBudget.consume! 1)
+              (let [module (Array.unsafe-nth modules i)
+                    segments (String.split-by (CtModuleFrame.path module) &[\.])]
+                (unless (String.empty? (CtModuleFrame.path module))
+                  (for [start 0 (Array.length &segments)]
+                    (let [path (String.join "." &(Array.suffix &segments start))
+                          base (String.append &path ".")]
+                      (when (or (String.starts-with? prefix &base)
+                                (String.starts-with? &base prefix))
+                        (let-do [members (the (Set String) (Set.create))]
+                          ;; Qualified lookup also sees parents and imports.
+                          (editing-frame-names! environment
+                                                (CtModuleFrame.frame module)
+                                                &members)
+                          (let [all (Set.to-array &members)]
+                            (for [j 0 (Array.length &all)]
+                              (when (WorkBudget.consume! 1)
+                                (let [member (Array.unsafe-nth &all j)]
+                                  (when (editing-public-name? member)
+                                    (Set.put! &names
+                                              &(String.append &base member)))))))))))))))
+          (let [all (Set.to-array &names)]
+            (for [i 0 (Array.length &all)]
+              (let [name (Array.unsafe-nth &all i)]
+                (when (and (String.starts-with? name prefix)
+                           (editing-public-name? name))
+                  (editing-add! view name &results)))))))
+      results))
+
+  (doc observe-environment! "captures compact cell summaries and lexical frames.
+Queries call the evaluator's shared lookup kernel. No mutable values, code
+pointers, or callable closures from the analyzed program escape the query.")
+  (defn observe-environment! [node state frame]
+    (when (SourceObservations.written? node)
+      (let-do [key (fmt "%d:%d"
+                        (CtEnv.epoch (CtState.environment state))
+                        @(FrameId.index frame))
+               existing (SourceObservations.environment-index &key)]
+        (if (Int.>= existing 0)
+          (SourceObservations.select-environment! existing)
+          (match (editing-snapshot state frame)
+            (Maybe.Nothing) (SourceObservations.select-environment! -1)
+            (Maybe.Just view)
+              (SourceObservations.add-environment! key
+                                                   (fn [prefix exact]
+                                                     (editing-query &view
+                                                                    prefix
+                                                                    exact)))))
+        (SourceObservations.scope! node &[])))))

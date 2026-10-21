@@ -1,0 +1,180 @@
+; These registrations expose LLVM's existing value printer and graph.
+; Artifact selection and ownership remain Carp data; no IR text is parsed.
+(doc LLVMArtifactBinding "is scoped either to the committed resolver snapshot
+or to this publication. Transient IDs must never match a later resident binding.")
+(deftype LLVMArtifactBinding [instance Specialization
+                              resident Bool])
+(defmodule LLVMArtifactBinding
+  (doc symbol "is the emitted specialization symbol for this scoped binding.")
+  (defn symbol [binding] (Specialization.symbol (instance binding))))
+
+(deftype LLVMArtifactEntity
+  [symbol String
+   bindings (Array LLVMArtifactBinding)
+   definition Bool
+   ir String
+   dependencies (Array String)])
+
+(def *llvm-artifact-owners* (the (Array (Pair String String)) []))
+
+(defmodule LLVMArtifacts
+  (private print-value-raw)
+  (hidden print-value-raw)
+  (register print-value-raw
+    (Fn [LLVMValue] (Ptr CChar))
+    "LLVMPrintValueToString")
+  (private dispose-message)
+  (hidden dispose-message)
+  (register dispose-message (Fn [(Ptr CChar)] ()) "LLVMDisposeMessage")
+  (private value-name-raw)
+  (hidden value-name-raw)
+  (register value-name-raw (Fn [LLVMValue] (Ptr CChar)) "LLVMGetValueName")
+  (private copy-name)
+  (hidden copy-name)
+  (register copy-name (Fn [(Ptr CChar)] String) "strdup")
+  (private first-function)
+  (hidden first-function)
+  (register first-function (Fn [LLVMModule] LLVMValue) "LLVMGetFirstFunction")
+  (private next-function)
+  (hidden next-function)
+  (register next-function (Fn [LLVMValue] LLVMValue) "LLVMGetNextFunction")
+  (private first-global)
+  (hidden first-global)
+  (register first-global (Fn [LLVMModule] LLVMValue) "LLVMGetFirstGlobal")
+  (private next-global)
+  (hidden next-global)
+  (register next-global (Fn [LLVMValue] LLVMValue) "LLVMGetNextGlobal")
+  (private declaration?)
+  (hidden declaration?)
+  (register declaration? (Fn [LLVMValue] Int) "LLVMIsDeclaration")
+  (private global-value)
+  (hidden global-value)
+  (register global-value (Fn [LLVMValue] LLVMValue) "LLVMIsAGlobalValue")
+  (private constant-value)
+  (hidden constant-value)
+  (register constant-value (Fn [LLVMValue] LLVMValue) "LLVMIsAConstant")
+  (private user-value)
+  (hidden user-value)
+  (register user-value (Fn [LLVMValue] LLVMValue) "LLVMIsAUser")
+  (private operand-count)
+  (hidden operand-count)
+  (register operand-count (Fn [LLVMValue] Int) "LLVMGetNumOperands")
+  (private operand)
+  (hidden operand)
+  (register operand (Fn [LLVMValue Int] LLVMValue) "LLVMGetOperand")
+  (private block-count)
+  (hidden block-count)
+  (register block-count (Fn [LLVMValue] Int) "LLVMCountBasicBlocks")
+  (private first-block)
+  (hidden first-block)
+  (register first-block (Fn [LLVMValue] LLVMBasicBlock) "LLVMGetFirstBasicBlock")
+  (private next-block)
+  (hidden next-block)
+  (register next-block
+    (Fn [LLVMBasicBlock] LLVMBasicBlock)
+    "LLVMGetNextBasicBlock")
+  (private first-instruction)
+  (hidden first-instruction)
+  (register first-instruction
+    (Fn [LLVMBasicBlock] LLVMValue)
+    "LLVMGetFirstInstruction")
+  (private next-instruction)
+  (hidden next-instruction)
+  (register next-instruction (Fn [LLVMValue] LLVMValue) "LLVMGetNextInstruction")
+
+  (doc begin! "starts the emitter's explicit entity ownership table.")
+  (defn begin! [] (set! *llvm-artifact-owners* []))
+
+  (doc own! "associates an emitted helper with its actual backend binding.")
+  (defn own! [symbol owner]
+    (Array.push-back! &*llvm-artifact-owners*
+                      (Pair.init (String.copy symbol) (String.copy owner))))
+
+  (private name)
+  (hidden name)
+  (defn name [value] (copy-name (value-name-raw value)))
+
+  (private text)
+  (hidden text)
+  (defn text [value]
+    (let-do [raw (print-value-raw value)
+             owned (String.from-cstr raw)]
+      (dispose-message raw)
+      owned))
+
+  (private add-reference!)
+  (hidden add-reference!)
+  (defn add-reference! [value names]
+    (cond
+      (not (LLVM.value-null? (global-value value)))
+        (Set.put! names &(name value))
+      (and
+        (not (LLVM.value-null? (constant-value value)))
+        (not (LLVM.value-null? (user-value value))))
+        (for [i 0 (operand-count value)]
+          (add-reference! (operand value i) names))
+      ()))
+
+  (private operands!)
+  (hidden operands!)
+  (defn operands! [value names]
+    (for [i 0 (operand-count value)] (add-reference! (operand value i) names)))
+
+  (private dependencies)
+  (hidden dependencies)
+  (defn dependencies [value function]
+    (let-do [names (the (Set String) (Set.create))]
+      (if function
+        (let-do [count (block-count value)
+                 block (first-block value)]
+          (for [i 0 count]
+            (do
+              (let-do [instruction (first-instruction block)]
+                (while-do (not (LLVM.value-null? instruction))
+                  (operands! instruction &names)
+                  (set! instruction (next-instruction instruction))))
+              (set! block (next-block block)))))
+        (operands! value &names))
+      (Set.to-array &names)))
+
+  (private bindings)
+  (hidden bindings)
+  (defn bindings [backend symbol]
+    (let-do [owner (String.copy symbol)
+             result (the (Array LLVMArtifactBinding) [])
+             instances (BackendModule.symbols backend)]
+      (for [i 0 (Array.length &*llvm-artifact-owners*)]
+        (let [entry (Array.unsafe-nth &*llvm-artifact-owners* i)]
+          (when (String.= symbol (Pair.a entry)) (set! owner @(Pair.b entry)))))
+      (for [i 0 (Array.length instances)]
+        (let [instance (Array.unsafe-nth instances i)]
+          (when (String.= &owner (Specialization.symbol instance))
+            (Array.push-back! &result
+                              (LLVMArtifactBinding.init @instance
+                                                        (Array.contains? (BackendModule.resident-symbols backend)
+                                                                         (Specialization.symbol instance)))))))
+      result))
+
+  (private entity)
+  (hidden entity)
+  (defn entity [backend value function]
+    (let [symbol (name value)]
+      (LLVMArtifactEntity.init @&symbol
+                               (bindings backend &symbol)
+                               (Int.= (declaration? value) 0)
+                               (text value)
+                               (dependencies value function))))
+
+  (doc capture "copies exact emitted values and LLVM operand edges before ORC
+takes ownership of the module. Returned artifacts contain no LLVM handles.")
+  (defn capture [backend mod]
+    (let-do [result (the (Array LLVMArtifactEntity) [])
+             global (first-global mod)
+             function (first-function mod)]
+      (while-do (not (LLVM.value-null? global))
+        (Array.push-back! &result (entity backend global false))
+        (set! global (next-global global)))
+      (while-do (not (LLVM.value-null? function))
+        (Array.push-back! &result (entity backend function true))
+        (set! function (next-function function)))
+      result)))

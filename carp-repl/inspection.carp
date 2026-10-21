@@ -1,0 +1,475 @@
+(load "../carp-llvm-backend/carp-session-jit.carp")
+(load "input.carp")
+
+(deftype NativeView
+  [address Long
+   type (Box MonoType)
+   publication Int
+   borrowed Bool])
+(deftype InspectRequest
+  [offset Int
+   count Int
+   depth Int
+   bytes Int
+   raw Bool
+   view String
+   views Bool])
+(deftype InspectOutput [parts (Array String)
+                        remaining Int
+                        truncated Bool])
+(deftype NativeChildren
+  [name String
+   address Long
+   fields (Array NativeFieldLayout)])
+
+(doc ReplInspect "reads bounded borrowed views of native values. Every offset,
+stride, and capture type comes from the publication that generated the value.")
+(defmodule ReplInspect
+  (defn defaults [] (InspectRequest.init 0 32 6 4096 false @"" false))
+
+  (defn long-at [address]
+    (Pointer.to-value (the (Ptr Long) (Pointer.from-long address))))
+  (defn int-at [address]
+    (Pointer.to-value (the (Ptr Int) (Pointer.from-long address))))
+  (defn byte-at [address]
+    (Pointer.to-value (the (Ptr Byte) (Pointer.from-long address))))
+
+  (doc dereference "follows references with a fixed indirection limit.")
+  (defn dereference [view]
+    (let-do [current @view
+             failure false]
+      (for [i 0 32]
+        (match-ref (Box.peek (NativeView.type &current))
+          (MonoType.Reference inner _)
+            (if (Long.= @(NativeView.address &current) 0l)
+              (set! failure true)
+              (set! current
+                    (NativeView.init (long-at @(NativeView.address &current))
+                                     @inner
+                                     @(NativeView.publication &current)
+                                     true)))
+          _ ()))
+      (if (or failure (Long.= @(NativeView.address &current) 0l))
+        (Result.Error @"null native reference")
+        (match-ref (Box.peek (NativeView.type &current))
+          (MonoType.Reference _ _)
+            (Result.Error @"reference indirection limit reached")
+          _ (Result.Success current)))))
+
+  (defn children [jit view representation]
+    (match-ref representation
+      (NativeRepresentation.Nominal tag-offset variants)
+        (let-do [tag (match-ref tag-offset
+                   (Maybe.Nothing)
+                     @(NativeVariantLayout.tag (Array.unsafe-nth variants 0))
+                   (Maybe.Just offset)
+                     (int-at (Long.+ @(NativeView.address view) @offset)))
+                 answer (Result.Error @"invalid sum tag")]
+          (for [i 0 (Array.length variants)]
+            (let [variant (Array.unsafe-nth variants i)]
+              (when (Int.= tag @(NativeVariantLayout.tag variant))
+                (set! answer
+                      (Result.Success
+                        (NativeChildren.init @(NativeVariantLayout.name variant)
+                                             @(NativeView.address view)
+                                             @(NativeVariantLayout.fields variant)))))))
+          answer)
+      (NativeRepresentation.Function callback-offset environment-offset)
+        (let [callback (long-at
+                (Long.+ @(NativeView.address view) @callback-offset))
+              environment (long-at
+                (Long.+ @(NativeView.address view) @environment-offset))]
+          (match (SessionJit.closure-layout jit callback)
+            (Maybe.Nothing)
+              (if (Long.= environment 0l)
+                (Result.Success (NativeChildren.init @"<function>" 0l []))
+                (Result.Error @"<function> [opaque environment]"))
+            (Maybe.Just layout)
+              (Result.Success
+                (NativeChildren.init @"<function>"
+                                     environment
+                                     @(NativeClosureLayout.captures &layout)))))
+      _ (Result.Error @"value has no fields")))
+
+  (defn field-view [parent children field]
+    (NativeView.init
+      (Long.+ @(NativeChildren.address children)
+              @(NativeFieldLayout.offset field))
+      @(NativeFieldLayout.type field)
+      @(NativeView.publication parent)
+      true))
+
+  (defn element-view [view element length-offset data-offset stride index]
+    (let [length (long-at (Long.+ @(NativeView.address view) length-offset))
+          data (long-at (Long.+ @(NativeView.address view) data-offset))]
+      (cond
+        (or (Int.< index 0) (Long.>= (Long.from-int index) length))
+          (Result.Error @"index out of bounds")
+        (or (Long.= data 0l)
+            (and (Long.> stride 0l)
+                 (Long.> (Long.from-int index) (Long./ Long.MAX stride))))
+          (Result.Error @"invalid native sequence")
+        (Result.Success
+          (NativeView.init
+            (Long.+ data (Long.* (Long.from-int index) stride))
+            @element
+            @(NativeView.publication view)
+            true)))))
+
+  (defn child [jit original selector]
+    (match (dereference original)
+      (Result.Error error) (Result.Error error)
+      (Result.Success view)
+        (match (SessionJit.value-layout jit
+                                        @(NativeView.publication &view)
+                                        (Box.peek (NativeView.type &view)))
+          (Result.Error error) (Result.Error error)
+          (Result.Success layout)
+            (match-ref (NativeValueLayout.representation &layout)
+              (NativeRepresentation.Sequence element
+                                             length-offset
+                                             data-offset
+                                             stride)
+                (match (ReplInput.nonnegative-int selector)
+                  (Maybe.Nothing)
+                    (Result.Error
+                      @"array selectors must be nonnegative integer indices")
+                  (Maybe.Just index)
+                    (element-view &view
+                                  element
+                                  @length-offset
+                                  @data-offset
+                                  @stride
+                                  index))
+              representation
+                (match (children jit &view representation)
+                  (Result.Error error) (Result.Error error)
+                  (Result.Success fields)
+                    (let-do [answer (Result.Error @"no field")
+                             names (the (Array String) [])
+                             items (NativeChildren.fields &fields)
+                             index (ReplInput.nonnegative-int selector)
+                             found false]
+                      (for [i 0 (Array.length items)]
+                        (let-do [field (Array.unsafe-nth items i)]
+                          (Array.push-back! &names
+                                            @(NativeFieldLayout.name field))
+                          (when-do (or
+                              (String.= selector (NativeFieldLayout.name field))
+                              (match-ref &index
+                                (Maybe.Just n) (Int.= @n i)
+                                _ false))
+                            (set! found true)
+                            (set! answer
+                                  (Result.Success (field-view &view
+                                                              &fields
+                                                              field))))))
+                      (unless found
+                        (set! answer
+                              (Result.Error
+                                (fmt "no field %s in %s; fields: %s"
+                                     selector
+                                     &(Type.render (Box.peek (NativeView.type &view)))
+                                     &(String.join " " &names)))))
+                      answer))))))
+
+  (defn navigate [jit view selectors]
+    (let-do [answer (Result.Success @view)]
+      (for [i 0 (Array.length selectors)]
+        (match-ref &answer
+          (Result.Error _) ()
+          (Result.Success current)
+            (set! answer (child jit current (Array.unsafe-nth selectors i)))))
+      answer))
+
+  (doc emit!
+    "bounds allocation before appending text and preserves UTF-8 boundaries.")
+  (defn emit! [output text]
+    (let-do [limit @(InspectOutput.remaining output)
+             end (Int.min limit (String.length text))]
+      (when (Int.< end (String.length text))
+        (while-do (and (Int.> end 0)
+                       (Int.=
+                         (Int.bit-and (Char.to-int (String.char-at text end))
+                                      192)
+                         128))
+          (set! end (Int.dec end))))
+      (when-do (Int.> end 0)
+        (Array.push-back! (InspectOutput.parts output)
+                          (String.byte-slice text 0 end))
+        (InspectOutput.set-remaining! output (Int.- limit end)))
+      (when (Int.< end (String.length text))
+        (InspectOutput.set-truncated! output true))))
+
+  (doc text!
+    "copies at most the remaining output allowance from a native string.
+The offset is in UTF-8 bytes and advances to a character boundary.")
+  (defn text! [output address offset]
+    (let-do [data (long-at address)
+             cursor 0
+             ended false
+             bytes (the (Array Byte) [])
+             limit @(InspectOutput.remaining output)]
+      (if (Long.= data 0l)
+        (emit! output "<null string>")
+        (do
+          (while-do (and (Int.< cursor offset) (not ended))
+            (if (Byte.=
+                (byte-at (Long.+ data (Long.from-int cursor)))
+                (Byte.from-int 0))
+              (set! ended true)
+              (set! cursor (Int.inc cursor))))
+          (while-do (and (not ended)
+                         (Int.=
+                           (Int.bit-and
+                             (Byte.to-int
+                               (byte-at (Long.+ data (Long.from-int cursor))))
+                             192)
+                           128))
+            (set! cursor (Int.inc cursor)))
+          (while-do (and (not ended) (Int.< (Array.length &bytes) limit))
+            (let [byte (byte-at (Long.+ data (Long.from-int cursor)))]
+              (if (Byte.= byte (Byte.from-int 0))
+                (set! ended true)
+                (do
+                  (Array.push-back! &bytes byte)
+                  (set! cursor (Int.inc cursor))))))
+          (unless ended
+            (let [next (Byte.to-int
+                    (byte-at (Long.+ data (Long.from-int cursor))))]
+              (if (Int.= next 0)
+                (set! ended true)
+                (do
+                  (while-do (and (not (Array.empty? &bytes))
+                                 (Int.= (Int.bit-and next 192) 128))
+                    (ignore (Array.pop-back! &bytes))
+                    (set! cursor (Int.dec cursor))
+                    (set! next
+                          (Byte.to-int
+                            (byte-at (Long.+ data (Long.from-int cursor))))))
+                  (InspectOutput.set-truncated! output true)))))
+          (Array.push-back! &bytes (Byte.from-int 0))
+          (emit! output
+                 &(String.from-cstr
+                   (Pointer.from-long
+                     (Pointer.to-long
+                       (Pointer.address (Array.unsafe-nth &bytes 0))))))))))
+
+  (defn scalar [address representation]
+    (match-ref representation
+      (NativeRepresentation.Signed bits)
+        (cond
+          (Int.= @bits 8)
+            (Int8.str
+              (Pointer.to-value (the (Ptr Int8) (Pointer.from-long address))))
+          (Int.= @bits 16)
+            (Int16.str
+              (Pointer.to-value (the (Ptr Int16) (Pointer.from-long address))))
+          (Int.= @bits 32) (Int.str (int-at address))
+          (Long.str (long-at address)))
+      (NativeRepresentation.Unsigned bits)
+        (cond
+          (Int.= @bits 8)
+            (Uint8.str
+              (Pointer.to-value (the (Ptr Uint8) (Pointer.from-long address))))
+          (Int.= @bits 16)
+            (Uint16.str
+              (Pointer.to-value (the (Ptr Uint16) (Pointer.from-long address))))
+          (Int.= @bits 32)
+            (Uint32.str
+              (Pointer.to-value (the (Ptr Uint32) (Pointer.from-long address))))
+          (Uint64.str
+            (Pointer.to-value (the (Ptr Uint64) (Pointer.from-long address)))))
+      (NativeRepresentation.Real bits)
+        (if (Int.= @bits 32)
+          (Float.str
+            (Pointer.to-value (the (Ptr Float) (Pointer.from-long address))))
+          (Double.str
+            (Pointer.to-value (the (Ptr Double) (Pointer.from-long address)))))
+      (NativeRepresentation.Boolean)
+        (if (Byte.= (byte-at address) (Byte.from-int 0)) @"false" @"true")
+      (NativeRepresentation.Character)
+        (String.from-chars &[(Char.from-int (int-at address))])
+      (NativeRepresentation.Unit) @"()"
+      (NativeRepresentation.Pointer)
+        (fmt "<pointer %sl>" &(Long.str (long-at address)))
+      _ @"<opaque>"))
+
+  (defn render-into! [jit original request depth offset output]
+    (when (Int.> @(InspectOutput.remaining output) 0)
+      (match (dereference original)
+        (Result.Error error) (emit! output &error)
+        (Result.Success view)
+          (match (SessionJit.value-layout jit
+                                          @(NativeView.publication &view)
+                                          (Box.peek (NativeView.type &view)))
+            (Result.Error error) (emit! output &error)
+            (Result.Success layout)
+              (match-ref (NativeValueLayout.representation &layout)
+                (NativeRepresentation.Text)
+                  (if (Int.= depth @(InspectRequest.depth request))
+                    (text! output @(NativeView.address &view) offset)
+                    (let-do [slice (InspectOutput.init []
+                                                       @(InspectOutput.remaining output)
+                                                       false)]
+                      (text! &slice @(NativeView.address &view) offset)
+                      (emit! output "@")
+                      (emit! output
+                             &(Surface.render
+                               &(SurfaceNode.generated (SurfaceSpan.anywhere)
+                                                       (SurfaceForm.StringLit
+                                                         (String.concat (InspectOutput.parts &slice))))))
+                      (when @(InspectOutput.truncated &slice)
+                        (InspectOutput.set-truncated! output true))))
+                (NativeRepresentation.Sequence element
+                                               length-offset
+                                               data-offset
+                                               stride)
+                  (let-do [length (long-at
+                             (Long.+ @(NativeView.address &view) @length-offset))
+                           end (Long.min length
+                                         (Long.+ (Long.from-int offset)
+                                                 (Long.from-int @(InspectRequest.count request))))]
+                    (emit! output "[")
+                    (if (Int.<= depth 0)
+                      (emit! output "…")
+                      (for [i offset (Long.to-int end)]
+                        (when-do (Int.> @(InspectOutput.remaining output) 0)
+                          (when (Int.> i offset) (emit! output " "))
+                          (match (element-view &view
+                                               element
+                                               @length-offset
+                                               @data-offset
+                                               @stride
+                                               i)
+                            (Result.Error error) (emit! output &error)
+                            (Result.Success child)
+                              (render-into! jit
+                                            &child
+                                            request
+                                            (Int.dec depth)
+                                            0
+                                            output)))))
+                    (when (Long.< end length) (emit! output " …"))
+                    (emit! output "]"))
+                representation
+                  (match-ref representation
+                    (NativeRepresentation.Nominal _ _)
+                      (render-fields! jit
+                                      &view
+                                      representation
+                                      request
+                                      depth
+                                      offset
+                                      output)
+                    (NativeRepresentation.Function _ _)
+                      (render-fields! jit
+                                      &view
+                                      representation
+                                      request
+                                      depth
+                                      offset
+                                      output)
+                    _
+                      (emit! output
+                             &(scalar @(NativeView.address &view) representation))))))))
+
+  (defn render-fields! [jit view representation request depth offset output]
+    (match (children jit view representation)
+      (Result.Error error) (emit! output &error)
+      (Result.Success children)
+        (let-do [fields (NativeChildren.fields &children)
+                 count (Array.length fields)
+                 end (Int.min count
+                              (Int.+ offset @(InspectRequest.count request)))]
+          (emit! output (NativeChildren.name &children))
+          (unless-do (Array.empty? fields)
+            (emit! output " {")
+            (if (Int.<= depth 0)
+              (emit! output "…")
+              (for [i offset end]
+                (when-do (Int.> @(InspectOutput.remaining output) 0)
+                  (when (Int.> i offset) (emit! output ", "))
+                  (let [field (Array.unsafe-nth fields i)
+                        child (field-view view &children field)]
+                    (emit! output (NativeFieldLayout.name field))
+                    (emit! output ": ")
+                    (render-into! jit &child request (Int.dec depth) 0 output)))))
+            (when (Int.< end count) (emit! output ", …"))
+            (emit! output "}")))))
+
+  (defn render [jit view request]
+    (let-do [output (InspectOutput.init [] @(InspectRequest.bytes request) false)]
+      (render-into! jit
+                    view
+                    request
+                    @(InspectRequest.depth request)
+                    @(InspectRequest.offset request)
+                    &output)
+      (when @(InspectOutput.truncated &output)
+        (Array.push-back! (InspectOutput.parts &output) @"
+… truncated"))
+      (String.concat (InspectOutput.parts &output))))
+
+  (doc parse "validates bounded ranges before any native access.")
+  (defn parse [arguments]
+    (let-do [request (defaults)
+             selectors (the (Array String) [])
+             error (the (Maybe String) (Maybe.Nothing))
+             i 0]
+      (while-do (Int.< i (Array.length arguments))
+        (let [argument (Array.unsafe-nth arguments i)]
+          (cond
+            (String.= argument "--raw") (InspectRequest.set-raw! &request true)
+            (String.= argument "--views")
+              (InspectRequest.set-views! &request true)
+            (String.= argument "--view")
+              (if (Int.>= (Int.inc i) (Array.length arguments))
+                (set! error (Maybe.Just @"--view needs a selector"))
+                (do
+                  (set! i (Int.inc i))
+                  (InspectRequest.set-view! &request
+                                            @(Array.unsafe-nth arguments i))))
+            (String.starts-with? argument "--")
+              (if (Int.>= (Int.inc i) (Array.length arguments))
+                (set! error
+                      (Maybe.Just
+                        @"inspection option needs a nonnegative integer"))
+                (do
+                  (set! i (Int.inc i))
+                  (match (ReplInput.nonnegative-int (Array.unsafe-nth arguments
+                                                                      i))
+                    (Maybe.Nothing)
+                      (set! error
+                            (Maybe.Just
+                              @"inspection option needs a nonnegative integer"))
+                    (Maybe.Just n)
+                      (cond
+                        (String.= argument "--offset")
+                          (InspectRequest.set-offset! &request n)
+                        (String.= argument "--count")
+                          (InspectRequest.set-count! &request n)
+                        (String.= argument "--depth")
+                          (InspectRequest.set-depth! &request n)
+                        (String.= argument "--bytes")
+                          (InspectRequest.set-bytes! &request n)
+                        (set! error
+                              (Maybe.Just
+                                (fmt "unknown inspection option %s" argument)))))))
+            (Array.push-back! &selectors @argument)))
+        (set! i (Int.inc i)))
+      (cond
+        (Maybe.just? &error)
+          (match error
+            (Maybe.Just message) (Result.Error message)
+            (Maybe.Nothing) (Result.Error @"inspection option error"))
+        (or
+          (Int.> @(InspectRequest.offset &request) 1048576)
+          (or
+            (Int.> @(InspectRequest.count &request) 1024)
+            (or
+              (Int.> @(InspectRequest.depth &request) 32)
+              (Int.> @(InspectRequest.bytes &request) 65536))))
+          (Result.Error
+            @"inspection limits: offset 1048576, count 1024, depth 32, bytes 65536")
+        (Result.Success (Pair.init selectors request))))))

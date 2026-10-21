@@ -5,35 +5,31 @@
 ;; the transactional cell pipeline at the lowered BackendModule, and this
 ;; component (loaded only by hosts that want the JIT) does the LLVM work.
 ;;
-;; Per session there is one LLVM context, target machine, and data layout,
-;; plus one C shim dylib holding the template specializations (deftemplate
-;; bodies, primitive templates, wrappers): clang compiles it ONCE, on the
-;; first cell, and again only when a later cell introduces a template
-;; specialization the dylib does not have yet. A cell whose templates are all
-;; materialized pays no clang at all: its BackendModule is emitted into a
-;; new LLVM module containing only symbols not published by earlier cells,
-;; added to one LLJIT (which resolves template symbols from the dlopened shim),
-;; and its uniquely named roots function runs
-;; in-process — echo output prints to the host's stdout, and the returned
-;; Int is the last integer-typed top-level's value, like the driver's.
+;; Each cell emits an incremental LLVM module. Native templates and ABI
+;; helpers are rendered through the C backend, compiled by the matching clang
+;; to IR, and added with that module under one ORC resource tracker. Publication
+;; commits code, materialization caches, and artifacts only after lookup succeeds;
+;; failure removes the whole transaction. Already published support is imported
+;; by later cells, so cells with no new C dependencies avoid clang.
 ;;
 ;; Published code and global storage persist across cells. A committed edit
-;; clears published code while retaining the LLJIT and thread-safe context;
+;; retires both C-derived and LLVM modules while retaining the LLJIT and context;
 ;; the next cell republishes the new dependency world.
 
 (load "../carp-session/carp-session.carp")
-(load "carp-llvm-backend.carp")
+(load "inspection-layout.carp")
 
-(system-include "dlfcn.h")
+(load "session-artifacts.carp")
 
-(deftemplate carp-jit-dlopen-global
-             (Fn [(Ptr CChar)] Long)
-             "Long $NAME(char* path)"
-             "$DECL { void* h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
-  if (!h) fprintf(stderr, \"carp-jit: dlopen: %s\\n\", dlerror());
-  return (Long)(intptr_t)h; }")
-(hidden carp-jit-dlopen-global)
-
+(deftype NativePublication
+  [serial Int
+   environment NativeLayoutEnvironment
+   closures (Array NativeClosureLayout)])
+(deftype NativeLayoutCache [publication Int
+                            key String
+                            layout NativeValueLayout])
+(deftype NativeCallbackCache [symbol String
+                              address Long])
 (deftype JitSession
   [context LLVMContext
    thread-context LLVMOrcThreadSafeContext
@@ -48,16 +44,27 @@
    code (Array String)
    instances (Array Specialization)
    last-declarations Int
-   serial Int])
+   serial Int
+   artifacts (Array JitArtifact)
+   c-artifacts (Array JitCArtifact)
+   publications (Array NativePublication)
+   layouts (Array NativeLayoutCache)
+   callbacks (Array NativeCallbackCache)
+   context-id Int
+   last-executed Long
+   generation Int])
+
+(load "native-support.carp")
 
 (defmodule SessionJit
   (doc create "creates a warm JIT for one session: one thread-safe LLVM
 context, LLJIT, target machine, and data layout are shared by every cell.
 `core-dir` locates the runtime
-headers the shim compiles against; `scratch` is a writable directory for the
-shim C file and dylib.")
+headers native support compiles against; `scratch` holds its C and IR files.")
   (defn create [core-dir scratch]
-    (let-do [_init (do
+    (let-do [context-id *jit-context-serial*
+             _context (set! *jit-context-serial* (Int.inc context-id))
+             _init (do
                (ignore (LLVM.initialize-native-target))
                (ignore (LLVM.initialize-native-asm-printer))
                0)
@@ -91,17 +98,33 @@ shim C file and dylib.")
                        (the (Array String) [])
                        (the (Array Specialization) [])
                        0
+                       0
+                       []
+                       []
+                       []
+                       []
+                       []
+                       context-id
+                       0l
                        0)))
 
   (doc reset-code! "removes every published module while retaining the LLJIT,
-thread-safe context, target state, and template shim. Committed source changes
-use this conservative invalidation boundary.")
+thread-safe context and target state. C support, LLVM code, materialization
+caches, and artifacts share this invalidation boundary.")
   (defn reset-code! [js]
     (let-do [error (LLVM.orc-clear-dylib (LLVM.dup (JitSession.dylib js)))]
       (when-do (String.empty? &error)
         (JitSession.set-code! js (the (Array String) []))
         (JitSession.set-instances! js (the (Array Specialization) []))
-        (JitSession.set-last-declarations! js 0))
+        (JitSession.set-last-declarations! js 0)
+        (JitSession.set-artifacts! js [])
+        (JitSession.set-materialized! js [])
+        (JitSession.set-c-artifacts! js [])
+        (JitSession.set-publications! js [])
+        (JitSession.set-layouts! js [])
+        (JitSession.set-callbacks! js [])
+        (JitSession.set-last-executed! js 0l)
+        (JitSession.set-generation! js (Int.inc @(JitSession.generation js))))
       error))
 
   (doc dispose "frees the persistent JIT, thread-safe context, target data,
@@ -113,29 +136,6 @@ and target machine.")
         (LLVM.dup (JitSession.thread-context js)))
       (LLVM.dispose-target-data (LLVM.dup (JitSession.data js)))
       (LLVM.dispose-target-machine (LLVM.dup (JitSession.machine js)))))
-
-  (private template-symbols)
-  (hidden template-symbols)
-  (defn template-symbols [backend]
-    (let-do [symbols (the (Array String) [])
-             declarations (BackendModule.declarations backend)]
-      (for [i 0 (Array.length declarations)]
-        (match-ref (Array.unsafe-nth declarations i)
-          (BackendDeclaration.Template symbol _ _ _)
-            (Array.push-back! &symbols (String.copy symbol))
-          (BackendDeclaration.SourceTemplate symbol _ _ _ _)
-            (Array.push-back! &symbols (String.copy symbol))
-          _ ()))
-      symbols))
-
-  (private materialized?)
-  (hidden materialized?)
-  (defn materialized? [js symbol]
-    (let-do [found false]
-      (for [i 0 (Array.length (JitSession.materialized js))]
-        (when (String.= (Array.unsafe-nth (JitSession.materialized js) i) symbol)
-          (set! found true)))
-      found))
 
   (private published?)
   (hidden published?)
@@ -150,57 +150,6 @@ and target machine.")
   (hidden jit-diagnostic)
   (defn jit-diagnostic [message]
     (Diagnostic.init @"jit" message (the (Maybe SourceSpan) (Maybe.Nothing))))
-
-  (doc ensure-shim! "makes every template specialization `backend` needs
-resolvable in the process: when one is missing from the materialized set, the
-full shim translation unit is rendered, clang-compiled to a dylib (the one
-clang invocation a session pays, repeated only when new specializations
-appear), and dlopened RTLD_GLOBAL so ORC's process resolver finds the
-symbols.")
-  (defn ensure-shim! [js backend]
-    (let-do [needed (template-symbols backend)
-             missing false]
-      (for [i 0 (Array.length &needed)]
-        (unless (materialized? js (Array.unsafe-nth &needed i))
-          (set! missing true)))
-      (if (not missing)
-        (Result.Success ())
-        (match (LLVMBackend.shim-translation-unit backend)
-          (Result.Error error)
-            (Result.Error (jit-diagnostic @(BackendError.message &error)))
-          (Result.Success shim)
-            (let-do [serial @(JitSession.serial js)
-                     base (fmt "%s/carp-jit-shim-%d"
-                               (JitSession.scratch js)
-                               serial)
-                     c-path (fmt "%s.c" &base)
-                     dylib-path (fmt "%s.dylib" &base)]
-              (JitSession.set-serial! js (Int.inc serial))
-              (match (IO.write-file &shim &c-path)
-                (Result.Error e)
-                  (Result.Error
-                    (jit-diagnostic (fmt "cannot write shim: %s" &e)))
-                (Result.Success _)
-                  (cond
-                    (Int./= 0
-                            (System.system
-                              &(fmt
-                                "clang -dynamiclib -undefined dynamic_lookup -o %s %s -I %s %s"
-                                &dylib-path
-                                &c-path
-                                (JitSession.core-dir js)
-                                &(String.join " " &(CtEval.collected-cflags)))))
-                      (Result.Error (jit-diagnostic @"shim clang failed"))
-                    (Long.= 0l
-                            (carp-jit-dlopen-global (String.cstr &dylib-path)))
-                      (Result.Error (jit-diagnostic @"shim dlopen failed"))
-                    (let-do [known (JitSession.materialized js)]
-                      (for [i 0 (Array.length &needed)]
-                        (unless (materialized? js (Array.unsafe-nth &needed i))
-                          (Array.push-back! known
-                                            (String.copy (Array.unsafe-nth &needed
-                                                                           i)))))
-                      (Result.Success ())))))))))
 
   (private named-f32-function-symbol)
   (hidden named-f32-function-symbol)
@@ -238,120 +187,256 @@ symbols.")
                   1000000.0)))
       (Maybe.Nothing) ()))
 
-  (defn publish-lowered [js lowered requested]
+  ; Use the compiler from the LLVM installation selected by LLVM.setup.
+  ; System clang can produce IR with an incompatible target data layout.
+  (defmacro support-clang []
+    (if (= (host-os) "darwin")
+      "$(brew --prefix llvm)/bin/clang"
+      "$(llvm-config --bindir)/clang"))
+
+  (private prepare-support)
+  (hidden prepare-support)
+  (defn prepare-support [js backend input ir serial]
+    (match (LLVMBackend.session-support-emission backend
+                                                 (JitSession.materialized js))
+      (Result.Error error)
+        (Result.Error (jit-diagnostic @(BackendError.message &error)))
+      (Result.Success emission)
+        (if (not
+            (JitCBackend.required? ir &emission (JitSession.materialized js)))
+          (Result.Success (the (Maybe JitCPrepared) (Maybe.Nothing)))
+          (let-do [base (fmt "%s/carp-jit-shim-%d"
+                             (JitSession.scratch js)
+                             serial)
+                   c-path (String.append &base ".c")
+                   ir-path (String.append &base ".ll")]
+            (match (IO.write-file (CTranslationUnit.source &emission) &c-path)
+              (Result.Error error)
+                (Result.Error
+                  (jit-diagnostic (fmt "cannot write native support: %s" &error)))
+              (Result.Success _)
+                (if (Int./= 0
+                            (System.system
+                              &(fmt
+                                "%s -S -emit-llvm -target %s -o %s %s -I %s %s"
+                                (support-clang)
+                                (JitSession.triple js)
+                                &ir-path
+                                &c-path
+                                (JitSession.core-dir js)
+                                &(String.join " " &(CtEval.collected-cflags)))))
+                  (Result.Error (jit-diagnostic @"native support clang failed"))
+                  (let [buffer (LLVM.memory-buffer-of-file (String.cstr &ir-path))]
+                    (if (LLVM.memory-buffer-null? buffer)
+                      (Result.Error
+                        (jit-diagnostic @"cannot read native support IR"))
+                      (let [mod (LLVM.parse-ir (LLVM.dup (JitSession.context js))
+                                               buffer)]
+                        (if (LLVM.module-null? mod)
+                          (Result.Error
+                            (jit-diagnostic @"cannot parse native support IR"))
+                          (let-do [symbols (JitCBackend.normalize! mod
+                                                                   &emission
+                                                                   (JitSession.materialized js))
+                                   verify (LLVM.verify-module mod)
+                                   bindings (the (Array LLVMArtifactBinding) [])
+                                   instances (BackendModule.symbols backend)
+                                   entities (the (Array CArtifactEntity) [])]
+                            (if (not (String.empty? &verify))
+                              (do
+                                (LLVM.module-dispose mod)
+                                (Result.Error
+                                  (jit-diagnostic
+                                    (fmt "native support verifier: %s" &verify))))
+                              (do
+                                (for [i 0 (Array.length instances)]
+                                  (let [instance (Array.unsafe-nth instances i)]
+                                    (Array.push-back! &bindings
+                                                      (LLVMArtifactBinding.init @instance
+                                                                                (Array.contains? (BackendModule.resident-symbols backend)
+                                                                                                 (Specialization.symbol instance))))))
+                                (let [emitted (CTranslationUnit.entities &emission)]
+                                  (for [i 0 (Array.length emitted)]
+                                    (let [entity (Array.unsafe-nth emitted i)]
+                                      (when (Array.contains? &symbols
+                                                             (CArtifactEntity.symbol entity))
+                                        (Array.push-back! &entities @entity)))))
+                                (CTranslationUnit.set-entities! &emission
+                                                                entities)
+                                (Result.Success
+                                  (Maybe.Just
+                                    (JitCPrepared.init mod
+                                                       (JitCArtifact.init base
+                                                                          @(JitSession.context-id js)
+                                                                          serial
+                                                                          @(JitSession.generation js)
+                                                                          (SourceInput.copy input)
+                                                                          0
+                                                                          emission
+                                                                          symbols
+                                                                          bindings
+                                                                          [])))))))))))))))))
+
+  (private add-module!)
+  (hidden add-module!)
+  (defn add-module! [js tracker mod]
+    (LLVM.orc-add-module-tracked (LLVM.dup (JitSession.jit js))
+                                 (LLVM.dup tracker)
+                                 (LLVM.orc-thread-safe-module mod
+                                                              (LLVM.dup (JitSession.thread-context js)))))
+
+  (private rollback-publication!)
+  (hidden rollback-publication!)
+  (defn rollback-publication! [tracker message]
+    (let [error (LLVM.orc-remove-resources (LLVM.dup tracker))]
+      (Result.Error
+        (jit-diagnostic
+          (if (String.empty? &error)
+            (String.copy message)
+            (fmt "%s; rollback failed: %s" message &error))))))
+
+  (private publish-prepared!)
+  (hidden publish-prepared!)
+  (defn publish-prepared! [js
+                           input
+                           backend
+                           instances
+                           mod
+                           support
+                           publication
+                           serial
+                           cell-name
+                           roots-name
+                           requested]
+    (let-do [artifact-ir (LLVM.print-module mod)
+             artifact-entities (LLVMArtifacts.capture backend mod)
+             tracker (LLVM.orc-resource-tracker (LLVM.dup (JitSession.dylib js)))
+             support-error (match-ref &support
+               (Maybe.Nothing) @""
+               (Maybe.Just prepared)
+                 (add-module! js
+                              &tracker
+                              (LLVM.dup (JitCPrepared.module prepared))))
+             add-error (if (String.empty? &support-error)
+               (add-module! js &tracker mod)
+               (do (LLVM.module-dispose mod) (String.copy &support-error)))
+             result (if (not (String.empty? &add-error))
+               (rollback-publication! &tracker
+                                      &(fmt "ORC publication: %s" &add-error))
+               (let-do [lookup-name (match-ref requested
+                          (Maybe.Just name)
+                            (match (named-f32-function-symbol backend name)
+                              (Maybe.Just symbol) symbol
+                              (Maybe.Nothing) @"")
+                          (Maybe.Nothing) (String.copy roots-name))
+                        address (if (String.empty? &lookup-name)
+                          0l
+                          (LLVM.orc-lookup (LLVM.dup (JitSession.jit js))
+                                           (String.cstr &lookup-name)))]
+                 (if (Long.= address 0l)
+                   (rollback-publication! &tracker
+                                          "requested JIT symbol not found")
+                   (let [defined (LLVMBackend.defined-symbols backend)]
+                     (for [i 0 (Array.length &defined)]
+                       (unless (published? js (Array.unsafe-nth &defined i))
+                         (Array.push-back! (JitSession.code js)
+                                           @(Array.unsafe-nth &defined i))))
+                     (Array.push-back! (JitSession.artifacts js)
+                                       (JitArtifact.init (String.copy cell-name)
+                                                         serial
+                                                         @(JitSession.generation js)
+                                                         (SourceInput.copy input)
+                                                         0
+                                                         artifact-entities
+                                                         artifact-ir
+                                                         (String.copy roots-name)
+                                                         address
+                                                         []))
+                     (match support
+                       (Maybe.Nothing) ()
+                       (Maybe.Just prepared)
+                         (let [artifact @(JitCPrepared.artifact &prepared)]
+                           (let [symbols (JitCArtifact.symbols &artifact)]
+                             (for [i 0 (Array.length symbols)]
+                               (Array.push-back! (JitSession.materialized js)
+                                                 @(Array.unsafe-nth symbols i))))
+                           (Array.push-back! (JitSession.c-artifacts js)
+                                             artifact)))
+                     (Array.push-back! (JitSession.publications js) publication)
+                     (JitSession.set-instances! js (Array.copy instances))
+                     (JitSession.set-last-declarations! js
+                                                        (Array.length (BackendModule.declarations backend)))
+                     (Result.Success address)))))]
+      (LLVM.orc-release-resource-tracker tracker)
+      result))
+
+  (defn publish-lowered [js input lowered requested]
     (match lowered
       (Result.Error diagnostic) (Result.Error diagnostic)
       (Result.Success incremental)
         (let-do [backend @(IncrementalLowering.module &incremental)
-                 instances (Array.copy
-                   (IncrementalLowering.instances &incremental))
-                 started (System.nanotime)]
-          (let-do [serial @(JitSession.serial js)
-                   ctx (LLVM.dup (JitSession.context js))
-                   td (LLVM.dup (JitSession.data js))
-                   cell-name (fmt "carp-jit-cell-%d" serial)
-                   roots-name (fmt "carp_llvm_roots_%d" serial)
-                   init-name (fmt "carp_llvm_init_globals_%d" serial)
-                   mod (LLVM.module-create (String.cstr &cell-name) ctx)
-                   builder (LLVM.builder-create ctx)]
-            (LLVM.set-target mod (String.cstr (JitSession.triple js)))
-            (LLVM.set-module-data-layout mod td)
-            (match (LLVMBackend.emit-module-incremental ctx
-                                                        builder
-                                                        mod
-                                                        td
+                 instances (IncrementalLowering.instances &incremental)
+                 started (System.nanotime)
+                 serial @(JitSession.serial js)
+                 _reserve (JitSession.set-serial! js (Int.inc serial))
+                 ctx (LLVM.dup (JitSession.context js))
+                 td (LLVM.dup (JitSession.data js))
+                 cell-name (fmt "carp-jit-cell-%d" serial)
+                 roots-name (fmt "carp_llvm_roots_%d" serial)
+                 init-name (fmt "carp_llvm_init_globals_%d" serial)
+                 mod (LLVM.module-create (String.cstr &cell-name) ctx)
+                 builder (LLVM.builder-create ctx)]
+          (LLVM.set-target mod (String.cstr (JitSession.triple js)))
+          (LLVM.set-module-data-layout mod td)
+          (match (LLVMBackend.emit-module-incremental ctx
+                                                      builder
+                                                      mod
+                                                      td
+                                                      &backend
+                                                      (JitSession.code js)
+                                                      &roots-name
+                                                      &init-name)
+            (Result.Error message)
+              (do
+                (LLVM.builder-dispose builder)
+                (LLVM.module-dispose mod)
+                (Result.Error (jit-diagnostic (fmt "llvm backend: %s" &message))))
+            (Result.Success _)
+              (let-do [publication (NativePublication.init serial
+                                                           (LLVMBackend.inspection-environment &backend)
+                                                           (LLVMBackend.inspection-closures ctx
+                                                                                            td
+                                                                                            &backend))
+                       _emitted (jit-mark! "emitted" started)
+                       _debug (match (IO.getenv "CARP_DEBUG_JIT_IR")
+                         (Maybe.Just _) (IO.errorln &(LLVM.print-module mod))
+                         (Maybe.Nothing) ())
+                       verify (LLVM.verify-module mod)]
+                (LLVM.builder-dispose builder)
+                (if (not (String.empty? &verify))
+                  (do
+                    (LLVM.module-dispose mod)
+                    (Result.Error
+                      (jit-diagnostic (fmt "llvm verifier: %s" &verify))))
+                  (match (prepare-support js &backend input mod serial)
+                    (Result.Error error)
+                      (do (LLVM.module-dispose mod) (Result.Error error))
+                    (Result.Success support)
+                      (do
+                        (jit-mark! "support-ready" started)
+                        (let [result (publish-prepared! js
+                                                        input
                                                         &backend
-                                                        (JitSession.code js)
+                                                        instances
+                                                        mod
+                                                        support
+                                                        publication
+                                                        serial
+                                                        &cell-name
                                                         &roots-name
-                                                        &init-name)
-              (Result.Error message)
-                (do
-                  (LLVM.builder-dispose builder)
-                  (LLVM.module-dispose mod)
-                  (Result.Error
-                    (jit-diagnostic (fmt "llvm backend: %s" &message))))
-              (Result.Success _)
-                (let-do [_emit-mark (jit-mark! "emitted" started)
-                         _debug-module (match-ref requested
-                           (Maybe.Just _)
-                             (match (IO.getenv "CARP_DEBUG_JIT_IR")
-                               (Maybe.Just _)
-                                 (let [ir (LLVM.print-module mod)]
-                                   (IO.errorln &ir))
-                               (Maybe.Nothing) ())
-                           (Maybe.Nothing) ())
-                         verify (LLVM.verify-module mod)]
-                  (if (not (String.empty? &verify))
-                    (do
-                      (LLVM.builder-dispose builder)
-                      (LLVM.module-dispose mod)
-                      (Result.Error
-                        (jit-diagnostic (fmt "llvm verifier: %s" &verify))))
-                    (let-do [_verify-mark (jit-mark! "verified" started)
-                             ;; The shim is rendered from state emission
-                             ;; fills in: the invoke helpers and ABI
-                             ;; wrappers an aggregate-moving call needs are
-                             ;; only known once the module has been walked.
-                             ;; Building it earlier produces a shim missing
-                             ;; exactly the symbols the module then calls.
-                             shim-error (match (ensure-shim! js &backend)
-                               (Result.Error diagnostic) (Maybe.Just diagnostic)
-                               (Result.Success _)
-                                 (the (Maybe Diagnostic) (Maybe.Nothing)))
-                             _shim-mark (jit-mark! "shim-ready" started)
-                             _builder (LLVM.builder-dispose builder)
-                             thread-module (LLVM.orc-thread-safe-module mod
-                                                                        (LLVM.dup (JitSession.thread-context js)))
-                             tracker (LLVM.orc-resource-tracker (LLVM.dup (JitSession.dylib js)))
-                             add-error (LLVM.orc-add-module-tracked (LLVM.dup (JitSession.jit js))
-                                                                    (LLVM.dup &tracker)
-                                                                    thread-module)]
-                      (if (or (Maybe.just? &shim-error)
-                              (not (String.empty? &add-error)))
-                        (do
-                          (LLVM.orc-release-resource-tracker tracker)
-                          (match shim-error
-                            (Maybe.Just diagnostic) (Result.Error diagnostic)
-                            (Maybe.Nothing)
-                              (Result.Error
-                                (jit-diagnostic (fmt "orc add-module: %s"
-                                                     &add-error)))))
-                        (let-do [lookup-name (match-ref requested
-                                   (Maybe.Just name)
-                                     (match (named-f32-function-symbol &backend
-                                                                       name)
-                                       (Maybe.Just symbol) symbol
-                                       (Maybe.Nothing) (String.copy ""))
-                                   (Maybe.Nothing) (String.copy &roots-name))
-                                 address (if (String.empty? &lookup-name)
-                                   0l
-                                   (LLVM.orc-lookup (LLVM.dup (JitSession.jit js))
-                                                    (String.cstr &lookup-name)))]
-                          (if (Long.= 0l address)
-                            (let-do [remove-error (LLVM.orc-remove-resources (LLVM.dup &tracker))
-                                     _release (LLVM.orc-release-resource-tracker tracker)]
-                              (Result.Error
-                                (jit-diagnostic
-                                  (if (String.empty? &remove-error)
-                                    @"requested JIT symbol not found"
-                                    (fmt
-                                      "requested JIT symbol not found; rollback failed: %s"
-                                      &remove-error)))))
-                            (let-do [_lookup-mark (jit-mark! "looked-up" started)
-                                     defined (LLVMBackend.defined-symbols &backend)]
-                              (for [i 0 (Array.length &defined)]
-                                (unless (published? js
-                                                    (Array.unsafe-nth &defined i))
-                                  (Array.push-back! (JitSession.code js)
-                                                    (String.copy (Array.unsafe-nth &defined
-                                                                                   i)))))
-                              (JitSession.set-instances! js instances)
-                              (JitSession.set-last-declarations! js
-                                                                 (Array.length (BackendModule.declarations &backend)))
-                              (JitSession.set-serial! js (Int.inc serial))
-                              (LLVM.orc-release-resource-tracker tracker)
-                              (jit-mark! "published" started)
-                              (Result.Success address)))))))))))))
+                                                        requested)]
+                          (jit-mark! "published" started)
+                          result)))))))))
 
   (private lower-cell)
   (hidden lower-cell)
@@ -367,15 +452,19 @@ symbols.")
   (doc run-cell "checks, lowers, JIT-compiles, and RUNS `input` against the
 session: `Session.lower-cell-plain`'s transactional BackendModule is emitted
 into a fresh incremental LLVM module, ORC adds only symbols not already
-published in the shared LLJIT (template symbols resolve from the shim dylib),
+published in the shared LLJIT; C support joins the same publication tracker,
 and the roots function executes in-process.
 Returns the cell's value: the last integer-typed top-level's result, 0
 otherwise.")
   (defn run-cell [js session input]
     (match (publish-lowered js
+                            input
                             (lower-cell js session input false)
                             &(the (Maybe String) (Maybe.Nothing)))
-      (Result.Success address) (Result.Success (LLVM.call-i32 address))
+      (Result.Success address)
+        (let-do [answer (LLVM.call-i32 address)]
+          (executed! js address)
+          (Result.Success answer))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
   (doc run-cell-echoed "as `run-cell`, but with the driver's top-level result
@@ -384,18 +473,23 @@ binary would pick, and the returned Int is the echoed roots value (0 — the
 echo wrapping consumes the top level).")
   (defn run-cell-echoed [js session input]
     (match (publish-lowered js
+                            input
                             (lower-cell js session input true)
                             &(the (Maybe String) (Maybe.Nothing)))
-      (Result.Success address) (Result.Success (LLVM.call-i32 address))
+      (Result.Success address)
+        (let-do [answer (LLVM.call-i32 address)]
+          (executed! js address)
+          (Result.Success answer))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
   (doc compile-f32-function "checks, lowers, and publishes a transactional
 cell, then returns the address of its named `(Fn [Float] Float)` definition.
 The cell must make the definition reachable, normally by ending with a dummy
 call. Every successful call uses a fresh symbol namespace, so returned
-addresses remain valid until the JitSession is disposed.")
+addresses remain valid until reset-code! or disposal.")
   (defn compile-f32-function [js session input name]
     (publish-lowered js
+                     input
                      (lower-cell js session input false)
                      &(Maybe.Just (String.copy name))))
 
@@ -430,3 +524,75 @@ like `upsert`.")
 retaining the LLJIT and shared context.")
   (defn remove [js session name]
     (invalidated-after js (Session.remove session name))))
+
+(defmodule SessionJit
+  (doc compile-cell "Publishes a checked cell without running its roots.
+The caller may commit a candidate semantic session before calling the returned
+address. A preparation failure never executes the cell.")
+  (defn compile-cell [js session input echo]
+    (publish-lowered js
+                     input
+                     (lower-cell js session input echo)
+                     &(the (Maybe String) (Maybe.Nothing)))))
+
+(defmodule SessionJit
+  (doc value-layout
+    "returns a cached layout from the publication that owns a live value.")
+  (defn value-layout [js publication type]
+    (let-do [key (CAbi.type-key type)
+             result (Result.Error @"native publication is no longer live")
+             found false
+             layouts (JitSession.layouts js)]
+      (for [i 0 (Array.length layouts)]
+        (let [cached (Array.unsafe-nth layouts i)]
+          (when-do (and
+              (Int.= publication @(NativeLayoutCache.publication cached))
+              (String.= &key (NativeLayoutCache.key cached)))
+            (set! found true)
+            (set! result (Result.Success @(NativeLayoutCache.layout cached))))))
+      (unless-do found
+        (let [publications (JitSession.publications js)]
+          (for [i 0 (Array.length publications)]
+            (let [entry (Array.unsafe-nth publications i)]
+              (when (Int.= publication @(NativePublication.serial entry))
+                (set! result
+                      (LLVMBackend.inspection-layout (LLVM.dup (JitSession.machine js))
+                                                     (NativePublication.environment entry)
+                                                     type))))))
+        (match-ref &result
+          (Result.Success layout)
+            (Array.push-back! layouts
+                              (NativeLayoutCache.init publication key @layout))
+          (Result.Error _) ()))
+      result))
+
+  (doc closure-layout
+    "matches a live callback to its compiler-recorded environment.")
+  (defn closure-layout [js callback]
+    (let-do [result (the (Maybe NativeClosureLayout) (Maybe.Nothing))
+             publications (JitSession.publications js)]
+      (for [i 0 (Array.length publications)]
+        (let [closures (NativePublication.closures (Array.unsafe-nth publications
+                                                                     i))]
+          (for [j 0 (Array.length closures)]
+            (when (Maybe.nothing? &result)
+              (let-do [closure (Array.unsafe-nth closures j)
+                       symbol (NativeClosureLayout.symbol closure)
+                       address 0l
+                       known false
+                       callbacks (JitSession.callbacks js)]
+                (for [k 0 (Array.length callbacks)]
+                  (let [cached (Array.unsafe-nth callbacks k)]
+                    (when-do (String.= symbol
+                                       (NativeCallbackCache.symbol cached))
+                      (set! known true)
+                      (set! address @(NativeCallbackCache.address cached)))))
+                (unless-do known
+                  (set! address
+                        (LLVM.orc-lookup (LLVM.dup (JitSession.jit js))
+                                         (String.cstr symbol)))
+                  (Array.push-back! callbacks
+                                    (NativeCallbackCache.init @symbol address)))
+                (when (and (Long./= address 0l) (Long.= address callback))
+                  (set! result (Maybe.Just @closure))))))))
+      result)))

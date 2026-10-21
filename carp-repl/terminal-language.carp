@@ -1,0 +1,268 @@
+;; Loaded by terminal.carp. This module depends only on the protocol and OS.
+(defmodule ReplTerminal
+  (private send-language!)
+  (hidden send-language!)
+  (defn send-language! [editor operation]
+    (let-do [presentation (ReplEditor.presentation (state editor))
+             current (snapshot editor)
+             client (ReplPresentation.client presentation)
+             send @(ReplLanguageClient.request client)
+             serial (Long.+ @(ReplPresentation.request presentation) 1l)]
+      (ReplPresentation.set-request! presentation serial)
+      (send
+        (ReplLanguageRequest.init operation
+                                  @(ReplPresentation.document presentation)
+                                  @(ReplPresentation.revision presentation)
+                                  @(ReplPresentation.epoch presentation)
+                                  serial
+                                  @(Pair.a &current)
+                                  @(Pair.b &current)))))
+
+  (private synchronize-language!)
+  (hidden synchronize-language!)
+  (defn synchronize-language! [editor]
+    (let [presentation (ReplEditor.presentation (state editor))
+          current (snapshot editor)
+          source (Pair.a &current)
+          client (ReplPresentation.client presentation)
+          session @(ReplLanguageClient.session client)
+          epoch (session)]
+      (when-do (or
+          (String./= source (ReplPresentation.source presentation))
+          (Long./= epoch @(ReplPresentation.epoch presentation)))
+        (ReplPresentation.set-paint! presentation
+                                     (ReplPaint.rebase (ReplPresentation.paint presentation)
+                                                       source))
+        (ReplPresentation.set-source! presentation @source)
+        (ReplPresentation.set-epoch! presentation epoch)
+        (ReplPresentation.set-revision! presentation
+                                        (Long.+
+                                          @(ReplPresentation.revision presentation)
+                                          1l))
+        (ReplPresentation.set-changed! presentation (ReplNative.now))
+        (ReplPresentation.set-analyses! presentation [])
+        (ReplPresentation.set-pending! presentation [])
+        (ReplPresentation.set-dirty! presentation true)
+        (send-language! editor (ReplQuery.Analyze)))))
+
+  (private matching-analysis?)
+  (hidden matching-analysis?)
+  (defn matching-analysis? [presentation document revision epoch]
+    (and
+      (String.= document (ReplPresentation.document presentation))
+      (and
+        (Long.= revision @(ReplPresentation.revision presentation))
+        (Long.= epoch @(ReplPresentation.epoch presentation)))))
+
+  ; Apply language-produced source edits through libedit's existing replacement
+  ; path. Terminal code consumes ranges and replacement text, never syntax.
+  (private apply-edit!)
+  (hidden apply-edit!)
+  (defn apply-edit! [editor reply]
+    (let [current (snapshot editor)
+          source (Pair.a &current)
+          cursor @(Pair.b &current)
+          start @(ReplEditingReply.start reply)
+          end @(ReplEditingReply.end reply)
+          replacements (ReplEditingReply.replacements reply)]
+      (when (and (not (Array.empty? replacements))
+                 (and (Int.<= 0 start)
+                      (and (Int.<= start cursor)
+                           (and (Int.<= cursor end)
+                                (Int.<= end (String.length source))))))
+        (let-do [data (state editor)
+                 presentation (ReplEditor.presentation data)
+                 moves (Array.length
+                   &(String.chars &(String.byte-slice source cursor end)))
+                 deleting (Array.length
+                   &(String.chars &(String.byte-slice source start end)))
+                 keys (the (Array Int) [])]
+          (for [i 0 moves] (Array.push-back! &keys 6))
+          (for [i 0 6]
+            (Array.push-back! &keys @(Array.unsafe-nth &[27 91 57 57 57 126] i)))
+          (Array.push-back! &keys 0)
+          (ReplEditor.set-initial! data @(Array.unsafe-nth replacements 0))
+          (ReplPresentation.set-replace-count! presentation deleting)
+          (ReplPresentation.set-queued! presentation true)
+          (ReplEdit.push editor (Pointer.address (Array.unsafe-nth &keys 0)))))))
+
+  (private apply-completion!)
+  (hidden apply-completion!)
+  (defn apply-completion! [editor reply]
+    (let [current (snapshot editor)
+          source (Pair.a &current)
+          cursor @(Pair.b &current)
+          names (ReplEditingReply.replacements reply)
+          prefix (ReplSyntax.common-prefix names)
+          start @(ReplEditingReply.start reply)
+          end @(ReplEditingReply.end reply)]
+      (when (and (Int.<= 0 start)
+                 (and (Int.<= start cursor)
+                      (and (Int.<= cursor end)
+                           (Int.<= end (String.length source)))))
+        (let [old (String.byte-slice source start end)]
+          (when (and (not (String.empty? &prefix))
+                     (and
+                       (Int.>= (String.length &prefix) (Int.- cursor start))
+                       (String./= &prefix &old)))
+            (apply-edit! editor &(ReplEditingReply.init start end [prefix] @"")))))))
+
+  (private receive-language!)
+  (hidden receive-language!)
+  (defn receive-language! [editor]
+    (let-do [presentation (ReplEditor.presentation (state editor))
+             client (ReplPresentation.client presentation)
+             poll @(ReplLanguageClient.poll client)
+             reading true]
+      (while-do reading
+        (match (poll)
+          (Maybe.Nothing) (set! reading false)
+          (Maybe.Just update)
+            (match update
+              (ReplLanguageUpdate.Analysis analysis)
+                (when-do (matching-analysis? presentation
+                                             (ReplAnalysis.document &analysis)
+                                             @(ReplAnalysis.revision &analysis)
+                                             @(ReplAnalysis.session &analysis))
+                  (ReplPresentation.set-paint! presentation
+                                               (ReplPaint.accept (ReplPresentation.paint presentation)
+                                                                 (ReplPresentation.source presentation)
+                                                                 &analysis))
+                  (ReplPresentation.set-analyses! presentation [analysis])
+                  (ReplPresentation.set-dirty! presentation true))
+              (ReplLanguageUpdate.Editing result)
+                (let [current (snapshot editor)]
+                  (when (and
+                      (matching-analysis? presentation
+                                          (ReplEditingResult.document &result)
+                                          @(ReplEditingResult.revision &result)
+                                          @(ReplEditingResult.session &result))
+                      (and
+                        (Long.= @(ReplEditingResult.request &result)
+                                @(ReplPresentation.request presentation))
+                        (and
+                          (Int.= @(Pair.b &current)
+                                 @(ReplEditingResult.cursor &result))
+                          (not
+                            (Array.empty? (ReplPresentation.pending presentation))))))
+                    (let [reply (ReplEditingResult.reply &result)]
+                      (ReplPresentation.set-information! presentation
+                                                         @(ReplEditingReply.information reply))
+                      (ReplPresentation.set-information-source! presentation
+                                                                @(Pair.a &current))
+                      (ReplPresentation.set-information-cursor! presentation
+                                                                @(Pair.b &current))
+                      (match-ref (Array.unsafe-nth (ReplPresentation.pending presentation)
+                                                   0)
+                        (ReplQuery.Complete) (apply-completion! editor reply)
+                        _ ())
+                      (ReplPresentation.set-pending! presentation [])
+                      (ReplPresentation.set-dirty! presentation true)
+                      (unless-do @(ReplPresentation.rich presentation)
+                        (unless-do (String.empty? (ReplEditingReply.information reply))
+                          (IO.print "\r\n")
+                          (IO.println (ReplEditingReply.information reply)))
+                        (ignore (ReplEdit.set-int editor 20 0)))))))))))
+
+  (private language-feedback)
+  (hidden language-feedback)
+  (defn language-feedback [presentation]
+    (let-do [information (ReplPresentation.information presentation)
+             lines (the (Array String) [])]
+      (if (not (String.empty? information))
+        @information
+        (do
+          (when (and
+              (not (Array.empty? (ReplPresentation.analyses presentation)))
+              (Long.>=
+                (Long.- (ReplNative.now)
+                        @(ReplPresentation.changed presentation))
+                450000000l))
+            (let [analysis (Array.unsafe-nth (ReplPresentation.analyses presentation)
+                                             0)]
+              (match-ref (ReplAnalysis.state analysis)
+                (ReplAnalysisState.Unavailable reason)
+                  (Array.push-back! &lines @reason)
+                _
+                  (unless (match-ref (ReplAnalysis.completeness analysis)
+                      (ReplCompleteness.Incomplete) true
+                      _ false)
+                    (let [diagnostics (ReplAnalysis.diagnostics analysis)]
+                      (for [i 0 (Int.min 2 (Array.length diagnostics))]
+                        (Array.push-back! &lines
+                                          @(ReplDiagnostic.message (Array.unsafe-nth diagnostics
+                                                                                     i)))))))))
+          (String.join "
+" &lines)))))
+
+  (private query)
+  (hidden query)
+  (defn query [editor operation]
+    (let-do [presentation (ReplEditor.presentation (state editor))
+             current (snapshot editor)]
+      (synchronize-language! editor)
+      (ReplPresentation.set-pending! presentation [(ReplQuery.copy &operation)])
+      (ReplPresentation.set-pending-cursor! presentation @(Pair.b &current))
+      (send-language! editor operation)))
+
+  (private complete)
+  (hidden complete)
+  (sig complete (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn complete [editor key]
+    (do (query editor (ReplQuery.Complete)) ReplEdit.REFRESH))
+
+  (private read-byte)
+  (hidden read-byte)
+  (defn read-byte [editor updates]
+    (let-do [presentation (ReplEditor.presentation (state editor))
+             client (ReplPresentation.client presentation)
+             wake @(ReplLanguageClient.wake-fd client)
+             descriptors (the (Ptr ReplNativeFdSet)
+                              (ReplNative.allocate
+                                (Pointer.width
+                                  (the (Ptr ReplNativeFdSet)
+                                       (Pointer.from-long 0l)))))
+             timeout (the (Ptr ReplNativeTimeout)
+                          (ReplNative.allocate
+                            (Pointer.width
+                              (the (Ptr ReplNativeTimeout)
+                                   (Pointer.from-long 0l)))))
+             byte 0b
+             count -1l
+             again true]
+      (while-do again
+        (when-do updates
+          (synchronize-language! editor)
+          (receive-language! editor)
+          (refresh editor))
+        (if (and updates @(ReplPresentation.queued presentation))
+          (do (set! count 2l) (set! again false))
+          (do
+            (ReplNative.clear-fds descriptors)
+            (ReplNative.add-fd 0 descriptors)
+            (when updates (ReplNative.add-fd wake descriptors))
+            (ReplNativeTimeout.set-tv_sec! (Pointer.to-ref timeout) 0l)
+            (ReplNativeTimeout.set-tv_usec! (Pointer.to-ref timeout) 100000)
+            (let [ready (ReplNative.select (if updates (Int.inc wake) 1)
+                                           descriptors
+                                           (Pointer.from-long 0l)
+                                           (Pointer.from-long 0l)
+                                           timeout)]
+              (cond
+                (and (Int.> ready 0)
+                     (Int./= (ReplNative.has-fd 0 descriptors) 0))
+                  (do
+                    (set! count (ReplEdit.read 0 (Pointer.address &byte) 1l))
+                    (unless (and (Long.< count 0l)
+                                 (Int.= (Pointer.to-value (ReplEdit.errno))
+                                        ReplEdit.INTERRUPTED))
+                      (set! again false)))
+                (Int.< ready 0)
+                  (if (Int.= (Pointer.to-value (ReplEdit.errno))
+                             ReplEdit.INTERRUPTED)
+                    (ReplEdit.resize editor)
+                    (set! again false))
+                ())))))
+      (ReplNative.release timeout)
+      (ReplNative.release descriptors)
+      (Pair.init (Long.to-int count) (Byte.to-int byte)))))
