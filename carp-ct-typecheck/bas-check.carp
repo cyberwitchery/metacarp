@@ -592,6 +592,8 @@ one takes argument lists of any length, the others their usual arity.")
 ;; the globals made since the group began, and their values still to type
 (def *bas-created* (the (Array Int) []))
 (def *bas-pending* (the (Array (Pair Int (Pair Int Int))) []))
+;; the global each pending value expression is the value of, for messages
+(def *be-value-cells* (the (Map Int Int) (Map.create)))
 ;; the definition each closure value belongs to, by prototype and frame,
 ;; and the cells that hold definitions
 (def *bas-closure-defs* (the (Map Long Int) (Map.create)))
@@ -1460,9 +1462,11 @@ of `e` at level `lvl` under `env`.")
 found while typing it is reported at, innermost first.")
   (defn typeof [env lvl e]
     (let-do [outer @&*bas-at*
+             outer-origin *bv-origin*
              failed-before *bas-failed*]
       (match (Map.get-maybe &*be-spans* &e)
-        (Maybe.Just span) (set! *bas-at* (Maybe.Just span))
+        (Maybe.Just span)
+          (do (set! *bas-at* (Maybe.Just span)) (set! *bv-origin* e))
         (Maybe.Nothing) ())
       (let-do [t (typeof-node env lvl e)]
         (when (and *bas-failed*
@@ -1470,6 +1474,7 @@ found while typing it is reported at, innermost first.")
                    (Maybe.nothing? &*bas-failure-at*))
           (set! *bas-failure-at* @&*bas-at*))
         (set! *bas-at* outer)
+        (set! *bv-origin* outer-origin)
         t)))
 
   (private typeof-node)
@@ -1876,6 +1881,252 @@ and written once where it is long.")
         (Map.put! &*bp-rendered* &i &r)
         r)))
 
+;; ------------------------------------------------------------ messages
+
+(defmodule BDescribe
+  (doc mismatch "the message for a value of type `lhs` met where `rhs` is
+needed, in the language's words rather than the checker's types.")
+  (defn mismatch [lhs rhs]
+    (fmt "found %s where %s is needed" &(of lhs) &(of rhs)))
+
+  (doc of "`t` as a phrase: the sets of values the language has names for
+(a number, a list or array, a form), single kinds, literal symbols, functions
+by their number of arguments, and a field requirement as a non-empty
+sequence.")
+  (defn of [t] (describe t 0))
+
+  (private describe)
+  (hidden describe)
+  (defn describe [t depth]
+    (cond
+      (Int.= t (BT.top)) @"anything"
+      (Int.= t (BT.bot)) @"nothing"
+      (match (special t) (Maybe.Just name) true (Maybe.Nothing) false)
+        (Maybe.from (special t) @"")
+      (let-do [tags (the (Array Int) [])
+               phrases (the (Array String) [])]
+        (gather t depth &tags &phrases)
+        (join &(Array.concat &[(tag-phrases &tags) phrases])))))
+
+  (private definition-of)
+  (hidden definition-of)
+  (defn definition-of [t] (match (BT.get t) (BTy.Var v) (BT.definition v) _ -1))
+
+  (private special)
+  (hidden special)
+  (doc special "the name of one of the checker's own recursive types, met as
+itself or as its body.")
+  (defn special [t]
+    (cond
+      (or (Int.= t *bas-value*) (Int.= t (definition-of *bas-value*)))
+        (Maybe.Just @"any value")
+      (or (Int.= t *bas-syntax*) (Int.= t (definition-of *bas-syntax*)))
+        (Maybe.Just @"a form")
+      (or (Int.= t *bas-syntax-list*)
+          (Int.= t (definition-of *bas-syntax-list*)))
+        (Maybe.Just @"a list of forms")
+      (Maybe.Nothing)))
+
+  (private conjuncts)
+  (hidden conjuncts)
+  (defn conjuncts [t out]
+    (match (BT.get t)
+      (BTy.And a b) (do (conjuncts a out) (conjuncts b out))
+      _ (Array.push-back! out t)))
+
+  (private gather)
+  (hidden gather)
+  (doc gather "the tags and phrases the disjuncts of `t` stand for.")
+  (defn gather [t depth tags phrases]
+    (match (BT.get t)
+      (BTy.Or a b)
+        (do (gather a depth tags phrases) (gather b depth tags phrases))
+      (BTy.Var v)
+        (match (special t)
+          (Maybe.Just name) (Array.push-back! phrases name)
+          (Maybe.Nothing)
+            (if (and (Int.>= (BT.definition v) 0) (Int.< depth 3))
+              (gather (BT.definition v) (Int.inc depth) tags phrases)
+              (Array.push-back! phrases @"a value")))
+      (BTy.Tag x) (Array.push-back! tags x)
+      (BTy.Top) (Array.push-back! phrases @"anything")
+      (BTy.Bot) ()
+      (BTy.Not x)
+        (Array.push-back! phrases
+                          (fmt "anything but %s" &(describe x (Int.inc depth))))
+      _
+        (let-do [cs (the (Array Int) [])
+                 tag -1
+                 fun -1
+                 field false
+                 neg -1]
+          (conjuncts t &cs)
+          (for [i 0 (Array.length &cs)]
+            (let [c @(Array.unsafe-nth &cs i)]
+              (match (BT.get c)
+                (BTy.Tag x) (set! tag x)
+                (BTy.Fn _ _) (set! fun c)
+                (BTy.Fld _ _) (set! field true)
+                (BTy.Not _) (set! neg c)
+                _ ())))
+          (cond
+            (Int.>= fun 0) (Array.push-back! phrases (function-phrase fun))
+            (Int.>= tag 0) (Array.push-back! tags tag)
+            field (Array.push-back! phrases @"a non-empty list or array")
+            (Int.>= neg 0) (gather neg depth tags phrases)
+            (Array.push-back! phrases @"a value")))))
+
+  (private function-phrase)
+  (hidden function-phrase)
+  (doc function-phrase "a function, by its number of arguments when its
+argument list has a fixed length.")
+  (defn function-phrase [f]
+    (match (BT.get f)
+      (BTy.Fn a _)
+        (let-do [x a
+                 n 0
+                 fixed false
+                 going true]
+          (while-do going
+            (if (Int.= x (BT.named "ArgsNil"))
+              (do (set! fixed true) (set! going false))
+              (let-do [cs (the (Array Int) [])
+                       next -1]
+                (conjuncts x &cs)
+                (for [i 0 (Array.length &cs)]
+                  (match (BT.get @(Array.unsafe-nth &cs i))
+                    (BTy.Fld k y) (when (Int.= k 1) (set! next y))
+                    _ ()))
+                (if (Int.< next 0)
+                  (set! going false)
+                  (do (set! n (Int.inc n)) (set! x next))))))
+          (cond
+            (not fixed) @"a function"
+            (Int.= n 0) @"a function of no arguments"
+            (Int.= n 1) @"a function of 1 argument"
+            (fmt "a function of %d arguments" n)))
+      _ @"a function"))
+
+  (private tag-phrases)
+  (hidden tag-phrases)
+  (doc tag-phrases "names for a set of tags: the closed sets it holds whole
+first, then each tag left.")
+  (defn tag-phrases [tags]
+    (let-do [left (the (Array String) [])
+             out (the (Array String) [])]
+      (for [i 0 (Array.length tags)]
+        (let [name (BTag.name @(Array.unsafe-nth tags i))]
+          (unless (Array.contains? &left &name) (Array.push-back! &left name))))
+      (let [groups [(Pair.init
+                      [@"ListNil" @"ListCons" @"ArrayNil" @"ArrayCons"]
+                      @"a list or array")
+                    (Pair.init [@"ListCons" @"ArrayCons" @"StaticCons"]
+                               @"a non-empty list or array")
+                    (Pair.init [@"ListNil" @"ArrayNil" @"StaticNil"]
+                               @"an empty list or array")
+                    (Pair.init [@"ListNil" @"ListCons"] @"a list")
+                    (Pair.init [@"ArrayNil" @"ArrayCons"] @"an array")
+                    (Pair.init [@"StaticNil" @"StaticCons"] @"a static array")
+                    (Pair.init [@"ListCons" @"ArrayCons"]
+                               @"a non-empty list or array")
+                    (Pair.init [@"ListNil" @"ArrayNil"]
+                               @"an empty list or array")
+                    (Pair.init
+                      [@"Int" @"Long" @"Byte" @"Float" @"Double"]
+                      @"a number")
+                    (Pair.init [@"True" @"False"] @"a bool")
+                    (Pair.init [@"Closure" @"Builtin"] @"a function")]]
+        (for [g 0 (Array.length &groups)]
+          (let [members (Pair.a (Array.unsafe-nth &groups g))]
+            (when-do (Array.all? &(fn [m] (Array.contains? &left m)) members)
+              (Array.push-back! &out @(Pair.b (Array.unsafe-nth &groups g)))
+              (set! left
+                    (Array.copy-filter
+                      &(fn [m] (not (Array.contains? members m)))
+                      &left))))))
+      (for [i 0 (Array.length &left)]
+        (Array.push-back! &out (tag-name (Array.unsafe-nth &left i))))
+      out))
+
+  (private tag-name)
+  (hidden tag-name)
+  (defn tag-name [name]
+    (cond
+      (String.starts-with? name "Symbol:")
+      (fmt "the symbol '%s'" &(String.suffix name 7))
+      (String.= name "Symbol")
+      @"a symbol"
+      (String.= name "String")
+      @"a string"
+      (String.= name "Char")
+      @"a char"
+      (String.= name "Int")
+      @"an Int"
+      (String.= name "Long")
+      @"a Long"
+      (String.= name "Byte")
+      @"a Byte"
+      (String.= name "Float")
+      @"a Float"
+      (String.= name "Double")
+      @"a Double"
+      (String.= name "True")
+      @"true"
+      (String.= name "False")
+      @"false"
+      (String.= name "Pattern")
+      @"a pattern"
+      (String.= name "Dictionary")
+      @"a map"
+      (String.= name "Comment")
+      @"a comment"
+      (String.= name "ListNil")
+      @"the empty list"
+      (String.= name "ListCons")
+      @"a non-empty list"
+      (String.= name "ArrayNil")
+      @"an empty array"
+      (String.= name "ArrayCons")
+      @"a non-empty array"
+      (String.= name "StaticNil")
+      @"an empty static array"
+      (String.= name "StaticCons")
+      @"a non-empty static array"
+      (String.= name "ArgsNil")
+      @"no arguments"
+      (String.= name "ArgsCons")
+      @"arguments"
+      ;; a closure with no arrow: one `eval` may answer, or one whose code
+      ;; did not check
+      (String.= name "Closure")
+      @"a function of unknown type"
+      (String.= name "Builtin")
+      @"a builtin function"
+      (String.= name "Macro")
+      @"a macro"
+      (String.= name "Obj")
+      @"a value"
+      (fmt "a %s" name)))
+
+  (private join)
+  (hidden join)
+  (doc join "`ps` as one phrase: each once, the last joined by \"or\".")
+  (defn join [ps]
+    (let-do [seen (the (Array String) [])]
+      (for [i 0 (Array.length ps)]
+        (let [p (Array.unsafe-nth ps i)]
+          (unless (Array.contains? &seen p) (Array.push-back! &seen @p))))
+      (case (Array.length &seen)
+            0
+            @"nothing"
+            1
+            @(Array.unsafe-nth &seen 0)
+            (String.concat
+              &[(String.join ", "
+                             &(Array.prefix &seen (Int.dec (Array.length &seen))))
+                @" or "
+                @(Array.unsafe-nth &seen (Int.dec (Array.length &seen)))])))))
+
 ;; ------------------------------------------------------------ top level
 
 (def *bas-typed* (the (Map Int Int) (Map.create)))
@@ -1921,6 +2172,10 @@ Their schemes generalize everything above level 0.")
       (set! *bas-failed* false)
       (set! *bas-failure* @"")
       (set! *bas-failure-at* (Maybe.Nothing))
+      (set! *bas-fail-from* -1)
+      (set! *bas-fail-to* -1)
+      (set! *bas-fail-lhs* -1)
+      (set! *bas-fail-rhs* -1)
       (when recursive
         (for [i 0 (Array.length ds)]
           (let-do [v (BAst.fresh-var!)
@@ -1932,12 +2187,74 @@ Their schemes generalize everything above level 0.")
         (let-do [e (member state (Array.unsafe-nth ds i) &deps)]
           (type-pending state &env)
           (let-do [t (BTyper.typeof &env 1 e)]
-            (when recursive (BSolve.constrain t @(Array.unsafe-nth &selves i)))
+            ;; the definition meets its recursive uses here, outside any
+            ;; expression: what it is comes from its body
+            (when-do recursive
+              (set! *bv-origin* e)
+              (BSolve.constrain t @(Array.unsafe-nth &selves i))
+              (set! *bv-origin* -1))
             (Array.push-back! &out
                               (if recursive @(Array.unsafe-nth &selves i) t)))))
+      (when (and *bas-failed* (Maybe.nothing? &*bas-failure-at*))
+        (set! *bas-failure-at* (blamed-span)))
+      (when (and *bas-failed* (Int.>= *bas-fail-lhs* 0))
+        (set! *bas-failure*
+              (String.append
+                &(BDescribe.mismatch *bas-fail-lhs* *bas-fail-rhs*)
+                &(value-origin state))))
       (if *bas-failed*
         (do (BT.rollback!) (forget-created!) (Maybe.Nothing))
         (do (BT.commit!) (set! *bas-created* []) (Maybe.Just out)))))
+
+  (private value-origin)
+  (hidden value-origin)
+  (doc value-origin "where the value of a failure came from, when that is not
+where the failure is reported.")
+  (defn value-origin [state]
+    (match (Map.get-maybe &*be-spans* &*bas-fail-from*)
+      (Maybe.Nothing)
+        (match (Map.get-maybe &*be-value-cells* &*bas-fail-from*)
+          (Maybe.Just cell)
+            (match (BSession.cell-name state cell)
+              (Maybe.Just name)
+                (fmt " (the value comes from the global %s)" &name)
+              (Maybe.Nothing) @"")
+          (Maybe.Nothing) @"")
+      (Maybe.Just from)
+        (let [at (SurfaceSpan.start &from)
+              same (match-ref &*bas-failure-at*
+                (Maybe.Just reported)
+                  (let [r (SurfaceSpan.start reported)]
+                    (and (Int.= @(Info.line at) @(Info.line r))
+                         (Int.= @(Info.col at) @(Info.col r))))
+                (Maybe.Nothing) false)]
+          (cond
+            same
+            @""
+            ;; in another file: name it
+            (match-ref &*bas-failure-at*
+              (Maybe.Just reported)
+                (and
+                  (Int./= @(SurfaceSpan.source reported)
+                          @(SurfaceSpan.source &from))
+                  (not
+                    (String.empty? &(source-name @(SurfaceSpan.source &from)))))
+              (Maybe.Nothing) false)
+            (fmt " (the value comes from %s:%d:%d)"
+                 &(source-name @(SurfaceSpan.source &from))
+                 @(Info.line at)
+                 @(Info.col at))
+            (fmt " (the value comes from %d:%d)" @(Info.line at) @(Info.col at))))))
+
+  (private blamed-span)
+  (hidden blamed-span)
+  (doc blamed-span "where a failure found outside any expression is
+reported: the requirement the value broke, or else where the value came
+from.")
+  (defn blamed-span []
+    (match (Map.get-maybe &*be-spans* &*bas-fail-to*)
+      (Maybe.Just span) (Maybe.Just span)
+      (Maybe.Nothing) (Map.get-maybe &*be-spans* &*bas-fail-from*)))
 
   (private type-pending)
   (hidden type-pending)
@@ -1951,7 +2268,12 @@ below its global's variable; typing one can meet more.")
         (let-do [p @(Array.unsafe-nth &*bas-pending* i)
                  t @(Pair.a &p)
                  mark (BT.mark)]
+          ;; the value has no source of its own: what it gives comes from
+          ;; its global
+          (Map.put! &*be-value-cells* (Pair.a (Pair.b &p)) (Pair.b (Pair.b &p)))
+          (set! *bv-origin* @(Pair.a (Pair.b &p)))
           (BSolve.constrain (BTyper.typeof env 1 @(Pair.a (Pair.b &p))) t)
+          (set! *bv-origin* -1)
           ;; a value whose code does not check is opaque: its closures have
           ;; no arrow, so calling one is rejected, and nothing else is lost
           (when-do *bas-failed*

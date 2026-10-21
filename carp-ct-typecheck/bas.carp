@@ -33,6 +33,12 @@
 (def *bv-level* (the (Array Int) []))
 (def *bv-lo* (the (Array (Array Int)) []))
 (def *bv-hi* (the (Array (Array Int)) []))
+;; where each bound came from: the expression it was added for (an id the
+;; checker maps to its source), or -1
+(def *bv-lo-at* (the (Array (Array Int)) []))
+(def *bv-hi-at* (the (Array (Array Int)) []))
+;; the expression being typed: a constraint begun now comes from it
+(def *bv-origin* -1)
 ;; the body a variable is defined as (a recursive type), or -1: a defined
 ;; variable is a name for its body, not an unknown
 (def *bv-def* (the (Array Int) []))
@@ -48,6 +54,15 @@
 ;; the first failure of the current definition
 (def *bas-failure* @"")
 (def *bas-failed* false)
+;; where the value and the requirement the solver is comparing came from, and
+;; where they came from for the first failure
+(def *bs-from* -1)
+(def *bs-to* -1)
+(def *bas-fail-from* -1)
+(def *bas-fail-to* -1)
+;; the value and the requirement of the first failure, for its message
+(def *bas-fail-lhs* -1)
+(def *bas-fail-rhs* -1)
 
 (defmodule BTag
   (defn add! [name parent final]
@@ -141,6 +156,8 @@ tags of their own.")
       (set! *bv-level* [])
       (set! *bv-lo* [])
       (set! *bv-hi* [])
+      (set! *bv-lo-at* [])
+      (set! *bv-hi-at* [])
       (set! *bv-trail* [])
       (set! *bv-def* [])
       (BTag.reset!)
@@ -369,6 +386,8 @@ of their ids: a union or intersection is always built in that order.")
       (Array.push-back! &*bv-level* lvl)
       (Array.push-back! &*bv-lo* [])
       (Array.push-back! &*bv-hi* [])
+      (Array.push-back! &*bv-lo-at* [])
+      (Array.push-back! &*bv-hi-at* [])
       (Array.push-back! &*bv-def* -1)
       (intern (BTy.Var v))))
 
@@ -379,6 +398,8 @@ rollback removes the definition.")
     (do
       (Array.aset! &*bv-lo* v [body])
       (Array.aset! &*bv-hi* v [body])
+      (Array.aset! &*bv-lo-at* v [-1])
+      (Array.aset! &*bv-hi-at* v [-1])
       (Array.aset! &*bv-def* v body)))
 
   (doc definition "the body the variable `v` is defined as, or -1.")
@@ -387,20 +408,31 @@ rollback removes the definition.")
   (defn var-level [v] @(Array.unsafe-nth &*bv-level* v))
   (defn lower [v] @(Array.unsafe-nth &*bv-lo* v))
   (defn upper [v] @(Array.unsafe-nth &*bv-hi* v))
-  (defn add-lower! [v t]
+  (doc lower-at "where each of `v`'s lower bounds came from.")
+  (defn lower-at [v] @(Array.unsafe-nth &*bv-lo-at* v))
+  (doc upper-at "where each of `v`'s upper bounds came from.")
+  (defn upper-at [v] @(Array.unsafe-nth &*bv-hi-at* v))
+  (doc add-lower-at! "adds the lower bound `t`, which came from `at`.")
+  (defn add-lower-at! [v t at]
     (do
       (Array.push-back! &*bv-trail* (Int.* v 2))
-      (Array.push-back! (Array.unsafe-nth &*bv-lo* v) t)))
-  (defn add-upper! [v t]
+      (Array.push-back! (Array.unsafe-nth &*bv-lo* v) t)
+      (Array.push-back! (Array.unsafe-nth &*bv-lo-at* v) at)))
+  (doc add-upper-at! "adds the upper bound `t`, which came from `at`.")
+  (defn add-upper-at! [v t at]
     (do
       (Array.push-back! &*bv-trail* (Int.inc (Int.* v 2)))
-      (Array.push-back! (Array.unsafe-nth &*bv-hi* v) t)))
+      (Array.push-back! (Array.unsafe-nth &*bv-hi* v) t)
+      (Array.push-back! (Array.unsafe-nth &*bv-hi-at* v) at)))
+  (defn add-lower! [v t] (add-lower-at! v t *bv-origin*))
+  (defn add-upper! [v t] (add-upper-at! v t *bv-origin*))
 
   (doc fresh-var-from "a fresh variable at level `lvl` whose lower bound is
 `lo` from the start: no rollback removes it.")
   (defn fresh-var-from [lvl lo]
     (let-do [t (fresh-var lvl)]
       (Array.aset! &*bv-lo* (Int.dec (Array.length &*bv-lo*)) [lo])
+      (Array.aset! &*bv-lo-at* (Int.dec (Array.length &*bv-lo-at*)) [-1])
       t))
 
   (doc mark "where the bounds added so far end, for `rollback-to!`.")
@@ -411,10 +443,13 @@ rollback removes the definition.")
     (while-do (Int.> (Array.length &*bv-trail*) m)
       (let [e (Array.pop-back! &*bv-trail*)
             v (Int./ e 2)]
-        (ignore
-          (if (Int.= (Int.mod e 2) 0)
-            (Array.pop-back! (Array.unsafe-nth &*bv-lo* v))
-            (Array.pop-back! (Array.unsafe-nth &*bv-hi* v)))))))
+        (if (Int.= (Int.mod e 2) 0)
+          (do
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-lo* v)))
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-lo-at* v))))
+          (do
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-hi* v)))
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-hi-at* v))))))))
 
   (doc commit! "forgets the bounds added so far: no rollback removes them.")
   (defn commit! [] (set! *bv-trail* []))
@@ -425,10 +460,13 @@ first, so a failed definition leaves no constraints behind.")
     (while-do (Int.> (Array.length &*bv-trail*) 0)
       (let [e (Array.pop-back! &*bv-trail*)
             v (Int./ e 2)]
-        (ignore
-          (if (Int.= (Int.mod e 2) 0)
-            (Array.pop-back! (Array.unsafe-nth &*bv-lo* v))
-            (Array.pop-back! (Array.unsafe-nth &*bv-hi* v)))))))
+        (if (Int.= (Int.mod e 2) 0)
+          (do
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-lo* v)))
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-lo-at* v))))
+          (do
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-hi* v)))
+            (ignore (Array.pop-back! (Array.unsafe-nth &*bv-hi-at* v))))))))
 
   (doc rec-type "a recursive type: a variable at level `lvl` equal to the
 body `build` makes of it, as the paper encodes them (§2.2.5).")
@@ -590,12 +628,22 @@ disjunction is everything (a constraint with it on the right holds).")
   (defn fail! [msg]
     (unless-do *bas-failed*
       (set! *bas-failed* true)
+      (set! *bas-fail-from* *bs-from*)
+      (set! *bas-fail-to* *bs-to*)
       (set! *bas-failure* (String.copy msg))))
 
   (doc constrain "MLstruct's `constrain`: makes `lhs ≤ rhs` hold by bounding
 variables, or records a failure.")
   (defn constrain [lhs rhs]
-    (do (set! *bas-gen* (Int.inc *bas-gen*)) (rec lhs rhs)))
+    (do
+      (set! *bas-gen* (Int.inc *bas-gen*))
+      ;; both sides come from the expression being typed, until a variable's
+      ;; bound brings in one from elsewhere
+      (set! *bs-from* *bv-origin*)
+      (set! *bs-to* *bv-origin*)
+      (rec lhs rhs)
+      (set! *bs-from* -1)
+      (set! *bs-to* -1)))
 
   (defn rec [lhs rhs]
     (unless (or *bas-failed* (Int.= lhs rhs))
@@ -626,15 +674,27 @@ variables, or records a failure.")
         (rec lhs rd)
         ;; an unknown is bounded, by a recursive type as by anything else
         (and (Int.>= lv 0) (Int.<= (BT.level rhs) (BT.var-level lv)))
-        (do
-          (BT.add-upper! lv rhs)
-          (let [lbs (BT.lower lv)]
-            (for [i 0 (Array.length &lbs)] (rec @(Array.unsafe-nth &lbs i) rhs))))
+        (let-do [from *bs-from*]
+          (BT.add-upper-at! lv rhs *bs-to*)
+          ;; each value the variable already has meets the new requirement
+          (let [lbs (BT.lower lv)
+                ats (BT.lower-at lv)]
+            (for [i 0 (Array.length &lbs)]
+              (do
+                (set! *bs-from* @(Array.unsafe-nth &ats i))
+                (rec @(Array.unsafe-nth &lbs i) rhs))))
+          (set! *bs-from* from))
         (and (Int.>= rv 0) (Int.<= (BT.level lhs) (BT.var-level rv)))
-        (do
-          (BT.add-lower! rv lhs)
-          (let [ubs (BT.upper rv)]
-            (for [i 0 (Array.length &ubs)] (rec lhs @(Array.unsafe-nth &ubs i)))))
+        (let-do [to *bs-to*]
+          (BT.add-lower-at! rv lhs *bs-from*)
+          ;; the new value meets each requirement the variable already has
+          (let [ubs (BT.upper rv)
+                ats (BT.upper-at rv)]
+            (for [i 0 (Array.length &ubs)]
+              (do
+                (set! *bs-to* @(Array.unsafe-nth &ats i))
+                (rec lhs @(Array.unsafe-nth &ubs i)))))
+          (set! *bs-to* to))
         (Int.>= lv 0)
         (rec lhs (BExtrude.extrude rhs (BT.var-level lv) false))
         (Int.>= rv 0)
@@ -660,7 +720,17 @@ variables, or records a failure.")
               (BTy.And _ _) (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty))
               (BTy.Fn a1 r1)
                 (match-ref r
-                  (BTy.Fn a2 r2) (do (rec @a2 @a1) (rec @r1 @r2))
+                  (BTy.Fn a2 r2)
+                    (let-do [from *bs-from*
+                             to *bs-to*]
+                      ;; arguments flow the other way: the value meeting the
+                      ;; parameter comes from where the function is required
+                      (set! *bs-from* to)
+                      (set! *bs-to* from)
+                      (rec @a2 @a1)
+                      (set! *bs-from* from)
+                      (set! *bs-to* to)
+                      (rec @r1 @r2))
                   _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty)))
               (BTy.Fld f x)
                 (match-ref r
@@ -674,7 +744,10 @@ variables, or records a failure.")
               _ (annoying [lhs] (BLhs.empty) [rhs] (BRhs.empty))))))
 
   (defn mismatch [lhs rhs]
-    (fail! &(fmt "%s is not a %s" &(BT.str lhs) &(BT.str rhs))))
+    (unless-do *bas-failed*
+      (set! *bas-fail-lhs* lhs)
+      (set! *bas-fail-rhs* rhs)
+      (fail! &(fmt "%s is not a %s" &(BT.str lhs) &(BT.str rhs)))))
 
   (doc annoying "MLstruct's `annoying`: `ls` (a conjunction, with `dl`
 already normalized) below `rs` (a disjunction, with `dr` already
@@ -909,18 +982,24 @@ asks for (true: positive).")
                     pol
                       (do
                         (BT.add-upper! v nv)
-                        (let [lbs (BT.lower v)]
+                        (let [lbs (BT.lower v)
+                              ats (BT.lower-at v)]
                           (for [i 0 (Array.length &lbs)]
-                            (BT.add-lower! ni
-                                           (go @(Array.unsafe-nth &lbs i)
-                                               lvl
-                                               pol)))))
+                            (BT.add-lower-at! ni
+                                              (go @(Array.unsafe-nth &lbs i)
+                                                  lvl
+                                                  pol)
+                                              @(Array.unsafe-nth &ats i)))))
                     (do
                       (BT.add-lower! v nv)
-                      (let [ubs (BT.upper v)]
+                      (let [ubs (BT.upper v)
+                            ats (BT.upper-at v)]
                         (for [i 0 (Array.length &ubs)]
-                          (BT.add-upper! ni
-                                         (go @(Array.unsafe-nth &ubs i) lvl pol))))))
+                          (BT.add-upper-at! ni
+                                            (go @(Array.unsafe-nth &ubs i)
+                                                lvl
+                                                pol)
+                                            @(Array.unsafe-nth &ats i))))))
                   nv)))
         _ t)))
 
@@ -949,6 +1028,8 @@ above level `lim` renamed apart to a fresh one at `lvl`, bounds copied.")
                   (if (Int.>= (BT.definition v) 0)
                     (BT.define! ni (fresh lim (BT.definition v) lvl))
                     (do
+                      ;; an instance's bounds come from where it is used,
+                      ;; not from the definition's own code
                       (let [lbs (BT.lower v)]
                         (for [i 0 (Array.length &lbs)]
                           (BT.add-lower! ni

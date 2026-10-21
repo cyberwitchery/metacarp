@@ -98,6 +98,7 @@ list").
 
 ## Messages
 
-Seven of the 16 failures have no location: `unreachable`, `Dynamic.cxr`,
-`Dynamic.unreduce-internal`, `Dynamic.sort`, `Dynamic.List.find-index`,
-`thread-first-internal`, `thread-last-internal`.
+Every failure has a location in its own definition, and names both ends:
+`Dynamic.cxr` reads "found the empty list where a non-empty list or array
+is needed (the value comes from 22:15)", at the `(cddr x)` the recursive
+call's `(cons (- (car x) 1) (cdr x))` reaches.

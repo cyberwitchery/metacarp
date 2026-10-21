@@ -366,6 +366,23 @@ level's branch survives. On `eval-form`, whose parameter has six such
 levels and whose argument is every value, this takes the constraints solved
 from 161,793 to 933. A failure still names the dropped disjuncts.
 
+**Reporting a failure.** Each bound a variable gains records where it came
+from: the innermost expression being typed when it was added, or, when it
+was added while a constraint propagated, the origin of the bound that
+carried it there (the paper's type provenance, reduced to one source
+position per bound). The solver compares a value with a requirement and
+carries the origins of both; across a function's arguments they swap, since
+the value meeting a parameter comes from where the function is required. An
+instance of a definition's type takes its origin from the use, so a failure
+points into the definition being checked, not into the one it calls. A
+failure is reported at the requirement, with where the value came from when
+that is elsewhere: in the same file by position, in another by file, and for
+a value a global holds by the global's name. This gives a location to a
+failure found outside any expression, as when a recursive definition meets
+its own calls. The two types are named in the language's words (a number,
+the empty list, a non-empty list or array, a function of 2 arguments, a
+form), from the closed sets of tags and the checker's own recursive types.
+
 A recursive type is a variable defined as its body (`BT.define!`), as the
 paper encodes recursive types by bounds. The solver unfolds such a variable
 instead of bounding it, which is the paper's S-Hyp read from the other side:
