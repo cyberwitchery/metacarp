@@ -65,6 +65,27 @@
           (Result.success? &(CarpCompiler.derive-module-for-inference &core))
         (Result.Error _) false) (Result.Error _) false))
 
+;; a user-written `str` replaces the derived `str` only: the type keeps a
+;; derived `prn`, as the reference derives the two separately
+(defn own-str-keeps-the-derived-prn? [] (let [prelude "(defmodule String
+  (register concat (Fn [(Ref (Array String))] String) \"String_concat\")
+  (register copy (Fn [(Ref String)] String) \"String_copy\")
+  (implements copy String.copy))
+(register r-name (Fn [] String) \"r_name\")
+"] (and
+      (Result.success?
+        &(CarpCompiler.compile-source
+          &(String.concat &[@prelude @"(deftype R (A []) (B []))
+(defmodule R (sig str (Fn [(Ref R)] String)) (defn str [r] (r-name)))
+(defn run [] (let [r (R.A)] (prn &r)))
+(run)"])))
+      (Result.success?
+        &(CarpCompiler.compile-source
+          &(String.concat &[@prelude @"(deftype (G a) (GA [a]) (GB []))
+(defmodule G (sig str (Fn [(Ref (G a))] String)) (defn str [g] (r-name)))
+(defn run [] (let [g (the (G Bool) (G.GB))] (prn &g)))
+(run)"]))))))
+
 ;; a module that registers an accessor name itself keeps its own c: the
 ;; generated accessor must not replace a registered or templated builtin.
 (defn registered-accessor-name-keeps-its-own-c? []
@@ -91,6 +112,23 @@
            (and (not (contains-text? &c "int errno "))
                 (not (contains-text? &c "int _Bool "))))
     (Result.Error _) false))
+
+;; `main` is the entry point, so it must take nothing and answer an `Int` or
+;; `()`: one that does not is rejected rather than compiled into an empty entry
+(defn main-must-be-an-entry-point? []
+  (and
+    (match (CarpCompiler.compile-source "(register stop (Fn [Int] a) \"exit\")
+(defn main [] (stop 0))") (Result.Success _) false (Result.Error e)
+        (contains-text? (CompileError.message &e) "`main` was generic"))
+    (and
+      (match (CarpCompiler.compile-source "(defn main [] \"s\")")
+        (Result.Success _) false
+        (Result.Error e)
+          (contains-text? (CompileError.message &e)
+                          "can only return an `Int` or a unit type"))
+      (match (CarpCompiler.compile-source "(register inc (Fn [Int] Int) \"inc\")
+(defn main [x] (inc x))") (Result.Success _) false (Result.Error e)
+          (contains-text? (CompileError.message &e) "may not receive arguments")))))
 
 (defn pop-back-deletes-the-dropped-element? []
   (match (CarpCompiler.compile-source
@@ -188,6 +226,64 @@
                                     (String.copy "defs.carp")
                                     (String.copy
                                       "(register int-inc (Fn [Int] Int) \"int_inc\")
+(defn twice [x] (int-inc (int-inc x)))"))]
+        root (String.copy "root.carp")]
+    (Result.success? &(CarpCompiler.compile-sources &sources &root))))
+
+;; a generic type written bare in a signature is that type applied to fresh
+;; variables, so one function takes every instance, as the reference accepts
+(defn bare-generic-type-in-a-signature-is-generic? []
+  (Result.success?
+    &(CarpCompiler.compile-source "(register add (Fn [Int Int] Int) \"add\")
+(register int-copy (Fn [(Ref Int)] Int) \"copy_int\")
+(implements copy int-copy)
+(deftype (Handle t) [index Int])
+(sig idx (Fn [(Ref Handle)] Int))
+(defn idx [h] @(Handle.index h))
+(defn main [] (add (idx &(the (Handle Bool) (Handle.init 1)))
+                   (idx &(the (Handle Int) (Handle.init 2)))))")))
+
+;; and a body that fixes that variable fixes it for itself only: another
+;; signature's declared variable stays generic
+(defn bare-generic-type-fixed-by-the-body-stays-local? []
+  (Result.success?
+    &(CarpCompiler.compile-source "(register add (Fn [Int Int] Int) \"add\")
+(deftype (Handle t) [index Int])
+(deftype Holder [h (Handle Int)])
+(sig hold (Fn [Handle] Holder))
+(defn hold [h] (Holder.init h))
+(sig same (Fn [a] a))
+(defn same [x] x)
+(defn main [] (add 1 (if (same true) (same 2) 3)))")))
+
+;; `(load "repo@tag" "file.carp")` loads that file out of the checkout, as the
+;; reference does: its target names the reference and the file, so two files
+;; of one checkout are two sources, and the module splices the one it names
+(defn loads-a-named-file-of-a-git-checkout? []
+  (match (Surface.parse "(load \"git@host:org/coll@1.0\" \"deque.carp\")
+(load \"git@host:org/coll@1.0\" \"queue.carp\")
+(load \"local.carp\" \"ignored.carp\")") (Result.Success m)
+      (let [targets (collect-load-targets (SurfaceModule.forms &m))]
+        (and (Int.= 3 (Array.length &targets))
+             (and
+               (= (Array.unsafe-nth &targets 0)
+                  "git@host:org/coll@1.0 deque.carp")
+               (and
+                 (= (Array.unsafe-nth &targets 1)
+                    "git@host:org/coll@1.0 queue.carp")
+                 (= (Array.unsafe-nth &targets 2) "local.carp"))))) (Result.Error _)
+      false))
+
+(defn splices-a-named-file-of-a-git-checkout? []
+  (let [sources [(ModuleSource.init (String.copy "root.carp")
+                                    (String.copy "root.carp")
+                                    (String.copy
+                                      "(load \"git@host:org/coll@1.0\" \"defs.carp\")
+(twice 1)"))
+                 (ModuleSource.init
+                   (String.copy "git@host:org/coll@1.0 defs.carp")
+                   (String.copy "defs.carp")
+                   (String.copy "(register int-inc (Fn [Int] Int) \"int_inc\")
 (defn twice [x] (int-inc (int-inc x)))"))]
         root (String.copy "root.carp")]
     (Result.success? &(CarpCompiler.compile-sources &sources &root))))
@@ -428,6 +524,23 @@ answer")
   w = setold;
   ((void)0);
   widget_delete(w);") (Result.Error _) false))
+
+;; a set! whose value moves the target into a borrowed temporary consumes it:
+;; the old value is not deleted at the set (the literal owns it now), and the
+;; new value is deleted at scope exit
+(defn set-moving-target-into-a-temporary-consumes-it? []
+  (match (CarpCompiler.compile-source "(register-type Widget)
+(register make-widget (Fn [] Widget) \"make_widget\")
+(defmodule Widget (register delete (Fn [Widget] ()) \"widget_delete\"))
+(implements delete Widget.delete)
+(register first-widget (Fn [(Ref (Array Widget))] Widget) \"first_widget\")
+(defn replace-it []
+  (let [w (make-widget)]
+    (do (set! w (first-widget &[w])) ())))
+(replace-it)") (Result.Success c)
+      (and (not (contains-text? &c "widget_delete(w);
+  w = ")) (contains-text? &c "((void)0);
+  widget_delete(w);")) (Result.Error _) false))
 
 (defn compiles-managed-return-with-root-cleanup? []
   (match (CarpCompiler.compile-source "(register-type Widget)
@@ -1315,6 +1428,18 @@ answer")
     (compiles-loaded-source-registry?)
     "compiler composes deterministic module loading")
   (assert-true t
+    (bare-generic-type-in-a-signature-is-generic?)
+    "a generic type written bare in a signature is generic")
+  (assert-true t
+    (bare-generic-type-fixed-by-the-body-stays-local?)
+    "and a body that fixes it fixes it for itself only")
+  (assert-true t
+    (loads-a-named-file-of-a-git-checkout?)
+    "a load names a file of a git checkout")
+  (assert-true t
+    (splices-a-named-file-of-a-git-checkout?)
+    "and the module splices that file")
+  (assert-true t
     (emits-library-without-process-entry?)
     "library emission retains named roots without a process entry point")
   (assert-true t
@@ -1342,6 +1467,9 @@ answer")
     (pop-back-deletes-the-dropped-element?)
     "Array.pop-back deletes the element it drops")
   (assert-true t
+    (main-must-be-an-entry-point?)
+    "a main that is not an entry point is rejected")
+  (assert-true t
     (local-named-like-a-c-macro-is-renamed?)
     "a local named like a C macro or reserved identifier is renamed")
   (assert-true t
@@ -1356,6 +1484,9 @@ answer")
   (assert-true t
     (own-accessor-definition-satisfies-derivation?)
     "a module's own definition of an accessor name satisfies derivation")
+  (assert-true t
+    (own-str-keeps-the-derived-prn?)
+    "a user-written str keeps the derived prn")
   (assert-true t
     (missing-accessor-builtin-fails-derivation?)
     "an accessor without its builtin fails derivation, not the c link")
@@ -1390,6 +1521,9 @@ answer")
   (assert-true t
     (emits-scope-delete-after-owned-overwrite?)
     "an owned replacement is deleted at scope exit after set! drops the old value")
+  (assert-true t
+    (set-moving-target-into-a-temporary-consumes-it?)
+    "a set! that moves its target into a temporary consumes it")
   (assert-true t
     (array-set-deletes-replaced-element?)
     "array set deletes a managed element before replacing it")

@@ -88,6 +88,35 @@ class CommandTests(unittest.TestCase):
         self.assertIn("unknown option", result.stderr)
         self.assertNotIn("λ>", result.stdout)
 
+    def test_named_package_file_and_local_override_load_together(self):
+        with tempfile.TemporaryDirectory(prefix="metacarp-cli-load-") as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            packages = cache / "carp/libs/example.org_COLON_packages"
+            selected = packages / "selected/development"
+            selected.mkdir(parents=True)
+            (selected / "selected.carp").write_text('(defn selected [] 1000)\n')
+            (selected / "entry.carp").write_text('(defn selected [] 40)\n')
+            extra = packages / "extra/development"
+            extra.mkdir(parents=True)
+            (extra / "extra.carp").write_text('(defn extra [] 1000)\n')
+            override = root / "override.carp"
+            override.write_text('(defn extra [] 2)\n')
+            source = root / "program.carp"
+            source.write_text(
+                '(load "git@example.org:packages/selected@development" "entry.carp")\n'
+                '(load "git@example.org:packages/extra@development")\n'
+                '(defn main [] (IO.println &(Int.str (Int.+ (selected) (extra)))))\n'
+            )
+            result = self.invoke(
+                "--core", CORE, "--package-override",
+                f"git@example.org:packages/extra@development={override}", "-x", str(source),
+                env={"XDG_CACHE_HOME": str(cache), "CARP_PACKAGE_OVERRIDES": ""},
+                cwd=directory,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "42\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -260,6 +260,16 @@ contract for a caller-identified source.")
     (and (Int.> (String.length name) 0)
          (let [c (String.char-at name 0)] (and (Char.>= c \a) (Char.<= c \z)))))
 
+  (private variable-name?)
+  (hidden variable-name?)
+  (doc variable-name? "whether `name` names a variable rather than a type or a
+constructor: anything that does not start with an uppercase letter, as the
+reference's `isVarName` has it, so `_e` and `x'` are variables.")
+  (defn variable-name? [name]
+    (and (Int.> (String.length name) 0)
+         (let [c (String.char-at name 0)]
+           (not (and (Char.>= c \A) (Char.<= c \Z))))))
+
   (private reference-shorthand?)
   (hidden reference-shorthand?)
   (defn reference-shorthand? [name]
@@ -1594,8 +1604,10 @@ then reuse a reserved id.")
                         shape)
                     (Result.Error error) (set! result (Result.Error error))))
 
+                ;; an interface is global wherever it is declared: the
+                ;; reference keeps interfaces by bare name
                 (declaration? form @"definterface")
-                (match (typed-shape form @"definterface" false scope)
+                (match (typed-shape form @"definterface" false "")
                   (Result.Success shape) (add-interface! collected &shape)
                   (Result.Error error) (set! result (Result.Error error)))
 
@@ -1743,19 +1755,20 @@ no-redefinition case pays no second walk.")
 
   (defn scoped-global-by-name [globals scope name]
     (cond
-      (String.empty? scope) (global-by-name globals name)
+      (String.empty? scope)
+      (global-by-name globals name)
+      ;; a qualified name is looked for in each enclosing module, innermost
+      ;; first, then at the root, as the reference searches its environment
+      ;; chain
       (qualified-name? name)
-        (let [scoped (append-scope scope name)]
-          (match (global-by-name globals &scoped)
-            (Maybe.Just reference) (Maybe.Just reference)
-            (Maybe.Nothing)
-              (let [parent (parent-scope scope)]
-                (if (String.empty? &parent)
-                  (global-by-name globals name)
-                  (let [parent-scoped (append-scope &parent name)]
-                    (match (global-by-name globals &parent-scoped)
-                      (Maybe.Just reference) (Maybe.Just reference)
-                      (Maybe.Nothing) (global-by-name globals name)))))))
+      (let-do [found (the (Maybe CoreRef) (Maybe.Nothing))
+               at (String.copy scope)]
+        (while-do (and (Maybe.nothing? &found) (not (String.empty? &at)))
+          (set! found (global-by-name globals &(append-scope &at name)))
+          (set! at (parent-scope &at)))
+        (match found
+          (Maybe.Just reference) (Maybe.Just reference)
+          (Maybe.Nothing) (global-by-name globals name)))
       (let [scoped (qualify-name scope name)]
         (match (global-by-name globals &scoped)
           (Maybe.Just reference) (Maybe.Just reference)
@@ -2364,8 +2377,6 @@ as a written-out qualified one.")
   (hidden resolve-annotation)
   (private resolve-call)
   (hidden resolve-call)
-  (private resolve-unquote-call)
-  (hidden resolve-unquote-call)
 
   (defn resolve-lambda-parameters [nodes]
     (let-do [result (the (Result (Array CoreRef) ResolveError)
@@ -2799,7 +2810,7 @@ the second binding silently shadow the first within a single scope.")
           (Maybe.Just name)
             (cond
               (= &name "_") (Result.Success (CorePattern.Ignore))
-              (lowercase-start? &name)
+              (variable-name? &name)
                 (Result.Success
                   (CorePattern.Bind (local-reference node &name "pattern")))
               (match (resolve-reference-name node
@@ -3048,21 +3059,6 @@ resolution.")
             (Result.Error error) (Result.Error error))
         (Result.Error error) (Result.Error error))))
 
-  (defn resolve-unquote-call [node items locals globals imports scope]
-    (if (Int.>= (Array.length items) 2)
-      (match (resolve-expression (Box.peek (Array.unsafe-nth items 1))
-                                 locals
-                                 globals
-                                 imports
-                                 scope)
-        (Result.Success callee)
-          (match (resolve-arguments items 2 locals globals imports scope)
-            (Result.Success arguments)
-              (Result.Success (CoreExpr.Call -1 (Box.init callee) arguments))
-            (Result.Error error) (Result.Error error))
-        (Result.Error error) (Result.Error error))
-      (Result.Error (error-at node @"unquote call expects a callee"))))
-
   (defn resolve-expression-raw [node locals globals imports scope]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.Invalid _)
@@ -3131,8 +3127,6 @@ resolution.")
                 (resolve-match node &items locals globals imports scope)
               (operator? head @"the")
                 (resolve-annotation node &items locals globals imports scope)
-              (operator? head @"unquote")
-                (resolve-unquote-call node &items locals globals imports scope)
               (resolve-call node &items locals globals imports scope)))))
       (SurfaceForm.Array items)
       (let [elements (semantic-items items)]
@@ -3326,10 +3320,13 @@ resolution.")
 
   (private resolve-values)
   (hidden resolve-values)
-  (defn resolve-values [shapes globals imports]
+  (doc resolve-values "resolves each value's body. As in a function, a name
+that names an interface is the interface, even in a module that defines a
+function of that name, as the reference resolves it.")
+  (defn resolve-values [shapes globals imports interface-shapes]
     (let-do [result (the (Result (Array CoreValue) ResolveError)
                          (Result.Success []))
-             locals (the (Array CoreRef) [])
+             locals (interface-references globals interface-shapes)
              n (Array.length shapes)]
       (for [i 0 n]
         (match-ref &result
@@ -4514,7 +4511,8 @@ guessed at.")
                   (Result.Success functions)
                     (match (resolve-values (CollectedForms.values &collected)
                                            &all-globals
-                                           (CollectedForms.imports &collected))
+                                           (CollectedForms.imports &collected)
+                                           (CollectedForms.interfaces &collected))
                       (Result.Success values)
                         (match (resolve-builtins (CollectedForms.builtins &collected)
                                                  &all-globals)
