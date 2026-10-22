@@ -142,13 +142,15 @@ clients; its internal compiler representations are not API.
 (Session.prepare-emit (Ref Session)) -> ()
 (Session.emit-cell (Ref Session) SourceInput)
   -> (Result String Diagnostic)
+(Session.emit-library (Ref Session) SourceInput (Ref (Array String)))
+  -> (Result String Diagnostic)
 (Session.build-cell (Ref Session) SourceInput String)
   -> (Result BuildReport Diagnostic)
 ```
 
 `upsert` accepts exactly one top-level definition form in API version 1. A
 multi-form source is rejected with a parse diagnostic. `infer-cell`, `expand`,
-and `emit-cell` may accept multiple forms and never commit them.
+`emit-cell` and `emit-library` may accept multiple forms and never commit them.
 
 `remove` returns the transitive set of definitions invalidated by the removal.
 Removing an unknown name is an error rather than a silent no-op.
@@ -313,6 +315,12 @@ the session is created: it is done once and kept, and each emission normalizes
 only the overlay. On a compiler-sized project this is the difference between
 thirty seconds and two hundred milliseconds per cell. `prepare-emit` does the
 base half up front for callers that would rather pay it while loading.
+
+`emit-library` compiles the same way to a translation unit without `main`, for
+a host that links it into a shared library. It exports only the named roots,
+each of which must be a concrete function of the module the cell completes,
+and it rejects a cell whose top-level expressions do something, as
+`--library` does.
 
 `build-cell` is a later milestone. It splits reusable core output from
 cell-specific output, compiles core object code once per compatible cache key,
