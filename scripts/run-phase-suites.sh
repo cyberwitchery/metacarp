@@ -18,7 +18,7 @@ if [[ -n "$core_dir" ]]; then
   compiler_args=(-c "$core_dir")
 fi
 if [[ -n "${CARP_READER_SOURCE:-}" ]]; then
-  compiler_args+=(--package-override "git@github.com:carpentry-org/carp-reader@0.4.3=$CARP_READER_SOURCE")
+  compiler_args+=(--package-override "git@github.com:carpentry-org/carp-reader@0.5.0=$CARP_READER_SOURCE")
 fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then

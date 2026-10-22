@@ -144,11 +144,10 @@ The [terminal REPL](carp-repl/README.md) uses the warm session and LLVM JIT on
 macOS. It provides persistent definitions and typed results, mixed-input
 transactions, editable source history, completion, docs, highlighting,
 ownership and generated-code queries, and array/record inspection. Build it
-with a compiler rebuilt from current source. The current reader editing API
-also requires the sibling reader checkout:
+with a compiler rebuilt from current source. The reader editing API is included
+in the pinned `carp-reader@0.5.0` dependency:
 
 ```sh
-export CARP_PACKAGE_OVERRIDES="git@github.com:carpentry-org/carp-reader@0.4.3=$PWD/../carp-reader/carp-reader.carp"
 ./out/carp-compiler -c "$CARP_DIR/core" --optimize -b \
   -o out/carp-compiler-next main.carp
 ./out/carp-compiler-next -c "$CARP_DIR/core" --optimize -b \
@@ -339,7 +338,7 @@ references — `carp-reader` by `carp-surface`, `strbuf` by `carp-backend` and
 `carp-c-abi`:
 
 ```clojure
-(load "git@github.com:carpentry-org/carp-reader@0.4.2")
+(load "git@github.com:carpentry-org/carp-reader@0.5.0")
 (load "git@github.com:carpentry-org/strbuf@0.3.0")
 ```
 

@@ -31,7 +31,7 @@ compiler="$repo_root/out/carp-compiler"
 
 # Keep the same development package source through every compiler generation.
 if [[ -n "${CARP_READER_SOURCE:-}" ]]; then
-  export CARP_PACKAGE_OVERRIDES="git@github.com:carpentry-org/carp-reader@0.4.3=$CARP_READER_SOURCE${CARP_PACKAGE_OVERRIDES:+
+  export CARP_PACKAGE_OVERRIDES="git@github.com:carpentry-org/carp-reader@0.5.0=$CARP_READER_SOURCE${CARP_PACKAGE_OVERRIDES:+
 $CARP_PACKAGE_OVERRIDES}"
 fi
 
@@ -178,6 +178,7 @@ run_llvm() {
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/carp-session-jit.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/artifacts.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/inspection-layout.carp
+    CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/foreign-layout.carp
   )
   "$script_dir/check-llvm-memory.sh"
 }

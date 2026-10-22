@@ -8,8 +8,6 @@ Requires macOS, clang, the existing LLVM bindings, a linkable libLLVM, and Carp
 Core. Build the compiler from current source before building the REPL:
 
 ```sh
-export CARP_READER_SOURCE="$PWD/../carp-reader/carp-reader.carp"
-export CARP_PACKAGE_OVERRIDES="git@github.com:carpentry-org/carp-reader@0.4.3=$CARP_READER_SOURCE"
 ./out/carp-compiler -c "$CARP_DIR/core" --optimize -b \
   -o out/carp-compiler-next main.carp
 ./out/carp-compiler-next -c "$CARP_DIR/core" --optimize -b \
@@ -23,10 +21,9 @@ still compile, for example `metacarp -x program.carp`. The C-only bootstrap
 entry point remains `main.carp`; `main-repl.carp` builds a standalone
 `metacarp-repl` from the same driver.
 
-The reader checkout must include `Reader.read-syntax`. Until that API is
-released, the explicit package override selects the working-tree source for
-both compiler generations. `--package-override <reference>=<source.carp>`
-overrides one exact reference; `CARP_PACKAGE_OVERRIDES` supplies newline-separated
+The pinned `carp-reader@0.5.0` dependency includes `Reader.read-syntax`.
+For reader development, `--package-override <reference>=<source.carp>` overrides
+one exact reference; `CARP_PACKAGE_OVERRIDES` supplies newline-separated
 defaults. Missing sources fail instead of falling back to a cached release.
 
 `--core <dir>` overrides `$CARP_DIR/core`. `--help` lists all commands.
