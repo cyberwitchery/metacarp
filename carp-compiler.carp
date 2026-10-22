@@ -1244,9 +1244,17 @@ fields are enqueued for the worklist.")
   (private instance-strfn!)
   (hidden instance-strfn!)
   (doc instance-strfn! "generates the concrete `str` for one generic deftype
-instance and registers it as a `str` implementation pinned to the instance.
+instance and registers it, pinned to the instance, as the `str` and the `prn`
+implementation the user has not written (`derive-str?`, `derive-prn?`).
 Returns nested generic instances for the worklist.")
-  (defn instance-strfn! [inst constructors cell functions impls concat-ref]
+  (defn instance-strfn! [inst
+                         constructors
+                         cell
+                         functions
+                         impls
+                         concat-ref
+                         derive-str?
+                         derive-prn?]
     (let-do [str-ref (PrimitiveRegistry.reference 1 "str")
              deref-ref (PrimitiveRegistry.reference 6 "deref")
              copy-ref (PrimitiveRegistry.reference 0 "copy")
@@ -1255,8 +1263,9 @@ Returns nested generic instances for the worklist.")
       (match-ref inst
         (MonoType.Named base-name _)
           (let-do [fn-ref (CoreRef.init (next-id! cell)
-                                        (String.concat &[(String.copy base-name)
-                                                         @".str"])
+                                        (String.concat
+                                          &[(String.copy base-name)
+                                            (if derive-str? @".str" @".prn")])
                                         true)
                    ;; a per-instance str is derived, not user-written: record
                    ;; it so later instances of the same base are still derived.
@@ -1294,15 +1303,18 @@ Returns nested generic instances for the worklist.")
                                                                                             (CoreType.Reference (Box.init (mono->core inst))
                                                                                                                 (CoreLifetime.Inferred 0)))))
                                                                    branches))))
-            (Array.push-back! impls
-                              (CoreImplementation.init (CoreRef.copy &str-ref)
-                                                       (CoreRef.copy &fn-ref)))
+            (when derive-str?
+              (Array.push-back! impls
+                                (CoreImplementation.init (CoreRef.copy &str-ref)
+                                                         (CoreRef.copy &fn-ref))))
             ;; the reference derives both a `str` and a `prn` binder per deftype
-            ;; (Deftype.binderForStrOrPrn), with identical bodies for non-strings.
-            (Array.push-back! impls
-                              (CoreImplementation.init (PrimitiveRegistry.reference 2
-                                                                                    "prn")
-                                                       (CoreRef.copy &fn-ref))))
+            ;; (Deftype.binderForStrOrPrn), with identical bodies for non-strings,
+            ;; and a user-written one replaces only its own.
+            (when derive-prn?
+              (Array.push-back! impls
+                                (CoreImplementation.init (PrimitiveRegistry.reference 2
+                                                                                      "prn")
+                                                         (CoreRef.copy &fn-ref)))))
         _ ())
       new-insts))
 
@@ -1315,14 +1327,14 @@ Returns nested generic instances for the worklist.")
           (set! found true)))
       found))
 
-  (private user-str-defined?)
-  (hidden user-str-defined?)
-  ;; a `<T>.str` that is NOT one of the recorded generic fallbacks is
+  (private user-member-defined?)
+  (hidden user-member-defined?)
+  ;; a `<T>.str` or `<T>.prn` that is NOT one of the recorded derived ones is
   ;; user-written (or accessor-adopted): instance derivation must not
   ;; override it.
-  (defn user-str-defined? [functions base-name]
+  (defn user-member-defined? [functions base-name member]
     (let-do [found false
-             target (String.concat &[(String.copy base-name) @".str"])]
+             target (String.concat &[(String.copy base-name) @"." @member])]
       (for [i 0 (Array.length functions)]
         (let [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
           (when (and
@@ -1367,16 +1379,33 @@ user-written `<T>.str` keep it.")
                                       _ false))
                                   (match-ref inst
                                     (MonoType.Named base-name _)
-                                      (user-str-defined? &functions base-name)
+                                      (and
+                                        (user-member-defined? &functions
+                                                              base-name
+                                                              "str")
+                                        (user-member-defined? &functions
+                                                              base-name
+                                                              "prn"))
                                     _ true)))]
                 (unless-do skip
                   (set! done (Array.push-back done key))
-                  (let [new-insts (instance-strfn! inst
+                  (let [base (match-ref inst
+                          (MonoType.Named base-name _) @base-name
+                          _ @"")
+                        new-insts (instance-strfn! inst
                                                    constructors
                                                    &cell
                                                    &functions
                                                    &impls
-                                                   &concat-ref)]
+                                                   &concat-ref
+                                                   (not
+                                                     (user-member-defined? &functions
+                                                                           &base
+                                                                           "str"))
+                                                   (not
+                                                     (user-member-defined? &functions
+                                                                           &base
+                                                                           "prn")))]
                     (for [i 0 (Array.length &new-insts)]
                       (set! pending
                             (Array.push-back pending
@@ -2059,14 +2088,24 @@ their own `<T>.str` (e.g. via a user `derive`) are left alone.")
       (for [ci 0 cn]
         (let-do [c (Array.unsafe-nth constructors ci)
                  result-type (Box.peek (CoreConstructorDeclaration.result c))
-                 type-name (named-type-name result-type)]
+                 type-name (named-type-name result-type)
+                 ;; a user-written `<T>.str` or `<T>.prn` replaces only its
+                 ;; own member: the other is still derived, as in the reference
+                 derive-str? (not
+                   (function-named? (CoreModule.functions core)
+                                    &(String.concat &[(String.copy &type-name)
+                                                      @".str"])))
+                 derive-prn? (not
+                   (function-named? (CoreModule.functions core)
+                                    &(String.concat &[(String.copy &type-name)
+                                                      @".prn"])))]
           (unless-do (or (contains-key? &seen &type-name)
-                         (function-named? (CoreModule.functions core)
-                                          &(String.concat &[(String.copy &type-name)
-                                                            @".str"])))
+                         (not (or derive-str? derive-prn?)))
             (set! seen (Array.push-back seen (String.copy &type-name)))
             (let-do [branches (the (Array CoreMatchBranch) [])
-                     fn-name (String.concat &[(String.copy &type-name) @".str"])
+                     fn-name (String.concat
+                       &[(String.copy &type-name)
+                         (if derive-str? @".str" @".prn")])
                      ;; a qualified call site (`(T.str &x)`) makes resolution
                      ;; register a body-less builtin for the name; bind the
                      ;; derived definition to THAT reference and drop the
@@ -2140,15 +2179,17 @@ their own `<T>.str` (e.g. via a user `derive`) are left alone.")
                                                                                                    (CoreType.Reference (Box.init (CoreType.copy result-type))
                                                                                                                        (CoreLifetime.Inferred 0)))))
                                                                           branches)))))
-              (set! new-impls
-                    (Array.push-back new-impls
-                                     (CoreImplementation.init (CoreRef.copy &str-ref)
-                                                              (CoreRef.copy &fn-ref))))
-              (set! new-impls
-                    (Array.push-back new-impls
-                                     (CoreImplementation.init (PrimitiveRegistry.reference 2
-                                                                                           "prn")
-                                                              (CoreRef.copy &fn-ref))))))))
+              (when derive-str?
+                (set! new-impls
+                      (Array.push-back new-impls
+                                       (CoreImplementation.init (CoreRef.copy &str-ref)
+                                                                (CoreRef.copy &fn-ref)))))
+              (when derive-prn?
+                (set! new-impls
+                      (Array.push-back new-impls
+                                       (CoreImplementation.init (PrimitiveRegistry.reference 2
+                                                                                             "prn")
+                                                                (CoreRef.copy &fn-ref)))))))))
       (finish-indexing
         &(CoreModule.init new-functions
                           @(CoreModule.values core)
