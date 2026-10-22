@@ -132,6 +132,12 @@ of its source definition.")
 ;; error type.
 (def *infer-failure-node* (the (Maybe Int) (Maybe.Nothing)))
 (def *infer-base-bindings* (the (Array SchemeBinding) []))
+;; how many parameters each named type of the module takes, from its
+;; constructors: a generic type written bare in a declaration is applied to
+;; fresh variables
+(def *infer-type-arities* (the (Map String Int) (Map.create)))
+;; numbers the variables bare generic types are applied to, apart
+(def *infer-bare-variables* 0)
 
 (defmodule Infer
   (private state-copy)
@@ -231,24 +237,39 @@ of its source definition.")
   (defn convert-declaration-type [signature variables]
     (match-ref signature
       (CoreType.Integer)
-        (ConvertedType.init (Box.init (Type.integer)) (Array.copy variables))
+      (ConvertedType.init (Box.init (Type.integer)) (Array.copy variables))
       (CoreType.String)
-        (ConvertedType.init (Box.init (Type.string)) (Array.copy variables))
+      (ConvertedType.init (Box.init (Type.string)) (Array.copy variables))
       (CoreType.Boolean)
-        (ConvertedType.init (Box.init (Type.boolean)) (Array.copy variables))
+      (ConvertedType.init (Box.init (Type.boolean)) (Array.copy variables))
       (CoreType.Unit)
-        (ConvertedType.init (Box.init (Type.unit)) (Array.copy variables))
+      (ConvertedType.init (Box.init (Type.unit)) (Array.copy variables))
       (CoreType.Variable name)
-        (let [key (String.concat &[@"type:" (String.copy name)])
-              index (declaration-variable-index variables &key)]
-          (if (Int.>= index 0)
-            (ConvertedType.init
-              (Box.init (Type.variable (Int.- -1 index)))
-              (Array.copy variables))
-            (ConvertedType.init
-              (Box.init (Type.variable (Int.- -1 (Array.length variables))))
-              (Array.push-back (Array.copy variables) key))))
+      (let [key (String.concat &[@"type:" (String.copy name)])
+            index (declaration-variable-index variables &key)]
+        (if (Int.>= index 0)
+          (ConvertedType.init
+            (Box.init (Type.variable (Int.- -1 index)))
+            (Array.copy variables))
+          (ConvertedType.init
+            (Box.init (Type.variable (Int.- -1 (Array.length variables))))
+            (Array.push-back (Array.copy variables) key))))
+      ;; a generic type written bare, `Handle` for `(Handle t)`, is that type
+      ;; applied to fresh variables, as the reference accepts it in any
+      ;; instance
       (CoreType.Named name arguments)
+      (if (and (Array.empty? arguments)
+               (Int.> (Map.get-with-default &*infer-type-arities* name &0) 0))
+        (let-do [names (Array.copy variables)
+                 types (the (Array (Box MonoType)) [])]
+          (for [_ 0 (Map.get &*infer-type-arities* name)]
+            (do
+              (Array.push-back! &types
+                                (Box.init
+                                  (Type.variable (Int.- -1 (Array.length &names)))))
+              (Array.push-back! &names (fmt "bare:%d" *infer-bare-variables*))
+              (set! *infer-bare-variables* (Int.inc *infer-bare-variables*))))
+          (ConvertedType.init (Box.init (Type.named name types)) names))
         (let [converted-arguments (convert-declaration-arguments arguments
                                                                  variables)]
           (ConvertedType.init
@@ -256,29 +277,28 @@ of its source definition.")
               (Type.named name
                           (Array.copy
                             (ConvertedArguments.types &converted-arguments))))
-            @(ConvertedArguments.variables &converted-arguments)))
+            @(ConvertedArguments.variables &converted-arguments))))
       (CoreType.Reference inner lifetime)
-        (let [converted-inner (convert-declaration-type (Box.peek inner)
-                                                        variables)
-              converted-lifetime (convert-declaration-lifetime lifetime
-                                                               (ConvertedType.variables &converted-inner))]
-          (ConvertedType.init
-            (Box.init
-              (Type.reference
-                (MonoType.copy (Box.peek (ConvertedType.type &converted-inner)))
-                @(ConvertedLifetime.lifetime &converted-lifetime)))
-            @(ConvertedLifetime.variables &converted-lifetime)))
+      (let [converted-inner (convert-declaration-type (Box.peek inner) variables)
+            converted-lifetime (convert-declaration-lifetime lifetime
+                                                             (ConvertedType.variables &converted-inner))]
+        (ConvertedType.init
+          (Box.init
+            (Type.reference
+              (MonoType.copy (Box.peek (ConvertedType.type &converted-inner)))
+              @(ConvertedLifetime.lifetime &converted-lifetime)))
+          @(ConvertedLifetime.variables &converted-lifetime)))
       (CoreType.Function arguments result)
-        (let [converted-arguments (convert-declaration-arguments arguments
-                                                                 variables)
-              converted-result (convert-declaration-type (Box.peek result)
-                                                         (ConvertedArguments.variables &converted-arguments))]
-          (ConvertedType.init
-            (Box.init
-              (Type.function
-                (Array.copy (ConvertedArguments.types &converted-arguments))
-                (MonoType.copy (Box.peek (ConvertedType.type &converted-result)))))
-            @(ConvertedType.variables &converted-result)))))
+      (let [converted-arguments (convert-declaration-arguments arguments
+                                                               variables)
+            converted-result (convert-declaration-type (Box.peek result)
+                                                       (ConvertedArguments.variables &converted-arguments))]
+        (ConvertedType.init
+          (Box.init
+            (Type.function
+              (Array.copy (ConvertedArguments.types &converted-arguments))
+              (MonoType.copy (Box.peek (ConvertedType.type &converted-result)))))
+          @(ConvertedType.variables &converted-result)))))
 
   (doc declaration-scheme "the scheme a written signature declares, with the
 names the author used. A tool that wants to show a type the way it was
@@ -298,10 +318,17 @@ name to give.")
         (let [variable @(Array.unsafe-nth quantified i)
               index (Int.- -1 variable)]
           (if (and (Int.< variable 0)
-                   (and (Int.>= index 0) (Int.< index (Array.length variables))))
+                   (and (Int.>= index 0)
+                        (and (Int.< index (Array.length variables))
+                             (not
+                               (String.starts-with? (Array.unsafe-nth variables
+                                                                      index)
+                                                    "bare:")))))
             (Array.push-back! &names
                               (String.suffix (Array.unsafe-nth variables index)
                                              5))
+            ;; a bare generic type's variable has no name; see
+            ;; `release-bare-variables`
             (Array.push-back! &names @""))))
       names))
 
@@ -918,9 +945,12 @@ The solver is only consulted when something is left to quantify.")
   (defn quantify [environment state type-variables excluded]
     (let-do [raw (free-environment environment)
              quantified (the (Array Int) [])]
+      ;; the group's own variables are not the environment's, though the
+      ;; shared environment may have recorded them
       (for [i 0 (Array.length type-variables)]
         (let [variable @(Array.unsafe-nth type-variables i)]
-          (unless (Type.contains-variable? &raw variable)
+          (unless (and (Type.contains-variable? &raw variable)
+                       (not (Array.contains? excluded &variable)))
             (set! quantified (Type.append-variable &quantified variable)))))
       (unless (Array.empty? &quantified)
         (let-do [solver @(InferState.solver state)
@@ -2174,6 +2204,43 @@ monomorphic sharing the array relies on.")
   (private finalize-functions)
   (hidden finalize-functions)
 
+  (private release-bare-variables)
+  (hidden release-bare-variables)
+  (doc release-bare-variables "a definition's declared scheme, with the
+variables of its bare generic types (the ones with no name) made fresh
+unknowns instead of quantified ones: `(Ref Handle)` declares a `Handle` of
+some type the body decides, not of every type, so the body may fix it, and
+what it leaves open is generalized with the rest.")
+  (defn release-bare-variables [scheme state]
+    (let-do [bare (the (Array Int) [])
+             kept (the (Array Int) [])
+             kept-names (the (Array String) [])
+             variables (TypeScheme.variables scheme)
+             names (TypeScheme.names scheme)]
+      (for [i 0 (Array.length variables)]
+        (if (and (Int.< i (Array.length names))
+                 (String.empty? (Array.unsafe-nth names i)))
+          (Array.push-back! &bare @(Array.unsafe-nth variables i))
+          (do
+            (Array.push-back! &kept @(Array.unsafe-nth variables i))
+            (when (Int.< i (Array.length names))
+              (Array.push-back! &kept-names @(Array.unsafe-nth names i))))))
+      (if (Array.empty? &bare)
+        (Pair.init @scheme (state-copy state))
+        (let [fresh-result (instantiate-tagged
+                &(TypeScheme.init bare [] @(TypeScheme.body scheme) [] [])
+                state
+                "bare")]
+          (Pair.init
+            (TypeScheme.init kept
+                             @(TypeScheme.lifetime-variables scheme)
+                             (Box.init
+                               (MonoType.copy
+                                 (Box.peek (FreshType.type &fresh-result))))
+                             kept-names
+                             @(TypeScheme.choices scheme))
+            @(FreshType.state &fresh-result))))))
+
   (defn predeclare-functions [functions signatures environment state]
     (let-do [result (the
                (Result (Pair InferEnvironment InferState) InferError)
@@ -2188,11 +2255,14 @@ monomorphic sharing the array relies on.")
                   reference (CoreFunction.reference function)]
               (match (signature-for signatures reference)
                 (Maybe.Just scheme)
-                  (set! result
-                        (Result.Success
-                          (Pair.init
-                            (extend-environment (Pair.a pair) reference &scheme)
-                            @(Pair.b pair))))
+                  (let [released (release-bare-variables &scheme (Pair.b pair))]
+                    (set! result
+                          (Result.Success
+                            (Pair.init
+                              (extend-environment (Pair.a pair)
+                                                  reference
+                                                  (Pair.a &released))
+                              @(Pair.b &released)))))
                 (Maybe.Nothing)
                   (let [fresh-result (fresh (Pair.b pair))
                         placeholder (MonoType.copy
@@ -2275,11 +2345,14 @@ monomorphic sharing the array relies on.")
                   reference (CoreValue.reference value)]
               (match (signature-for signatures reference)
                 (Maybe.Just scheme)
-                  (set! result
-                        (Result.Success
-                          (Pair.init
-                            (extend-environment (Pair.a pair) reference &scheme)
-                            @(Pair.b pair))))
+                  (let [released (release-bare-variables &scheme (Pair.b pair))]
+                    (set! result
+                          (Result.Success
+                            (Pair.init
+                              (extend-environment (Pair.a pair)
+                                                  reference
+                                                  (Pair.a &released))
+                              @(Pair.b &released)))))
                 (Maybe.Nothing)
                   (let [fresh-result (fresh (Pair.b pair))
                         scheme (TypeScheme.init []
@@ -2451,8 +2524,30 @@ signature stands for.")
                                      (CoreFunction.reference (Array.unsafe-nth functions
                                                                                i)))
           (Maybe.Just variable) (Array.push-back! &result variable)
-          (Maybe.Nothing) ()))
+          (Maybe.Nothing)
+            (group-scheme-variables! &result
+                                     placeholders
+                                     (CoreFunction.reference (Array.unsafe-nth functions
+                                                                               i)))))
       result))
+
+  (private group-scheme-variables!)
+  (hidden group-scheme-variables!)
+  (doc group-scheme-variables! "adds the unknowns of a declared definition's
+scheme to its group's: the variables `release-bare-variables` freed are the
+group's own, to be generalized with it, though predeclaring recorded them in
+the shared environment.")
+  (defn group-scheme-variables! [result placeholders reference]
+    (match (binding-for placeholders reference)
+      (Maybe.Just scheme)
+        (let [free (Type.free-variables (Box.peek (TypeScheme.body &scheme)))]
+          (for [j 0 (Array.length &free)]
+            (let [v @(Array.unsafe-nth &free j)]
+              (when (and (Int.>= v 0)
+                         (not
+                           (Array.contains? (TypeScheme.variables &scheme) &v)))
+                (Array.push-back! result v)))))
+      (Maybe.Nothing) ()))
 
   (private value-placeholders)
   (hidden value-placeholders)
@@ -2463,7 +2558,11 @@ signature stands for.")
                                      (CoreValue.reference (Array.unsafe-nth values
                                                                             i)))
           (Maybe.Just variable) (Array.push-back! &result variable)
-          (Maybe.Nothing) ()))
+          (Maybe.Nothing)
+            (group-scheme-variables! &result
+                                     placeholders
+                                     (CoreValue.reference (Array.unsafe-nth values
+                                                                            i)))))
       result))
 
   (defn finalize-functions [functions base-environment placeholders state]
@@ -3031,8 +3130,25 @@ inference base.")
 
   (private run-module)
   (hidden run-module)
+  (private record-type-arities!)
+  (hidden record-type-arities!)
+  (doc record-type-arities! "records how many parameters each type of `core`
+takes, read off its constructors' result types; `fresh` forgets the types
+recorded before.")
+  (defn record-type-arities! [core fresh]
+    (do
+      (when fresh (set! *infer-type-arities* (Map.create)))
+      (for [i 0 (Array.length (CoreModule.constructors core))]
+        (match-ref (Box.peek
+            (CoreConstructorDeclaration.result
+              (Array.unsafe-nth (CoreModule.constructors core) i)))
+          (CoreType.Named name arguments)
+            (Map.put! &*infer-type-arities* name &(Array.length arguments))
+          _ ()))))
+
   (defn run-module [core]
-    (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
+    (let-do [_ignored-arities (record-type-arities! core true)
+             _ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
              solver (Type.solver)
              trace (InferenceTrace.init [] [] [] [])
              globals (InferGlobalEnvironment.init []
@@ -3166,7 +3282,8 @@ inference base.")
   (private infer-additions)
   (hidden infer-additions)
   (defn infer-additions [core base functions values taken-over]
-    (let-do [_ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
+    (let-do [_ignored-arities (record-type-arities! core false)
+             _ignored-failure (set! *infer-failure-node* (Maybe.Nothing))
              _ignored-base (set! *infer-base-bindings* [])
              inferred (InferenceBase.inferred base)
              solver (Type.solver-from-substitution (InferredModule.substitution inferred))
