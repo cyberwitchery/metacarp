@@ -42,8 +42,9 @@ lists and arrays holding a value that is not syntax. Each value has one
 - a literal: its kind's tag (`#Int`, `#String`, …); a symbol or bool: the
   final tag of that literal (`#Symbol:foo`, `#True`);
 - a sequence: a chain of cells `#KCons ⊓ {car : τ} ⊓ {cdr : π}` ending in
-  `#KNil`, for `K` in List, Array, Static; an array's tail is a list,
-  because that is what the evaluator's `cdr` of an array answers. A list or
+  `#KNil`, for `K` in List and Array; `cdr` keeps the kind. A static
+  array's cells are `#StaticCons` with a list tail, which no builtin reads,
+  since `car` and `cdr` reject a static array. A list or
   array holding a non-form has the same type as the form would; its `car`
   is simply not a form type;
 - a closure, a builtin, a macro: `#Closure`, `#Builtin`, `#Macro`. A
@@ -201,9 +202,12 @@ arrow cannot say. A call is lowered the way the evaluator runs it: the
 arguments are bound in order, the tail is tested with `list?`, and each
 branch calls a single-kind builtin on the narrowed tail. `cons` onto a list
 is `(ε, τ ≤ List) → #ListCons ⊓ {car : ε} ⊓ {cdr : τ}`, keeping the tail
-exactly; onto an array it is an array cell whose tail is a list of the
-elements. As a value, with no call to lower, `cons` answers a cell of either
-kind and `cons-last` a sequence of either kind. `append` needs both its
+exactly, and onto an array the same with `#ArrayCons`. As a value, with no
+call to lower, `cons` answers a cell of either kind and `cons-last` a
+sequence of either kind. `all-but-last` keeps the kind too, and is typed as
+answering a sequence of either kind: lowered the same way, the branch for
+the other kind, which T-If still types, would answer a sequence of that
+kind whatever the argument. `append` needs both its
 arguments to be of one kind, a condition on two variables that narrowing,
 one variable at a time, cannot express; its kinds are left unchecked
 (§8).

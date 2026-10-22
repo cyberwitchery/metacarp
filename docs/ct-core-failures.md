@@ -1,10 +1,10 @@
 # What the checker rejects in Core
 
 The compile-time checker (`carp-ct-typecheck`) run over every definition in
-Core, macros included, at upstream master c6309d90: 248 of 276 check. This
-classifies the 28 that do not.
+Core, macros included, at upstream master c6309d90: 251 of 276 check. This
+classifies the 25 that do not.
 
-12 of the 28 fail only because they use one that fails. The 16 direct
+10 of the 25 fail only because they use one that fails. The 15 direct
 failures were each read at their site. A failure counted as a real bug only
 if a program showing it was run on the reference compiler.
 
@@ -13,7 +13,7 @@ if a program showing it was run on the reference compiler.
 | real bugs | `Dynamic.Map.shrink`, `thread-first-internal`, `thread-last-internal` | 3 |
 | narrowing through a user-defined predicate | `Dynamic.sort`, `Dynamic.List.find-index`, `Introspect.arguments` | 3 |
 | `eval`'s result used as data | `unreachable`, `Dynamic.unreduce-internal`, `Derive.make-update-deriver`, `derive` | 4 |
-| an invariant on an argument's shape | `Dynamic.cxr`, `cond->`, `cond-->` | 3 |
+| an invariant on an argument's shape | `cond->`, `cond-->` | 2 |
 | a result that depends on an argument's value | `Project.append-flag` | 1 |
 | `expand` does not keep the macro's result type | `ignore-do` | 1 |
 | an invariant on the compiler's state | `current-file` | 1 |
@@ -59,9 +59,7 @@ derivers registered at load use the same `eval`/`members` pattern, so
 their closures are opaque (read, not run through the checker in
 isolation).
 
-**Shape.** `Dynamic.cxr` reads its first argument as count/letter pairs and
-takes `cddr` after reading one pair; that the list has even length is a
-precondition no local type states. `cond->` and `cond-->` take
+**Shape.** `cond->` and `cond-->` take
 `(last (all-but-last binds))` of a non-empty `binds`, which is safe because
 `cond-thread-binds` answers two items per clause. With that expression
 replaced by `(car binds)` in a copy of Core, `cond->` checks, including its
@@ -83,6 +81,6 @@ empty only when nothing is being loaded.
 ## Messages
 
 Every failure has a location in its own definition, and names both ends:
-`Dynamic.cxr` reads "found the empty list where a non-empty list or array
-is needed (the value comes from 22:15)", at the `(cddr x)` the recursive
-call's `(cons (- (car x) 1) (cdr x))` reaches.
+`thread-first-internal` reads "found the empty list where a non-empty list
+or array is needed (the value comes from 13:32)", at the `(last xs)` that
+the recursive call on `(all-but-last xs)` reaches.

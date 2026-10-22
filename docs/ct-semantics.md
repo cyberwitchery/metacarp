@@ -244,8 +244,6 @@ Found while writing this, by running both on the same input:
 | `(dynamic-type car)` | `list` | `fn` |
 | `(s-expr f)`, `f` a `defndynamic` | a list form, `(dynamic f [a] …)` | not a form: `str` of it fails |
 | `(dynamic-type (car (s-expr f)))` | `dynamic` | fails, as above |
-| `(cdr [1 2 3])`, `(cddr [1 2 3])` | `[2 3]`, `[3]` | `(2 3)`, `(3)` |
-| `(all-but-last [1 2 3])` | `[1 2]` | `(1 2)` |
 
 Each row was run through both compilers on the same file (the reference at
 the master revision this repository follows).
