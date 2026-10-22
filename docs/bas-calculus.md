@@ -235,7 +235,7 @@ is enforced by B1, because the tested call is typed (§4).
 O6).
 
 Both are checked against the evaluator by `test/bas-builtins.carp`: B1 on
-124 sample calls (result type below the declared result, and a call the
+131 sample calls (result type below the declared result, and a call the
 evaluator rejects rejected by the type too), B2 on 31 preimages over 38
 sample values of every kind. Sampling is evidence, not proof (O3).
 
@@ -377,9 +377,11 @@ whose tag has no common descendant with the left's, or a `¬T` whose `T`
 covers it. Each `cond` arm of type tests adds a T-If level
 `(T ⊓ t₁) ⊔ (t₂ ⊓ ¬T ⊓ Obj)` to a parameter's type, and splitting those
 levels is exponential in their number; for a left with a tag only one
-level's branch survives. On `eval-form`, whose parameter has six such
-levels and whose argument is every value, this takes the constraints solved
-from 161,793 to 933. A failure still names the dropped disjuncts.
+level's branch survives. Without the step, 13 of Core's 276 definitions,
+each checked with what it depends on, do not finish within a minute
+(`cond->`, `cond-->` and eleven `Dynamic.Map` functions); the others reach
+the same outcome either way, `Dynamic.nthcar` with 71,901 constraints
+solved instead of 512. A failure still names the dropped disjuncts.
 
 **Reporting a failure.** Each bound a variable gains records where it came
 from: the innermost expression being typed when it was added, or, when it
@@ -459,7 +461,7 @@ assuming the implementation matches the cases above. The solver tests
   could compute a function, and a function is not a form. The sound way to
   expand to what code evaluates to is `eval-form`, which checks that it got a
   form when it runs.
-- Definitions that fail to check (28 of 276 in Core) are not covered, and
+- Definitions that fail to check (25 of 276 in Core) are not covered, and
   through O5 they weaken the claim for definitions that read globals they
   write.
 - `set!` of a function binding is rejected rather than typed. No code in
@@ -487,4 +489,4 @@ assuming the implementation matches the cases above. The solver tests
 
 Precision losses that are not soundness gaps: no overloads; narrowing only
 on literal answers, and a length compared with a computed bound does not
-narrow; `cons` onto an array keeps the elements but not the length.
+narrow; `all-but-last` answers a sequence of either kind (§5).
