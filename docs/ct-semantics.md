@@ -244,17 +244,8 @@ Found while writing this, by running both on the same input:
 | `(dynamic-type car)` | `list` | `fn` |
 | `(s-expr f)`, `f` a `defndynamic` | a list form, `(dynamic f [a] …)` | not a form: `str` of it fails |
 | `(dynamic-type (car (s-expr f)))` | `dynamic` | fails, as above |
+| `(cdr [1 2 3])`, `(cddr [1 2 3])` | `[2 3]`, `[3]` | `(2 3)`, `(3)` |
+| `(all-but-last [1 2 3])` | `[1 2]` | `(1 2)` |
 
 Each row was run through both compilers on the same file (the reference at
 the master revision this repository follows).
-
-Fixed in this work: an array literal evaluated to a collection even when
-every element was a form (reference: an array); a list holding a non-form
-answered `array` to `dynamic-type` and `false` to `list?` (reference: `list`,
-`true`); `dynamic-type` answered
-`array` for static arrays and dictionaries (reference: `static-array`,
-`map`) and aborted the process on a macro (reference: `macro`); `macro-log`
-printed nothing, and a top-level one was not evaluated; `write-file`,
-`build`, `run` and `quit` did not exist; `cdr` past the end of a sequence
-and `all-but-last` of an empty one answered `()` (reference: an error, and
-for `all-but-last` an abort of the compiler).

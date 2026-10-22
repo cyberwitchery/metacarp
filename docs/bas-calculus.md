@@ -196,6 +196,18 @@ One arrow, never an intersection of arrows: by the merge rule,
 not satisfy. Overloads are given up for this reason; `+` is
 `∀ξ ≤ Number. (ξ, ξ) → ξ`, where mixed operands make `ξ` their union.
 
+`cons` and `cons-last` keep the kind of the sequence they extend, which one
+arrow cannot say. A call is lowered the way the evaluator runs it: the
+arguments are bound in order, the tail is tested with `list?`, and each
+branch calls a single-kind builtin on the narrowed tail. `cons` onto a list
+is `(ε, τ ≤ List) → #ListCons ⊓ {car : ε} ⊓ {cdr : τ}`, keeping the tail
+exactly; onto an array it is an array cell whose tail is a list of the
+elements. As a value, with no call to lower, `cons` answers a cell of either
+kind and `cons-last` a sequence of either kind. `append` needs both its
+arguments to be of one kind, a condition on two variables that narrowing,
+one variable at a time, cannot express; its kinds are left unchecked
+(§8).
+
 **Preimages** (`BBuiltin.preimage`):
 
 > **B2.** For every value `v` that `f` accepts, `(f v)` answers `l` exactly
@@ -453,8 +465,15 @@ assuming the implementation matches the cases above. The solver tests
   polymorphic type; neither is built, since nothing exercises it.
 - A symbol whose name is not known statically (one read from data, or
   passed into a macro) is not callable.
+- **`append`'s argument kinds are not checked.** It takes two sequences of
+  either kind and answers a sequence of either kind; the evaluator rejects a
+  list appended to an array or the other way round. Requiring one kind would
+  make it take lists only and reject the many array appends in Core. The
+  builtin check lists the mixed samples as known exceptions. A rule that a
+  cell tag always carries its fields (`#ListCons ⊓ {cdr : ⊥} ≡ ⊥`, true of
+  the evaluator's values, see O6) would let a test on the pair of arguments
+  check it.
 
 Precision losses that are not soundness gaps: no overloads; narrowing only
 on literal answers, and a length compared with a computed bound does not
-narrow; `cons` widens its tail to a list of the elements, so `cxr`-style
-length arithmetic is lost.
+narrow; `cons` onto an array keeps the elements but not the length.
