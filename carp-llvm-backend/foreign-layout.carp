@@ -1,0 +1,435 @@
+; Target C layout facts are independent of LLVM contexts and code lifetimes.
+(deftype ForeignFieldLayout [name String
+                             type (Box MonoType)
+                             offset Long])
+(deftype ForeignTypeLayout
+  [key String
+   size Long
+   alignment Int
+   fields (Array ForeignFieldLayout)])
+(deftype ForeignLayoutCache
+  [source String
+   target String
+   core String
+   flags (Array String)
+   layouts (Array ForeignTypeLayout)])
+
+(defmodule ForeignLayouts
+  (doc empty-cache "creates an empty, session-local cache of C layout queries.")
+  (defn empty-cache [] (ForeignLayoutCache.init @"" @"" @"" [] []))
+
+  (doc compiler
+    "the clang belonging to the LLVM installation selected by LLVM.setup.")
+  (defmacro compiler []
+    (if (= (host-os) "darwin")
+      "$(brew --prefix llvm)/bin/clang"
+      "$(llvm-config --bindir)/clang"))
+
+  (private initializer)
+  (hidden initializer)
+  (register initializer (Fn [LLVMValue] LLVMValue) "LLVMGetInitializer")
+  (private constant-int)
+  (hidden constant-int)
+  (register constant-int (Fn [LLVMValue] LLVMValue) "LLVMIsAConstantInt")
+  (private integer-value)
+  (hidden integer-value)
+  (register integer-value (Fn [LLVMValue] Long) "LLVMConstIntGetZExtValue")
+  (private temporary-directory)
+  (hidden temporary-directory)
+  (register temporary-directory (Fn [(Ptr CChar)] (Ptr CChar)) "mkdtemp")
+  (private remove-file)
+  (hidden remove-file)
+  (register remove-file (Fn [(Ptr CChar)] Int) "remove")
+  (private remove-directory)
+  (hidden remove-directory)
+  (register remove-directory (Fn [(Ptr CChar)] Int) "rmdir")
+
+  (doc shell-quote
+    "quotes one literal argument for the support compiler's shell command.")
+  (defn shell-quote [value]
+    (let-do [buffer (StringBuf.create)]
+      (StringBuf.append-str &buffer "'")
+      (for [i 0 (String.length value)]
+        (let [c (String.char-at value i)]
+          (if (Char.= c \')
+            (StringBuf.append-str &buffer "'\\''")
+            (StringBuf.append-char &buffer c))))
+      (StringBuf.append-str &buffer "'")
+      (StringBuf.into-string buffer)))
+
+  (private declaration-index)
+  (hidden declaration-index)
+  (defn declaration-index [backend name]
+    (let-do [found -1
+             declarations (BackendModule.type-declarations backend)]
+      (for [i 0 (Array.length declarations)]
+        (when (=
+            (CoreTypeDeclaration.name (Array.unsafe-nth declarations i))
+            name)
+          (set! found i)))
+      found))
+
+  (private collect-type!)
+  (hidden collect-type!)
+  (defn collect-type! [backend type by-value seen types]
+    (let [key (CAbi.type-key type)]
+      (unless-do (Array.contains? seen
+                                  &(String.append (if by-value "v:" "r:") &key))
+        (Array.push-back! seen (String.append (if by-value "v:" "r:") &key))
+        (match-ref type
+          (MonoType.Reference inner _)
+            (collect-type! backend (Box.peek inner) false seen types)
+          (MonoType.Function args ret)
+            (do
+              (for [i 0 (Array.length args)]
+                (collect-type! backend
+                               (Box.peek (Array.unsafe-nth args i))
+                               true
+                               seen
+                               types))
+              (collect-type! backend (Box.peek ret) true seen types))
+          (MonoType.Named name args)
+            (unless (= name "Ptr")
+              (let [registered (declaration-index backend name)]
+                (if (Int.>= registered 0)
+                  (when by-value (Array.push-back! types (Box.init @type)))
+                  (do
+                    (for [i 0 (Array.length args)]
+                      (collect-type! backend
+                                     (Box.peek (Array.unsafe-nth args i))
+                                     true
+                                     seen
+                                     types))
+                    (let [constructors (BackendModule.constructors backend)]
+                      (for [i 0 (Array.length constructors)]
+                        (let [ctor (Array.unsafe-nth constructors i)]
+                          (match-ref (Box.peek (CoreConstructorDeclaration.result ctor))
+                            (CoreType.Named candidate _)
+                              (when (= candidate name)
+                                (match (CBackend.constructor-fields ctor type)
+                                  (Result.Error _) ()
+                                  (Result.Success fields)
+                                    (for [j 0 (Array.length &fields)]
+                                      (collect-type! backend
+                                                     (Box.peek (Array.unsafe-nth &fields
+                                                                                 j))
+                                                     true
+                                                     seen
+                                                     types))))
+                            _ ()))))))))
+          _ ()))))
+
+  (private collect-expression!)
+  (hidden collect-expression!)
+  (defn collect-expression! [backend expression seen types]
+    (do
+      (collect-type! backend
+                     &(Specialize.expression-type expression)
+                     true
+                     seen
+                     types)
+      (match-ref expression
+        (SpecializedExpr.GlobalCall _ _ _ signature _ args)
+          (do
+            (collect-type! backend (Box.peek signature) true seen types)
+            (for [i 0 (Array.length args)]
+              (collect-expression! backend
+                                   (Box.peek (Array.unsafe-nth args i))
+                                   seen
+                                   types)))
+        (SpecializedExpr.GlobalValue _ _ _ signature _ _)
+          (collect-type! backend (Box.peek signature) true seen types)
+        (SpecializedExpr.Call _ _ callee args)
+          (do
+            (collect-expression! backend (Box.peek callee) seen types)
+            (for [i 0 (Array.length args)]
+              (collect-expression! backend
+                                   (Box.peek (Array.unsafe-nth args i))
+                                   seen
+                                   types)))
+        (SpecializedExpr.Do _ _ items)
+          (for [i 0 (Array.length items)]
+            (collect-expression! backend
+                                 (Box.peek (Array.unsafe-nth items i))
+                                 seen
+                                 types))
+        (SpecializedExpr.ArrayLit _ _ items)
+          (for [i 0 (Array.length items)]
+            (collect-expression! backend
+                                 (Box.peek (Array.unsafe-nth items i))
+                                 seen
+                                 types))
+        (SpecializedExpr.StaticArrayLit _ _ items)
+          (for [i 0 (Array.length items)]
+            (collect-expression! backend
+                                 (Box.peek (Array.unsafe-nth items i))
+                                 seen
+                                 types))
+        (SpecializedExpr.If _ _ condition yes no)
+          (do
+            (collect-expression! backend (Box.peek condition) seen types)
+            (collect-expression! backend (Box.peek yes) seen types)
+            (collect-expression! backend (Box.peek no) seen types))
+        (SpecializedExpr.Let _ _ _ value body)
+          (do
+            (collect-expression! backend (Box.peek value) seen types)
+            (collect-expression! backend (Box.peek body) seen types))
+        (SpecializedExpr.While _ _ condition body)
+          (do
+            (collect-expression! backend (Box.peek condition) seen types)
+            (collect-expression! backend (Box.peek body) seen types))
+        (SpecializedExpr.Set _ _ _ value)
+          (collect-expression! backend (Box.peek value) seen types)
+        (SpecializedExpr.Lambda _ _ _ body)
+          (collect-expression! backend (Box.peek body) seen types)
+        (SpecializedExpr.Annotation _ _ body _)
+          (collect-expression! backend (Box.peek body) seen types)
+        (SpecializedExpr.Match _ _ _ value branches)
+          (do
+            (collect-expression! backend (Box.peek value) seen types)
+            (for [i 0 (Array.length branches)]
+              (collect-expression! backend
+                                   (Box.peek
+                                     (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                                    i)))
+                                   seen
+                                   types)))
+        _ ())))
+
+  (private required-types)
+  (hidden required-types)
+  (defn required-types [backend]
+    (let-do [types (the (Array (Box MonoType)) [])
+             seen (the (Array String) [])
+             declarations (BackendModule.declarations backend)]
+      (for [i 0 (Array.length declarations)]
+        (match-ref (Array.unsafe-nth declarations i)
+          (BackendDeclaration.Function _ signature _ body)
+            (do
+              (collect-type! backend (Box.peek signature) true &seen &types)
+              (collect-expression! backend (Box.peek body) &seen &types))
+          (BackendDeclaration.Global _ signature body)
+            (do
+              (collect-type! backend (Box.peek signature) true &seen &types)
+              (collect-expression! backend (Box.peek body) &seen &types))
+          (BackendDeclaration.Constructor _ signature _)
+            (collect-type! backend (Box.peek signature) true &seen &types)
+          (BackendDeclaration.Intrinsic _ signature _)
+            (collect-type! backend (Box.peek signature) true &seen &types)
+          (BackendDeclaration.Template _ signature _ _)
+            (collect-type! backend (Box.peek signature) true &seen &types)
+          (BackendDeclaration.SourceTemplate _ signature _ _ _)
+            (collect-type! backend (Box.peek signature) true &seen &types)))
+      (let-do [roots (BackendModule.roots backend)
+               closures (BackendModule.closure-functions backend)]
+        (for [i 0 (Array.length roots)]
+          (collect-expression! backend
+                               (Box.peek (Array.unsafe-nth roots i))
+                               &seen
+                               &types))
+        (for [i 0 (Array.length closures)]
+          (let-do [closure (Array.unsafe-nth closures i)]
+            (collect-type! backend
+                           (Box.peek (ClosureFunction.signature closure))
+                           true
+                           &seen
+                           &types)
+            (collect-expression! backend
+                                 (Box.peek (ClosureFunction.body closure))
+                                 &seen
+                                 &types))))
+      types))
+
+  (private members)
+  (hidden members)
+  (defn members [backend type]
+    (match-ref type
+      (MonoType.Named name _)
+        @(CoreTypeDeclaration.members
+          (Array.unsafe-nth
+            (BackendModule.type-declarations backend)
+            (declaration-index backend name)))
+      _ []))
+
+  (doc probe-source
+    "renders C constants for reachable foreign values and their declared fields.")
+  (defn probe-source [backend types]
+    (match (CBackend.system-includes backend)
+      (Result.Error error) (Result.Error @(BackendError.message &error))
+      (Result.Success headers)
+        (match (CBackend.nominal-definitions backend)
+          (Result.Error error) (Result.Error @(BackendError.message &error))
+          (Result.Success definitions)
+            (let-do [buffer (StringBuf.create)
+                     failure (the (Maybe String) (Maybe.Nothing))]
+              (StringBuf.append-str &buffer &headers)
+              (StringBuf.append-str &buffer &definitions)
+              (for [i 0 (Array.length types)]
+                (let [type (Box.peek (Array.unsafe-nth types i))]
+                  (match (CAbi.render-type type)
+                    (Result.Error error)
+                      (set! failure (Maybe.Just @(CAbiError.message &error)))
+                    (Result.Success rendered)
+                      (do (StringBuf.append-str &buffer &(fmt "
+const unsigned long long metacarp_layout_%d_size = sizeof(%s);
+const unsigned long long metacarp_layout_%d_align = _Alignof(%s);
+" i &rendered i &rendered)) (let [fields (members backend type)]
+                          (for [j 0 (Array.length &fields)]
+                            (StringBuf.append-str &buffer
+                                                  &(fmt
+                                                    "const unsigned long long metacarp_layout_%d_field_%d = offsetof(%s, %s);
+"
+                                                    i
+                                                    j
+                                                    &rendered
+                                                    &(CAbi.runtime-symbol (Pair.a (Array.unsafe-nth &fields
+                                                                                                    j)))))))))))
+              (match failure
+                (Maybe.Just error) (Result.Error error)
+                (Maybe.Nothing) (Result.Success (StringBuf.into-string buffer)))))))
+
+  (private read-integer)
+  (hidden read-integer)
+  (defn read-integer [mod name]
+    (let [global (LLVM.get-named-global mod (String.cstr name))]
+      (if (LLVM.value-null? global)
+        (Result.Error (fmt "foreign layout constant missing: %s" name))
+        (let [value (initializer global)]
+          (if (or (LLVM.value-null? value)
+                  (LLVM.value-null? (constant-int value)))
+            (Result.Error (fmt "invalid foreign layout constant: %s" name))
+            (Result.Success (integer-value value)))))))
+
+  (private read-layouts)
+  (hidden read-layouts)
+  (defn read-layouts [backend types path]
+    (let-do [ctx (LLVM.context-create)
+             buffer (LLVM.memory-buffer-of-file (String.cstr path))
+             result (the
+               (Result (Array ForeignTypeLayout) String)
+               (Result.Error @"cannot read C layout IR"))]
+      (unless (LLVM.memory-buffer-null? buffer)
+        (let [mod (LLVM.parse-ir ctx buffer)]
+          (unless-do (LLVM.module-null? mod)
+            (let-do [layouts (the (Array ForeignTypeLayout) [])
+                     failure (the (Maybe String) (Maybe.Nothing))]
+              (for [i 0 (Array.length types)]
+                (let [type (Box.peek (Array.unsafe-nth types i))]
+                  (match (read-integer mod &(fmt "metacarp_layout_%d_size" i))
+                    (Result.Error error) (set! failure (Maybe.Just error))
+                    (Result.Success size)
+                      (match (read-integer mod
+                                           &(fmt "metacarp_layout_%d_align" i))
+                        (Result.Error error) (set! failure (Maybe.Just error))
+                        (Result.Success align)
+                          (let-do [fields (the (Array ForeignFieldLayout) [])
+                                   declared (members backend type)]
+                            (for [j 0 (Array.length &declared)]
+                              (let [member (Array.unsafe-nth &declared j)]
+                                (match (CBackend.concrete-type (Pair.b member))
+                                  (Result.Error error)
+                                    (set! failure
+                                          (Maybe.Just @(BackendError.message &error)))
+                                  (Result.Success field-type)
+                                    (match (read-integer mod
+                                                         &(fmt "metacarp_layout_%d_field_%d"
+                                                               i
+                                                               j))
+                                      (Result.Error error)
+                                        (set! failure (Maybe.Just error))
+                                      (Result.Success offset)
+                                        (Array.push-back! &fields
+                                                          (ForeignFieldLayout.init @(Pair.a member)
+                                                                                   (Box.init field-type)
+                                                                                   offset))))))
+                            (if (or (Long.<= size 0l)
+                                    (or (Long.> size 2147483647l)
+                                        (or (Long.<= align 0l)
+                                            (Long.> align 2147483647l))))
+                              (set! failure
+                                    (Maybe.Just
+                                      (fmt
+                                        "unsupported C layout size/alignment for %s"
+                                        &(CAbi.type-key type))))
+                              (Array.push-back! &layouts
+                                                (ForeignTypeLayout.init (CAbi.type-key type)
+                                                                        size
+                                                                        (Long.to-int align)
+                                                                        fields))))))))
+              (set! result
+                    (match failure
+                      (Maybe.Just error) (Result.Error error)
+                      (Maybe.Nothing) (Result.Success layouts))))
+            (LLVM.module-dispose mod))))
+      (LLVM.context-dispose ctx)
+      result))
+
+  (private compile-probe)
+  (hidden compile-probe)
+  (defn compile-probe [backend types source target core flags scratch]
+    (let [directory (fmt "%s/carp-layout-XXXXXX" scratch)]
+      (if (Pointer.eq
+          (temporary-directory (String.cstr &directory))
+          (the (Ptr CChar) NULL))
+        (Result.Error @"cannot create C layout query directory")
+        (let-do [c-path (String.append &directory "/probe.c")
+                 ir-path (String.append &directory "/probe.ll")
+                 result (match (IO.write-file source &c-path)
+                   (Result.Error error) (Result.Error error)
+                   (Result.Success _)
+                     (if (Int./= 0
+                                 (System.system
+                                   &(fmt
+                                     "%s -x c -S -emit-llvm -O0 -target %s -I . -I %s %s -o %s %s"
+                                     (compiler)
+                                     &(shell-quote target)
+                                     &(shell-quote core)
+                                     &(String.join " " flags)
+                                     &(shell-quote &ir-path)
+                                     &(shell-quote &c-path))))
+                       (Result.Error @"C compiler rejected foreign layout query")
+                       (read-layouts backend types &ir-path)))]
+          (ignore (remove-file (String.cstr &c-path)))
+          (ignore (remove-file (String.cstr &ir-path)))
+          (ignore (remove-directory (String.cstr &directory)))
+          result))))
+
+  (doc query
+    "obtains C size, alignment, and field offsets for one lowered module.
+The query compiles constants to IR for target; it never runs target code.
+The cache is owned by the caller and includes source, target, core, and flags.")
+  (defn query [backend target core flags scratch cache]
+    (let [types (required-types backend)]
+      (if (Array.empty? &types)
+        (Result.Success (empty-cache))
+        (match (probe-source backend &types)
+          (Result.Error error) (Result.Error error)
+          (Result.Success source)
+            (if (and
+                (= &source (ForeignLayoutCache.source cache))
+                (and
+                  (= target (ForeignLayoutCache.target cache))
+                  (and (= core (ForeignLayoutCache.core cache))
+                       (= flags (ForeignLayoutCache.flags cache)))))
+              (Result.Success @cache)
+              (match (compile-probe backend
+                                    &types
+                                    &source
+                                    target
+                                    core
+                                    flags
+                                    scratch)
+                (Result.Error error) (Result.Error error)
+                (Result.Success layouts)
+                  (Result.Success
+                    (ForeignLayoutCache.init source @target @core @flags layouts)))))))))
+
+(defmodule ForeignLayouts
+  (doc index
+    "finds a context-independent foreign layout by its concrete ABI key.")
+  (defn index [layouts key]
+    (let-do [found -1]
+      (for [i 0 (Array.length layouts)]
+        (when (= (ForeignTypeLayout.key (Array.unsafe-nth layouts i)) key)
+          (set! found i)))
+      found)))

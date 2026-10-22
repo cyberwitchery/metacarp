@@ -680,6 +680,75 @@ answer
     (Result.Error error)
       (do (IO.errorln &(CompileError.render &error)) (template-failure))))
 
+(def constructor-callback-source @"(register add (Fn [Int Int] Int) \"add\")
+(deftype Wide [a Int b Int c Int d Int e Int f Int])
+(deftype Tagged (Value [() Wide]) (Empty))
+(defn make-wide [make] (make 1 2 3 4 5 6))
+(defn make-tagged [make value] (make () value))
+(defn make-empty [make] (make))
+(defn code [tagged]
+  (match tagged (Tagged.Value _ (Wide.init _ _ _ _ _ value)) value (Tagged.Empty) 7))
+(defn constructor-score [ignored]
+  (let [wide (make-wide Wide.init)
+        tagged (make-tagged Tagged.Value wide)
+        direct (Wide.init 7 8 9 10 11 12)
+        empty (make-empty Tagged.Empty)]
+    (match direct (Wide.init _ _ _ _ _ value) (add (code tagged) (add value (code empty))))))
+(constructor-score 0)")
+
+(defn check-constructor-callbacks [backend]
+  (let-do [ctx (LLVM.context-create)
+           builder (LLVM.builder-create ctx)
+           mod (LLVM.module-create (String.cstr &@"constructors") ctx)
+           _init (do
+             (ignore (LLVM.initialize-native-target))
+             (ignore (LLVM.initialize-native-asm-printer))
+             0)
+           triple (LLVM.default-target-triple)
+           tm (LLVM.create-target-machine
+             (LLVM.target-from-triple (String.cstr &triple))
+             (String.cstr &triple)
+             (String.cstr &@"")
+             (String.cstr &@"")
+             LLVM.codegen-level-default
+             LLVM.reloc-pic
+             LLVM.codemodel-default)
+           td (LLVM.create-target-data-layout tm)
+           _setup (do
+             (LLVM.set-target mod (String.cstr &triple))
+             (LLVM.set-module-data-layout mod td)
+             0)
+           emitted (match (LLVMBackend.emit-module ctx builder mod td backend)
+             (Result.Success _) true
+             (Result.Error message) (do (IO.errorln &message) false))
+           verify (LLVM.verify-module mod)
+           shim-ok (match (LLVMBackend.shim-translation-unit backend)
+             (Result.Error _) false
+             (Result.Success shim)
+               (match (IO.write-file &shim "out/constructor-callbacks.c")
+                 (Result.Error _) false
+                 (Result.Success _)
+                   (match (IO.getenv "CARP_DIR")
+                     (Maybe.Nothing) false
+                     (Maybe.Just dir)
+                       (Int.= 0
+                              (System.system
+                                &(fmt
+                                  "clang -fsyntax-only out/constructor-callbacks.c -I %s/core"
+                                  &dir))))))]
+    (LLVM.dispose-target-data td)
+    (LLVM.dispose-target-machine tm)
+    (LLVM.module-dispose mod)
+    (LLVM.builder-dispose builder)
+    (LLVM.context-dispose ctx)
+    [emitted (String.empty? &verify) shim-ok]))
+
+(def constructor-callback-checks
+  (match (lower-to-backend &constructor-callback-source)
+    (Result.Success backend) (check-constructor-callbacks &backend)
+    (Result.Error error)
+      (do (IO.errorln (BackendError.message &error)) [false false false])))
+
 (register c-signal-size (Fn [] Int) "c_signal_size")
 (register c-signal-tag-offset (Fn [] Int) "c_signal_tag_offset")
 (register c-outer-size (Fn [] Int) "c_outer_size")
@@ -923,4 +992,13 @@ answer
   (assert-equal test
     15
     @(TemplateRun.roots &closures-run)
-    "closures: roots returns captured() == 15 (heap env + env-first call)"))
+    "closures: roots returns captured() == 15 (heap env + env-first call)")
+  (assert-true test
+    @(Array.unsafe-nth &constructor-callback-checks 0)
+    "constructor callbacks emit with elided unit arguments")
+  (assert-true test
+    @(Array.unsafe-nth &constructor-callback-checks 1)
+    "constructor callback declarations and calls pass the LLVM verifier")
+  (assert-true test
+    @(Array.unsafe-nth &constructor-callback-checks 2)
+    "constructor callback ABI adapters compile against their nominal layouts"))

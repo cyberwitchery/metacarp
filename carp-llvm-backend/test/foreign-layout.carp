@@ -1,0 +1,269 @@
+(load "../carp-session-jit.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(defn core-dir []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Just root)
+      (if (String.ends-with? &root "/core") root (String.append &root "/core"))
+    (Maybe.Nothing) @"../../../carp/core"))
+
+(def foreign-source @"(register-type ForeignWide)
+(register-type ForeignPacked [head Byte word Int])
+(register-type ForeignAligned)
+(register-type ForeignIncomplete)
+(register wide (Fn [] ForeignWide) \"foreign_wide\")
+(register packed (Fn [] ForeignPacked) \"foreign_packed\")
+(register aligned (Fn [] ForeignAligned) \"foreign_aligned\")
+(register incomplete (Fn [] (Ref ForeignIncomplete)) \"foreign_incomplete\")
+(wide)
+(packed)
+(aligned)
+(incomplete)")
+
+(defn find-layout [layouts name]
+  (ForeignLayouts.index layouts &(CAbi.type-key &(MonoType.Named @name []))))
+
+(defn check-layouts [backend cache]
+  (let-do [checks (the (Array Bool) [])
+           layouts (ForeignLayoutCache.layouts cache)
+           wide (find-layout layouts "ForeignWide")
+           packed (find-layout layouts "ForeignPacked")
+           aligned (find-layout layouts "ForeignAligned")
+           _init (ignore (LLVM.initialize-native-target))
+           triple (LLVM.default-target-triple)
+           machine (LLVM.create-target-machine
+             (LLVM.target-from-triple (String.cstr &triple))
+             (String.cstr &triple)
+             (String.cstr &@"")
+             (String.cstr &@"")
+             LLVM.codegen-level-default
+             LLVM.reloc-pic
+             LLVM.codemodel-default)
+           environment (NativeLayoutEnvironment.init @(BackendModule.constructors backend)
+                                                     @layouts)]
+    (Array.push-back! &checks
+                      (and (Int.>= wide 0)
+                           (and (Int.>= packed 0) (Int.>= aligned 0))))
+    (when-do @(Array.unsafe-nth &checks 0)
+      (Array.push-back! &checks
+                        (Long.= 24l
+                                @(ForeignTypeLayout.size (Array.unsafe-nth layouts
+                                                                           wide))))
+      (Array.push-back! &checks
+                        (and
+                          (Long.= 5l
+                                  @(ForeignTypeLayout.size (Array.unsafe-nth layouts
+                                                                             packed)))
+                          (Int.= 1
+                                 @(ForeignTypeLayout.alignment (Array.unsafe-nth layouts
+                                                                                 packed)))))
+      (Array.push-back! &checks
+                        (and
+                          (Long.= 64l
+                                  @(ForeignTypeLayout.size (Array.unsafe-nth layouts
+                                                                             aligned)))
+                          (Int.= 32
+                                 @(ForeignTypeLayout.alignment (Array.unsafe-nth layouts
+                                                                                 aligned)))))
+      (Array.push-back! &checks
+                        (match (LLVMBackend.inspection-layout machine
+                                                              &environment
+                                                              &(MonoType.Named @"ForeignWide"
+                                                                               []))
+                          (Result.Error error) (do (IO.errorln &error) false)
+                          (Result.Success layout)
+                            (Long.= 24l @(NativeValueLayout.size &layout))))
+      (Array.push-back! &checks
+                        (match (LLVMBackend.inspection-layout machine
+                                                              &environment
+                                                              &(MonoType.Named @"ForeignPacked"
+                                                                               []))
+                          (Result.Error error) (do (IO.errorln &error) false)
+                          (Result.Success layout)
+                            (match-ref (NativeValueLayout.representation &layout)
+                              (NativeRepresentation.Nominal _ variants)
+                                (let [fields (NativeVariantLayout.fields (Array.unsafe-nth variants
+                                                                                           0))]
+                                  (Long.= 1l
+                                          @(NativeFieldLayout.offset (Array.unsafe-nth fields
+                                                                                       1))))
+                              _ false)))
+      (Array.push-back! &checks
+                        (match (LLVMBackend.inspection-layout machine
+                                                              &environment
+                                                              &(MonoType.Named @"ForeignAligned"
+                                                                               []))
+                          (Result.Error error) (do (IO.errorln &error) false)
+                          (Result.Success layout)
+                            (Long.= 64l @(NativeValueLayout.size &layout))))
+      (Array.push-back! &checks
+                        (Int.< (find-layout layouts "ForeignIncomplete") 0))
+      (Array.push-back! &checks
+                        (match (ForeignLayouts.query backend
+                                                     &triple
+                                                     &(core-dir)
+                                                     &[]
+                                                     "/tmp"
+                                                     cache)
+                          (Result.Error _) false
+                          (Result.Success repeated)
+                            (= (ForeignLayoutCache.source &repeated)
+                               (ForeignLayoutCache.source cache))))
+      (Array.push-back! &checks
+                        (match (ForeignLayouts.query backend
+                                                     &triple
+                                                     &(core-dir)
+                                                     &[@"-DFOREIGN_LAYOUT_EXTRA=1"]
+                                                     "/tmp"
+                                                     cache)
+                          (Result.Error error) (do (IO.errorln &error) false)
+                          (Result.Success changed)
+                            (let [changed-layouts (ForeignLayoutCache.layouts &changed)]
+                              (Long.= 32l
+                                      @(ForeignTypeLayout.size
+                                        (Array.unsafe-nth changed-layouts
+                                                          (find-layout changed-layouts
+                                                                       "ForeignWide"))))))))
+    (Array.push-back! &checks
+                      (Result.error?
+                        &(LLVMBackend.inspection-layout machine
+                                                        &(NativeLayoutEnvironment.init []
+                                                                                       [])
+                                                        &(MonoType.Named @"ForeignWide"
+                                                                         []))))
+    (LLVM.dispose-target-machine machine)
+    checks))
+
+(defn scenario []
+  (match (CarpCompiler.lower-source &foreign-source)
+    (Result.Error error)
+      (do (IO.errorln &(CompileError.render &error)) (the (Array Bool) []))
+    (Result.Success backend)
+      (match (IO.read-file "test/memory/foreign-layout.h")
+        (Result.Error error) (do (IO.errorln &error) [])
+        (Result.Success header)
+          (let-do [_header (Array.push-back! (BackendModule.system-includes &backend)
+                                             header)
+                   target (LLVM.default-target-triple)]
+            (match (ForeignLayouts.query &backend
+                                         &target
+                                         &(core-dir)
+                                         &[]
+                                         "/tmp"
+                                         &(ForeignLayouts.empty-cache))
+              (Result.Error error) (do (IO.errorln &error) [])
+              (Result.Success cache) (check-layouts &backend &cache))))))
+
+(defn native-scenario []
+  (let-do [checks (the (Array Bool) [])
+           dir (core-dir)]
+    (match (Session.create &dir)
+      (Result.Error error) (IO.errorln (Diagnostic.message &error))
+      (Result.Success session)
+        (match (IO.read-file "test/memory/foreign-layout.h")
+          (Result.Error error) (IO.errorln &error)
+          (Result.Success header)
+            (let-do [jit (SessionJit.create &dir "/tmp")
+                     declarations (String.byte-slice &foreign-source
+                                                     0
+                                                     (String.index-of-string &foreign-source
+                                                                             "(wide)"))
+                     header-literal (Surface.render
+                       &(SurfaceNode.init
+                         (SurfaceSpan.init (Info.init 0 1 1)
+                                           (Info.init 0 1 1)
+                                           -1
+                                           (Maybe.Nothing))
+                         (SurfaceForm.StringLit @&header)))
+                     source (fmt "(Unsafe.preproc (Unsafe.emit-c %s))
+%s
+(register check-native (Fn [ForeignWide ForeignPacked ForeignAligned] Int) \"foreign_check\")" &header-literal &declarations)
+                     input (SourceInput.init @"foreign:declarations" source)
+                     committed (Session.upsert-input &session &input)]
+              (Array.push-back! &checks (Result.success? &committed))
+              (match-ref &committed
+                (Result.Error error) (IO.errorln (Diagnostic.message error))
+                _ ())
+              (for [i 0 2]
+                (let [cell (SourceInput.init (fmt "foreign:cell-%d" i)
+                                             @"(check-native (wide) (packed) (aligned))")]
+                  (Array.push-back! &checks
+                                    (match (SessionJit.run-cell &jit
+                                                                &session
+                                                                &cell)
+                                      (Result.Error error)
+                                        (do
+                                          (IO.errorln (Diagnostic.message &error))
+                                          false)
+                                      (Result.Success value) (Int.= value 1)))))
+              (Array.push-back! &checks
+                                (match (SessionJit.value-layout &jit
+                                                                0
+                                                                &(MonoType.Named @"ForeignPacked"
+                                                                                 []))
+                                  (Result.Error error)
+                                    (do (IO.errorln &error) false)
+                                  (Result.Success layout)
+                                    (match-ref (NativeValueLayout.representation &layout)
+                                      (NativeRepresentation.Nominal _ variants)
+                                        (let [fields (NativeVariantLayout.fields (Array.unsafe-nth variants
+                                                                                                   0))]
+                                          (Long.= 1l
+                                                  @(NativeFieldLayout.offset (Array.unsafe-nth fields
+                                                                                               1))))
+                                      _ false)))
+              (ignore (SessionJit.reset-code! &jit))
+              (Array.push-back! &checks
+                                (Array.empty?
+                                  (ForeignLayoutCache.layouts (JitSession.foreign-layout-cache &jit))))
+              (SessionJit.dispose &jit))))
+    checks))
+
+(def native-checks (native-scenario))
+(defn native-check [i]
+  (and (Int.< i (Array.length &native-checks))
+       @(Array.unsafe-nth &native-checks i)))
+
+(def checks (scenario))
+
+(defn check [i]
+  (and (Int.< i (Array.length &checks)) @(Array.unsafe-nth &checks i)))
+
+(deftest test
+  (assert-equal test 11 (Array.length &checks) "all foreign layout cases ran")
+  (assert-true test (check 0) "all foreign types have layouts")
+  (assert-true test (check 1) "opaque storage uses its C size")
+  (assert-true test (check 2) "packed storage uses C size and alignment")
+  (assert-true test (check 3) "over-aligned storage uses C size and alignment")
+  (assert-true test (check 4) "inspection uses opaque C size")
+  (assert-true test (check 5) "inspection uses C field offsets")
+  (assert-true test (check 6) "inspection preserves over-aligned storage size")
+  (assert-true test
+    (check 7)
+    "incomplete types behind references need no value layout")
+  (assert-true test (check 8) "identical queries reuse the cache")
+  (assert-true test (check 9) "changed C flags invalidate cached layout facts")
+  (assert-true test (check 10) "missing foreign value layouts are rejected")
+  (assert-equal test
+    "'a'\\''b'"
+    &(ForeignLayouts.shell-quote "a'b")
+    "support compiler arguments are shell quoted")
+  (assert-equal test
+    5
+    (Array.length &native-checks)
+    "all native foreign layout cases ran")
+  (assert-true test (native-check 0) "foreign declarations commit in a session")
+  (assert-true test
+    (native-check 1)
+    "a JIT cell crosses foreign aggregate boundaries")
+  (assert-true test
+    (native-check 2)
+    "a later cell reuses foreign aggregate support")
+  (assert-true test
+    (native-check 3)
+    "published foreign fields retain their C offsets")
+  (assert-true test
+    (native-check 4)
+    "reset invalidates foreign layout cache facts"))

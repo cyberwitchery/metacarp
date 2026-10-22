@@ -34,14 +34,26 @@ Lowering decisions worth knowing:
   against zero at branch sites.
 - Sum types mirror the C backend's layout under the module's target data
   layout (`emit-module` takes an `LLVMTargetData`): `{ union-rep, i32 tag }`,
-  where union-rep is the strictest-aligned variant struct padded with bytes to
-  the union's ABI size, and a nullary variant is `{ i8 }` like the C backend's
+  where union-rep stores every payload byte with the union's size and alignment.
+  A typed carrier would discard bytes that fall in its padding when another
+  variant uses them. A nullary variant is `{ i8 }` like the C backend's
   `unsigned char unused`. Variant access goes through memory — opaque-pointer
   typed GEPs overlay the active variant on the union area — so constructors
   spill to an alloca and matches store the scrutinee into a pre-allocated
   entry-block spill slot. Match compiles to tag tests with the C backend's
   `abort()` on fall-through. The test asserts size and tag-offset parity
   against the host C compiler's `sizeof`/`offsetof` (`LLVMBackend.sum-layout`).
+- Foreign values use size, alignment, and declared field offsets queried from
+  the target clang and the actual C headers. The query emits constants to IR
+  without executing target code. Registered type declarations survive lowering
+  so emission and inspection use the same facts. The CLI prepares these facts
+  before emitting; embedding hosts pass them through `emit-module-with-layouts`
+  or `emit-module-incremental-with-layouts`. Missing value layouts are errors;
+  incomplete types can still be used behind pointers and references.
+- A JIT owns its layout cache within a publication generation. The key includes
+  the query source, target, core directory, and C flags. Resetting code also
+  clears layout facts; native header changes require that same reset as cached
+  C support. Published inspection environments retain their own layout facts.
 - Aggregates cross the LLVM/C call boundary through generated pointer-only
   wrappers: a C-native callee (template or header-backed registered function)
   whose signature moves an aggregate by value gets a `<symbol>_carpabi`
