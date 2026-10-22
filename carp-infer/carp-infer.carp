@@ -85,6 +85,17 @@ dependency graph without scanning per reference.")
    type (Box MonoType)
    state InferState])
 
+(doc DeclaredPromise "what a signature promised, as one body instantiated it:
+the declared type in the instance's variables (`body`) and the type each
+declared variable became (`images`), checked once the body's group is
+inferred.")
+(deftype DeclaredPromise
+  [kind String
+   reference CoreRef
+   names (Array String)
+   body (Box MonoType)
+   images (Array (Box MonoType))])
+
 (deftype InferredModule
   [environment (Array SchemeBinding)
    expression-types (Array (Box MonoType))
@@ -2401,12 +2412,126 @@ what it leaves open is generalized with the rest.")
           @": "
           (String.copy message)])))
 
+  (private declared-instance)
+  (hidden declared-instance)
+  (doc declared-instance "a fresh instance of a definition's declared scheme
+to check its body against, with the type each declared variable became. The
+body meets the instance, never the scheme: the scheme's own variables are
+numbered by position in the signature (-1, -2, ...), so every signature
+shares them.")
+  (defn declared-instance [scheme state]
+    (let-do [variables (TypeScheme.variables scheme)
+             witnesses (the (Array (Box MonoType)) [])]
+      (for [i 0 (Array.length variables)]
+        (Array.push-back! &witnesses
+                          (Box.init
+                            (Type.variable @(Array.unsafe-nth variables i)))))
+      (let [parts (instantiate-parts
+              &(TypeScheme.init @variables
+                                @(TypeScheme.lifetime-variables scheme)
+                                (Box.init
+                                  (Type.function witnesses
+                                                 (MonoType.copy (Box.peek (TypeScheme.body scheme)))))
+                                []
+                                [])
+              state
+              "declared")
+            fresh (Pair.a &parts)]
+        (match-ref (Box.peek (FreshType.type fresh))
+          (MonoType.Function images body)
+            (Pair.init
+              (FreshType.init @body @(FreshType.state fresh))
+              (Array.copy images))
+          _ (Pair.init @fresh [])))))
+
+  (private broken-promise)
+  (hidden broken-promise)
+  (doc broken-promise "the error for the first signature whose body fixed one
+of its declared variables or made two of them one, if any. A signature is a
+promise for every type its variables range over, so its body may not narrow
+it; the reference instead lets the body fix the signature.")
+  (defn broken-promise [promises solver]
+    (let-do [found (the (Maybe InferError) (Maybe.Nothing))]
+      (for [i 0 (Array.length promises)]
+        (when (Maybe.nothing? &found)
+          (let-do [promise (Array.unsafe-nth promises i)
+                   names (DeclaredPromise.names promise)
+                   images (DeclaredPromise.images promise)
+                   seen (the (Array Int) [])
+                   name-of (fn [k]
+                     (if (and (Int.< k (Array.length names))
+                              (not (String.empty? (Array.unsafe-nth names k))))
+                       (fmt "`%s`" (Array.unsafe-nth names k))
+                       @"a variable"))]
+            (for [k 0 (Array.length images)]
+              (when (Maybe.nothing? &found)
+                (let [solved (Type.solver-apply-at solver
+                                                   (Box.peek (Array.unsafe-nth images
+                                                                               k)))]
+                  (match-ref &solved
+                    (MonoType.Variable v)
+                    ;; `seen` has an entry per earlier variable, so a position in it is
+                    ;; that variable's position in the signature
+                    (match (Array.index-of &seen v)
+                      (Maybe.Just earlier)
+                        (set! found
+                              (Maybe.Just
+                                (contextual-error (DeclaredPromise.kind promise)
+                                                  (DeclaredPromise.reference promise)
+                                                  &(fmt
+                                                    "the signature is more general than the body: the body makes %s and %s the same"
+                                                    &(name-of earlier)
+                                                    &(name-of k)))))
+                      (Maybe.Nothing) (Array.push-back! &seen @v))
+
+                    _
+                    (set! found
+                          (Maybe.Just
+                            (contextual-error (DeclaredPromise.kind promise)
+                                              (DeclaredPromise.reference promise)
+                                              &(fmt
+                                                "the signature is more general than the body: it declares %s for every type, but the body needs %s"
+                                                &(name-of k)
+                                                &(Type.render &solved))))))))))))
+      found))
+
+  (private kept-promises)
+  (hidden kept-promises)
+  (doc kept-promises "each kept promise's scheme, restated in the variables
+its body was inferred in: the body's types mention those, not the
+declaration's -1, -2, ..., so specialization maps the body's types through
+this scheme. The declared variables stayed free and distinct, so this is the
+declared type, renamed.")
+  (defn kept-promises [promises solver]
+    (let-do [schemes (the (Array SchemeBinding) [])]
+      (for [i 0 (Array.length promises)]
+        (let-do [promise (Array.unsafe-nth promises i)
+                 body (Type.solver-apply-at solver
+                                            (Box.peek (DeclaredPromise.body promise)))
+                 variables (the (Array Int) [])]
+          (for [k 0 (Array.length (DeclaredPromise.images promise))]
+            (match (Type.solver-apply-at solver
+                                         (Box.peek
+                                           (Array.unsafe-nth (DeclaredPromise.images promise)
+                                                             k)))
+              (MonoType.Variable v) (Array.push-back! &variables v)
+              _ ()))
+          (Array.push-back! &schemes
+                            (SchemeBinding.init @(DeclaredPromise.reference promise)
+                                                (TypeScheme.init variables
+                                                                 (Type.free-lifetimes &body)
+                                                                 (Box.init body)
+                                                                 @(DeclaredPromise.names promise)
+                                                                 [])))))
+      schemes))
+
   (defn infer-value-bodies [values environment state]
     (let-do [result (the
                (Result (Pair InferEnvironment InferState) InferError)
                (Result.Success
                  (Pair.init (InferEnvironment.copy environment)
                             (state-copy state))))
+             promises (the (Array DeclaredPromise) [])
              n (Array.length values)]
       (for [i 0 n]
         (match-ref &result
@@ -2418,25 +2543,34 @@ what it leaves open is generalized with the rest.")
                   (match (binding-for (Pair.a pair)
                                       (InferredFunctionBody.reference &inferred))
                     (Maybe.Just placeholder)
-                      (match (Type.solver-unify-at!
-                          @(InferState.solver (InferredFunctionBody.state &inferred))
-                          (Box.peek (InferredFunctionBody.type &inferred))
-                          (Box.peek (TypeScheme.body &placeholder)))
-                        (Result.Success _)
-                          (let [next-state (InferState.init
-                                  @(InferState.next-variable (InferredFunctionBody.state &inferred))
-                                  @(InferState.solver (InferredFunctionBody.state &inferred))
-                                  @(InferState.trace (InferredFunctionBody.state &inferred)))]
+                      (let-do [instance (declared-instance &placeholder
+                                                           (InferredFunctionBody.state &inferred))
+                               instance-state (FreshType.state (Pair.a &instance))]
+                        (unless (Array.empty? (TypeScheme.variables &placeholder))
+                          (Array.push-back! &promises
+                                            (DeclaredPromise.init @"value"
+                                                                  (CoreRef.copy reference)
+                                                                  @(TypeScheme.names &placeholder)
+                                                                  @(FreshType.type (Pair.a &instance))
+                                                                  @(Pair.b &instance))))
+                        (match (Type.solver-unify-at! @(InferState.solver instance-state)
+                                                      (Box.peek (InferredFunctionBody.type &inferred))
+                                                      (Box.peek (FreshType.type (Pair.a &instance))))
+                          (Result.Success _)
+                            (let [next-state (InferState.init
+                                    @(InferState.next-variable instance-state)
+                                    @(InferState.solver instance-state)
+                                    @(InferState.trace instance-state))]
+                              (set! result
+                                    (Result.Success
+                                      (Pair.init (InferEnvironment.copy (Pair.a pair))
+                                                 next-state))))
+                          (Result.Error error)
                             (set! result
-                                  (Result.Success
-                                    (Pair.init (InferEnvironment.copy (Pair.a pair))
-                                               next-state))))
-                        (Result.Error error)
-                          (set! result
-                                (Result.Error
-                                  (contextual-error "value"
-                                                    reference
-                                                    &(TypeError.message &error)))))
+                                  (Result.Error
+                                    (contextual-error "value"
+                                                      reference
+                                                      &(TypeError.message &error))))))
                     (Maybe.Nothing)
                       (set! result
                             (Result.Error
@@ -2450,7 +2584,27 @@ what it leaves open is generalized with the rest.")
                                             reference
                                             (InferError.message &error))))))
           (Result.Error _) ()))
-      result))
+      ;; only once the whole group is inferred: a later body may still fix a
+      ;; variable an earlier one left free
+      (let [broken (match-ref &result
+              (Result.Success pair)
+                (broken-promise &promises @(InferState.solver (Pair.b pair)))
+              _ (Maybe.Nothing))]
+        (match broken
+          (Maybe.Just error) (Result.Error error)
+          (Maybe.Nothing)
+            (match result
+              (Result.Success pair)
+                (let-do [environment @(Pair.a &pair)
+                         schemes (kept-promises &promises
+                                                @(InferState.solver (Pair.b &pair)))]
+                  (for [i 0 (Array.length &schemes)]
+                    (let [binding (Array.unsafe-nth &schemes i)]
+                      (extend-environment! &environment
+                                           (SchemeBinding.reference binding)
+                                           (SchemeBinding.scheme binding))))
+                  (Result.Success (Pair.init environment @(Pair.b &pair))))
+              (Result.Error error) (Result.Error error))))))
 
   (defn infer-function-bodies [functions environment state]
     (let-do [result (the
@@ -2458,6 +2612,7 @@ what it leaves open is generalized with the rest.")
                (Result.Success
                  (Pair.init (InferEnvironment.copy environment)
                             (state-copy state))))
+             promises (the (Array DeclaredPromise) [])
              n (Array.length functions)]
       (for [i 0 n]
         (match-ref &result
@@ -2469,25 +2624,34 @@ what it leaves open is generalized with the rest.")
                   (match (binding-for (Pair.a pair)
                                       (InferredFunctionBody.reference &inferred))
                     (Maybe.Just placeholder)
-                      (match (Type.solver-unify-at!
-                          @(InferState.solver (InferredFunctionBody.state &inferred))
-                          (Box.peek (InferredFunctionBody.type &inferred))
-                          (Box.peek (TypeScheme.body &placeholder)))
-                        (Result.Success _)
-                          (let [next-state (InferState.init
-                                  @(InferState.next-variable (InferredFunctionBody.state &inferred))
-                                  @(InferState.solver (InferredFunctionBody.state &inferred))
-                                  @(InferState.trace (InferredFunctionBody.state &inferred)))]
+                      (let-do [instance (declared-instance &placeholder
+                                                           (InferredFunctionBody.state &inferred))
+                               instance-state (FreshType.state (Pair.a &instance))]
+                        (unless (Array.empty? (TypeScheme.variables &placeholder))
+                          (Array.push-back! &promises
+                                            (DeclaredPromise.init @"function"
+                                                                  (CoreRef.copy reference)
+                                                                  @(TypeScheme.names &placeholder)
+                                                                  @(FreshType.type (Pair.a &instance))
+                                                                  @(Pair.b &instance))))
+                        (match (Type.solver-unify-at! @(InferState.solver instance-state)
+                                                      (Box.peek (InferredFunctionBody.type &inferred))
+                                                      (Box.peek (FreshType.type (Pair.a &instance))))
+                          (Result.Success _)
+                            (let [next-state (InferState.init
+                                    @(InferState.next-variable instance-state)
+                                    @(InferState.solver instance-state)
+                                    @(InferState.trace instance-state))]
+                              (set! result
+                                    (Result.Success
+                                      (Pair.init (InferEnvironment.copy (Pair.a pair))
+                                                 next-state))))
+                          (Result.Error error)
                             (set! result
-                                  (Result.Success
-                                    (Pair.init (InferEnvironment.copy (Pair.a pair))
-                                               next-state))))
-                        (Result.Error error)
-                          (set! result
-                                (Result.Error
-                                  (contextual-error "function"
-                                                    reference
-                                                    &(TypeError.message &error)))))
+                                  (Result.Error
+                                    (contextual-error "function"
+                                                      reference
+                                                      &(TypeError.message &error))))))
                     (Maybe.Nothing)
                       (set! result
                             (Result.Error
@@ -2501,7 +2665,27 @@ what it leaves open is generalized with the rest.")
                                             reference
                                             (InferError.message &error))))))
           (Result.Error _) ()))
-      result))
+      ;; only once the whole group is inferred: a later body may still fix a
+      ;; variable an earlier one left free
+      (let [broken (match-ref &result
+              (Result.Success pair)
+                (broken-promise &promises @(InferState.solver (Pair.b pair)))
+              _ (Maybe.Nothing))]
+        (match broken
+          (Maybe.Just error) (Result.Error error)
+          (Maybe.Nothing)
+            (match result
+              (Result.Success pair)
+                (let-do [environment @(Pair.a &pair)
+                         schemes (kept-promises &promises
+                                                @(InferState.solver (Pair.b &pair)))]
+                  (for [i 0 (Array.length &schemes)]
+                    (let [binding (Array.unsafe-nth &schemes i)]
+                      (extend-environment! &environment
+                                           (SchemeBinding.reference binding)
+                                           (SchemeBinding.scheme binding))))
+                  (Result.Success (Pair.init environment @(Pair.b &pair))))
+              (Result.Error error) (Result.Error error))))))
 
   (private placeholder-variable)
   (hidden placeholder-variable)
