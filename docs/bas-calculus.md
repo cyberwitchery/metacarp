@@ -469,10 +469,17 @@ assuming the implementation matches the cases above. The solver tests
   either kind and answers a sequence of either kind; the evaluator rejects a
   list appended to an array or the other way round. Requiring one kind would
   make it take lists only and reject the many array appends in Core. The
-  builtin check lists the mixed samples as known exceptions. A rule that a
-  cell tag always carries its fields (`#ListCons ⊓ {cdr : ⊥} ≡ ⊥`, true of
-  the evaluator's values, see O6) would let a test on the pair of arguments
-  check it.
+  builtin check lists the mixed samples as known exceptions. A test on the
+  pair of arguments cannot check it either: where an argument's kind is an
+  unknown, so are the pair's field types, and no test on one variable tells
+  a mixed pair from a same-kind one.
+- **O6 is assumed, not derived.** A rule that a cell tag always carries its
+  fields (`T ⊓ {f : ⊥} ≡ ⊥` for the cell tags), sound in the evaluator's
+  values, would derive it: the solver applied it where a constraint would
+  otherwise fail or bound an unknown, with a check that a field is empty
+  that bounds nothing. It was built and measured: every definition of Core
+  checked as before, the check cost about 10%, and it does not make
+  `append`'s kinds checkable (above). It is kept off for that reason.
 
 Precision losses that are not soundness gaps: no overloads; narrowing only
 on literal answers, and a length compared with a computed bound does not
