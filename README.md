@@ -25,7 +25,9 @@ carp -b --optimize main.carp
 
 This produces `./out/carp-compiler`.
 
-The optional LLVM driver additionally requires a linkable `libLLVM`:
+The optional LLVM driver additionally requires LLVM 21 or later with development
+headers and a linkable `libLLVM`. The session JIT also needs Clang from the same
+installation. Linux CI uses LLVM and Clang 22:
 
 ```sh
 carp -b --optimize main-llvm.carp
