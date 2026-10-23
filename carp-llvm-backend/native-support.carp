@@ -1,0 +1,256 @@
+(system-include "dlfcn.h")
+
+; C support is compiled by clang and published as IR in the cell's ORC tracker.
+; Header ownership is declared by the renderer and preserved by clang metadata.
+(deftype JitCPrepared [module LLVMModule
+                       artifact JitCArtifact])
+
+(register-type JitCSize "size_t")
+
+(defmodule JitCBackend
+  (private first-function)
+  (hidden first-function)
+  (register first-function (Fn [LLVMModule] LLVMValue) "LLVMGetFirstFunction")
+  (private next-function)
+  (hidden next-function)
+  (register next-function (Fn [LLVMValue] LLVMValue) "LLVMGetNextFunction")
+  (private first-global)
+  (hidden first-global)
+  (register first-global (Fn [LLVMModule] LLVMValue) "LLVMGetFirstGlobal")
+  (private next-global)
+  (hidden next-global)
+  (register next-global (Fn [LLVMValue] LLVMValue) "LLVMGetNextGlobal")
+  (private named-global)
+  (hidden named-global)
+  (register named-global
+    (Fn [LLVMModule (Ptr CChar)] LLVMValue)
+    "LLVMGetNamedGlobal")
+  (private initializer)
+  (hidden initializer)
+  (register initializer (Fn [LLVMValue] LLVMValue) "LLVMGetInitializer")
+  (private set-initializer)
+  (hidden set-initializer)
+  (register set-initializer (Fn [LLVMValue (Ptr ())] ()) "LLVMSetInitializer")
+  (private operand)
+  (hidden operand)
+  (register operand (Fn [LLVMValue Int] LLVMValue) "LLVMGetOperand")
+  (private operands)
+  (hidden operands)
+  (register operands (Fn [LLVMValue] Int) "LLVMGetNumOperands")
+  (private constant-expression)
+  (hidden constant-expression)
+  (register constant-expression (Fn [LLVMValue] LLVMValue) "LLVMIsAConstantExpr")
+  (private constant-string?)
+  (hidden constant-string?)
+  (register constant-string? (Fn [LLVMValue] Int) "LLVMIsConstantString")
+  (private constant-data)
+  (hidden constant-data)
+  (register constant-data
+    (Fn [LLVMValue (Ptr JitCSize)] (Ptr CChar))
+    "LLVMGetAsString")
+  (private zero-size)
+  (hidden zero-size)
+  (register zero-size JitCSize "0")
+  (private value-name)
+  (hidden value-name)
+  (register value-name (Fn [LLVMValue] (Ptr CChar)) "LLVMGetValueName")
+
+  ; LLVM owns the returned const strings. strdup gives Carp an owned copy,
+  ; matching the LLVM binding's message-copying convention.
+  (private copy-cstr)
+  (hidden copy-cstr)
+  (register copy-cstr (Fn [(Ptr CChar)] String) "strdup")
+  (private declaration?)
+  (hidden declaration?)
+  (register declaration? (Fn [LLVMValue] Int) "LLVMIsDeclaration")
+  (private linkage)
+  (hidden linkage)
+  (register linkage (Fn [LLVMValue] Int) "LLVMGetLinkage")
+  (private set-linkage)
+  (hidden set-linkage)
+  (register set-linkage (Fn [LLVMValue Int] ()) "LLVMSetLinkage")
+  (private external-linkage)
+  (hidden external-linkage)
+  (register external-linkage Int "LLVMExternalLinkage")
+  (private internal-linkage)
+  (hidden internal-linkage)
+  (register internal-linkage Int "LLVMInternalLinkage")
+  (private private-linkage)
+  (hidden private-linkage)
+  (register private-linkage Int "LLVMPrivateLinkage")
+  (private global-type)
+  (hidden global-type)
+  (register global-type (Fn [LLVMValue] LLVMType) "LLVMGlobalGetValueType")
+  (private delete-function)
+  (hidden delete-function)
+  (register delete-function (Fn [LLVMValue] ()) "LLVMDeleteFunction")
+  (private replace-uses)
+  (hidden replace-uses)
+  (register replace-uses (Fn [LLVMValue LLVMValue] ()) "LLVMReplaceAllUsesWith")
+  (private set-name)
+  (hidden set-name)
+  (register set-name (Fn [LLVMValue (Ptr CChar)] ()) "LLVMSetValueName")
+  (private convention)
+  (hidden convention)
+  (register convention (Fn [LLVMValue] Int) "LLVMGetFunctionCallConv")
+  (private set-convention)
+  (hidden set-convention)
+  (register set-convention (Fn [LLVMValue Int] ()) "LLVMSetFunctionCallConv")
+  (private parameter-count)
+  (hidden parameter-count)
+  (register parameter-count (Fn [LLVMValue] Int) "LLVMCountParams")
+  (private attribute-count)
+  (hidden attribute-count)
+  (register attribute-count
+    (Fn [LLVMValue Int] Int)
+    "LLVMGetAttributeCountAtIndex")
+  (private attributes)
+  (hidden attributes)
+  (register attributes
+    (Fn [LLVMValue Int (Ptr LLVMAttribute)] ())
+    "LLVMGetAttributesAtIndex")
+  (private enum-attribute)
+  (hidden enum-attribute)
+  (register enum-attribute
+    (Fn [LLVMValue Int Int] LLVMAttribute)
+    "LLVMGetEnumAttributeAtIndex")
+  (private add-attribute)
+  (hidden add-attribute)
+  (register add-attribute
+    (Fn [LLVMValue Int LLVMAttribute] ())
+    "LLVMAddAttributeAtIndex")
+  (private process)
+  (hidden process)
+  (register process (Ptr ()) "RTLD_DEFAULT")
+  (private symbol-address)
+  (hidden symbol-address)
+  (register symbol-address (Fn [(Ptr ()) (Ptr CChar)] (Ptr ())) "dlsym")
+
+  (private name)
+  (hidden name)
+  (defn name [value] (copy-cstr (value-name value)))
+
+  (private constant-base)
+  (hidden constant-base)
+  (defn constant-base [value]
+    (let-do [base value]
+      (while-do (not (LLVM.value-null? (constant-expression base)))
+        (set! base (operand base 0)))
+      base))
+
+  (private runtime-symbols)
+  (hidden runtime-symbols)
+  (defn runtime-symbols [mod]
+    (let-do [result (the (Set String) (Set.create))
+             annotations (named-global mod
+                                       (String.cstr &@"llvm.global.annotations"))]
+      (unless (LLVM.value-null? annotations)
+        (let [entries (initializer annotations)]
+          (for [i 0 (operands entries)]
+            (let-do [entry (operand entries i)
+                     tag-global (constant-base (operand entry 1))
+                     tag (initializer tag-global)]
+              (when (Int./= 0 (constant-string? tag))
+                (let [length zero-size
+                      text (copy-cstr
+                        (constant-data tag (Pointer.address &length)))]
+                  (when (String.= &text "metacarp.runtime")
+                    (Set.put! &result &(name (constant-base (operand entry 0)))))))))))
+      result))
+
+  (private external?)
+  (hidden external?)
+  (defn external? [value]
+    (not
+      (or (Int.= (linkage value) internal-linkage)
+          (Int.= (linkage value) private-linkage))))
+
+  (private copy-attributes!)
+  (hidden copy-attributes!)
+  (defn copy-attributes! [old replacement index]
+    (let-do [count (attribute-count old index)
+             attrs (the (Array LLVMAttribute) [])]
+      (for [i 0 count] (Array.push-back! &attrs (enum-attribute old index 0)))
+      (when (Int.> count 0) (attributes old index (LLVM.raw &attrs)))
+      (for [i 0 count]
+        (add-attribute replacement index (LLVM.dup (Array.unsafe-nth &attrs i))))))
+
+  (private import-function!)
+  (hidden import-function!)
+  (defn import-function! [mod old symbol]
+    (let-do [replacement (LLVM.add-function mod
+                                            (String.cstr
+                                              &(String.append "metacarp_import_"
+                                                              symbol))
+                                            (global-type old))]
+      (set-convention replacement (convention old))
+      (copy-attributes! old replacement -1)
+      (for [i 0 (Int.inc (parameter-count old))]
+        (copy-attributes! old replacement i))
+      (replace-uses old replacement)
+      (delete-function old)
+      (set-name replacement (String.cstr symbol))))
+
+  (private import?)
+  (hidden import?)
+  (defn import? [symbol runtime exports known]
+    (or
+      (and (Set.contains? known symbol)
+           (or (Set.contains? runtime symbol) (Set.contains? exports symbol)))
+      (and (Set.contains? runtime symbol)
+           (and (not (Set.contains? exports symbol))
+                (not (null? (symbol-address process (String.cstr symbol))))))))
+
+  (doc required? "checks actual emitted LLVM declarations against the support
+manifest. A scalar-only cell can avoid clang; new ABI helpers still trigger it.")
+  (defn required? [ir emission known]
+    (let-do [needed false
+             entities (CTranslationUnit.entities emission)]
+      (for [i 0 (Array.length entities)]
+        (let [symbol (CArtifactEntity.symbol (Array.unsafe-nth entities i))]
+          (when (and (not (Array.contains? known symbol))
+                     (or
+                       (not
+                         (LLVM.value-null?
+                           (LLVM.get-named-function ir (String.cstr symbol))))
+                       (not
+                         (LLVM.value-null? (named-global ir (String.cstr symbol))))))
+            (set! needed true))))
+      needed))
+
+  (doc normalize! "imports previously published support and host runtime
+definitions using explicit compiler annotations. Native definitions remain strong,
+including helpers inside opaque source templates. Returns newly owned symbols.")
+  (defn normalize! [mod emission published]
+    (let-do [runtime (runtime-symbols mod)
+             exports (the (Set String) (Set.create))
+             known (the (Set String) (Set.create))
+             defined (the (Array String) [])
+             entities (CTranslationUnit.entities emission)
+             function (first-function mod)
+             global (first-global mod)]
+      (for [i 0 (Array.length entities)]
+        (Set.put! &exports
+                  (CArtifactEntity.symbol (Array.unsafe-nth entities i))))
+      (for [i 0 (Array.length published)]
+        (Set.put! &known (Array.unsafe-nth published i)))
+      (while-do (not (LLVM.value-null? function))
+        (let-do [next (next-function function)
+                 symbol (name function)]
+          (when (and (external? function) (Int.= (declaration? function) 0))
+            (if (import? &symbol &runtime &exports &known)
+              (import-function! mod function &symbol)
+              (Array.push-back! &defined @&symbol)))
+          (set! function next)))
+      (while-do (not (LLVM.value-null? global))
+        (let-do [next (next-global global)
+                 symbol (name global)]
+          (when (and (external? global) (Int.= (declaration? global) 0))
+            (if (import? &symbol &runtime &exports &known)
+              (do
+                (set-initializer global (the (Ptr ()) (Pointer.from-long 0l)))
+                (set-linkage global external-linkage))
+              (unless (String.starts-with? &symbol "llvm.")
+                (Array.push-back! &defined @&symbol))))
+          (set! global next)))
+      defined)))

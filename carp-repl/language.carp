@@ -1,0 +1,752 @@
+(load "engine.carp")
+(load "language-syntax.carp")
+(load "service.carp")
+(load "commands.carp")
+(load "../carp-session/carp-type-editing.carp")
+
+(doc ReplLanguageContext
+  "is owned by the host and borrowed only by the serialized
+language worker. The host pauses the worker before touching its engine.")
+(deftype ReplLanguageContext
+  [engine (Ptr ReplEngineState)
+   epoch Long
+   document String
+   revision Long
+   syntax (Array EditingSurfaceModule)
+   models (Array EditingModel)
+   analyses (Array ReplAnalysis)
+   candidates (Array Candidate)
+   type-heads (Array ResolvedTypeHead)
+   roots (Array (Box SurfaceNode))
+   failure (Maybe String)])
+
+(defmodule ReplLanguage
+  (private publish-editing!)
+  (hidden publish-editing!)
+  (defn publish-editing! [request reply publish]
+    (publish
+      (ReplLanguageUpdate.Editing
+        (ReplEditingResult.init @(ReplLanguageRequest.document request)
+                                @(ReplLanguageRequest.revision request)
+                                @(ReplLanguageRequest.session request)
+                                @(ReplLanguageRequest.request request)
+                                @(ReplLanguageRequest.cursor request)
+                                reply))))
+
+  (private stopped-reason)
+  (hidden stopped-reason)
+  (defn stopped-reason [deadline]
+    (if (Long.> (ReplNative.now) deadline)
+      @"analysis time limit reached"
+      (WorkBudget.reason)))
+
+  (private environment-unavailable!)
+  (hidden environment-unavailable!)
+  (defn environment-unavailable! [context request publish]
+    (match-ref (ReplLanguageContext.failure context)
+      (Maybe.Nothing) false
+      (Maybe.Just reason)
+        (let-do [analysis (Array.unsafe-nth (ReplLanguageContext.analyses context)
+                                            0)]
+          (ReplAnalysis.set-state! analysis
+                                   (ReplAnalysisState.Unavailable @reason))
+          (publish (ReplLanguageUpdate.Analysis @analysis))
+          (match-ref (ReplLanguageRequest.operation request)
+            (ReplQuery.Analyze) ()
+            _
+              (publish-editing! request
+                                (ReplEditingReply.init @(ReplLanguageRequest.cursor request)
+                                                       @(ReplLanguageRequest.cursor request)
+                                                       []
+                                                       @reason)
+                                publish))
+          true)))
+
+  (private host-request)
+  (hidden host-request)
+  (defn host-request [request publish]
+    (do
+      (publish
+        (ReplLanguageUpdate.Analysis
+          (ReplAnalysis.init @(ReplLanguageRequest.document request)
+                             @(ReplLanguageRequest.revision request)
+                             @(ReplLanguageRequest.session request)
+                             [(ReplCommands.highlight (ReplLanguageRequest.source request))]
+                             []
+                             []
+                             (ReplCompleteness.Complete)
+                             (ReplAnalysisState.SyntaxOnly))))
+      (match-ref (ReplLanguageRequest.operation request)
+        (ReplQuery.Analyze) ()
+        _
+          (publish-editing! request
+                            (ReplCommands.reply (ReplLanguageRequest.operation request)
+                                                (ReplLanguageRequest.source request)
+                                                @(ReplLanguageRequest.cursor request))
+                            publish))))
+
+  (private namespace-reply)
+  (hidden namespace-reply)
+  (defn namespace-reply [context request]
+    (if (ReplCommands.at-head? (ReplLanguageRequest.source request)
+                               @(ReplLanguageRequest.cursor request))
+      (ReplCommands.reply (ReplLanguageRequest.operation request)
+                          (ReplLanguageRequest.source request)
+                          @(ReplLanguageRequest.cursor request))
+      (let-do [editing (Array.unsafe-nth (ReplLanguageContext.syntax context) 0)
+               word (ReplLanguageSyntax.word (EditingSurfaceModule.syntax editing)
+                                             @(ReplLanguageRequest.cursor request))
+               candidates (ReplLanguageContext.candidates context)
+               names (the (Array String) [])
+               lines (the (Array String) [])
+               complete (match-ref (ReplLanguageRequest.operation request)
+                 (ReplQuery.Complete) true
+                 _ false)]
+        (when @(ReplWord.active &word)
+          (for [i 0 (Array.length candidates)]
+            (when (WorkBudget.consume! 1)
+              (let [candidate (Array.unsafe-nth candidates i)
+                    name (Candidate.name candidate)]
+                (if complete
+                  (when-do (String.starts-with? name (ReplWord.prefix &word))
+                    (Array.push-back! &names @name)
+                    (when (Int.< (Array.length &lines) 8)
+                      (Array.push-back! &lines
+                                        (fmt "%s : %s"
+                                             name
+                                             (Candidate.scheme candidate)))))
+                  (when-do (String.= name (ReplWord.name &word))
+                    (Array.push-back! &lines
+                                      (fmt "%s : %s"
+                                           name
+                                           (Candidate.scheme candidate)))
+                    (match-ref (Candidate.documentation candidate)
+                      (Maybe.Nothing) ()
+                      (Maybe.Just text) (Array.push-back! &lines @text))))))))
+        (ReplEditingReply.init @(ReplWord.start &word)
+                               @(ReplWord.end &word)
+                               names
+                               (String.join "
+" &lines)))))
+
+  (private namespace-request)
+  (hidden namespace-request)
+  (defn namespace-request [pointer request cancelled publish]
+    (let-do [context (Pointer.to-ref pointer)
+             deadline (Long.+ (ReplNative.now) 500000000l)
+             _budget (WorkBudget.begin! 2000000
+                                        true
+                                        (fn []
+                                          (or (cancelled)
+                                              (Long.> (ReplNative.now) deadline))))]
+      (prepare-source! context request @&publish)
+      (match-ref (ReplLanguageRequest.operation request)
+        (ReplQuery.Analyze) ()
+        _
+          (let [attempt (namespace-reply context request)
+                reply (if (WorkBudget.stopped?)
+                  (ReplEditingReply.init @(ReplLanguageRequest.cursor request)
+                                         @(ReplLanguageRequest.cursor request)
+                                         []
+                                         (stopped-reason deadline))
+                  attempt)]
+            (unless (cancelled) (publish-editing! request reply publish))))
+      (ignore (WorkBudget.end!))))
+
+  (private compile-documentation!)
+  (hidden compile-documentation!)
+  (defn compile-documentation! [context binding lines]
+    (match-ref (SourceLexicalBinding.identity binding)
+      (SourceLexicalIdentity.Local _) ()
+      (SourceLexicalIdentity.Cell identity)
+        (let [engine (Pointer.to-ref @(ReplLanguageContext.engine context))
+              overlay (Array.unsafe-nth
+                (CompilerSession.overlay (ReplEngineState.session engine))
+                0)
+              expansion (Rc.value-ref (SessionOverlay.expansion overlay))
+              name (SourceLexicalBinding.name binding)]
+          (match (CtEval.lookup-status (ExpandSnapshot.state expansion)
+                                       (ExpandScope.frame (ExpandSnapshot.scope expansion))
+                                       name)
+            (CtEnvLookup.Found cell)
+              (when (Int.= @identity @(CellId.index &cell))
+                (append-documentation! (ReplLanguageContext.candidates context)
+                                       name
+                                       lines))
+            _ ()))))
+
+  (private runtime-documentation!)
+  (hidden runtime-documentation!)
+  (defn runtime-documentation! [context reference lines]
+    (let [engine (Pointer.to-ref @(ReplLanguageContext.engine context))
+          overlay (Array.unsafe-nth
+            (CompilerSession.overlay (ReplEngineState.session engine))
+            0)
+          globals (ResolveSnapshot.globals (SessionOverlay.resolution overlay))]
+      (for [i 0 (Array.length globals)]
+        (when (CoreIR.same-ref? reference (Array.unsafe-nth globals i))
+          (append-documentation! (ReplLanguageContext.candidates context)
+                                 (CoreRef.name reference)
+                                 lines)))))
+
+  (private runtime-reply)
+  (hidden runtime-reply)
+  (private append-documentation!)
+  (hidden append-documentation!)
+  (defn append-documentation! [candidates name lines]
+    (for [i 0 (Array.length candidates)]
+      (let [candidate (Array.unsafe-nth candidates i)]
+        (when (String.= name (Candidate.name candidate))
+          (match-ref (Candidate.documentation candidate)
+            (Maybe.Nothing) ()
+            (Maybe.Just text) (Array.push-back! lines @text))))))
+
+  (private editing-reply)
+  (hidden editing-reply)
+  (private type-reply)
+  (hidden type-reply)
+  (defn type-reply [context request scope]
+    (let-do [editing (Array.unsafe-nth (ReplLanguageContext.syntax context) 0)
+             model (Array.unsafe-nth (ReplLanguageContext.models context) 0)
+             word (ReplLanguageSyntax.word (EditingSurfaceModule.syntax editing)
+                                           @(ReplLanguageRequest.cursor request))
+             heads @(ReplLanguageContext.type-heads context)
+             pending (ResolutionObservations.type-heads (EditingModel.observations model))
+             names (the (Array String) [])
+             lines (the (Array String) [])
+             documentation (match-ref (ReplLanguageRequest.operation request)
+               (ReplQuery.Documentation) true
+               _ false)]
+      (for [i 0 (Array.length pending)]
+        (let [head (Array.unsafe-nth pending i)]
+          (TypeCatalogue.add! &heads
+                              (ResolvedTypeHead.name head)
+                              @(ResolvedTypeHead.arity head))))
+      (when @(ReplWord.active &word)
+        (if documentation
+          (match (SessionEditing.scope-at model
+                                          @(ReplLanguageRequest.cursor request))
+            (Maybe.Nothing)
+              (Array.push-back! &lines
+                                @"type scope unavailable in partial analysis")
+            (Maybe.Just runtime-scope)
+              (match (Resolve.query-type (EditingModel.observations model)
+                                         &runtime-scope
+                                         (ReplWord.name &word))
+                (Result.Error error)
+                  (Array.push-back! &lines @(ResolveError.message &error))
+                (Result.Success type)
+                  (match-ref &type
+                    (CoreType.Variable _)
+                      (Array.push-back! &lines
+                                        (fmt "%s : type parameter"
+                                             (ReplWord.name &word)))
+                    _
+                      (let-do [identity (TypeCatalogue.name &type)
+                               known false]
+                        (for [i 0 (Array.length &heads)]
+                          (when (String.=
+                              (ResolvedTypeHead.name (Array.unsafe-nth &heads i))
+                              &identity)
+                            (set! known true)))
+                        (if known
+                          (do
+                            (Array.push-back! &lines
+                                              (fmt "%s : type"
+                                                   (ReplWord.name &word)))
+                            (let [engine (Pointer.to-ref @(ReplLanguageContext.engine context))]
+                              (match (Session.type-documentation (ReplEngineState.session engine)
+                                                                 &identity)
+                                (Maybe.Nothing) ()
+                                (Maybe.Just text) (Array.push-back! &lines text))))
+                          (Array.push-back! &lines
+                                            (fmt "unknown type %s"
+                                                 (ReplWord.name &word))))))))
+          (do
+            (for [i 0 (Array.length &heads)]
+              (let [name (ResolvedTypeHead.name (Array.unsafe-nth &heads i))]
+                (match (SessionEditing.scope-at model
+                                                @(ReplLanguageRequest.cursor request))
+                  (Maybe.Nothing) ()
+                  (Maybe.Just runtime-scope)
+                    (match (Resolve.type-spelling (EditingModel.observations model)
+                                                  &runtime-scope
+                                                  name)
+                      (Maybe.Nothing) ()
+                      (Maybe.Just spelling)
+                        (when (and
+                            (String.starts-with? &spelling
+                                                 (ReplWord.prefix &word))
+                            (not (Array.contains? &names &spelling)))
+                          (Array.push-back! &names spelling))))))
+            (let [parameters (SourceCompileScope.locals scope)]
+              (for [i 0 (Array.length parameters)]
+                (let [parameter (Array.unsafe-nth parameters i)
+                      name (SourceLexicalBinding.name parameter)
+                      introducing (match-ref (SourceLexicalBinding.declaration parameter)
+                        (Maybe.Nothing) false
+                        (Maybe.Just span)
+                          (and
+                            (Int.= @(SourceSpan.start span)
+                                   @(ReplWord.start &word))
+                            (Int.= @(SourceSpan.end span) @(ReplWord.end &word))))]
+                  (when (and (not introducing)
+                             (String.starts-with? name (ReplWord.prefix &word)))
+                    (Array.push-back! &names @name)))))
+            (for [i 0 (Int.min 8 (Array.length &names))]
+              (Array.push-back! &lines
+                                (fmt "%s : type" (Array.unsafe-nth &names i)))))))
+      (ReplEditingReply.init @(ReplWord.start &word)
+                             @(ReplWord.end &word)
+                             names
+                             (String.join "
+" &lines))))
+
+  (defn editing-reply [context request]
+    (let [model (Array.unsafe-nth (ReplLanguageContext.models context) 0)
+          editing (Array.unsafe-nth (ReplLanguageContext.syntax context) 0)
+          word (ReplLanguageSyntax.word (EditingSurfaceModule.syntax editing)
+                                        @(ReplLanguageRequest.cursor request))]
+      (match (SessionEditing.compile-scope-at model
+                                              @(ReplLanguageRequest.cursor request))
+        (Maybe.Nothing) (runtime-reply context request)
+        (Maybe.Just scope)
+          (if (match-ref (SourceCompileScope.context &scope)
+              (SourceContext.Type) true
+              _ false)
+            (type-reply context request &scope)
+            (let-do [names (the (Array String) [])
+                     lines (the (Array String) [])
+                     documentation (match-ref (ReplLanguageRequest.operation request)
+                       (ReplQuery.Documentation) true
+                       _ false)
+                     _context (match-ref (SourceCompileScope.context &scope)
+                       (SourceContext.Evaluation) ()
+                       (SourceContext.Quoted)
+                         (Array.push-back! &lines @"quoted syntax")
+                       (SourceContext.Type)
+                         (Array.push-back! &lines
+                                           @"type namespace queries are unavailable"))
+                     visible (if @(ReplWord.active &word)
+                       (SessionEditing.compile-visible model
+                                                       &scope
+                                                       (if documentation
+                                                         (ReplWord.name &word)
+                                                         (ReplWord.prefix &word)))
+                       [])]
+              (for [i 0 (Array.length &visible)]
+                (let [binding (Array.unsafe-nth &visible i)
+                      name (SourceLexicalBinding.name binding)]
+                  (if documentation
+                    (when-do (String.= name (ReplWord.name &word))
+                      (Array.push-back! &lines
+                                        (fmt "%s : %s"
+                                             name
+                                             (SourceLexicalBinding.role binding)))
+                      (compile-documentation! context binding &lines))
+                    (do
+                      (Array.push-back! &names @name)
+                      (when (Int.< (Array.length &lines) 8)
+                        (Array.push-back! &lines
+                                          (fmt "%s : %s"
+                                               name
+                                               (SourceLexicalBinding.role binding))))))))
+              (ReplEditingReply.init @(ReplWord.start &word)
+                                     @(ReplWord.end &word)
+                                     names
+                                     (String.join "
+" &lines)))))))
+
+  (private prepare-source!)
+  (hidden prepare-source!)
+  (defn prepare-source! [context request publish]
+    (let [engine (Pointer.to-ref @(ReplLanguageContext.engine context))
+          epoch @(ReplLanguageRequest.session request)
+          fresh (or
+            (Long./= @(ReplLanguageRequest.session request)
+                     @(ReplLanguageContext.epoch context))
+            (or
+              (String./= (ReplLanguageRequest.document request)
+                         (ReplLanguageContext.document context))
+              (Long./= @(ReplLanguageRequest.revision request)
+                       @(ReplLanguageContext.revision context))))]
+      (when-do fresh
+        (ReplLanguageContext.set-syntax! context [])
+        (ReplLanguageContext.set-models! context [])
+        (ReplLanguageContext.set-analyses! context [])
+        (ReplLanguageContext.set-document! context
+                                           @(ReplLanguageRequest.document request))
+        (ReplLanguageContext.set-revision! context
+                                           @(ReplLanguageRequest.revision request))
+        (when-do (Long./= epoch @(ReplLanguageContext.epoch context))
+          (ReplLanguageContext.set-epoch! context epoch)
+          (ReplLanguageContext.set-candidates! context
+                                               (Session.complete (ReplEngineState.session engine)
+                                                                 ""))
+          (ReplLanguageContext.set-type-heads! context
+                                               (Session.type-heads (ReplEngineState.session engine)))
+          (match (alias-bindings engine)
+            (Result.Success bindings)
+              (do
+                (ReplLanguageContext.set-roots! context bindings)
+                (ReplLanguageContext.set-failure! context (Maybe.Nothing)))
+            (Result.Error error)
+              (ReplLanguageContext.set-failure! context
+                                                (Maybe.Just
+                                                  (fmt
+                                                    "result alias environment unavailable: %s"
+                                                    (Diagnostic.message &error))))))
+        (let-do [input (SourceInput.init @(ReplLanguageRequest.document request)
+                                         @(ReplLanguageRequest.source request))
+                 editing (Surface.editing-input &input)
+                 analysis (ReplLanguageSyntax.analysis request
+                                                       (EditingSurfaceModule.syntax &editing))]
+          (when (ReplCommands.command? (ReplLanguageRequest.source request))
+            (Array.push-back! (ReplAnalysis.highlights &analysis)
+                              (ReplCommands.highlight (ReplLanguageRequest.source request))))
+          (when (ReplCommands.language? (ReplLanguageRequest.source request))
+            (let [forms (SurfaceModule.forms (EditingSurfaceModule.module &editing))]
+              (EditingSurfaceModule.set-module! &editing
+                                                (SurfaceModule.init (Array.suffix forms
+                                                                                  1)))))
+          (when-do (ReplCommands.namespace? (ReplLanguageRequest.source request))
+            (ReplAnalysis.set-diagnostics! &analysis [])
+            (ReplAnalysis.set-completeness! &analysis
+                                            (ReplCompleteness.Complete)))
+          (Array.push-back! (ReplLanguageContext.analyses context) analysis)
+          (Array.push-back! (ReplLanguageContext.syntax context) editing))
+        (publish
+          (ReplLanguageUpdate.Analysis
+            @(Array.unsafe-nth (ReplLanguageContext.analyses context) 0))))))
+  (private analyze-request)
+  (hidden analyze-request)
+  (defn backend [pointer request cancelled publish]
+    (if (Int.> (String.length (ReplLanguageRequest.source request)) 262144)
+      (do
+        (publish
+          (ReplLanguageUpdate.Analysis
+            (ReplAnalysis.init @(ReplLanguageRequest.document request)
+                               @(ReplLanguageRequest.revision request)
+                               @(ReplLanguageRequest.session request)
+                               []
+                               []
+                               []
+                               (ReplCompleteness.Unknown)
+                               (ReplAnalysisState.Unavailable
+                                 @"editing analysis is limited to 256 KiB"))))
+        (match-ref (ReplLanguageRequest.operation request)
+          (ReplQuery.Analyze) ()
+          _
+            (publish-editing! request
+                              (ReplEditingReply.init @(ReplLanguageRequest.cursor request)
+                                                     @(ReplLanguageRequest.cursor request)
+                                                     []
+                                                     @"editing analysis is limited to 256 KiB")
+                              publish)))
+      (cond
+        (ReplCommands.namespace? (ReplLanguageRequest.source request))
+          (namespace-request pointer request cancelled publish)
+        (and
+          (ReplCommands.command? (ReplLanguageRequest.source request))
+          (not (ReplCommands.language? (ReplLanguageRequest.source request))))
+          (host-request request publish)
+        (analyze-request pointer request cancelled publish))))
+
+  (defn create [engine]
+    (Pointer.unsafe-alloc
+      (ReplLanguageContext.init engine
+                                -1l
+                                @""
+                                -1l
+                                []
+                                []
+                                []
+                                []
+                                []
+                                []
+                                (Maybe.Nothing))))
+
+  (defn dispose [context]
+    (let [-owned (Pointer.to-value context)] (Pointer.free context)))
+
+  (private alias-bindings)
+  (hidden alias-bindings)
+  (defn alias-bindings [engine]
+    (let [source (fmt "[%s]"
+                      &(ReplValues.aliases (ReplEngineState.results engine)))
+          input (SourceInput.init @"repl:aliases" source)]
+      (match (Surface.parse-input-diagnosed &input)
+        (Result.Error error) (Result.Error error)
+        (Result.Success parsed)
+          (let-do [node @(Box.peek
+                     (Array.unsafe-nth
+                       (SurfaceModule.forms (SourcedSurfaceModule.module &parsed))
+                       0))]
+            (Surface.reanchor! &node &(SurfaceSpan.anywhere))
+            (match-ref (SurfaceNode.form &node)
+              (SurfaceForm.Array bindings) (Result.Success @bindings)
+              _
+                (Result.Error
+                  (Diagnostic.init @"repl"
+                                   @"invalid result alias environment"
+                                   (Maybe.Nothing))))))))
+
+  (private global-kind)
+  (hidden global-kind)
+  (defn global-kind [candidates name]
+    (let-do [kind (ReplHighlightKind.Value)]
+      (for [i 0 (Array.length candidates)]
+        (let [candidate (Array.unsafe-nth candidates i)]
+          (when (String.= name (Candidate.name candidate))
+            (set! kind
+                  (match-ref (Candidate.kind candidate)
+                    (SessionDefKind.Function) (ReplHighlightKind.Function)
+                    (SessionDefKind.External) (ReplHighlightKind.External)
+                    (SessionDefKind.Interface) (ReplHighlightKind.Interface)
+                    (SessionDefKind.Value) (ReplHighlightKind.Value)
+                    (SessionDefKind.Other label)
+                      (cond
+                        (String.= label "macro") (ReplHighlightKind.Macro)
+                        (String.= label "type") (ReplHighlightKind.Type)
+                        (String.= label "constructor")
+                          (ReplHighlightKind.Function)
+                        (ReplHighlightKind.Value)))))))
+      kind))
+
+  (private reference-kind)
+  (hidden reference-kind)
+  (defn reference-kind [model candidates reference]
+    (let [role (SessionEditing.role-of model reference)]
+      (cond
+        (String.= &role "result") (ReplHighlightKind.Result)
+        (String.= &role "parameter") (ReplHighlightKind.Parameter)
+        (not @(CoreRef.global reference)) (ReplHighlightKind.Local)
+        (SessionEditing.function? model reference) (ReplHighlightKind.Function)
+        (global-kind candidates (CoreRef.name reference)))))
+
+  (private add-semantic!)
+  (hidden add-semantic!)
+  (defn add-semantic! [analysis model candidates]
+    (let-do [highlights (ReplAnalysis.highlights analysis)
+             surface (EditingModel.surface-uses model)
+             uses (ResolutionObservations.uses (EditingModel.observations model))]
+      (for [i 0 (Array.length surface)]
+        (let [fact (Array.unsafe-nth surface i)
+              span (SourceSemanticFact.span fact)]
+          (Array.push-back! highlights
+                            (ReplHighlight.init
+                              (ReplRange.init @(SourceSpan.start span)
+                                              @(SourceSpan.end span))
+                              (let [role (SourceSemanticFact.role fact)]
+                                (cond
+                                  (String.= role "type")
+                                    (ReplHighlightKind.Type)
+                                  (String.= role "macro")
+                                    (ReplHighlightKind.Macro)
+                                  (String.= role "compile-time-function")
+                                    (ReplHighlightKind.Function)
+                                  (String.= role "compile-time-parameter")
+                                    (ReplHighlightKind.Parameter)
+                                  (String.= role "compile-time-local")
+                                    (ReplHighlightKind.Local)
+                                  (String.= role "compile-time-value")
+                                    (ReplHighlightKind.Value)
+                                  (ReplHighlightKind.Syntax)))))))
+      (for [i 0 (Array.length uses)]
+        (let [fact (Array.unsafe-nth uses i)
+              span (ResolvedSourceUse.span fact)
+              role (ResolvedSourceUse.role fact)]
+          (Array.push-back! highlights
+                            (ReplHighlight.init
+                              (ReplRange.init @(SourceSpan.start span)
+                                              @(SourceSpan.end span))
+                              (cond
+                                (String.= role "syntax")
+                                  (ReplHighlightKind.Syntax)
+                                (String.= role "function-declaration")
+                                  (ReplHighlightKind.Function)
+                                (match-ref (ResolvedSourceUse.reference fact)
+                                  (Maybe.Just reference)
+                                    (reference-kind model candidates reference)
+                                  (Maybe.Nothing)
+                                    (global-kind candidates
+                                                 (ResolvedSourceUse.name fact))))))))))
+
+  (private add-diagnostics!)
+  (hidden add-diagnostics!)
+  (defn add-diagnostics! [analysis diagnostics]
+    (for [i 0 (Array.length diagnostics)]
+      (let [diagnostic (Array.unsafe-nth diagnostics i)]
+        (Array.push-back! (ReplAnalysis.diagnostics analysis)
+                          (ReplDiagnostic.init
+                            (match-ref (Diagnostic.span diagnostic)
+                              (Maybe.Nothing) (Maybe.Nothing)
+                              (Maybe.Just span)
+                                (if (String.= (SourceSpan.source-id span)
+                                              (ReplAnalysis.document analysis))
+                                  (Maybe.Just
+                                    (ReplRange.init @(SourceSpan.start span)
+                                                    @(SourceSpan.end span)))
+                                  (Maybe.Nothing)))
+                            (ReplSeverity.Error)
+                            @(Diagnostic.message diagnostic))))))
+
+  (private description)
+  (hidden description)
+  (defn description [model reference name]
+    (match (SessionEditing.type-of model reference)
+      (Maybe.Just text) (fmt "%s : %s" name &text)
+      (Maybe.Nothing) (fmt "%s : type unavailable in partial analysis" name)))
+
+  (private editing-reply)
+  (hidden editing-reply)
+  (defn runtime-reply [context request]
+    (let-do [editing (Array.unsafe-nth (ReplLanguageContext.syntax context) 0)
+             word (ReplLanguageSyntax.word (EditingSurfaceModule.syntax editing)
+                                           @(ReplLanguageRequest.cursor request))
+             cursor @(ReplLanguageRequest.cursor request)
+             names (the (Array String) [])
+             lines (the (Array String) [])]
+      (when (and @(ReplWord.active &word)
+                 (not (Array.empty? (ReplLanguageContext.models context))))
+        (let [model (Array.unsafe-nth (ReplLanguageContext.models context) 0)]
+          (match (if (match-ref (ReplLanguageRequest.operation request)
+                (ReplQuery.Documentation) true
+                _ false)
+              (SessionEditing.reference-at model
+                                           @(ReplWord.start &word)
+                                           @(ReplWord.end &word))
+              (the (Maybe CoreRef) (Maybe.Nothing)))
+            (Maybe.Just reference)
+              (do
+                (Array.push-back! &lines
+                                  (description model
+                                               &reference
+                                               (ReplWord.name &word)))
+                (runtime-documentation! context &reference &lines))
+            (Maybe.Nothing)
+              (match (SessionEditing.scope-at model cursor)
+                (Maybe.Nothing)
+                  (Array.push-back! &lines
+                                    @"lexical scope unavailable in partial analysis")
+                (Maybe.Just scope)
+                  (let [visible (Resolve.visible-names (EditingModel.observations model)
+                                                       &scope
+                                                       (if (match-ref (ReplLanguageRequest.operation request)
+                                                           (ReplQuery.Documentation)
+                                                             true
+                                                           _ false)
+                                                         (ReplWord.name &word)
+                                                         (ReplWord.prefix &word)))]
+                    (for [i 0 (Array.length &visible)]
+                      (let [candidate (Array.unsafe-nth &visible i)
+                            name (ResolvedSourceCandidate.name candidate)
+                            reference (ResolvedSourceCandidate.reference candidate)]
+                        (match-ref (ReplLanguageRequest.operation request)
+                          (ReplQuery.Complete)
+                            (do
+                              (Array.push-back! &names @name)
+                              (when (Int.< (Array.length &lines) 8)
+                                (Array.push-back! &lines
+                                                  (description model
+                                                               reference
+                                                               name))))
+                          (ReplQuery.Documentation)
+                            (when-do (String.= name (ReplWord.name &word))
+                              (Array.push-back! &lines
+                                                (description model
+                                                             reference
+                                                             name))
+                              (runtime-documentation! context reference &lines))
+                          _ ()))))))))
+      (ReplEditingReply.init @(ReplWord.start &word)
+                             @(ReplWord.end &word)
+                             names
+                             (String.join "
+" &lines))))
+
+  (doc backend "publishes reader facts before bounded semantic analysis. Cached
+artifacts are keyed by source and session revisions, never by cursor position.")
+  (defn analyze-request [pointer request cancelled publish]
+    (let-do [context (Pointer.to-ref pointer)
+             engine (Pointer.to-ref @(ReplLanguageContext.engine context))
+             epoch @(ReplLanguageRequest.session request)]
+      (prepare-source! context request @&publish)
+      (unless (or (cancelled)
+                  (environment-unavailable! context request @&publish))
+        (let-do [saved (CtEval.checkpoint)
+                 deadline (Long.+ (ReplNative.now) 500000000l)
+                 _budget (WorkBudget.begin! 2000000
+                                            (not
+                                              (match-ref (ReplLanguageRequest.operation request)
+                                                (ReplQuery.Check) true
+                                                _ false))
+                                            (fn []
+                                              (or (cancelled)
+                                                  (Long.> (ReplNative.now)
+                                                          deadline))))]
+          (when (Array.empty? (ReplLanguageContext.models context))
+            (let-do [model (SessionEditing.analyze (ReplEngineState.session engine)
+                                                   (Array.unsafe-nth (ReplLanguageContext.syntax context)
+                                                                     0)
+                                                   (ReplLanguageContext.roots context)
+                                                   "result")
+                     analysis (Array.unsafe-nth (ReplLanguageContext.analyses context)
+                                                0)]
+              (add-semantic! analysis
+                             &model
+                             (ReplLanguageContext.candidates context))
+              (unless (WorkBudget.stopped?)
+                (add-diagnostics! analysis (EditingModel.diagnostics &model)))
+              (ReplAnalysis.set-state! analysis
+                                       (cond
+                                         (WorkBudget.stopped?)
+                                           (ReplAnalysisState.Unavailable (stopped-reason deadline))
+                                         (and @(EditingModel.complete &model)
+                                              (match-ref (ReplAnalysis.completeness analysis)
+                                                (ReplCompleteness.Complete) true
+                                                _ false))
+                                           (ReplAnalysisState.Ready)
+                                         (ReplAnalysisState.Partial)))
+              (Array.push-back! (ReplLanguageContext.models context) model)))
+          (unless-do (cancelled)
+            (publish
+              (ReplLanguageUpdate.Analysis
+                @(Array.unsafe-nth (ReplLanguageContext.analyses context) 0)))
+            (match-ref (ReplLanguageRequest.operation request)
+              (ReplQuery.Analyze) ()
+              _
+                (let [attempt (if (and
+                          (ReplCommands.command? (ReplLanguageRequest.source request))
+                          (ReplCommands.at-head? (ReplLanguageRequest.source request)
+                                                 @(ReplLanguageRequest.cursor request)))
+                        (ReplCommands.reply (ReplLanguageRequest.operation request)
+                                            (ReplLanguageRequest.source request)
+                                            @(ReplLanguageRequest.cursor request))
+                        (match-ref (ReplLanguageRequest.operation request)
+                          (ReplQuery.Check)
+                            (ReplEditingReply.init @(ReplLanguageRequest.cursor request)
+                                                   @(ReplLanguageRequest.cursor request)
+                                                   []
+                                                   (ReplEngine.editing-check engine
+                                                                             (if (ReplCommands.command? (ReplLanguageRequest.source request))
+                                                                               (ReplCommandInput.arguments
+                                                                                 &(ReplCommands.parse (ReplLanguageRequest.source request)))
+                                                                               (ReplLanguageRequest.source request))))
+                          _ (editing-reply context request)))
+                      reply (if (WorkBudget.stopped?)
+                        (ReplEditingReply.init @(ReplLanguageRequest.cursor request)
+                                               @(ReplLanguageRequest.cursor request)
+                                               []
+                                               (stopped-reason deadline))
+                        attempt)]
+                  (publish
+                    (ReplLanguageUpdate.Editing
+                      (ReplEditingResult.init @(ReplLanguageRequest.document request)
+                                              @(ReplLanguageRequest.revision request)
+                                              epoch
+                                              @(ReplLanguageRequest.request request)
+                                              @(ReplLanguageRequest.cursor request)
+                                              reply))))))
+          (ignore (WorkBudget.end!))
+          (CtEval.restore! saved))))))

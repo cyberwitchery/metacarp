@@ -1,0 +1,377 @@
+(load "../carp-session-jit.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(defn core-dir []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Just dir)
+      (if (or (String.ends-with? &dir "/core") (String.ends-with? &dir "/core/"))
+        dir
+        (String.append &dir "/core"))
+    (Maybe.Nothing) @"../../../carp/core"))
+
+(defn snapshot-text-matches? [artifact]
+  (let-do [matches true
+           entities (JitArtifact.entities artifact)]
+    (for [i 0 (Array.length entities)]
+      (unless (String.contains-string? (JitArtifact.module-ir artifact)
+                                       (LLVMArtifactEntity.ir (Array.unsafe-nth entities
+                                                                                i)))
+        (set! matches false)))
+    matches))
+
+(defn scenario []
+  (let-do [dir (core-dir)
+           results (the (Array Bool) [])]
+    (match (Session.create &dir)
+      (Result.Error error) (IO.errorln (Diagnostic.message &error))
+      (Result.Success session)
+        (let-do [js (SessionJit.create &dir "/tmp")
+                 source (SourceInput.init @"definitions:values"
+                                          @"(def x 1) (def y (let [a x] (if true (Int.inc a) 0)))")
+                 _commit (Session.upsert-input &session &source)
+                 input (SourceInput.init @"cell:read" @"y")
+                 first (SessionJit.run-cell &js &session &input)
+                 before (Array.length (JitSession.artifacts &js))
+                 last @(JitSession.last-executed &js)]
+          (Array.push-back! &results
+                            (match first (Result.Success n) (Int.= n 2) _ false))
+          (Array.push-back! &results (Int.= before 1))
+          (Array.push-back! &results
+                            (snapshot-text-matches?
+                              (Array.unsafe-nth (JitSession.artifacts &js) 0)))
+          (let [bad (SourceInput.init @"cell:missing"
+                                      @"(missing-artifact-function)")]
+            (Array.push-back! &results
+                              (Result.error?
+                                &(SessionJit.compile-cell &js
+                                                          &session
+                                                          &bad
+                                                          false))))
+          (Array.push-back! &results
+                            (Int.= before
+                                   (Array.length (JitSession.artifacts &js))))
+          (let [bad (SourceInput.init @"cell:missing-native"
+                                      @"(register missing-native (Fn [] Int) \"metacarp_artifact_missing_native\") (missing-native)")]
+            (Array.push-back! &results
+                              (Result.error?
+                                &(SessionJit.compile-cell &js
+                                                          &session
+                                                          &bad
+                                                          false))))
+          (Array.push-back! &results
+                            (Int.= before
+                                   (Array.length (JitSession.artifacts &js))))
+          (let [prepared (SourceInput.init @"cell:prepared" @"(Int.+ 1 2)")]
+            (Array.push-back! &results
+                              (Result.success?
+                                &(SessionJit.compile-cell &js
+                                                          &session
+                                                          &prepared
+                                                          false))))
+          (Array.push-back! &results
+                            (Long.= last @(JitSession.last-executed &js)))
+          (Array.push-back! &results
+                            (String.contains-string?
+                              &(SessionJit.inspect-artifacts &js
+                                                             &(the (Maybe CoreRef)
+                                                                   (Maybe.Nothing))
+                                                             false
+                                                             false)
+                              "; cell cell:read revision 0"))
+          (let [transient (SourceInput.init @"cell:transient"
+                                            @"(defn later [] 5) (later)")]
+            (ignore (SessionJit.compile-cell &js &session &transient false)))
+          (ignore
+            (Session.upsert &session
+                            &(SourceInput.init @"definition:later"
+                                               @"(defn later [x] x)")))
+          (let-do [overlay (Array.unsafe-nth (CompilerSession.overlay &session)
+                                             0)
+                   globals (ResolveSnapshot.globals (SessionOverlay.resolution overlay))
+                   correct false]
+            (for [i 0 (Array.length globals)]
+              (let [reference (Array.unsafe-nth globals i)]
+                (when (String.= (CoreRef.name reference) "later")
+                  (set! correct
+                        (String.contains-string?
+                          &(SessionJit.inspect-artifacts &js
+                                                         &(Maybe.Just @reference)
+                                                         false
+                                                         false)
+                          "later: not compiled yet")))))
+            (Array.push-back! &results correct))
+          (let [error (SessionJit.reset-code! &js)]
+            (Array.push-back! &results (String.empty? &error)))
+          (Array.push-back! &results (Array.empty? (JitSession.artifacts &js)))
+          (Array.push-back! &results (Int.= @(JitSession.generation &js) 1))
+          (Array.push-back! &results (Long.= @(JitSession.last-executed &js) 0l))
+          (SessionJit.dispose &js)))
+    results))
+
+(def *artifact-checks* (scenario))
+
+(defn c-support-scenario []
+  (let-do [dir (core-dir)
+           results (the (Array Bool) [])]
+    (match (Session.create &dir)
+      (Result.Error error) (IO.errorln (Diagnostic.message &error))
+      (Result.Success session)
+        (let-do [js (SessionJit.create &dir "/tmp")
+                 definition (SourceInput.init @"c:def"
+                                              @"(deftemplate artifact-native (Fn [Int] Int) \"int $NAME(int x)\" \"$DECL { return x + 1; }\")")
+                 _commit (Session.upsert-input &session &definition)
+                 input (SourceInput.init @"c:call" @"(artifact-native 41)")
+                 first (SessionJit.run-cell &js &session &input)
+                 support (JitSession.c-artifacts &js)
+                 artifact (Array.unsafe-nth support 0)
+                 emission (JitCArtifact.emission artifact)
+                 original @(CTranslationUnit.source emission)
+                 path (String.append (JitCArtifact.name artifact) ".c")
+                 matches true]
+          (Array.push-back! &results
+                            (match first (Result.Success n) (Int.= n 42) _ false))
+          (Array.push-back! &results (Int.= (Array.length support) 1))
+          (Array.push-back! &results
+                            (match (IO.read-file &path)
+                              (Result.Success source)
+                                (String.= &source &original)
+                              _ false))
+          (let [entities (CTranslationUnit.entities emission)]
+            (for [i 0 (Array.length entities)]
+              (unless (String.contains-string? &original
+                                               (CArtifactEntity.source (Array.unsafe-nth entities
+                                                                                         i)))
+                (set! matches false))))
+          (Array.push-back! &results matches)
+          (IO.Raw.unlink! &path)
+          (Array.push-back! &results
+                            (String.contains-string?
+                              &(SessionJit.inspect-c-artifacts &js
+                                                               &(the (Maybe CoreRef)
+                                                                     (Maybe.Nothing))
+                                                               true)
+                              &original))
+          (let [bad (SourceInput.init @"c:failed"
+                                      @"(deftemplate failed-support (Fn [] Int) \"int $NAME(void)\" \"$DECL { return 7; }\") (register missing-native (Fn [] Int) \"metacarp_c_artifact_missing_native\") (failed-support) (missing-native)")]
+            (Array.push-back! &results
+                              (Result.error?
+                                &(SessionJit.compile-cell &js
+                                                          &session
+                                                          &bad
+                                                          false))))
+          (Array.push-back! &results
+                            (and
+                              (Int.=
+                                (Array.length (JitSession.c-artifacts &js))
+                                1)
+                              (Int.= (Array.length (JitSession.artifacts &js)) 1)))
+          (let [view (SessionJit.inspect-c-artifacts &js
+                                                     &(the (Maybe CoreRef)
+                                                           (Maybe.Nothing))
+                                                     false)]
+            (Array.push-back! &results
+                              (and
+                                (String.contains-string? &view "return x + 1")
+                                (not (String.contains-string? &view "return 7")))))
+          ; The failed cell must not reserve its support symbol or leave code
+          ; behind in ORC. Reusing the symbol with a different body tests both.
+          (let [retry (SourceInput.init @"c:retry"
+                                        @"(deftemplate failed-support (Fn [] Int) \"int $NAME(void)\" \"$DECL { return 9; }\") (failed-support)")]
+            (Array.push-back! &results
+                              (match (SessionJit.run-cell &js &session &retry)
+                                (Result.Success n) (Int.= n 9)
+                                _ false)))
+          (let [bad-c (SourceInput.init @"c:invalid"
+                                        @"(deftemplate invalid-support (Fn [] Int) \"int $NAME(void)\" \"$DECL { invalid C body }\") (invalid-support)")
+                count (Array.length (JitSession.artifacts &js))
+                support-count (Array.length (JitSession.c-artifacts &js))]
+            (Array.push-back! &results
+                              (and
+                                (Result.error?
+                                  &(SessionJit.compile-cell &js
+                                                            &session
+                                                            &bad-c
+                                                            false))
+                                (and
+                                  (Int.= count
+                                         (Array.length (JitSession.artifacts &js)))
+                                  (Int.= support-count
+                                         (Array.length (JitSession.c-artifacts &js)))))))
+          (let [reset-error (SessionJit.reset-code! &js)]
+            (Array.push-back! &results
+                              (and (String.empty? &reset-error)
+                                   (and
+                                     (Array.empty? (JitSession.c-artifacts &js))
+                                     (and
+                                       (Array.empty? (JitSession.materialized &js))
+                                       (String.contains-string?
+                                         &(SessionJit.inspect-c-artifacts &js
+                                                                          &(the (Maybe CoreRef)
+                                                                                (Maybe.Nothing))
+                                                                          false)
+                                         "no evaluated cell"))))))
+          (Array.push-back! &results
+                            (and
+                              (match (SessionJit.run-cell &js &session &input)
+                                (Result.Success n) (Int.= n 42)
+                                _ false)
+                              (Int.=
+                                (Array.length (JitSession.c-artifacts &js))
+                                1)))
+          (Array.push-back! &results
+                            (String.contains-string?
+                              &(SessionJit.inspect-c-artifacts &js
+                                                               &(the (Maybe CoreRef)
+                                                                     (Maybe.Nothing))
+                                                               false)
+                              "published in generation 1; current generation 1"))
+          (SessionJit.dispose &js)))
+    results))
+
+(def *c-artifact-checks* (c-support-scenario))
+
+(defn isolation-scenario []
+  (let-do [dir (core-dir)
+           results (the (Array Bool) [])]
+    (match (Session.create &dir)
+      (Result.Error error) (IO.errorln (Diagnostic.message &error))
+      (Result.Success session)
+        (let-do [left (SessionJit.create &dir "/tmp")
+                 right (SessionJit.create &dir "/tmp")
+                 first (SourceInput.init @"isolation:left"
+                                         @"(deftemplate isolated-native (Fn [] Int) \"int $NAME(void)\" \"$DECL { return 11; }\") (isolated-native)")
+                 second (SourceInput.init @"isolation:right"
+                                          @"(deftemplate isolated-native (Fn [] Int) \"int $NAME(void)\" \"$DECL { return 22; }\") (isolated-native)")]
+          (Array.push-back! &results
+                            (match (SessionJit.run-cell &left &session &first)
+                              (Result.Success n) (Int.= n 11)
+                              _ false))
+          (Array.push-back! &results
+                            (match (SessionJit.run-cell &right &session &second)
+                              (Result.Success n) (Int.= n 22)
+                              _ false))
+          (Array.push-back! &results
+                            (match (SessionJit.run-cell &left &session &first)
+                              (Result.Success n) (Int.= n 11)
+                              _ false))
+          (SessionJit.dispose &left)
+          (Array.push-back! &results
+                            (match (SessionJit.run-cell &right &session &second)
+                              (Result.Success n) (Int.= n 22)
+                              _ false))
+          (SessionJit.dispose &right)))
+    results))
+
+(def *isolation-checks* (isolation-scenario))
+
+(deftest test
+  (assert-equal test
+    15
+    (Array.length &*artifact-checks*)
+    "the publication scenario completed")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 0)
+    "initializer entities preserve declaration order and control flow")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 1)
+    "a successful publication retains one artifact")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 2)
+    "entity text is copied from the exact published module")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 3)
+    "an invalid cell returns a diagnostic")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 4)
+    "a failed resolution retains no artifact")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 5)
+    "an unresolved native dependency rejects publication")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 6)
+    "rolled-back native publication retains no artifact")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 7)
+    "a cell can be prepared without execution")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 8)
+    "preparation preserves the last evaluated cell")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 9)
+    "bare inspection selects the last executed publication")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 10)
+    "transient compiler IDs cannot impersonate later committed bindings")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 11)
+    "native reset succeeds")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 12)
+    "reset releases retired artifact storage")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 13)
+    "reset advances the JIT generation")
+  (assert-true test
+    @(Array.unsafe-nth &*artifact-checks* 14)
+    "reset clears the last executed cell")
+  (assert-equal test
+    13
+    (Array.length &*c-artifact-checks*)
+    "the C support scenario completed")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 0)
+    "native template execution succeeds")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 1)
+    "one published C translation unit is retained")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 2)
+    "C artifacts exactly match the source passed to clang")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 3)
+    "C excerpts come from the retained translation unit")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 4)
+    "full C inspection works after the source file is removed")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 5)
+    "an unresolved LLVM dependency rejects the cell")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 6)
+    "failed publication rolls back C and LLVM artifacts together")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 7)
+    "failed publications preserve the last executed C selection")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 8)
+    "a failed publication leaves its support symbol available for retry")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 9)
+    "a C compile failure publishes neither code nor artifacts")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 10)
+    "reset retires C support, caches, and the last cell")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 11)
+    "a new generation republishes C support")
+  (assert-true test
+    @(Array.unsafe-nth &*c-artifact-checks* 12)
+    "C inspection reports the active publication generation")
+  (assert-equal test
+    4
+    (Array.length &*isolation-checks*)
+    "the isolation scenario completed")
+  (assert-true test
+    @(Array.unsafe-nth &*isolation-checks* 0)
+    "the first JIT publishes its native body")
+  (assert-true test
+    @(Array.unsafe-nth &*isolation-checks* 1)
+    "another JIT can define the same symbol independently")
+  (assert-true test
+    @(Array.unsafe-nth &*isolation-checks* 2)
+    "publication in another JIT does not replace the first body")
+  (assert-true test
+    @(Array.unsafe-nth &*isolation-checks* 3)
+    "disposing another JIT preserves this JIT's C support"))

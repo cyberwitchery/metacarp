@@ -1,0 +1,150 @@
+(load "protocol.carp")
+
+(doc ReplPaintSpan "is cached presentation, with no compiler binding identity.
+A rebased span is provisional until analysis of its exact source revision arrives.")
+(deftype ReplPaintSpan [range ReplRange
+                        style Int
+                        semantic Bool])
+(deftype ReplPaint [source String
+                    spans (Array ReplPaintSpan)
+                    provisional Bool])
+
+(defmodule ReplPaint
+  (doc category "maps supplied language roles to presentation categories.")
+  (defn category [kind]
+    (match-ref kind
+      (ReplHighlightKind.Comment) 2
+      (ReplHighlightKind.String) 3
+      (ReplHighlightKind.Pattern) 3
+      (ReplHighlightKind.Character) 3
+      (ReplHighlightKind.Delimiter) 4
+      (ReplHighlightKind.ReaderPrefix) 4
+      (ReplHighlightKind.Number) 5
+      (ReplHighlightKind.Boolean) 5
+      (ReplHighlightKind.Invalid) 7
+      (ReplHighlightKind.Syntax) 1
+      (ReplHighlightKind.Command) 1
+      (ReplHighlightKind.Macro) 1
+      (ReplHighlightKind.Type) 8
+      (ReplHighlightKind.Function) 9
+      (ReplHighlightKind.Parameter) 10
+      (ReplHighlightKind.Local) 10
+      (ReplHighlightKind.Result) 11
+      _ 0))
+
+  (private semantic?)
+  (hidden semantic?)
+  (defn semantic? [kind]
+    (match-ref kind
+      (ReplHighlightKind.Syntax) true
+      (ReplHighlightKind.Macro) true
+      (ReplHighlightKind.Type) true
+      (ReplHighlightKind.Function) true
+      (ReplHighlightKind.Parameter) true
+      (ReplHighlightKind.Local) true
+      (ReplHighlightKind.Result) true
+      _ false))
+
+  (private boundary?)
+  (hidden boundary?)
+  (defn boundary? [bytes position]
+    (or (Int.= position (Array.length bytes))
+        (let [byte (Byte.to-int @(Array.unsafe-nth bytes position))]
+          (or (Int.< byte 128) (Int.>= byte 192)))))
+
+  (doc rebase
+    "projects spans whose written bytes are unchanged into the new source.
+Overlapping spans are invalidated; reader replies revalidate token boundaries. This cache is never queried by
+completion, documentation, diagnostics, or compiler operations.")
+  (defn rebase [previous source]
+    (if (String.= (ReplPaint.source previous) source)
+      (let-do [result @previous]
+        (ReplPaint.set-provisional! &result true)
+        result)
+      (let-do [old (String.to-bytes (ReplPaint.source previous))
+               new (String.to-bytes source)
+               prefix 0
+               suffix 0
+               old-length (Array.length &old)
+               new-length (Array.length &new)
+               maximum (Int.min old-length new-length)
+               spans (ReplPaint.spans previous)
+               result (the (Array ReplPaintSpan) [])]
+        (while-do (and (Int.< prefix maximum)
+                       (Byte.= @(Array.unsafe-nth &old prefix)
+                               @(Array.unsafe-nth &new prefix)))
+          (set! prefix (Int.inc prefix)))
+        (while-do (and (Int.> prefix 0)
+                       (not
+                         (and (boundary? &old prefix) (boundary? &new prefix))))
+          (set! prefix (Int.dec prefix)))
+        (while-do (and (Int.< suffix (Int.- maximum prefix))
+                       (Byte.=
+                         @(Array.unsafe-nth &old
+                                            (Int.- (Int.dec old-length) suffix))
+                         @(Array.unsafe-nth &new
+                                            (Int.- (Int.dec new-length) suffix))))
+          (set! suffix (Int.inc suffix)))
+        (while-do (and (Int.> suffix 0)
+                       (not
+                         (and
+                           (boundary? &old (Int.- old-length suffix))
+                           (boundary? &new (Int.- new-length suffix)))))
+          (set! suffix (Int.dec suffix)))
+        (for [i 0 (Array.length spans)]
+          (let [span (Array.unsafe-nth spans i)
+                range (ReplPaintSpan.range span)
+                start @(ReplRange.start range)
+                end @(ReplRange.end range)
+                old-end (Int.- old-length suffix)
+                shift (Int.- new-length old-length)]
+            (cond
+              (Int.<= end prefix) (Array.push-back! &result @span)
+              (Int.>= start old-end)
+                (Array.push-back! &result
+                                  (ReplPaintSpan.init
+                                    (ReplRange.init (Int.+ start shift)
+                                                    (Int.+ end shift))
+                                    @(ReplPaintSpan.style span)
+                                    @(ReplPaintSpan.semantic span)))
+              ())))
+        (ReplPaint.init (String.copy source) result true))))
+
+  (doc accept "replaces paint with exact revision facts. Reader-only replies
+may retain provisional formatting on intact symbol spans; final semantic replies
+replace it even when analysis is partial or unavailable.")
+  (defn accept [previous source analysis]
+    (let-do [spans (the (Array ReplPaintSpan) [])
+             highlights (ReplAnalysis.highlights analysis)
+             syntax-only (match-ref (ReplAnalysis.state analysis)
+               (ReplAnalysisState.SyntaxOnly) true
+               _ false)]
+      (for [i 0 (Array.length highlights)]
+        (let [highlight (Array.unsafe-nth highlights i)]
+          (Array.push-back! &spans
+                            (ReplPaintSpan.init @(ReplHighlight.range highlight)
+                                                (category (ReplHighlight.kind highlight))
+                                                (semantic? (ReplHighlight.kind highlight))))))
+      (when (and syntax-only (String.= source (ReplPaint.source previous)))
+        (let-do [symbols (the (Set String) (Set.create))
+                 cached (ReplPaint.spans previous)]
+          (for [i 0 (Array.length highlights)]
+            (let [fresh (Array.unsafe-nth highlights i)
+                  range (ReplHighlight.range fresh)]
+              (when (match-ref (ReplHighlight.kind fresh)
+                  (ReplHighlightKind.Symbol) true
+                  _ false)
+                (Set.put! &symbols
+                          &(fmt "%d:%d"
+                                @(ReplRange.start range)
+                                @(ReplRange.end range))))))
+          (for [i 0 (Array.length cached)]
+            (let [span (Array.unsafe-nth cached i)
+                  range (ReplPaintSpan.range span)]
+              (when (and @(ReplPaintSpan.semantic span)
+                         (Set.contains? &symbols
+                                        &(fmt "%d:%d"
+                                              @(ReplRange.start range)
+                                              @(ReplRange.end range))))
+                (Array.push-back! &spans @span))))))
+      (ReplPaint.init (String.copy source) spans syntax-only))))

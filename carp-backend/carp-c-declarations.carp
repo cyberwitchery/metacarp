@@ -441,135 +441,150 @@ the linkage the unit gives its definitions.")
         _ ()))
     found))
 
-(defn collect-nominal-application! [constructors type visiting ordered]
-  (if (concrete-type-listed? ordered type)
+(defn collect-nominal-application! [constructors type seen applications]
+  (if (concrete-type-listed? seen type)
     (Result.Success ())
-    (match-ref type
-      (MonoType.Named name arguments)
-      (if (source-nominal? constructors name)
-        (if (concrete-type-listed? visiting type)
-          ;; re-entering a type whose members are all indirections is how a
-          ;; recursive type terminates, not a cycle: `(Box Json)` reaches
-          ;; `Json` through its `(Ptr a)`, and `Json` reaches `(Box Json)`
-          ;; back through a member.
-          (if (CoreIR.indirection-nominal? constructors name)
-            (Result.Success ())
-            (Result.Error
-              (BackendError.init
-                @"recursive by-value nominal layouts are not supported")))
-          (let-do [result (the (Result Unit BackendError) (Result.Success ()))
-                   indirection (CoreIR.indirection-nominal? constructors name)
-                   _ignored-visiting (Array.push-back! visiting
-                                                       (Box.init (MonoType.copy type)))
-                   ;; a type whose members are all indirections depends on no
-                   ;; layout but its own, so it is ordered BEFORE the walk
-                   ;; descends: a type that holds it BY value — the
-                   ;; `(Pair String (Box Json))` inside `Json` — is reached
-                   ;; through that descent and has to be completed after it.
-                   ;; The reference scores a flagged type 1 for this reason.
-                   _ignored-early (when indirection
-                     (Array.push-back! ordered (Box.init (MonoType.copy type))))
-                   n (Array.length constructors)]
-            (for [i 0 n]
+    (let-do [result (the (Result Unit BackendError) (Result.Success ()))]
+      (Array.push-back! seen (Box.init (MonoType.copy type)))
+      (match-ref type
+        (MonoType.Named name arguments)
+          (if (source-nominal? constructors name)
+            (do
+              (Array.push-back! applications (Box.init (MonoType.copy type)))
+              (for [i 0 (Array.length constructors)]
+                (let [constructor (Array.unsafe-nth constructors i)]
+                  (match-ref (Box.peek
+                      (CoreConstructorDeclaration.result constructor))
+                    (CoreType.Named candidate _)
+                      (when (= candidate name)
+                        (match (collect-template-bindings
+                            (Box.peek
+                              (CoreConstructorDeclaration.result constructor))
+                            type
+                            &[])
+                          (Result.Error error)
+                            (set! result (Result.Error error))
+                          (Result.Success bindings)
+                            (let [fields (CoreConstructorDeclaration.arguments constructor)]
+                              (for [j 0 (Array.length fields)]
+                                (match-ref &result
+                                  (Result.Error _) ()
+                                  (Result.Success _)
+                                    (match (concretize-core-type &bindings
+                                                                 (Box.peek (Array.unsafe-nth fields
+                                                                                             j)))
+                                      (Result.Error error)
+                                        (set! result (Result.Error error))
+                                      (Result.Success member)
+                                        (set! result
+                                              (collect-nominal-application! constructors
+                                                                            &member
+                                                                            seen
+                                                                            applications))))))))
+                    _ ()))))
+            (for [i 0 (Array.length arguments)]
               (match-ref &result
+                (Result.Error _) ()
                 (Result.Success _)
-                  (let [constructor (Array.unsafe-nth constructors i)]
-                    (match-ref (Box.peek
-                        (CoreConstructorDeclaration.result constructor))
-                      (CoreType.Named candidate _)
-                        (when (= candidate name)
-                          (match (collect-template-bindings
-                              (Box.peek
-                                (CoreConstructorDeclaration.result constructor))
-                              type
-                              &[])
-                            (Result.Success bindings)
-                              (let [fields (CoreConstructorDeclaration.arguments constructor)
-                                    field-count (Array.length fields)]
-                                (for [j 0 field-count]
-                                  (match-ref &result
-                                    (Result.Success _)
-                                      (match (concretize-core-type &bindings
-                                                                   (Box.peek (Array.unsafe-nth fields
-                                                                                               j)))
-                                        (Result.Success field-type)
-                                          (set! result
-                                                (collect-nominal-application! constructors
-                                                                              &field-type
-                                                                              visiting
-                                                                              ordered))
-                                        (Result.Error error)
-                                          (set! result (Result.Error error)))
-                                    (Result.Error _) ())))
-                            (Result.Error error)
-                              (set! result (Result.Error error))))
-                      _ ()))
-                (Result.Error _) ()))
-            (match result
-              (Result.Success _)
-                (do
-                  (unless indirection
-                    (Array.push-back! ordered (Box.init (MonoType.copy type))))
-                  (Result.Success ()))
-              (Result.Error error) (Result.Error error))))
-        ;; a builtin container (Array, Box, Ptr, ...) stores its payload
-        ;; behind a heap pointer, never inline, so a recursive occurrence
-        ;; through one is legal: skip any type already being visited (that
-        ;; skip also terminates the walk), and descend into the rest only
-        ;; for typedef ordering.
-        (let-do [result (the (Result Unit BackendError) (Result.Success ()))
-                 n (Array.length arguments)]
-          (for [i 0 n]
-            (match-ref &result
-              (Result.Success _)
-                (let [argument (Box.peek (Array.unsafe-nth arguments i))]
-                  (unless (concrete-type-listed? visiting argument)
-                    (set! result
-                          (collect-nominal-application! constructors
-                                                        argument
-                                                        visiting
-                                                        ordered))))
-              (Result.Error _) ()))
-          result))
-      (MonoType.Reference inner _)
-      (collect-nominal-application! constructors
-                                    (Box.peek inner)
-                                    visiting
-                                    ordered)
-      ;; A function value is a fixed-size `Lambda` struct: a callback plus an
-      ;; environment pointer, never its argument or result inline. So a member
-      ;; typed `(Fn [T] T)` does NOT make T contain itself by value — descend to
-      ;; collect the types for typedef ORDERING, but skip any type already being
-      ;; visited instead of reporting unsupported recursion. Skipping is also
-      ;; what terminates the walk: in produces-output/function_members,
-      ;; `(deftype SelfReferencer [hp Int f (λ [SelfReferencer] SelfReferencer)])`
-      ;; has a Lambda over SelfReferencer forever.
-      (MonoType.Function arguments result-type)
-      (let-do [result (the (Result Unit BackendError) (Result.Success ()))
-               n (Array.length arguments)]
-        (for [i 0 n]
-          (match-ref &result
-            (Result.Success _)
-              (let [argument (Box.peek (Array.unsafe-nth arguments i))]
-                (unless (concrete-type-listed? visiting argument)
                   (set! result
                         (collect-nominal-application! constructors
-                                                      argument
-                                                      visiting
-                                                      ordered))))
-            (Result.Error _) ()))
-        (match result
-          (Result.Success _)
-            (let [inner (Box.peek result-type)]
-              (if (concrete-type-listed? visiting inner)
-                (Result.Success ())
+                                                      (Box.peek (Array.unsafe-nth arguments
+                                                                                  i))
+                                                      seen
+                                                      applications)))))
+        (MonoType.Reference inner _)
+          (set! result
                 (collect-nominal-application! constructors
-                                              inner
-                                              visiting
-                                              ordered)))
-          (Result.Error error) (Result.Error error)))
-      _
-      (Result.Success ()))))
+                                              (Box.peek inner)
+                                              seen
+                                              applications))
+        (MonoType.Function arguments output)
+          (do
+            (for [i 0 (Array.length arguments)]
+              (match-ref &result
+                (Result.Error _) ()
+                (Result.Success _)
+                  (set! result
+                        (collect-nominal-application! constructors
+                                                      (Box.peek (Array.unsafe-nth arguments
+                                                                                  i))
+                                                      seen
+                                                      applications))))
+            (match-ref &result
+              (Result.Error _) ()
+              (Result.Success _)
+                (set! result
+                      (collect-nominal-application! constructors
+                                                    (Box.peek output)
+                                                    seen
+                                                    applications))))
+        _ ())
+      result)))
+
+(private nominal-index)
+(hidden nominal-index)
+(defn nominal-index [applications type]
+  (let-do [index -1]
+    (for [i 0 (Array.length applications)]
+      (when (Type.same-representation?
+          (Box.peek (Array.unsafe-nth applications i))
+          type)
+        (set! index i)))
+    index))
+
+(private order-nominal-applications)
+(hidden order-nominal-applications)
+(doc order-nominal-applications "orders concrete layouts by actual by-value
+members. Pointer, reference, array and function payloads still need forward
+declarations, but do not constrain the order of complete struct definitions.")
+(defn order-nominal-applications [constructors applications]
+  (let-do [empty (the (Array Int) [])
+           edges (Array.replicate (Array.length applications) &empty)
+           result (the (Result Unit BackendError) (Result.Success ()))]
+    (for [i 0 (Array.length applications)]
+      (let [application (Box.peek (Array.unsafe-nth applications i))]
+        (for [j 0 (Array.length constructors)]
+          (let [constructor (Array.unsafe-nth constructors j)]
+            (match (collect-template-bindings
+                (Box.peek (CoreConstructorDeclaration.result constructor))
+                application
+                &[])
+              (Result.Error _) ()
+              (Result.Success bindings)
+                (let [fields (CoreConstructorDeclaration.arguments constructor)]
+                  (for [k 0 (Array.length fields)]
+                    (match (concretize-core-type &bindings
+                                                 (Box.peek (Array.unsafe-nth fields
+                                                                             k)))
+                      (Result.Error error) (set! result (Result.Error error))
+                      (Result.Success member)
+                        (match-ref &member
+                          (MonoType.Named _ _)
+                            (let [dependency (nominal-index applications &member)]
+                              (when (Int.>= dependency 0)
+                                (Array.push-back! (Array.unsafe-nth &edges i)
+                                                  dependency)))
+                          _ ())))))))))
+    (match result
+      (Result.Error error) (Result.Error error)
+      (Result.Success _)
+        (let-do [components (IntGraph.strong-components &(IntGraph.init (Array.copy &edges)))
+                 ordered (the (Array (Box MonoType)) [])
+                 cyclic false]
+          (for [i 0 (Array.length &components)]
+            (let-do [component (Array.unsafe-nth &components i)]
+              (when (Int.> (Array.length component) 1) (set! cyclic true))
+              (for [j 0 (Array.length component)]
+                (let-do [index @(Array.unsafe-nth component j)]
+                  (when (Array.contains? (Array.unsafe-nth &edges index) &index)
+                    (set! cyclic true))
+                  (Array.push-back! &ordered
+                                    @(Array.unsafe-nth applications index))))))
+          (if cyclic
+            (Result.Error
+              (BackendError.init
+                @"recursive by-value nominal layouts are not supported"))
+            (Result.Success ordered))))))
 
 (defn nominal-applications [module]
   (let-do [result (the (Result Unit BackendError) (Result.Success ()))
@@ -633,7 +648,7 @@ the linkage the unit gives its definitions.")
                                                   &ordered)))
           (Result.Error _) ())))
     (match result
-      (Result.Success _) (Result.Success ordered)
+      (Result.Success _) (order-nominal-applications constructors &ordered)
       (Result.Error error) (Result.Error error))))
 
 (doc append-record-members! "renders a record's members flat, the way the
@@ -2159,24 +2174,52 @@ selected by specialization.")
 (doc template-definitions "renders every reachable registry-declared
 primitive template. User function bodies and source-defined intrinsic payloads
 are separate backend inputs.")
-(defn template-definitions [module]
+(doc template-emission "renders templates once, retaining the exact fragments
+and declared backend dependency edges used by the translation-unit assembler.")
+(defn template-emission [module]
   (let-do [result (the (Result Unit BackendError) (Result.Success ()))
            buffer (StringBuf.create)
-           rendered-any false
-           declarations (BackendModule.declarations module)
-           n (Array.length declarations)]
-    (for [i 0 n]
+           entities (the (Array CArtifactEntity) [])
+           declarations (BackendModule.declarations module)]
+    (for [i 0 (Array.length declarations)]
       (match-ref &result
         (Result.Success _)
           (let [declaration (Array.unsafe-nth declarations i)]
             (when (template-declaration? declaration)
               (match (template-definition declaration)
                 (Result.Success rendered)
-                  (do (when rendered-any (StringBuf.append-str &buffer "
+                  (let-do [symbol (match-ref declaration
+                             (BackendDeclaration.Template name _ _ _) @name
+                             (BackendDeclaration.SourceTemplate name _ _ _ _)
+                               @name
+                             _ @"")
+                           dependencies (the (Array String) [])]
+                    (match-ref declaration
+                      (BackendDeclaration.Template _ _ _ edges)
+                        (for [e 0 (Array.length edges)]
+                          (Array.push-back! &dependencies
+                                            @(BackendDependency.symbol (Array.unsafe-nth edges
+                                                                                         e))))
+                      _ ())
+                    (unless (Array.empty? &entities)
+                      (StringBuf.append-str &buffer "
 
-")) (StringBuf.append-str &buffer &rendered) (set! rendered-any true))
+"))
+                    (CArtifacts.append! &buffer
+                                        &entities
+                                        &symbol
+                                        &dependencies
+                                        &rendered))
                 (Result.Error error) (set! result (Result.Error error)))))
         (Result.Error _) ()))
     (match result
-      (Result.Success _) (Result.Success (StringBuf.into-string buffer))
+      (Result.Success _)
+        (Result.Success
+          (CTranslationUnit.init (StringBuf.into-string buffer) entities))
       (Result.Error error) (Result.Error error))))
+
+(defn template-definitions [module]
+  (match (template-emission module)
+    (Result.Success emission)
+      (Result.Success @(CTranslationUnit.source &emission))
+    (Result.Error error) (Result.Error error)))

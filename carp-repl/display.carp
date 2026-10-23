@@ -1,0 +1,469 @@
+(load "syntax.carp")
+(load "paint.carp")
+(load "git@github.com:carpentry-org/strbuf@0.3.0")
+(load "text-width.carp")
+
+(deftype ReplDisplayCell [glyph String
+                          width Int
+                          style Int])
+(deftype ReplDisplayRow [text String
+                         width Int
+                         cells (Array ReplDisplayCell)])
+(deftype ReplFrame
+  [text String
+   rows (Array ReplDisplayRow)
+   cursor-row Int
+   cursor-column Int
+   end-row Int
+   end-column Int])
+(deftype ReplStyledText [characters (Array Char)
+                         styles (Array Int)
+                         cursor Int])
+
+(doc ReplDisplay
+  "Bounded terminal frames built from source, lexical styles, and feedback.")
+(defmodule ReplDisplay
+  (private style)
+  (hidden style)
+  (defn style [kind] (ReplPaint.category kind))
+
+  (private color)
+  (hidden color)
+  (defn color [style]
+    (if (Int.= style 0)
+      @"\u001b[0m"
+      (String.append "\u001b[0m"
+                     &(String.copy
+                       (cond
+                         (Int.= style 1) "\u001b[35m"
+                         (Int.= style 2) "\u001b[90m"
+                         (Int.= style 3) "\u001b[32m"
+                         (Int.= style 4) "\u001b[36m"
+                         (Int.= style 5) "\u001b[34m"
+                         (Int.= style 6) "\u001b[1;36m"
+                         (Int.= style 7) "\u001b[31m"
+                         (Int.= style 8) "\u001b[33m"
+                         (Int.= style 9) "\u001b[34m"
+                         (Int.= style 10) "\u001b[3m"
+                         (Int.= style 11) "\u001b[36m"
+                         "\u001b[0m")))))
+
+  (private paint!)
+  (hidden paint!)
+  (defn paint! [styles range category]
+    (for [i
+          (Int.max 0 @(ReplRange.start range))
+          (Int.min (Array.length styles) @(ReplRange.end range))]
+      (Array.aset! styles i category)))
+
+  (private at-delimiter?)
+  (hidden at-delimiter?)
+  (defn at-delimiter? [range cursor]
+    (cond
+      (and (Int.<= @(ReplRange.start range) cursor)
+           (Int.< cursor @(ReplRange.end range)))
+        2
+      (Int.= cursor @(ReplRange.end range)) 1
+      0))
+
+  (doc styled "applies supplied byte ranges and a theme. Cursor motion only
+selects delimiter pairs; this layer never parses source.")
+  (private styled-bytes)
+  (hidden styled-bytes)
+  (defn styled-bytes [source cursor bytes analyses]
+    (let-do [characters (String.chars source)
+             styles (the (Array Int) [])
+             position 0
+             character-cursor 0]
+      (unless (Array.empty? analyses)
+        (let-do [analysis (Array.unsafe-nth analyses 0)
+                 pairs (ReplAnalysis.pairs analysis)
+                 selected (the (Maybe ReplDelimiterPair) (Maybe.Nothing))
+                 best 0]
+          (for [i 0 (Array.length pairs)]
+            (let [pair (Array.unsafe-nth pairs i)
+                  rank (Int.max
+                    (at-delimiter? (ReplDelimiterPair.opening pair) cursor)
+                    (at-delimiter? (ReplDelimiterPair.closing pair) cursor))]
+              (when-do (Int.> rank best)
+                (set! selected (Maybe.Just (ReplDelimiterPair.copy pair)))
+                (set! best rank))))
+          (match-ref &selected
+            (Maybe.Nothing) ()
+            (Maybe.Just pair)
+              (do
+                (paint! bytes (ReplDelimiterPair.opening pair) 6)
+                (paint! bytes (ReplDelimiterPair.closing pair) 6)))))
+      (for [i 0 (Array.length &characters)]
+        (let-do [c @(Array.unsafe-nth &characters i)]
+          (Array.push-back! &styles @(Array.unsafe-nth bytes position))
+          (when (Int.< position cursor)
+            (set! character-cursor (Int.inc character-cursor)))
+          (set! position
+                (Int.+ position (String.length &(String.from-chars &[c]))))))
+      (ReplStyledText.init characters styles character-cursor)))
+
+  (defn styled [source cursor analyses]
+    (let-do [bytes (the (Array Int)
+                        (Array.repeat (String.length source) &(fn [] 0)))]
+      (unless (Array.empty? analyses)
+        (let [highlights (ReplAnalysis.highlights (Array.unsafe-nth analyses 0))]
+          (for [i 0 (Array.length highlights)]
+            (let [highlight (Array.unsafe-nth highlights i)]
+              (paint! &bytes
+                      (ReplHighlight.range highlight)
+                      (style (ReplHighlight.kind highlight)))))))
+      (styled-bytes source cursor &bytes analyses)))
+
+  (private painted)
+  (hidden painted)
+  (defn painted [source cursor analyses presentation]
+    (let-do [bytes (the (Array Int)
+                        (Array.repeat (String.length source) &(fn [] 0)))
+             spans (ReplPaint.spans presentation)]
+      (when (String.= source (ReplPaint.source presentation))
+        (for [i 0 (Array.length spans)]
+          (let [span (Array.unsafe-nth spans i)]
+            (paint! &bytes
+                    (ReplPaintSpan.range span)
+                    @(ReplPaintSpan.style span)))))
+      (styled-bytes source cursor &bytes analyses)))
+
+  (private width-of)
+  (hidden width-of)
+  (defn width-of [c] (ReplTextWidth.character c))
+
+  (private glyph)
+  (hidden glyph)
+  (defn glyph [c]
+    (let [code (Char.to-int c)]
+      (cond
+        (Int.= code 9) (String.copy "    ")
+        (Int.< code 32)
+          (String.from-chars
+            &[(Char.from-int 94) (Char.from-int (Int.+ code 64))])
+        (Int.= code 127) (String.copy "^?")
+        (String.from-chars &[c]))))
+
+  (private positions)
+  (hidden positions)
+  (defn positions [characters columns]
+    (let-do [points (the (Array (Pair Int Int)) [])
+             row 0
+             column 0]
+      (for [i 0 (Array.length characters)]
+        (let-do [c @(Array.unsafe-nth characters i)
+                 width (width-of c)]
+          (when-do (and (not (Char.= c (Char.from-int 10)))
+                        (and (Int.> width 0)
+                             (Int.> (Int.+ column width) columns)))
+            (set! row (Int.inc row))
+            (set! column 0))
+          (Array.push-back! &points
+                            (Pair.init
+                              (if (Int.= column columns) (Int.inc row) row)
+                              (if (Int.= column columns) 0 column)))
+          (if (Char.= c (Char.from-int 10))
+            (do (set! row (Int.inc row)) (set! column 0))
+            (set! column (Int.+ column width)))))
+      (Array.push-back! &points
+                        (Pair.init
+                          (if (Int.= column columns) (Int.inc row) row)
+                          (if (Int.= column columns) 0 column)))
+      points))
+
+  (private short-line)
+  (hidden short-line)
+  (defn short-line [line columns]
+    (let-do [characters (String.chars line)
+             pieces (the (Array String) [])
+             width 0
+             done false]
+      (for [i 0 (Array.length &characters)]
+        (unless done
+          (let [c @(Array.unsafe-nth &characters i)
+                next (Int.+ width (width-of c))]
+            (if (Int.>= next columns)
+              (set! done true)
+              (do (Array.push-back! &pieces (glyph c)) (set! width next))))))
+      (Pair.init (String.concat &pieces) width)))
+
+  ; Projection adds terminal decoration without changing source coordinates.
+  (private prompted)
+  (hidden prompted)
+  (defn prompted [prompt source]
+    (let-do [primary (String.chars prompt)
+             width 0
+             characters @&primary
+             styles (the (Array Int)
+                         (Array.repeat (Array.length &primary) &(fn [] 0)))
+             source-characters (ReplStyledText.characters source)
+             caret (Array.length &primary)]
+      (for [i 0 (Array.length &primary)]
+        (set! width (Int.+ width (width-of @(Array.unsafe-nth &primary i)))))
+      (let-do [continuation (String.chars
+                 &(cond
+                   (Int.<= width 0) @""
+                   (Int.= width 1) @"·"
+                   (Int.= width 2) @"· "
+                   (String.append
+                     &(String.allocate (Int.- width 3) \space)
+                     "·> ")))]
+        (for [i 0 (Array.length source-characters)]
+          (do
+            (when (Int.= i @(ReplStyledText.cursor source))
+              (set! caret (Array.length &characters)))
+            (let-do [c @(Array.unsafe-nth source-characters i)]
+              (Array.push-back! &characters c)
+              (Array.push-back! &styles
+                                @(Array.unsafe-nth (ReplStyledText.styles source)
+                                                   i))
+              (when (Char.= c \newline)
+                (for [j 0 (Array.length &continuation)]
+                  (do
+                    (Array.push-back! &characters
+                                      @(Array.unsafe-nth &continuation j))
+                    (Array.push-back! &styles 0)))))))
+        (when (Int.= @(ReplStyledText.cursor source)
+                     (Array.length source-characters))
+          (set! caret (Array.length &characters))))
+      (ReplStyledText.init characters styles caret)))
+
+  (private display-row)
+  (hidden display-row)
+  (defn display-row [pieces cells width colors]
+    (ReplDisplayRow.init
+      (if colors
+        (String.append &(String.concat pieces) &(color 0))
+        (String.concat pieces))
+      width
+      (Array.copy cells)))
+
+  (doc frame
+    "Lays out decorated rows and source cursor positions within the terminal viewport.")
+  (private layout-frame)
+  (hidden layout-frame)
+  (defn layout-frame [prompt text columns rows information colors]
+    (let-do [layout (prompted prompt text)
+             characters (ReplStyledText.characters &layout)
+             points (positions characters columns)
+             caret (Array.unsafe-nth &points @(ReplStyledText.cursor &layout))
+             feedback-lines (if (String.empty? information)
+               (the (Array String) [])
+               (let [lines (String.lines information)]
+                 (Array.take (Int.min 3 (Array.length &lines)) &lines)))
+             visible-rows (Int.max 1
+                                   (Int.- (Int.dec rows)
+                                          (Array.length &feedback-lines)))
+             top (Int.max 0 (Int.- @(Pair.a caret) (Int.dec visible-rows)))
+             bottom (Int.+ top visible-rows)
+             lines (the (Array ReplDisplayRow) [])
+             pieces (the (Array String) [])
+             cells (the (Array ReplDisplayCell) [])
+             current-row top
+             current-column 0
+             style -1]
+      (for [i 0 (Array.length characters)]
+        (let [point (Array.unsafe-nth &points i)
+              row @(Pair.a point)
+              column @(Pair.b point)
+              c @(Array.unsafe-nth characters i)
+              category @(Array.unsafe-nth (ReplStyledText.styles &layout) i)]
+          (when-do (and (Int.>= row top)
+                        (and (Int.< row bottom) (not (Char.= c \newline))))
+            (for [j current-row row]
+              (do
+                (Array.push-back! &lines
+                                  (display-row &pieces
+                                               &cells
+                                               current-column
+                                               colors))
+                (set! pieces [])
+                (set! cells [])
+                (set! current-column 0)
+                (set! style -1)))
+            (set! current-row row)
+            (when-do (and colors (Int./= category style))
+              (Array.push-back! &pieces (color category))
+              (set! style category))
+            (let-do [rendered (glyph c)]
+              (Array.push-back! &pieces @&rendered)
+              (Array.push-back! &cells
+                                (ReplDisplayCell.init rendered
+                                                      (width-of c)
+                                                      (if colors category -1))))
+            (set! current-column (Int.+ column (width-of c))))))
+      ; Include the empty row after an exact-width final glyph. It owns the
+      ; wrapped cursor position and must precede any feedback rows.
+      (let [end (Array.unsafe-nth &points (Array.length characters))
+            last-row (Int.min @(Pair.a end) (Int.dec bottom))]
+        (for [j current-row last-row]
+          (do
+            (Array.push-back! &lines
+                              (display-row &pieces &cells current-column colors))
+            (set! pieces [])
+            (set! cells [])
+            (set! current-column 0)
+            (set! current-row (Int.inc current-row)))))
+      (for [i 0 (Array.length &feedback-lines)]
+        (let-do [line (short-line (Array.unsafe-nth &feedback-lines i) columns)]
+          (Array.push-back! &lines
+                            (display-row &pieces &cells current-column colors))
+          (set! pieces [])
+          (set! cells [])
+          (when colors (Array.push-back! &pieces (color 2)))
+          (Array.push-back! &pieces @(Pair.a &line))
+          (let [characters (String.chars (Pair.a &line))]
+            (for [j 0 (Array.length &characters)]
+              (let [c @(Array.unsafe-nth &characters j)]
+                (Array.push-back! &cells
+                                  (ReplDisplayCell.init (String.from-chars &[c])
+                                                        (width-of c)
+                                                        (if colors 2 -1))))))
+          (set! current-column @(Pair.b &line))
+          (set! current-row (Int.inc current-row))))
+      (Array.push-back! &lines
+                        (display-row &pieces &cells current-column colors))
+      (let [text (Array.copy-map &(fn [line] @(ReplDisplayRow.text line)) &lines)]
+        (ReplFrame.init (String.join "\r\n" &text)
+                        lines
+                        (Int.- @(Pair.a caret) top)
+                        @(Pair.b caret)
+                        (Int.- current-row top)
+                        current-column))))
+
+  (defn frame [prompt source cursor columns rows information colors analyses]
+    (layout-frame prompt
+                  &(styled source cursor analyses)
+                  columns
+                  rows
+                  information
+                  colors))
+
+  (doc frame-painted
+    "renders provisional presentation separately from current analysis facts.")
+  (defn frame-painted [prompt
+                       source
+                       cursor
+                       columns
+                       rows
+                       information
+                       colors
+                       analyses
+                       presentation]
+    (layout-frame prompt
+                  &(painted source cursor analyses presentation)
+                  columns
+                  rows
+                  information
+                  colors))
+
+  (private vertical)
+  (hidden vertical)
+  (defn vertical [from to]
+    (cond
+      (Int.< to from) (fmt "\u001b[%dA" (Int.- from to))
+      (Int.> to from) (fmt "\u001b[%dB" (Int.- to from))
+      @""))
+
+  (private shared-prefix)
+  (hidden shared-prefix)
+  (defn shared-prefix [old new]
+    (let-do [count 0
+             maximum (Int.min (Array.length old) (Array.length new))]
+      (while-do (and (Int.< count maximum)
+                     (let [left (Array.unsafe-nth old count)
+                           right (Array.unsafe-nth new count)]
+                       (and
+                         (String.= (ReplDisplayCell.glyph left)
+                                   (ReplDisplayCell.glyph right))
+                         (and
+                           (Int.= @(ReplDisplayCell.width left)
+                                  @(ReplDisplayCell.width right))
+                           (Int.= @(ReplDisplayCell.style left)
+                                  @(ReplDisplayCell.style right))))))
+        (set! count (Int.inc count)))
+      ; A combining-mark edit must repaint its base glyph as one visual unit.
+      (when-do (and (Int.> count 0)
+                    (or
+                      (and (Int.< count (Array.length old))
+                           (Int.=
+                             @(ReplDisplayCell.width (Array.unsafe-nth old count))
+                             0))
+                      (and (Int.< count (Array.length new))
+                           (Int.=
+                             @(ReplDisplayCell.width (Array.unsafe-nth new count))
+                             0))))
+        (set! count (Int.dec count))
+        (while-do (and (Int.> count 0)
+                       (Int.=
+                         @(ReplDisplayCell.width (Array.unsafe-nth new count))
+                         0))
+          (set! count (Int.dec count))))
+      count))
+
+  (private suffix-text)
+  (hidden suffix-text)
+  (defn suffix-text [cells start]
+    (let-do [buffer (StringBuf.create)
+             style -2]
+      (for [i start (Array.length cells)]
+        (let-do [cell (Array.unsafe-nth cells i)
+                 next @(ReplDisplayCell.style cell)]
+          (when (and (Int.>= next 0) (Int./= style next))
+            (StringBuf.append-str &buffer &(color next)))
+          (StringBuf.append-str &buffer (ReplDisplayCell.glyph cell))
+          (set! style next)))
+      (when (Int.>= style 0) (StringBuf.append-str &buffer &(color 0)))
+      (StringBuf.into-string buffer)))
+
+  (doc patch
+    "updates changed cells without erasing equal-width content. New rows
+use line feeds so the terminal can scroll; cursor-only changes emit movement only.")
+  (defn patch [previous previous-cursor frame -columns]
+    (let-do [lines (ReplFrame.rows frame)
+             buffer (StringBuf.create)
+             row previous-cursor
+             bottom (Int.max 0 (Int.dec (Array.length previous)))]
+      (for [i 0 (Int.max (Array.length lines) (Array.length previous))]
+        (when (or (Int.>= i (Array.length lines))
+                  (or (Int.>= i (Array.length previous))
+                      (String./=
+                        (ReplDisplayRow.text (Array.unsafe-nth lines i))
+                        (ReplDisplayRow.text (Array.unsafe-nth previous i)))))
+          (let-do [target (Int.min i bottom)]
+            (StringBuf.append-str &buffer "\r")
+            (StringBuf.append-str &buffer &(vertical row target))
+            (for [j bottom i] (StringBuf.append-str &buffer "\r\n"))
+            (set! bottom (Int.max bottom i))
+            (set! row i)
+            (if (Int.< i (Array.length lines))
+              (let-do [line (Array.unsafe-nth lines i)
+                       cells (ReplDisplayRow.cells line)
+                       old-width (if (Int.< i (Array.length previous))
+                         @(ReplDisplayRow.width (Array.unsafe-nth previous i))
+                         0)
+                       prefix (if (Int.< i (Array.length previous))
+                         (shared-prefix
+                           (ReplDisplayRow.cells (Array.unsafe-nth previous i))
+                           cells)
+                         0)
+                       column 0]
+                (for [j 0 prefix]
+                  (set! column
+                        (Int.+ column
+                               @(ReplDisplayCell.width (Array.unsafe-nth cells j)))))
+                (when (Int.> column 0)
+                  (StringBuf.append-str &buffer &(fmt "\u001b[%dC" column)))
+                (StringBuf.append-str &buffer &(suffix-text cells prefix))
+                (when (Int.< @(ReplDisplayRow.width line) old-width)
+                  (StringBuf.append-str &buffer "\u001b[K")))
+              (StringBuf.append-str &buffer "\u001b[2K")))))
+      (StringBuf.append-str &buffer "\r")
+      (StringBuf.append-str &buffer
+                            &(vertical row @(ReplFrame.cursor-row frame)))
+      (when (Int.> @(ReplFrame.cursor-column frame) 0)
+        (StringBuf.append-str &buffer
+                              &(fmt "\u001b[%dC"
+                                    @(ReplFrame.cursor-column frame))))
+      (StringBuf.into-string buffer))))

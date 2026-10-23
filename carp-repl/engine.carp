@@ -1,0 +1,1261 @@
+(load "../carp-session/carp-input.carp")
+(load "input.carp")
+(load "values.carp")
+(load "view-query.carp")
+(load "journal.carp")
+(load "syntax.carp")
+(load "inspection.carp")
+(load "prelude.carp")
+
+(doc ReplEngineState "the REPL's compiler adapter. The terminal only calls
+ReplEngine operations and receives display text or structured diagnostics.")
+(deftype ReplEngineState
+  [session CompilerSession
+   jit JitSession
+   serial Int
+   results (Array ReplValue)
+   next-result Int
+   entries (Array ReplEntry)
+   editing Int
+   last-input String
+   generation Int
+   events (Array ReplEntry)
+   pending-remove Int
+   pending-revision Int
+   view-queries (Array ReplViewQuery)])
+
+(defmodule ReplEngine
+  (defn- input-mask [engine parsed]
+    (let [module (SourcedSurfaceModule.module parsed)
+          id (SourceInput.id (SourcedSurfaceModule.input parsed))]
+      (match (Session.input-expansion (ReplEngineState.session engine) module id)
+        (Result.Error error) (Result.Error error)
+        (Result.Success expanded)
+          (ReplInput.declaration-mask (SurfaceModule.forms module)
+                                      (SurfaceModule.forms &expanded)
+                                      id))))
+
+  (doc create "loads Core once and creates the persistent native session.")
+  (defn create [core-dir scratch]
+    (match (ReplPrelude.create-session core-dir)
+      (Result.Error diagnostic) (Result.Error diagnostic)
+      (Result.Success session)
+        (Result.Success
+          (ReplEngineState.init session
+                                (SessionJit.create core-dir scratch)
+                                1
+                                (the (Array ReplValue) [])
+                                1
+                                (the (Array ReplEntry) [])
+                                0
+                                (String.copy "")
+                                0
+                                (the (Array ReplEntry) [])
+                                0
+                                0
+                                []))))
+
+  (doc dispose "releases the native session before the host drops its state.")
+  (defn dispose [engine]
+    (let-do [jit (ReplEngineState.jit engine)
+             count @(JitSession.serial jit)
+             scratch (String.copy (JitSession.scratch jit))]
+      (do
+        (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+        (ReplValues.clear! (ReplEngineState.results engine)))
+      (SessionJit.dispose jit)
+      (for [i 0 count]
+        (let-do [base (fmt "%s/carp-jit-shim-%d" &scratch i)]
+          (IO.Raw.unlink! &(String.append &base ".c"))
+          (IO.Raw.unlink! &(String.append &base ".ll"))))))
+
+  (private next-input)
+  (hidden next-input)
+  (defn next-input [engine source]
+    (let-do [serial @(ReplEngineState.serial engine)]
+      (ReplEngineState.set-serial! engine (Int.inc serial))
+      (ReplEngineState.set-last-input! engine (fmt "repl:%d" serial))
+      (SourceInput.init (fmt "repl:%d" serial) (String.copy source))))
+
+  (private diagnostic)
+  (hidden diagnostic)
+  (defn diagnostic [message]
+    (Diagnostic.init (String.copy "repl") message (Maybe.Nothing)))
+
+  (private definition-lines)
+  (hidden definition-lines)
+  (defn definition-lines [definitions]
+    (let-do [lines (the (Array String) [])]
+      (for [i 0 (Array.length definitions)]
+        (let [definition (Array.unsafe-nth definitions i)]
+          (Array.push-back! &lines
+                            (fmt "%s : %s"
+                                 (SessionDefInfo.name definition)
+                                 (SessionDefInfo.scheme definition)))))
+      (String.join "
+" &lines)))
+
+  (private committed-message)
+  (hidden committed-message)
+  (defn committed-message [definitions had-code]
+    (let [lines (definition-lines definitions)]
+      (if had-code (String.append &lines "
+[native state reset after definition commit]") lines)))
+
+  (private commit)
+  (hidden commit)
+  (defn commit [engine input single]
+    (let [previous (Session.definitions (ReplEngineState.session engine))
+          committed (if single
+            (Session.upsert-cell (ReplEngineState.session engine) input)
+            (Session.upsert-input (ReplEngineState.session engine) input))]
+      (match committed
+        (Result.Error error) (Result.Error error)
+        (Result.Success definitions)
+          (let-do [invalidate (Int.> @(ReplEngineState.editing engine) 0)
+                   had-code (not
+                     (Array.empty?
+                       (JitSession.code (ReplEngineState.jit engine))))]
+            (for [i 0 (Array.length &definitions)]
+              (let-do [definition (Array.unsafe-nth &definitions i)]
+                (match-ref (SessionDefInfo.kind definition)
+                  (SessionDefKind.Function) ()
+                  (SessionDefKind.Value) ()
+                  _ (set! invalidate true))
+                (for [j 0 (Array.length &previous)]
+                  (when (String.= (SessionDefInfo.name definition)
+                                  (SessionDefInfo.name (Array.unsafe-nth &previous
+                                                                         j)))
+                    (set! invalidate true)))))
+            (let [error (if invalidate
+                    (do
+                      (ReplEngineState.set-generation! engine
+                                                       (Int.inc @(ReplEngineState.generation engine)))
+                      (do
+                        (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+                        (ReplValues.clear! (ReplEngineState.results engine)))
+                      (SessionJit.reset-code! (ReplEngineState.jit engine)))
+                    (String.copy ""))]
+              (if (String.empty? &error)
+                (Result.Success
+                  (committed-message &definitions (and invalidate had-code)))
+                (Result.Error (diagnostic error))))))))
+
+  (private runtime-input)
+  (hidden runtime-input)
+  (defn runtime-input [engine input]
+    (ReplValues.runtime-input (ReplEngineState.results engine) input))
+
+  (private runtime-error)
+  (hidden runtime-error)
+
+  (defn runtime-error [engine error input]
+    (let [span (match-ref (Diagnostic.span error)
+            (Maybe.Just span)
+              (if (String.= (SourceSpan.source-id span) (SourceInput.id input))
+                (Maybe.Just
+                  (SourceSpan.init
+                    (String.copy (SourceSpan.source-id span))
+                    (Int.max 0
+                             (Int.- @(SourceSpan.start span)
+                                    (String.length
+                                      &(ReplValues.prefix (ReplEngineState.results engine)))))
+                    (Int.max 0
+                             (Int.- @(SourceSpan.end span)
+                                    (String.length
+                                      &(ReplValues.prefix (ReplEngineState.results engine)))))))
+                (Maybe.Just (SourceSpan.copy span)))
+            (Maybe.Nothing) (Maybe.Nothing))]
+      (Diagnostic.init (String.copy (Diagnostic.phase error))
+                       (String.copy (Diagnostic.message error))
+                       span)))
+
+  (private evaluate-input)
+  (hidden evaluate-input)
+  (doc evaluate-input
+    "Submits source atomically and prepares mixed runtime roots before execution.")
+  (defn evaluate-input [engine input]
+    (match (Surface.parse-input-diagnosed input)
+      (Result.Error error) (Result.Error error)
+      (Result.Success parsed)
+        (match (input-mask engine &parsed)
+          (Result.Error error) (Result.Error error)
+          (Result.Success mask)
+            (let-do [forms (SurfaceModule.forms (SourcedSurfaceModule.module &parsed))
+                     declarations 0
+                     expressions 0
+                     count 0]
+              (for [i 0 (Array.length forms)]
+                (let [node (Box.peek (Array.unsafe-nth forms i))]
+                  (match-ref (SurfaceNode.form node)
+                    (SurfaceForm.Comment _) ()
+                    _
+                      (do
+                        (set! count (Int.inc count))
+                        (if @(Array.unsafe-nth &mask i)
+                          (set! declarations (Int.inc declarations))
+                          (set! expressions (Int.inc expressions)))))))
+              (cond
+                (Int.= count 0) (Result.Success (String.copy ""))
+                (and (Int.> declarations 0) (Int.> expressions 0))
+                  (evaluate-mixed engine input forms &mask)
+                (Int.> declarations 0)
+                  (commit engine
+                          input
+                          (and (Int.= count 1)
+                               (and
+                                 (ReplInput.declaration? (Box.peek (Array.unsafe-nth forms
+                                                                                     0)))
+                                 (Int.= @(ReplEngineState.editing engine) 0))))
+                (if (and
+                    (Int.> @(ReplEngineState.editing engine) 0)
+                    (active-input? engine (SourceInput.id input)))
+                  (evaluate-mixed engine input forms &mask)
+                  (evaluate-result engine input)))))))
+
+  (doc definitions "lists the committed user definitions and their schemes.")
+  (defn definitions [engine]
+    (definition-lines &(Session.definitions (ReplEngineState.session engine))))
+
+  (doc error-source
+    "finds the exact current or committed source for a diagnostic.
+An empty answer means the host should display the source ID and byte offset.")
+  (defn error-source [engine error current-source]
+    (let-do [source (String.copy "")]
+      (match-ref (Diagnostic.span error)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (if (String.= (SourceSpan.source-id span)
+                        (ReplEngineState.last-input engine))
+            (set! source (String.copy current-source))
+            (let [definitions (Session.definitions (ReplEngineState.session engine))]
+              (for [i 0 (Array.length &definitions)]
+                (let [input (SessionDefInfo.source (Array.unsafe-nth &definitions
+                                                                     i))]
+                  (when (String.= (SourceInput.id input)
+                                  (SourceSpan.source-id span))
+                    (set! source (String.copy (SourceInput.source input)))))))))
+      (for [i 0 (Array.length (ReplEngineState.entries engine))]
+        (let [entry (Array.unsafe-nth (ReplEngineState.entries engine) i)]
+          (match-ref (Diagnostic.span error)
+            (Maybe.Nothing) ()
+            (Maybe.Just span)
+              (when (and
+                  (String.= (SourceSpan.source-id span)
+                            (SourceInput.id (ReplEntry.input entry)))
+                  (and
+                    (not
+                      (String.= (SourceSpan.source-id span)
+                                (ReplEngineState.last-input engine)))
+                    (String.= (ReplEntry.status entry) "ok")))
+                (set! source
+                      (String.copy (SourceInput.source (ReplEntry.input entry))))))))
+      source))
+
+  (doc reset "clears native and semantic user state, retaining warm Core.")
+  (defn reset [engine]
+    (let [_released (do
+            (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+            (ReplValues.clear! (ReplEngineState.results engine)))
+          error (SessionJit.reset-code! (ReplEngineState.jit engine))]
+      (if (String.empty? &error)
+        (do
+          (Session.reset (ReplEngineState.session engine))
+          (ReplEngineState.set-pending-remove! engine 0)
+          (ReplEngineState.set-editing! engine 0)
+          (ReplEngineState.set-generation! engine
+                                           (Int.inc @(ReplEngineState.generation engine)))
+          (for [i 0 (Array.length (ReplEngineState.entries engine))]
+            (ReplEntry.set-stale!
+              (Array.unsafe-nth (ReplEngineState.entries engine) i)
+              true))
+          (Result.Success @"session reset"))
+        (Result.Error (diagnostic error)))))
+
+  (doc type-of "checks an expression without running or committing it.")
+  (defn type-of [engine source]
+    (let-do [input (next-input engine source)
+             runtime (runtime-input engine &input)]
+      (match (Session.infer-cell (ReplEngineState.session engine) &runtime)
+        (Result.Error error) (Result.Error (runtime-error engine &error &input))
+        (Result.Success report)
+          (let-do [forms (CellReport.forms &report)
+                   lines (the (Array String) [])]
+            (for [i 0 (Array.length forms)]
+              (Array.push-back! &lines
+                                (String.copy
+                                  (SessionTypedEntity.type (Array.unsafe-nth forms
+                                                                             i)))))
+            (Result.Success (String.join "
+" &lines))))))
+
+  (doc expand "expands source without committing compile-time effects.")
+  (defn expand [engine source]
+    (let [input (next-input engine source)]
+      (match (Session.expand (ReplEngineState.session engine) &input)
+        (Result.Error error) (Result.Error error)
+        (Result.Success expanded)
+          (Result.Success
+            (match expanded
+              (Maybe.Just text) text
+              (Maybe.Nothing) (String.copy ""))))))
+
+  (doc complete "returns deterministic name and scheme lines for a prefix.")
+  (defn complete [engine prefix]
+    (let-do [candidates (Session.complete (ReplEngineState.session engine)
+                                          prefix)
+             lines (the (Array String) [])]
+      (for [i 0 (Array.length &candidates)]
+        (let [candidate (Array.unsafe-nth &candidates i)]
+          (Array.push-back! &lines
+                            (fmt "%s : %s"
+                                 (Candidate.name candidate)
+                                 (Candidate.scheme candidate)))))
+      (String.join "
+" &lines)))
+
+  (doc documentation "returns documentation for an exact visible name.")
+  (defn documentation [engine name]
+    (match (Session.doc (ReplEngineState.session engine) name)
+      (Maybe.Just info) (Result.Success (fmt "%s : %s
+%s" (DocInfo.name &info) (DocInfo.scheme &info) (DocInfo.documentation &info)))
+      (Maybe.Nothing)
+        (Result.Error (diagnostic (fmt "no documentation for %s" name))))))
+
+(defmodule ReplEngine
+  (doc expand-once "Performs one expansion step without committing changes.")
+  (defn expand-once [engine source]
+    (let [input (next-input engine source)]
+      (match (Session.expand-1 (ReplEngineState.session engine) &input)
+        (Result.Error error) (Result.Error error)
+        (Result.Success expanded)
+          (Result.Success
+            (match expanded
+              (Maybe.Just text) text
+              (Maybe.Nothing) (String.copy source))))))
+
+  (doc ownership "Shows ownership actions with their original source ranges.")
+  (defn ownership [engine name]
+    (match (Session.ownership (ReplEngineState.session engine) name)
+      (Result.Error error) (Result.Error error)
+      (Result.Success report)
+        (let-do [lines [(fmt "ownership %s : %s"
+                             name
+                             (OwnershipReport.scheme &report))]
+                 actions (OwnershipReport.actions &report)]
+          (for [i 0 (Array.length actions)]
+            (let [action (Array.unsafe-nth actions i)
+                  kind (match-ref (SpannedOwnershipAction.action action)
+                    (OwnershipAction.Move _ _ _ ty)
+                      (fmt "move %s" &(Type.render (Box.peek ty)))
+                    (OwnershipAction.Borrow _ _ _) (String.copy "borrow")
+                    (OwnershipAction.Delete _ _ ty)
+                      (fmt "delete %s" &(Type.render (Box.peek ty))))
+                  location (match-ref (SpannedOwnershipAction.span action)
+                    (Maybe.Just span)
+                      (fmt "%s:%d..%d"
+                           (SourceSpan.source-id span)
+                           @(SourceSpan.start span)
+                           @(SourceSpan.end span))
+                    (Maybe.Nothing) (String.copy "generated"))]
+              (Array.push-back! &lines (fmt "  %s at %s" &kind &location))))
+          (Result.Success (String.join "
+" &lines)))))
+
+  (doc render-c "renders an explicit alternate C-backend compilation without
+executing or publishing native code. Compile-time query state is restored.")
+  (defn render-c [engine source]
+    (if (String.empty? source)
+      (Result.Error (diagnostic @"usage: :c-render <source>"))
+      (let-do [input (SourceInput.init @"repl:c-render" (String.copy source))
+               runtime (runtime-input engine &input)
+               saved (CtEval.checkpoint)
+               result (match (Session.emit-cell (ReplEngineState.session engine)
+                                                &runtime)
+                 (Result.Error error)
+                   (Result.Error (runtime-error engine &error &input))
+                 (Result.Success code)
+                   (Result.Success
+                     (String.append
+                       "// Alternate C-backend rendering; not executed by the REPL.
+"
+                       &code)))]
+        (CtEval.restore! saved)
+        result)))
+
+  (private inspect-code)
+  (hidden inspect-code)
+  (defn inspect-code [engine query c-support]
+    (let-do [words (String.words query)
+             dependencies false
+             full false
+             target @""
+             invalid false
+             usage (if c-support
+               @"usage: :c [--full] [name]"
+               @"usage: :llvm [--deps|--full] [name]")]
+      (for [i 0 (Array.length &words)]
+        (let [word (Array.unsafe-nth &words i)]
+          (cond
+            (String.= word "--deps")
+              (if (or c-support (or dependencies full))
+                (set! invalid true)
+                (set! dependencies true))
+            (String.= word "--full")
+              (if (or dependencies full) (set! invalid true) (set! full true))
+            (or (String.starts-with? word "--") (not (String.empty? &target)))
+              (set! invalid true)
+            (set! target @word))))
+      (cond
+        invalid (Result.Error (diagnostic usage))
+        (String.empty? &target)
+          (Result.Success
+            (if c-support
+              (SessionJit.inspect-c-artifacts (ReplEngineState.jit engine)
+                                              &(the (Maybe CoreRef)
+                                                    (Maybe.Nothing))
+                                              full)
+              (SessionJit.inspect-artifacts (ReplEngineState.jit engine)
+                                            &(the (Maybe CoreRef)
+                                                  (Maybe.Nothing))
+                                            dependencies
+                                            full)))
+        (let-do [overlay (Array.unsafe-nth
+                   (CompilerSession.overlay (ReplEngineState.session engine))
+                   0)
+                 globals (ResolveSnapshot.globals (SessionOverlay.resolution overlay))
+                 found (the (Maybe CoreRef) (Maybe.Nothing))]
+          (for [i 0 (Array.length globals)]
+            (let [reference (Array.unsafe-nth globals i)]
+              (when (String.= &target (CoreRef.name reference))
+                (set! found (Maybe.Just @reference)))))
+          (match found
+            (Maybe.Nothing)
+              (Result.Error
+                (diagnostic (fmt "no runtime binding named %s" &target)))
+            (Maybe.Just reference)
+              (Result.Success
+                (if c-support
+                  (SessionJit.inspect-c-artifacts (ReplEngineState.jit engine)
+                                                  &(Maybe.Just reference)
+                                                  full)
+                  (SessionJit.inspect-artifacts (ReplEngineState.jit engine)
+                                                &(Maybe.Just reference)
+                                                dependencies
+                                                full))))))))
+
+  (doc emit-llvm
+    "inspects retained LLVM publications without entering the compiler.
+An empty target selects the last executed cell; names select compiler binding
+identities. Dependencies and complete modules are explicit views.")
+  (defn emit-llvm [engine query] (inspect-code engine query false))
+
+  (doc emit-c "inspects retained native C support for a published binding or
+the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
+  (defn emit-c [engine query] (inspect-code engine query true))
+
+  (private describe-artifacts!)
+  (hidden describe-artifacts!)
+  (defn describe-artifacts! [engine input]
+    (let-do [session (ReplEngineState.session engine)
+             definitions (Session.definitions session)
+             overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)
+             globals (ResolveSnapshot.globals (SessionOverlay.resolution overlay))
+             events (ReplEngineState.events engine)
+             revision (Int.inc (Array.length events))
+             origins (the (Array JitArtifactOrigin) [])]
+      (for [i 0 (Array.length &definitions)]
+        (let-do [definition (Array.unsafe-nth &definitions i)
+                 source (SessionDefInfo.source definition)
+                 source-revision 0]
+          (for [e 0 (Array.length events)]
+            (let [event (Array.unsafe-nth events e)]
+              (when (and (String.= (ReplEntry.status event) "ok")
+                         (String.= (SourceInput.id source)
+                                   (SourceInput.id (ReplEntry.input event))))
+                (set! source-revision (Int.inc e)))))
+          (when (String.= (SourceInput.id source) (SourceInput.id input))
+            (set! source-revision revision))
+          (for [g 0 (Array.length globals)]
+            (let [reference (Array.unsafe-nth globals g)]
+              (when (and
+                  (String.= (SessionDefInfo.name definition)
+                            (CoreRef.name reference))
+                  (match (CoreProvenance.binding-span (SessionOverlay.provenance overlay)
+                                                      reference)
+                    (Maybe.Just span)
+                      (String.= (SourceSpan.source-id &span)
+                                (SourceInput.id source))
+                    (Maybe.Nothing) false))
+                (Array.push-back! &origins
+                                  (JitArtifactOrigin.init @reference
+                                                          (if (String.= (SourceInput.id source)
+                                                                        (SourceInput.id input))
+                                                            (SourceInput.copy input)
+                                                            (SourceInput.copy source))
+                                                          source-revision)))))))
+      (SessionJit.describe-artifacts! (ReplEngineState.jit engine)
+                                      input
+                                      revision
+                                      &origins))))
+
+(defmodule ReplEngine
+  (private capture-error)
+  (hidden capture-error)
+  (defn capture-error [error input prefix]
+    (Diagnostic.init (String.copy (Diagnostic.phase error))
+                     (String.copy (Diagnostic.message error))
+                     (match-ref (Diagnostic.span error)
+                       (Maybe.Just span)
+                         (Maybe.Just
+                           (if (String.= (SourceSpan.source-id span)
+                                         (SourceInput.id input))
+                             (SourceSpan.init
+                               (String.copy (SourceSpan.source-id span))
+                               (Int.max 0
+                                        (Int.- @(SourceSpan.start span) prefix))
+                               (Int.max 0 (Int.- @(SourceSpan.end span) prefix)))
+                             (SourceSpan.copy span)))
+                       (Maybe.Nothing) (Maybe.Nothing))))
+
+  (private evaluate-result)
+  (hidden evaluate-result)
+  (defn evaluate-result [engine input]
+    (match (prepare-result engine
+                           (ReplEngineState.session engine)
+                           (ReplEngineState.jit engine)
+                           input
+                           (ReplEngineState.results engine))
+      (Result.Error error) (Result.Error error)
+      (Result.Success prepared) (run-prepared engine &prepared)))
+
+  (doc results "Lists live owned results in this JIT generation.")
+  (defn results [engine]
+    (let-do [lines (the (Array String) [])
+             values (ReplEngineState.results engine)]
+      (for [i 0 (Array.length values)]
+        (let [value (Array.unsafe-nth values i)]
+          (Array.push-back! &lines
+                            (fmt "_%d : %s"
+                                 @(ReplValue.number value)
+                                 (ReplValue.type value)))))
+      (String.join "
+" &lines)))
+
+  (doc inspect
+    "Inspects a retained typed value without reevaluating its source.")
+  (defn inspect [engine number] (inspect-path engine number &[]))
+
+  (doc drop-result "Drops a result and newer results that could borrow it.")
+  (defn drop-result [engine number]
+    (let-do [values (ReplEngineState.results engine)
+             found false]
+      (for [i 0 (Array.length values)]
+        (when (Int.= number @(ReplValue.number (Array.unsafe-nth values i)))
+          (set! found true)))
+      (if found
+        (do
+          (while-do (and (not (Array.empty? values))
+                         (Int.>=
+                           @(ReplValue.number
+                             (Array.unsafe-nth values
+                                               (Int.dec (Array.length values))))
+                           number))
+            (ReplValues.release
+              (Array.unsafe-nth values (Int.dec (Array.length values))))
+            (ignore (Array.pop-back! values)))
+          (Result.Success (fmt "released _%d and newer results" number)))
+        (Result.Error (diagnostic (fmt "no live result _%d" number)))))))
+
+(defmodule ReplEngine
+  (private input-definitions)
+  (hidden input-definitions)
+  (defn input-definitions [engine id]
+    (let-do [names (the (Array String) [])
+             definitions (Session.definitions (ReplEngineState.session engine))]
+      (for [i 0 (Array.length &definitions)]
+        (let [definition (Array.unsafe-nth &definitions i)]
+          (when (String.= id (SourceInput.id (SessionDefInfo.source definition)))
+            (Array.push-back! &names
+                              (String.copy (SessionDefInfo.name definition))))))
+      names))
+
+  (private dependency-source)
+  (hidden dependency-source)
+  (defn dependency-source [engine input]
+    (let-do [declarations (the (Array String) [])
+             expressions (the (Array String) [])]
+      (match (Surface.parse-input-diagnosed input)
+        (Result.Error _) ()
+        (Result.Success parsed)
+          (let [forms (SurfaceModule.forms (SourcedSurfaceModule.module &parsed))
+                mask (match (input-mask engine &parsed)
+                  (Result.Success kinds) kinds
+                  (Result.Error _) (Array.replicate (Array.length forms) &false))]
+            (for [i 0 (Array.length forms)]
+              (let [node (Box.peek (Array.unsafe-nth forms i))]
+                (Array.push-back!
+                  (if @(Array.unsafe-nth &mask i) &declarations &expressions)
+                  (Surface.render node))))))
+      (SourceInput.init (String.copy (SourceInput.id input))
+                        (String.concat &[(String.join "
+" &declarations) @"
+(defn __repl_dependencies [] " (ReplValues.prefix (ReplEngineState.results engine)) (String.join "
+"
+                                                                                                 &expressions) @"
+)))"]))))
+
+  (private resolved-dependencies)
+  (hidden resolved-dependencies)
+  (defn resolved-dependencies [engine input]
+    (let [probe (dependency-source engine input)
+          overlay (Array.unsafe-nth
+            (CompilerSession.overlay (ReplEngineState.session engine))
+            0)]
+      (match (Surface.parse-input-diagnosed &probe)
+        (Result.Error _) (Maybe.Nothing)
+        (Result.Success parsed)
+          (match (MacroExpand.expand-module-against (SourcedSurfaceModule.module &parsed)
+                                                    (Rc.value-ref (SessionOverlay.expansion overlay)))
+            (Result.Error _) (Maybe.Nothing)
+            (Result.Success expanded)
+              (let [sourced (SourcedSurfaceModule.init (SourceInput.copy &probe)
+                                                       expanded)
+                    allocator (IdAllocator.copy (SessionOverlay.node-allocator overlay))]
+                (match (Resolve.module-with-provenance-against &sourced
+                                                               &allocator
+                                                               (SessionOverlay.resolution overlay))
+                  (Result.Error _) (Maybe.Nothing)
+                  (Result.Success resolved) (Maybe.Just resolved)))))))
+
+  (private input-dependencies)
+  (hidden input-dependencies)
+  (defn input-dependencies [engine input]
+    (let-do [names (the (Array String) [])]
+      (match (resolved-dependencies engine input)
+        (Maybe.Nothing) ()
+        (Maybe.Just resolved)
+          (let [core (ProvenancedCoreModule.core &resolved)
+                bindings (CoreProvenance.definitions
+                  (ProvenancedCoreModule.provenance &resolved))]
+            (for [i 0 (Array.length bindings)]
+              (let [references (CoreIR.global-dependencies core
+                                                           (BindingProvenance.reference (Array.unsafe-nth bindings
+                                                                                                          i)))]
+                (for [r 0 (Array.length &references)]
+                  (let [name (CoreRef.name (Array.unsafe-nth &references r))]
+                    (unless (Array.contains? &names name)
+                      (Array.push-back! &names (String.copy name)))))))))
+      names))
+
+  (doc history "Lists the source journal and its current dependency status.")
+  (defn history [engine] (ReplJournal.render (ReplEngineState.entries engine)))
+
+  (doc begin-edit
+    "Selects an input by stable journal number and returns its source.")
+  (defn begin-edit [engine number]
+    (let [entries (ReplEngineState.entries engine)]
+      (if (or (Int.< number 1) (Int.> number (Array.length entries)))
+        (Result.Error (diagnostic (fmt "no input %d" number)))
+        (do
+          (ReplEngineState.set-editing! engine number)
+          (Result.Success
+            (String.copy
+              (SourceInput.source
+                (ReplEntry.input (Array.unsafe-nth entries (Int.dec number))))))))))
+
+  (doc cancel-edit
+    "Returns to creating new inputs without changing active source.")
+  (defn cancel-edit [engine] (ReplEngineState.set-editing! engine 0))
+
+  (doc export
+    "Writes active source in the session's replay order, or the full transcript.")
+  (defn export [engine path transcript]
+    (let-do [parts (the (Array String) [])]
+      (unless transcript
+        (let [overlay (Array.unsafe-nth
+                (CompilerSession.overlay (ReplEngineState.session engine))
+                0)
+              inputs (SessionOverlay.inputs overlay)]
+          (for [i 0 (Array.length inputs)]
+            (Array.push-back! &parts
+                              (String.copy
+                                (SourceInput.source (Array.unsafe-nth inputs i)))))))
+      (let [text (if transcript
+              (ReplJournal.transcript (ReplEngineState.events engine))
+              (String.append &(String.join "
+
+" &parts) "
+"))]
+        (match (IO.write-file &text path)
+          (Result.Error error) (Result.Error (diagnostic error))
+          (Result.Success _) (Result.Success (fmt "exported %s" path))))))
+
+  (doc submit
+    "Evaluates or replaces one journal input; failed edits preserve active source.")
+  (defn submit [engine source]
+    (let-do [editing @(ReplEngineState.editing engine)
+             entries (ReplEngineState.entries engine)
+             input (if (Int.> editing 0)
+               (SourceInput.init
+                 (String.copy
+                   (SourceInput.id
+                     (ReplEntry.input
+                       (Array.unsafe-nth entries (Int.dec editing)))))
+                 (String.copy source))
+               (next-input engine source))
+             _current (ReplEngineState.set-last-input! engine
+                                                       (String.copy (SourceInput.id &input)))
+             dependencies (input-dependencies engine &input)
+             before-generation @(ReplEngineState.generation engine)
+             answer (evaluate-input engine &input)
+             succeeded (Result.success? &answer)
+             _artifact-origin (when succeeded
+               (describe-artifacts! engine &input))
+             definitions (if succeeded
+               (input-definitions engine (SourceInput.id &input))
+               (the (Array String) []))
+             affected (if succeeded
+               (ReplJournal.affected entries &definitions)
+               (the (Array Int) []))
+             number (if (and succeeded (Int.> editing 0))
+               editing
+               (Int.inc (Array.length entries)))
+             entry (ReplEntry.init number
+                                   input
+                                   (String.copy (if succeeded "ok" "error"))
+                                   definitions
+                                   dependencies
+                                   false)]
+      (Array.push-back! (ReplEngineState.events engine) (ReplEntry.copy &entry))
+      (when (Int./= before-generation @(ReplEngineState.generation engine))
+        (for [i 0 (Array.length entries)]
+          (let [previous (Array.unsafe-nth entries i)]
+            (ReplEntry.set-stale! previous true))))
+
+      (when succeeded
+        (for [i 0 (Array.length entries)]
+          (let [previous (Array.unsafe-nth entries i)]
+            (when-do (and
+                (String.= (ReplEntry.status previous) "ok")
+                (and
+                  (not (Array.empty? (ReplEntry.definitions previous)))
+                  (or
+                    (not
+                      (active-input? engine
+                                     (SourceInput.id (ReplEntry.input previous))))
+                    (and
+                      (String.=
+                        (SourceInput.id (ReplEntry.input previous))
+                        (SourceInput.id (ReplEntry.input &entry)))
+                      (Int./= @(ReplEntry.number previous) number)))))
+              (ReplEntry.set-status! previous (String.copy "superseded"))
+              (ReplEntry.set-stale! previous true)))))
+      (ReplEngineState.set-editing! engine 0)
+      (for [i 0 (Array.length &affected)]
+        (ReplEntry.set-stale!
+          (Array.unsafe-nth entries (Int.dec @(Array.unsafe-nth &affected i)))
+          true))
+      (if (and succeeded (Int.> editing 0))
+        (Array.aset! entries (Int.dec editing) entry)
+        (Array.push-back! entries entry))
+      answer)))
+
+(defmodule ReplEngine
+  (private run-prepared)
+  (hidden run-prepared)
+  (defn run-prepared [engine prepared]
+    (let-do [slot @(ReplPreparedResult.slot prepared)]
+      (ignore (LLVM.call-i32 @(ReplPreparedResult.address prepared)))
+      (SessionJit.executed! (ReplEngineState.jit engine)
+                            @(ReplPreparedResult.address prepared))
+      (if (null? slot)
+        (Result.Success (String.copy ""))
+        (let-do [number @(ReplEngineState.next-result engine)
+                 value (ReplValue.init number
+                                       (String.copy (ReplPreparedResult.type prepared))
+                                       @(ReplPreparedResult.type-info prepared)
+                                       @(ReplPreparedResult.publication prepared)
+                                       slot)
+                 view (NativeView.init
+                   @(ReplValueSlot.address (Pointer.to-ref slot))
+                   @(ReplValue.type-info &value)
+                   @(ReplValue.publication &value)
+                   false)
+                 answer (render-view engine &view &(ReplInspect.defaults))]
+          (if (and @(ReplPreparedResult.retain prepared)
+                   (Int.< (Array.length (ReplEngineState.results engine)) 32))
+            (do
+              (ReplEngineState.set-next-result! engine (Int.inc number))
+              (Array.push-back! (ReplEngineState.results engine) value))
+            (ReplValues.release &value))
+          answer))))
+
+  (private mixed-needs-reset?)
+  (hidden mixed-needs-reset?)
+  (defn mixed-needs-reset? [engine definitions]
+    (let-do [previous (Session.definitions (ReplEngineState.session engine))
+             reset (Int.> @(ReplEngineState.editing engine) 0)]
+      (for [i 0 (Array.length definitions)]
+        (let-do [definition (Array.unsafe-nth definitions i)]
+          (match-ref (SessionDefInfo.kind definition)
+            (SessionDefKind.Function) ()
+            (SessionDefKind.Value) ()
+            _ (set! reset true))
+          (for [j 0 (Array.length &previous)]
+            (when (String.= (SessionDefInfo.name definition)
+                            (SessionDefInfo.name (Array.unsafe-nth &previous j)))
+              (set! reset true)))))
+      reset))
+
+  (private evaluate-mixed)
+  (hidden evaluate-mixed)
+  (defn evaluate-mixed [engine input forms mask]
+    (let-do [parts (ReplInput.partition (SourceInput.source input) forms mask)
+             candidate (CompilerSession.copy (ReplEngineState.session engine))
+             declarations (SourceInput.init (String.copy (SourceInput.id input))
+                                            @(Pair.a &parts))
+             expressions (SourceInput.init (String.copy (SourceInput.id input))
+                                           @(Pair.b &parts))]
+      (match (stage-input &candidate &declarations)
+        (Result.Error error) (Result.Error error)
+        (Result.Success definitions)
+          (if (mixed-needs-reset? engine &definitions)
+            (let-do [old (ReplEngineState.jit engine)
+                     staged (SessionJit.create (JitSession.core-dir old)
+                                               (JitSession.scratch old))]
+              (JitSession.set-serial! &staged (Int.inc @(JitSession.serial old)))
+              (JitSession.set-generation! &staged
+                                          (Int.inc @(JitSession.generation old)))
+              (let [prepared (prepare-result engine
+                                             &candidate
+                                             &staged
+                                             &expressions
+                                             &(the (Array ReplValue) []))]
+                (match prepared
+                  (Result.Error error)
+                    (do
+                      (JitSession.set-serial! old
+                                              (Int.inc @(JitSession.serial &staged)))
+                      (SessionJit.dispose &staged)
+                      (Result.Error error))
+                  (Result.Success ready)
+                    (do
+                      (ReplEngineState.set-generation! engine
+                                                       (Int.inc @(ReplEngineState.generation engine)))
+                      (do
+                        (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+                        (ReplValues.clear! (ReplEngineState.results engine)))
+                      (SessionJit.dispose old)
+                      (ReplEngineState.set-jit! engine staged)
+                      (ReplEngineState.set-session! engine candidate)
+                      (match (run-prepared engine &ready)
+                        (Result.Error error) (Result.Error error)
+                        (Result.Success text)
+                          (Result.Success
+                            (String.append
+                              "[native state reset after definition commit]
+"
+                              &text)))))))
+            (match (prepare-result engine
+                                   &candidate
+                                   (ReplEngineState.jit engine)
+                                   &expressions
+                                   (ReplEngineState.results engine))
+              (Result.Error error) (Result.Error error)
+              (Result.Success ready)
+                (do
+                  (ReplEngineState.set-session! engine candidate)
+                  (run-prepared engine &ready))))))))
+
+(defmodule ReplEngine
+  (private prepare-result)
+  (hidden prepare-result)
+  (defn prepare-result [-engine session jit input values]
+    (let [runtime (ReplValues.runtime-input values input)]
+      (match (Session.infer-cell session &runtime)
+        (Result.Error error)
+          (Result.Error
+            (capture-error &error
+                           input
+                           (String.length &(ReplValues.prefix values))))
+        (Result.Success report)
+          (let-do [original-type (SessionTypedEntity.type
+                     (Array.unsafe-nth (CellReport.forms &report) 0))
+                   copied-string (String.= original-type "(Ref String)")
+                   type-info (if copied-string
+                     (Box.init (MonoType.String))
+                     @(Array.unsafe-nth (CellReport.root-types &report) 0))
+                   type (if copied-string
+                     (String.copy "String")
+                     (String.copy original-type))
+                   display (and (not (String.= &type "()"))
+                                (not (String.= &type "Unit")))
+                   retain (and display (not (String.starts-with? &type "(Ref ")))
+                   validation (if (and display (not retain))
+                     (match (Session.lower-cell-plain session &runtime)
+                       (Result.Error error) (Result.Error error)
+                       (Result.Success _) (Result.Success ()))
+                     (Result.Success ()))
+                   validation-failed (Result.error? &validation)
+                   slot (if display
+                     (ReplValues.allocate)
+                     (the (Ptr ReplValueSlot) (Pointer.from-long 0l)))
+                   copy-prefix "(String.copy (do
+"
+                   copied (if copied-string
+                     (SourceInput.init (String.copy (SourceInput.id input))
+                                       (String.concat
+                                         &[(String.copy copy-prefix)
+                                           (String.copy (SourceInput.source input))
+                                           @"
+))"]))
+                     (SourceInput.copy input))
+                   capture (if display
+                     (ReplValues.capture-input values &copied slot)
+                     (Pair.init (SourceInput.copy &runtime)
+                                (String.length &(ReplValues.prefix values))))
+                   offset (Int.+ @(Pair.b &capture)
+                                 (if (and display copied-string)
+                                   (String.length copy-prefix)
+                                   0))]
+            (match (match validation
+                (Result.Error error) (Result.Error error)
+                (Result.Success _)
+                  (SessionJit.compile-cell jit session (Pair.a &capture) false))
+              (Result.Error error)
+                (do
+                  (unless (null? slot) (ReplValues.discard-slot slot))
+                  (Result.Error
+                    (capture-error &error
+                                   input
+                                   (if validation-failed
+                                     (String.length &(ReplValues.prefix values))
+                                     offset))))
+              (Result.Success address)
+                (Result.Success
+                  (ReplPreparedResult.init address
+                                           slot
+                                           type
+                                           type-info
+                                           (Int.dec @(JitSession.serial jit))
+                                           retain))))))))
+
+(defmodule ReplEngine
+  (private active-input?)
+  (hidden active-input?)
+  (defn active-input? [engine id]
+    (let-do [active false
+             overlay (Array.unsafe-nth
+               (CompilerSession.overlay (ReplEngineState.session engine))
+               0)
+             inputs (SessionOverlay.inputs overlay)]
+      (for [i 0 (Array.length inputs)]
+        (when (String.= id (SourceInput.id (Array.unsafe-nth inputs i)))
+          (set! active true)))
+      active))
+
+  (private removal-impact)
+  (hidden removal-impact)
+  (defn removal-impact [engine number]
+    (let-do [entries (ReplEngineState.entries engine)
+             selected (Array.unsafe-nth entries (Int.dec number))
+             impact (ReplJournal.affected entries
+                                          (ReplEntry.definitions selected))
+             conservative false
+             definitions (Session.definitions (ReplEngineState.session engine))]
+      (for [i 0 (Array.length &definitions)]
+        (let [definition (Array.unsafe-nth &definitions i)]
+          (when (Array.contains? (ReplEntry.definitions selected)
+                                 (SessionDefInfo.name definition))
+            (match-ref (SessionDefInfo.kind definition)
+              (SessionDefKind.Function) ()
+              (SessionDefKind.Value) ()
+              _ (set! conservative true)))))
+      (Array.push-back! &impact number)
+      (when conservative
+        (for [i 0 (Array.length entries)]
+          (unless (Array.contains? &impact
+                                   (ReplEntry.number (Array.unsafe-nth entries i)))
+            (Array.push-back! &impact
+                              @(ReplEntry.number (Array.unsafe-nth entries i))))))
+      impact))
+
+  (doc preview-remove
+    "Previews input and dependency removal at the current journal revision.")
+  (defn preview-remove [engine number]
+    (let [entries (ReplEngineState.entries engine)]
+      (cond
+        (or (Int.< number 1) (Int.> number (Array.length entries)))
+          (Result.Error (diagnostic (fmt "no input %d" number)))
+        (let [entry (Array.unsafe-nth entries (Int.dec number))]
+          (or
+            (String./= (ReplEntry.status entry) "ok")
+            (or
+              (Array.empty? (ReplEntry.definitions entry))
+              (not
+                (active-input? engine (SourceInput.id (ReplEntry.input entry)))))))
+          (Result.Error
+            (diagnostic (fmt "input %d has no active definitions" number)))
+        (let-do [impact (removal-impact engine number)
+                 lines [(fmt "remove input %d; affected inputs:" number)]]
+          (for [i 0 (Array.length &impact)]
+            (let [entry (Array.unsafe-nth entries
+                                          (Int.dec @(Array.unsafe-nth &impact i)))]
+              (Array.push-back! &lines
+                                (fmt "  %d  %s"
+                                     @(ReplEntry.number entry)
+                                     &(String.join ", "
+                                                   (ReplEntry.definitions entry))))))
+          (Array.push-back! &lines
+                            (fmt
+                              "use :remove! %d to apply; expressions will not be replayed"
+                              number))
+          (ReplEngineState.set-pending-remove! engine number)
+          (ReplEngineState.set-pending-revision! engine
+                                                 (Array.length (ReplEngineState.events engine)))
+          (Result.Success (String.join "
+" &lines))))))
+
+  (doc remove-entry
+    "Applies a reviewed removal atomically, without replaying runtime effects.")
+  (defn remove-entry [engine number]
+    (if (or
+        (Int./= number @(ReplEngineState.pending-remove engine))
+        (Int./=
+          @(ReplEngineState.pending-revision engine)
+          (Array.length (ReplEngineState.events engine))))
+      (Result.Error
+        (diagnostic (fmt "preview this revision with :remove %d first" number)))
+      (let-do [entries (ReplEngineState.entries engine)
+               impact (removal-impact engine number)
+               ids (the (Array String) [])]
+        (ReplEngineState.set-pending-remove! engine 0)
+        (for [i 0 (Array.length &impact)]
+          (let [entry (Array.unsafe-nth entries
+                                        (Int.dec @(Array.unsafe-nth &impact i)))
+                id (SourceInput.id (ReplEntry.input entry))]
+            (when (and
+                (and (String.= (ReplEntry.status entry) "ok")
+                     (not (Array.empty? (ReplEntry.definitions entry))))
+                (and (active-input? engine id) (not (Array.contains? &ids id))))
+              (Array.push-back! &ids (String.copy id)))))
+        (match (Session.remove-inputs (ReplEngineState.session engine) &ids)
+          (Result.Error error) (Result.Error error)
+          (Result.Success _)
+            (let-do [_released (do
+                       (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+                       (ReplValues.clear! (ReplEngineState.results engine)))
+                     error (SessionJit.reset-code! (ReplEngineState.jit engine))]
+              (ReplEngineState.set-generation! engine
+                                               (Int.inc @(ReplEngineState.generation engine)))
+              (for [i 0 (Array.length &impact)]
+                (let-do [entry (Array.unsafe-nth entries
+                                                 (Int.dec @(Array.unsafe-nth &impact
+                                                                             i)))]
+                  (ReplEntry.set-stale! entry true)
+                  (when (Array.contains? &ids
+                                         (SourceInput.id (ReplEntry.input entry)))
+                    (ReplEntry.set-status! entry (String.copy "removed")))))
+              (if (String.empty? &error)
+                (Result.Success
+                  (String.copy
+                    "inputs removed; native state reset; expressions were not replayed"))
+                (Result.Error (diagnostic error)))))))))
+
+(defmodule ReplEngine
+  (defn editing-check [engine source]
+    (let [input (SourceInput.init @"repl:check" (String.copy source))
+          has-declarations (match (Surface.parse-input-diagnosed &input)
+            (Result.Error _) false
+            (Result.Success parsed)
+              (match (input-mask engine &parsed)
+                (Result.Error _) true
+                (Result.Success mask) (Array.contains? &mask &true)))
+          checked (if has-declarations
+            (SourceInput.copy &input)
+            (runtime-input engine &input))]
+      (match (Session.lower-cell-plain (ReplEngineState.session engine) &checked)
+        (Result.Error error)
+          (fmt "%s: %s" (Diagnostic.phase &error) (Diagnostic.message &error))
+        (Result.Success _)
+          (match (Session.infer-cell (ReplEngineState.session engine) &checked)
+            (Result.Error error) (String.copy (Diagnostic.message &error))
+            (Result.Success report)
+              (let-do [lines (the (Array String) [])
+                       definitions (CellReport.definitions &report)
+                       forms (CellReport.forms &report)]
+                (for [i 0 (Array.length definitions)]
+                  (Array.push-back! &lines
+                                    (fmt "%s : %s"
+                                         (SessionDefInfo.name (Array.unsafe-nth definitions
+                                                                                i))
+                                         (SessionDefInfo.scheme (Array.unsafe-nth definitions
+                                                                                  i)))))
+                (for [i 0 (Array.length forms)]
+                  (Array.push-back! &lines
+                                    (String.copy
+                                      (SessionTypedEntity.type (Array.unsafe-nth forms
+                                                                                 i)))))
+                (String.join "
+" &lines)))))))
+
+(defmodule ReplEngine
+  (doc inspect-path
+    "navigates borrowed native views without reevaluating source.")
+  (defn inspect-path [engine number arguments]
+    (match (ReplInspect.parse arguments)
+      (Result.Error error) (Result.Error (diagnostic error))
+      (Result.Success parsed)
+        (let-do [answer (Result.Error
+                   (diagnostic (fmt "no live result _%d" number)))
+                 values (ReplEngineState.results engine)
+                 selectors (Pair.a &parsed)
+                 request (Pair.b &parsed)]
+          (for [i 0 (Array.length values)]
+            (let [value (Array.unsafe-nth values i)]
+              (when (Int.= number @(ReplValue.number value))
+                (let [root (NativeView.init
+                        @(ReplValueSlot.address (Pointer.to-ref @(ReplValue.slot value)))
+                        @(ReplValue.type-info value)
+                        @(ReplValue.publication value)
+                        false)]
+                  (set! answer
+                        (match (ReplInspect.navigate (ReplEngineState.jit engine)
+                                                     &root
+                                                     selectors)
+                          (Result.Error error) (Result.Error (diagnostic error))
+                          (Result.Success view)
+                            (let [type (Type.render (Box.peek (NativeView.type &view)))
+                                  label (if (Array.empty? selectors)
+                                    @""
+                                    (String.append " "
+                                                   &(String.join " " selectors)))
+                                  rendered (render-view engine &view request)]
+                              (match rendered
+                                (Result.Error error) (Result.Error error)
+                                (Result.Success text)
+                                  (Result.Success (fmt "_%d%s : %s
+%s" number &label &(if @(NativeView.borrowed &view) (fmt "(Ref %s)" &type) type) &text))))))))))
+          answer))))
+
+(defmodule ReplEngine
+  (private stage-input)
+  (hidden stage-input)
+  (defn stage-input [candidate declarations]
+    (if (ReplInput.blank? (SourceInput.source declarations))
+      (match (Session.remove-input candidate (SourceInput.id declarations))
+        (Result.Error error) (Result.Error error)
+        (Result.Success _) (Result.Success (the (Array SessionDefInfo) [])))
+      (Session.upsert-input candidate declarations))))
+
+(defmodule ReplEngine
+  (defn- view-query! [engine view request selected]
+    (let-do [key (fmt "%s/%d/%s"
+                      &(Type.render (Box.peek (NativeView.type view)))
+                      @(CoreRef.id selected)
+                      (CoreRef.name selected))
+             queries (ReplEngineState.view-queries engine)
+             index -1]
+      (for [i 0 (Array.length queries)]
+        (when (String.= &key (ReplViewQuery.key (Array.unsafe-nth queries i)))
+          (set! index i)))
+      (if (>= index 0)
+        (let-do [channel (Pointer.to-ref
+                   @(ReplViewQuery.input (Array.unsafe-nth queries index)))]
+          (ReplViewInput.set-source! channel @(NativeView.address view))
+          (ReplViewInput.set-request! channel @request)
+          (Result.Success index))
+        (let [channel (Pointer.unsafe-alloc
+                (ReplViewInput.init @(NativeView.address view) @request))]
+          (match (prepare-result engine
+                                 (ReplEngineState.session engine)
+                                 (ReplEngineState.jit engine)
+                                 &(SourceInput.init @"repl:view"
+                                                    (ReplViewQueries.source channel
+                                                                            &(Type.render (Box.peek (NativeView.type view)))
+                                                                            (CoreRef.name selected)))
+                                 &[])
+            (Result.Error error)
+              (do (ReplViewQueries.discard-input channel) (Result.Error error))
+            (Result.Success prepared)
+              (do
+                (Array.push-back! queries
+                                  (ReplViewQuery.init key channel prepared))
+                (Result.Success (Int.dec (Array.length queries)))))))))
+
+  (private render-view)
+  (hidden render-view)
+  (defn render-view [engine original request]
+    (match (ReplInspect.dereference original)
+      (Result.Error error) (Result.Error (diagnostic error))
+      (Result.Success view)
+        (if (or @(InspectRequest.raw request)
+                (or
+                  (String.= (InspectRequest.view request) "raw")
+                  (String.= (InspectRequest.view request) "gtRawFor")))
+          (Result.Success
+            (ReplInspect.render (ReplEngineState.jit engine) &view request))
+          (match (Session.view-provider (ReplEngineState.session engine)
+                                        (Box.peek (NativeView.type &view)))
+            (Maybe.Nothing)
+              (Result.Success
+                (ReplInspect.render (ReplEngineState.jit engine) &view request))
+            (Maybe.Just selected)
+              (match (view-query! engine &view request &selected)
+                (Result.Error error) (Result.Error error)
+                (Result.Success index)
+                  (let [query (Array.unsafe-nth (ReplEngineState.view-queries engine)
+                                                index)
+                        prepared (ReplViewQuery.prepared query)]
+                    (let-do [_run (ignore
+                               (LLVM.call-i32 @(ReplPreparedResult.address prepared)))
+                             value (ReplValue.init 0
+                                                   @"ReplViewPresentation"
+                                                   @(ReplPreparedResult.type-info prepared)
+                                                   @(ReplPreparedResult.publication prepared)
+                                                   @(ReplPreparedResult.slot prepared))
+                             result-view (NativeView.init
+                               @(ReplValueSlot.address
+                                 (Pointer.to-ref @(ReplValue.slot &value)))
+                               @(ReplValue.type-info &value)
+                               @(ReplValue.publication &value)
+                               false)
+                             available (ReplInspect.navigate (ReplEngineState.jit engine)
+                                                             &result-view
+                                                             &[@"available"])
+                             text (ReplInspect.navigate (ReplEngineState.jit engine)
+                                                        &result-view
+                                                        &[@"text"])
+                             answer (match available
+                               (Result.Error error)
+                                 (Result.Error (diagnostic error))
+                               (Result.Success flag)
+                                 (if (=
+                                     (ReplInspect.byte-at @(NativeView.address &flag))
+                                     (Byte.from-int 0))
+                                   (if (String.empty? (InspectRequest.view request))
+                                     (Result.Success
+                                       (ReplInspect.render (ReplEngineState.jit engine)
+                                                           &view
+                                                           request))
+                                     (Result.Error
+                                       (diagnostic
+                                         (fmt "no applicable view %s"
+                                              (InspectRequest.view request)))))
+                                   (match text
+                                     (Result.Error error)
+                                       (Result.Error (diagnostic error))
+                                     (Result.Success output)
+                                       (let [rendered (ReplInspect.render (ReplEngineState.jit engine)
+                                                                          &output
+                                                                          &(InspectRequest.init 0
+                                                                                                @(InspectRequest.count request)
+                                                                                                @(InspectRequest.depth request)
+                                                                                                @(InspectRequest.bytes request)
+                                                                                                true
+                                                                                                @""
+                                                                                                false))]
+                                         (Result.Success rendered)))))]
+                      (ReplValues.reset-slot! @(ReplPreparedResult.slot prepared))
+                      answer))))))))

@@ -1,0 +1,111 @@
+(load "../carp-session-jit.carp")
+(load "Test.carp")
+(Project.no-echo)
+(when (= (host-os) "darwin") (add-cflag "-Wl,-stack_size,0x20000000"))
+(use-all Test)
+
+(defn core-dir []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Just root)
+      (if (String.ends-with? &root "/core") root (String.append &root "/core"))
+    (Maybe.Nothing) @"../../../carp/core"))
+
+(defn fields-match? [layout tagged]
+  (match-ref (NativeValueLayout.representation layout)
+    (NativeRepresentation.Nominal tag variants)
+      (let [fields (NativeVariantLayout.fields
+              (Array.unsafe-nth variants (if tagged 1 0)))]
+        (and (Bool.= tagged (Maybe.just? tag))
+             (and (Int.= (Array.length fields) 4)
+                  (and
+                    (Long.=
+                      @(NativeFieldLayout.offset (Array.unsafe-nth fields 2))
+                      8l)
+                    (Long.=
+                      @(NativeFieldLayout.offset (Array.unsafe-nth fields 3))
+                      16l)))))
+    _ false))
+
+(defn scenario []
+  (let-do [checks (the (Array Bool) [])]
+    (match (Session.create &(core-dir))
+      (Result.Error error) (IO.errorln (Diagnostic.message &error))
+      (Result.Success session)
+        (let-do [jit (SessionJit.create &(core-dir) "/tmp")
+                 declarations (SourceInput.init @"layout:types"
+                                                @"(deftype Packet [flag Bool unit () word Long data (Array Int)])
+(deftype (Padded a) (Empty []) (Data [Bool () Long a]))")
+                 committed (Session.upsert-input &session &declarations)
+                 input (SourceInput.init @"layout:value"
+                                         @"(do (ignore (Packet.init true () 9l [1 2])) (ignore (Padded.Data false () 8l [3 4])))")
+                 compiled (SessionJit.compile-cell &jit &session &input false)]
+          (Array.push-back! &checks (Result.success? &committed))
+          (Array.push-back! &checks (Result.success? &compiled))
+          (Array.push-back! &checks
+                            (match (SessionJit.value-layout &jit
+                                                            0
+                                                            &(MonoType.Named @"Packet"
+                                                                             []))
+                              (Result.Error error)
+                                (do (IO.errorln &error) false)
+                              (Result.Success layout)
+                                (and
+                                  (Long.= 40l @(NativeValueLayout.size &layout))
+                                  (fields-match? &layout false))))
+          (Array.push-back! &checks
+                            (match (SessionJit.value-layout &jit
+                                                            0
+                                                            &(MonoType.Named @"Padded"
+                                                                             [(Box.init
+                                                                                (MonoType.Named @"Array"
+                                                                                                [(Box.init (MonoType.Integer))]))]))
+                              (Result.Error error)
+                                (do (IO.errorln &error) false)
+                              (Result.Success layout)
+                                (and
+                                  (Long.= 48l @(NativeValueLayout.size &layout))
+                                  (fields-match? &layout true))))
+          (let-do [before (Array.length (JitSession.publications &jit))
+                   bad (SourceInput.init @"layout:bad"
+                                         @"(register missing-layout (Fn [] Int) \"metacarp_inspection_missing_native\") (missing-layout)")]
+            (Array.push-back! &checks
+                              (Result.error?
+                                &(SessionJit.compile-cell &jit
+                                                          &session
+                                                          &bad
+                                                          false)))
+            (Array.push-back! &checks
+                              (Int.= before
+                                     (Array.length (JitSession.publications &jit)))))
+          (ignore (SessionJit.reset-code! &jit))
+          (Array.push-back! &checks
+                            (Array.empty? (JitSession.publications &jit)))
+          (Array.push-back! &checks (Array.empty? (JitSession.layouts &jit)))
+          (Array.push-back! &checks
+                            (Result.error?
+                              &(SessionJit.value-layout &jit
+                                                        0
+                                                        &(MonoType.Integer))))
+          (SessionJit.dispose &jit)))
+    checks))
+
+(def *checks* (scenario))
+(defn check [index]
+  (if (Int.< index (Array.length &*checks*))
+    @(Array.unsafe-nth &*checks* index)
+    false))
+(deftest test
+  (assert-equal test 9 (Array.length &*checks*) "all layout scenarios completed")
+  (assert-true test (check 0) "layout declarations commit")
+  (assert-true test (check 1) "layouts come from successful native publication")
+  (assert-true test
+    (check 2)
+    "product padding, unit elision, and absent tag match emission")
+  (assert-true test
+    (check 3)
+    "generic sum payload offsets and tag match emission")
+  (assert-true test (check 4) "failed publication reports its error")
+  (assert-true test (check 5) "failed publication retains no layout environment")
+  (assert-true test (check 6) "reset retires native schemas")
+  (assert-true test (check 7) "reset retires cached views")
+  (assert-true test (check 8) "retired publication cannot be queried"))

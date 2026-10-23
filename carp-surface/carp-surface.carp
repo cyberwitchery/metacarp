@@ -1,13 +1,24 @@
-(load "git@github.com:carpentry-org/carp-reader@0.4.3")
+(load "git@github.com:carpentry-org/carp-reader@0.5.0")
 (load "../carp-source/carp-source.carp")
 
 (doc SurfaceSpan
   "is the half-open source range of a syntax node. It deliberately
 reuses carp-reader's `Info` values, so diagnostics can be reported without
 depending on a compiler driver or file system API.")
-(deftype SurfaceSpan [start Info
-                      end Info
-                      source Int])
+(doc SurfaceOrigin "identifies bytes that were written by the caller. Expansion
+may change a node's diagnostic location while retaining this origin.")
+(deftype SurfaceOrigin
+  [source Int
+   start Int
+   end Int
+   direct Bool
+   content-end Info])
+
+(deftype SurfaceSpan
+  [start Info
+   end Info
+   source Int
+   origin (Maybe SurfaceOrigin)])
 
 ;; which file the reader is currently reading, so a span knows where it came
 ;; from. Positions alone cannot say: every file starts at offset zero, and a
@@ -61,20 +72,49 @@ spans may call this.")
       (set! *surface-sources* kept))))
 
 (defmodule SurfaceSpan
+  (doc with-content-end "retains the reader's closing-token position for
+editing inside a container, including containers with a missing closer.")
+  (defn with-content-end [span point]
+    (let [origin (match-ref (SurfaceSpan.origin span)
+            (Maybe.Nothing) (the (Maybe SurfaceOrigin) (Maybe.Nothing))
+            (Maybe.Just original)
+              (let-do [bounded (SurfaceOrigin.copy original)]
+                (SurfaceOrigin.set-content-end! &bounded @point)
+                (Maybe.Just bounded)))]
+      (SurfaceSpan.init @(SurfaceSpan.start span)
+                        @(SurfaceSpan.end span)
+                        @(SurfaceSpan.source span)
+                        origin)))
+
   (doc from-located "creates a span from a `Reader.Located` node, in whichever
 file is being read.")
+  (defn from-reader [begin end]
+    (SurfaceSpan.init @begin
+                      @end
+                      *surface-source-index*
+                      (if (and (Int.> @(Info.line begin) 0)
+                               (Int.> @(Info.line end) 0))
+                        (Maybe.Just
+                          (SurfaceOrigin.init *surface-source-index*
+                                              @(Info.pos begin)
+                                              @(Info.pos end)
+                                              true
+                                              @end))
+                        (Maybe.Nothing))))
+
   (defn from-located [located]
-    (SurfaceSpan.init @(Located.info located)
-                      @(Located.end located)
-                      *surface-source-index*))
+    (from-reader (Located.info located) (Located.end located)))
 
   (doc anywhere "a span with no position and no file, for syntax a phase made
 up rather than read.")
   (defn anywhere []
-    (SurfaceSpan.init (Info.init 0 0 0) (Info.init 0 0 0) (no-source)))
+    (SurfaceSpan.init (Info.init 0 0 0)
+                      (Info.init 0 0 0)
+                      (no-source)
+                      (Maybe.Nothing)))
 
   (doc at "a span with positions but no file, for syntax built from parts.")
-  (defn at [start end] (SurfaceSpan.init start end (no-source)))
+  (defn at [start end] (SurfaceSpan.init start end (no-source) (Maybe.Nothing)))
 
   (doc byte-start "returns the UTF-8 byte offset at the start of a surface
 span.")
@@ -114,7 +154,8 @@ names, interpret special forms, or discard comments.")
   (Array [(Array (Box SurfaceNode))])
   (StaticArray [(Array (Box SurfaceNode))])
   (Dictionary [(Array (Box SurfaceNode))])
-  (Comment [String]))
+  (Comment [String])
+  (Invalid [String]))
 
 (doc SurfaceNode "is a `SurfaceForm` with the exact source range it came from.")
 (deftype SurfaceNode [span SurfaceSpan
@@ -128,6 +169,101 @@ buffer and stable identity supplied by its caller.")
 (deftype SourcedSurfaceModule [input SourceInput
                                module SurfaceModule])
 
+(defmodule SurfaceSpan
+  (doc generated "copies a diagnostic location without claiming written source.")
+  (defn generated [span]
+    (SurfaceSpan.init @(SurfaceSpan.start span)
+                      @(SurfaceSpan.end span)
+                      @(SurfaceSpan.source span)
+                      (Maybe.Nothing)))
+
+  (doc reanchored
+    "changes diagnostic blame while preserving a node's written origin.")
+  (defn reanchored [span blame]
+    (let [origin (match-ref (SurfaceSpan.origin span)
+            (Maybe.Nothing) (the (Maybe SurfaceOrigin) (Maybe.Nothing))
+            (Maybe.Just original)
+              (let-do [retained (SurfaceOrigin.copy original)]
+                (SurfaceOrigin.set-direct! &retained
+                                           (and @(SurfaceOrigin.direct original)
+                                                (and
+                                                  (Int.= @(SurfaceOrigin.source original)
+                                                         @(SurfaceSpan.source blame))
+                                                  (and
+                                                    (Int.>= @(SurfaceOrigin.start original)
+                                                            (byte-start blame))
+                                                    (Int.<= @(SurfaceOrigin.end original)
+                                                            (byte-end blame))))))
+                (Maybe.Just retained)))]
+      (SurfaceSpan.init @(SurfaceSpan.start blame)
+                        @(SurfaceSpan.end blame)
+                        @(SurfaceSpan.source blame)
+                        origin)))
+
+  (doc missing-at-end "is a zero-width source position for an absent expression.
+It retains origin only when its enclosing syntax belongs to the caller.")
+  (defn missing-at-end [span]
+    (let [point (match-ref (SurfaceSpan.origin span)
+            (Maybe.Just origin)
+              (if @(SurfaceOrigin.direct origin)
+                @(SurfaceOrigin.content-end origin)
+                @(SurfaceSpan.end span))
+            (Maybe.Nothing) @(SurfaceSpan.end span))
+          origin (match-ref (SurfaceSpan.origin span)
+            (Maybe.Just original)
+              (if @(SurfaceOrigin.direct original)
+                (Maybe.Just
+                  (SurfaceOrigin.init @(SurfaceOrigin.source original)
+                                      @(Info.pos &point)
+                                      @(Info.pos &point)
+                                      true
+                                      @&point))
+                (Maybe.Nothing))
+            (Maybe.Nothing) (Maybe.Nothing))]
+      (SurfaceSpan.init @&point @&point @(SurfaceSpan.source span) origin)))
+
+  (doc original-in-source "returns the exact original source range, when the
+node was written rather than generated. Unlike in-source, expansion does not
+change this range.")
+
+  (defn original-in-source [span source-id]
+    (match-ref (SurfaceSpan.origin span)
+      (Maybe.Nothing) (the (Maybe SourceSpan) (Maybe.Nothing))
+      (Maybe.Just origin)
+        (if @(SurfaceOrigin.direct origin)
+          (Maybe.Just
+            (SourceSpan.init
+              (let [own (source-name @(SurfaceOrigin.source origin))]
+                (if (String.empty? &own) (String.copy source-id) own))
+              @(SurfaceOrigin.start origin)
+              @(SurfaceOrigin.end origin)))
+          (Maybe.Nothing))))
+
+  (doc written-region "is the written body region after a binding boundary,
+ending before its container's actual closing token.")
+  (defn written-region [container boundary source]
+    (match (original-in-source container source)
+      (Maybe.Nothing) (the (Maybe SourceSpan) (Maybe.Nothing))
+      (Maybe.Just outer)
+        (match (original-in-source boundary source)
+          (Maybe.Nothing) (Maybe.Nothing)
+          (Maybe.Just lower)
+            (match-ref (SurfaceSpan.origin container)
+              (Maybe.Nothing) (Maybe.Nothing)
+              (Maybe.Just origin)
+                (let [start @(SourceSpan.end &lower)
+                      end @(Info.pos (SurfaceOrigin.content-end origin))]
+                  (if (Int.<= start end)
+                    (Maybe.Just
+                      (SourceSpan.init @(SourceSpan.source-id &outer) start end))
+                    (Maybe.Nothing))))))))
+
+(defmodule SurfaceNode
+  (doc generated "constructs compiler-generated syntax at a diagnostic location.
+Copying existing syntax preserves its written origin instead.")
+  (defn generated [span form]
+    (SurfaceNode.init (SurfaceSpan.generated &span) form)))
+
 (defmodule Surface
   (sig reanchor! (Fn [(Ref SurfaceNode) (Ref SurfaceSpan)] ()))
   (doc reanchor! "assigns every node in a generated syntax tree the supplied
@@ -135,7 +271,10 @@ source span. Macro expansion uses this on an owned copy so diagnostics point at
 the caller's invocation rather than at offsets in the macro definition buffer.")
   (defn reanchor! [node span]
     (do
-      (SurfaceNode.set-span! node (SurfaceSpan.copy span))
+      (SurfaceNode.set-span! node
+                             (SurfaceSpan.reanchored (SurfaceNode.span node)
+                                                     span))
+
       (match-ref (SurfaceNode.form node)
         (SurfaceForm.List items)
           (for [i 0 (Array.length items)]
@@ -289,6 +428,7 @@ the caller's invocation rather than at offsets in the macro definition buffer.")
 
   (defn append-node [buffer node]
     (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Invalid source) (StringBuf.append-str buffer source)
       (SurfaceForm.IntLit value) (StringBuf.append-str buffer &(Int.str @value))
       (SurfaceForm.ByteLit value)
         (StringBuf.append-str buffer &(Byte.str @value))
@@ -522,3 +662,5 @@ phase, a message, and where it happened.")
       (Result.Error diagnostic) diagnostic
       (Result.Success _)
         (Diagnostic.init @"parse" @"this source parses" (Maybe.Nothing)))))
+
+(load "observations.carp")

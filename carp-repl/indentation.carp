@@ -1,0 +1,189 @@
+(load "protocol.carp")
+(load "text-width.carp")
+(load "../carp-surface/carp-surface.carp")
+
+(deftype ReplIndentTarget
+  (Column [Int])
+  (Literal []))
+
+(doc ReplIndentation "formats newline edits from the shared reader's recovered
+structure. It never executes source or infers semantic binding identities.")
+(defmodule ReplIndentation
+  (private body-head?)
+  (hidden body-head?)
+  (defn body-head? [node]
+    (match-ref (ReaderNode.kind node)
+      (ReaderNodeKind.Atom (Form.Sym segments))
+        (and (Int.= (Array.length segments) 1)
+             (Array.contains?
+               &[@"def"
+                 @"defn"
+                 @"defmacro"
+                 @"defndynamic"
+                 @"fn"
+                 @"let"
+                 @"let-do"
+                 @"if"
+                 @"do"
+                 @"cond"
+                 @"match"
+                 @"match-ref"
+                 @"for"
+                 @"while"
+                 @"while-do"
+                 @"when"
+                 @"when-do"
+                 @"unless"
+                 @"unless-do"
+                 @"defmodule"
+                 @"deftest"]
+               (Array.unsafe-nth segments 0)))
+      _ false))
+
+  (private element-indices)
+  (hidden element-indices)
+  (defn element-indices [node]
+    (let-do [result (the (Array Int) [])
+             children (ReaderNode.children node)]
+      (for [i 0 (Array.length children)]
+        (let [child (Box.peek (Array.unsafe-nth children i))]
+          (match-ref (ReaderNode.kind child)
+            (ReaderNodeKind.Whitespace) ()
+            (ReaderNodeKind.Punctuation _) ()
+            (ReaderNodeKind.Missing _) ()
+            _
+              (unless (match (Reader.node-category child)
+                  (ReaderCategory.Comment) true
+                  _ false)
+                (Array.push-back! &result i)))))
+      result))
+
+  (private next-text)
+  (hidden next-text)
+  (defn next-text [source position]
+    (let-do [end position
+             length (String.length source)]
+      (while-do (and (Int.< end length)
+                     (or
+                       (Char.= (String.char-at source end) \space)
+                       (Char.= (String.char-at source end) \tab)))
+        (set! end (Int.inc end)))
+      end))
+
+  (private group-column)
+  (hidden group-column)
+  (defn group-column [source node group position quoted]
+    (let [children (ReaderNode.children node)
+          opening (Box.peek (Array.unsafe-nth children 0))
+          column (ReplTextWidth.column source
+                                       @(Info.pos (ReaderNode.start opening)))
+          items (element-indices node)
+          next (next-text source position)
+          closing (match-ref group
+            (ReaderGroup.List) \)
+            (ReaderGroup.Dictionary) \}
+            _ \])]
+      (cond
+        (and (Int.< next (String.length source))
+             (Char.= (String.char-at source next) closing))
+          column
+        (and (not quoted) (match-ref group (ReaderGroup.List) true _ false))
+          (cond
+            (Array.empty? &items) (Int.inc column)
+            (body-head?
+              (Box.peek (Array.unsafe-nth children @(Array.unsafe-nth &items 0))))
+              (Int.+ column 2)
+            (Int.> (Array.length &items) 1)
+              (ReplTextWidth.column source
+                                    @(Info.pos
+                                      (ReaderNode.start
+                                        (Box.peek
+                                          (Array.unsafe-nth children
+                                                            @(Array.unsafe-nth &items
+                                                                               1))))))
+            (Int.+ column 2))
+        (not (Array.empty? &items))
+          (ReplTextWidth.column source
+                                @(Info.pos
+                                  (ReaderNode.start
+                                    (Box.peek
+                                      (Array.unsafe-nth children
+                                                        @(Array.unsafe-nth &items
+                                                                           0))))))
+        (ReplTextWidth.column source @(Info.pos (ReaderNode.end opening))))))
+
+  (private active)
+  (hidden active)
+  (sig active
+       (Fn [(Ref String) (Ref ReaderNode) Int Int] (Maybe ReplIndentTarget)))
+  (defn active [source node position depth]
+    (if (Int./= @(Info.pos (ReaderNode.end node)) position)
+      (Maybe.Nothing)
+      (let-do [children (ReaderNode.children node)
+               data (match-ref (ReaderNode.kind node)
+                 (ReaderNodeKind.ReaderMacro name)
+                   (cond
+                     (String.= name "quote") -1
+                     (String.= name "quasiquote")
+                       (if (Int.< depth 0) depth (Int.inc depth))
+                     (or (String.= name "unquote")
+                         (String.= name "unquote-splicing"))
+                       (if (Int.> depth 0) (Int.dec depth) depth)
+                     depth)
+                 _ depth)
+               inner (the (Maybe ReplIndentTarget) (Maybe.Nothing))]
+        (for [i 0 (Array.length children)]
+          (when (Maybe.nothing? &inner)
+            (set! inner
+                  (active source
+                          (Box.peek (Array.unsafe-nth children i))
+                          position
+                          data))))
+        (if (Maybe.just? &inner)
+          inner
+          (match-ref (ReaderNode.kind node)
+            (ReaderNodeKind.Invalid category)
+              (match-ref category
+                (ReaderCategory.String) (Maybe.Just (ReplIndentTarget.Literal))
+                (ReaderCategory.Pattern) (Maybe.Just (ReplIndentTarget.Literal))
+                (ReaderCategory.Character)
+                  (Maybe.Just (ReplIndentTarget.Literal))
+                _ (Maybe.Nothing))
+            (ReaderNodeKind.Group group)
+              (if (and (not (Array.empty? children))
+                       (match-ref (ReaderNode.kind
+                           (Box.peek
+                             (Array.unsafe-nth children
+                                               (Int.dec (Array.length children)))))
+                         (ReaderNodeKind.Missing _) true
+                         _ false))
+                (Maybe.Just
+                  (ReplIndentTarget.Column
+                    (group-column source node group position (Int./= depth 0))))
+                (Maybe.Nothing))
+            _ (Maybe.Nothing))))))
+
+  (doc newline "returns a UTF-8 replacement at the exact cursor. Calls align
+with their first argument, body forms nest by two columns, and collections align
+with their first element. Newlines inside unfinished literals add no whitespace.")
+  (defn newline [source cursor]
+    (let-do [position (Int.max 0 (Int.min cursor (String.length source)))
+             prefix (String.byte-slice source 0 position)
+             document (Reader.read-syntax &prefix)
+             nodes (ReaderDocument.nodes &document)
+             target (the (Maybe ReplIndentTarget) (Maybe.Nothing))]
+      (for [i 0 (Array.length nodes)]
+        (when (Maybe.nothing? &target)
+          (set! target
+                (active source (Box.peek (Array.unsafe-nth nodes i)) position 0))))
+      (match target
+        (Maybe.Just (ReplIndentTarget.Literal))
+          (ReplEditingReply.init position position [@"
+"] @"")
+        _
+          (let-do [column (match-ref &target
+                     (Maybe.Just (ReplIndentTarget.Column n)) @n
+                     _ 0)
+                   end (next-text source position)]
+            (ReplEditingReply.init position end [(String.append "
+" &(String.allocate column \space))] @""))))))

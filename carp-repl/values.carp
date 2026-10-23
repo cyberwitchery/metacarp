@@ -1,0 +1,136 @@
+(load "../carp-source/carp-source.carp")
+(load "../carp-types/carp-types.carp")
+
+; The native result and its release callback live in the same JIT generation.
+; The host releases both before invalidating that generation.
+(deftype ReplValueSlot [address Long
+                        release (Fn [Long] ())])
+(deftype ReplValue
+  [number Int
+   type String
+   type-info (Box MonoType)
+   publication Int
+   slot (Ptr ReplValueSlot)])
+(deftype ReplPreparedResult
+  [address Long
+   slot (Ptr ReplValueSlot)
+   type String
+   type-info (Box MonoType)
+   publication Int
+   retain Bool])
+
+(doc ReplValues
+  "owns typed runtime results. Printed text is never the value store.")
+(defmodule ReplValues
+  (private empty-release)
+  (hidden empty-release)
+  (defn empty-release [unused] (ignore (the Long unused)))
+
+  (doc allocate "allocates an empty result channel before native publication.")
+  (defn allocate [] (Pointer.unsafe-alloc (ReplValueSlot.init 0l empty-release)))
+
+  (doc reset-slot! "releases one query result while keeping its stable
+channel address for the next invocation. Clears the native callback first.")
+  (defn reset-slot! [slot]
+    (let-do [channel (Pointer.to-ref slot)
+             drop @(ReplValueSlot.release channel)]
+      (when (Long./= @(ReplValueSlot.address channel) 0l) (drop 0l))
+      (ReplValueSlot.set-address! channel 0l)
+      (ReplValueSlot.set-release! channel empty-release)))
+
+  (doc discard-slot
+    "releases callback environments before the JIT is invalidated.")
+  (defn discard-slot [slot]
+    (let [-owned (Pointer.to-value slot)] (Pointer.free slot)))
+
+  (doc release "releases the owned value, then its native callback environment.")
+  (defn release [value]
+    (let-do [slot @(ReplValue.slot value)
+             drop @(ReplValueSlot.release (Pointer.to-ref slot))]
+      (drop 0l)
+      (discard-slot slot)))
+
+  (doc clear! "drops newer results before the values they might borrow.")
+  (defn clear! [values]
+    (let-do [count (Array.length values)]
+      (for [i count 0 -1] (release (Array.unsafe-nth values (Int.dec i))))
+      (while-do (not (Array.empty? values)) (ignore (Array.pop-back! values)))))
+
+  (doc primitive?
+    "identifies result types whose expression aliases copy a scalar.")
+  (defn primitive? [type]
+    (Array.contains?
+      &[@"Int"
+        @"Long"
+        @"Bool"
+        @"Float"
+        @"Double"
+        @"Byte"
+        @"Char"
+        @"Int8"
+        @"Int16"
+        @"Int32"
+        @"Int64"
+        @"Uint8"
+        @"Uint16"
+        @"Uint32"
+        @"Uint64"
+        @"CChar"]
+      type))
+
+  (doc aliases
+    "builds lexical aliases over live typed storage, without copying owners.")
+  (defn aliases [values]
+    (let-do [bindings (the (Array String) [])]
+      (for [i 0 (Array.length values)]
+        (let-do [value (Array.unsafe-nth values i)
+                 slot (Pointer.to-ref @(ReplValue.slot value))
+                 expression (fmt
+                   "(%s (the (Ptr %s) (Pointer.from-long %sl)))"
+                   (if (primitive? (ReplValue.type value))
+                     "Pointer.to-value"
+                     "Pointer.to-ref")
+                   (ReplValue.type value)
+                   &(Long.str @(ReplValueSlot.address slot)))]
+          (Array.push-back! &bindings
+                            (fmt "_%d %s" @(ReplValue.number value) &expression))
+          (when (Int.= i (Int.dec (Array.length values)))
+            (Array.push-back! &bindings (String.append "_ " &expression)))))
+      (String.join " " &bindings)))
+
+  (doc prefix
+    "the exact prefix whose byte length maps diagnostics to caller source.")
+  (defn prefix [values] (fmt "(let [%s] (do
+" &(aliases values)))
+
+  (doc runtime-input
+    "checks and evaluates expressions against live result aliases.")
+  (defn runtime-input [values input]
+    (SourceInput.init (String.copy (SourceInput.id input))
+                      (String.concat
+                        &[(prefix values)
+                          (String.copy (SourceInput.source input))
+                          @"
+))"])))
+
+  (doc capture-input
+    "builds one native evaluation that stores an owned value exactly once.")
+  (defn capture-input [values input slot]
+    (let [begin (fmt "(let [%s __repl_value (do
+" &(aliases values))
+          channel (Pointer.to-ref slot)
+          end (fmt "
+) __repl_storage (Pointer.unsafe-alloc __repl_value)]
+ (do
+  (Pointer.set (the (Ptr Long) (Pointer.from-long %sl)) (Pointer.to-long __repl_storage))
+  (Pointer.set (the (Ptr (Fn [Long] ())) (Pointer.from-long %sl))
+   (fn [unused] (let-do [owned (Pointer.to-value __repl_storage)]
+     (Pointer.free __repl_storage) (ignore owned))))))" &(Long.str
+                     (Pointer.to-long
+                       (Pointer.address (ReplValueSlot.address channel)))) &(Long.str
+                     (Pointer.to-long
+                       (Pointer.address (ReplValueSlot.release channel)))))] (Pair.init
+        (SourceInput.init (String.copy (SourceInput.id input))
+                          (String.concat
+                            &[begin (String.copy (SourceInput.source input)) end]))
+        (String.length &begin)))))

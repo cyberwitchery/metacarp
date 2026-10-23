@@ -1,0 +1,125 @@
+(load "protocol.carp")
+(load "../carp-surface/editing.carp")
+
+(doc ReplLanguageSyntax "translates the shared reader's lossless tree into
+protocol ranges. It does not recognize Carp spellings or invent token kinds.")
+(defmodule ReplLanguageSyntax
+  (defn range [node]
+    (ReplRange.init @(Info.pos (ReaderNode.start node))
+                    @(Info.pos (ReaderNode.end node))))
+
+  (defn kind [category]
+    (match-ref category
+      (ReaderCategory.Symbol) (ReplHighlightKind.Symbol)
+      (ReaderCategory.Number) (ReplHighlightKind.Number)
+      (ReaderCategory.Boolean) (ReplHighlightKind.Boolean)
+      (ReaderCategory.String) (ReplHighlightKind.String)
+      (ReaderCategory.Pattern) (ReplHighlightKind.Pattern)
+      (ReaderCategory.Character) (ReplHighlightKind.Character)
+      (ReaderCategory.Comment) (ReplHighlightKind.Comment)
+      (ReaderCategory.Open) (ReplHighlightKind.Delimiter)
+      (ReaderCategory.Close) (ReplHighlightKind.Delimiter)
+      (ReaderCategory.Prefix) (ReplHighlightKind.ReaderPrefix)
+      _ (ReplHighlightKind.Symbol)))
+
+  (sig collect!
+       (Fn
+         [(Ref ReaderNode)
+          (Ref (Array ReplHighlight))
+          (Ref (Array ReplDelimiterPair))]
+         ()))
+  (defn collect! [node highlights pairs]
+    (let [children (ReaderNode.children node)]
+      (if (Array.empty? children)
+        (match-ref (ReaderNode.kind node)
+          (ReaderNodeKind.Whitespace) ()
+          (ReaderNodeKind.Missing _) ()
+          _
+            (Array.push-back! highlights
+                              (ReplHighlight.init (range node)
+                                                  (kind &(Reader.node-category node)))))
+        (do
+          (match-ref (ReaderNode.kind node)
+            (ReaderNodeKind.Group _)
+              (when (Int.>= (Array.length children) 2)
+                (let [first (Box.peek (Array.unsafe-nth children 0))
+                      last (Box.peek
+                        (Array.unsafe-nth children
+                                          (Int.dec (Array.length children))))]
+                  (match-ref (ReaderNode.kind last)
+                    (ReaderNodeKind.Punctuation (ReaderCategory.Close))
+                      (Array.push-back! pairs
+                                        (ReplDelimiterPair.init (range first)
+                                                                (range last)))
+                    _ ())))
+            _ ())
+          (for [i 0 (Array.length children)]
+            (collect! (Box.peek (Array.unsafe-nth children i)) highlights pairs))))))
+
+  (defn analysis [request document]
+    (let-do [highlights (the (Array ReplHighlight) [])
+             pairs (the (Array ReplDelimiterPair) [])
+             diagnostics (the (Array ReplDiagnostic) [])
+             nodes (ReaderDocument.nodes document)
+             issues (ReaderDocument.issues document)]
+      (for [i 0 (Array.length nodes)]
+        (collect! (Box.peek (Array.unsafe-nth nodes i)) &highlights &pairs))
+      (for [i 0 (Array.length issues)]
+        (let [issue (Array.unsafe-nth issues i)]
+          (Array.push-back! &diagnostics
+                            (ReplDiagnostic.init
+                              (Maybe.Just
+                                (ReplRange.init @(Info.pos (ReaderIssue.start issue))
+                                                @(Info.pos (ReaderIssue.end issue))))
+                              (ReplSeverity.Error)
+                              (Parser.format-error (ReaderIssue.error issue))))))
+      (ReplAnalysis.init @(ReplLanguageRequest.document request)
+                         @(ReplLanguageRequest.revision request)
+                         @(ReplLanguageRequest.session request)
+                         highlights
+                         pairs
+                         diagnostics
+                         (match (ReaderDocument.status document)
+                           (ReaderStatus.Complete) (ReplCompleteness.Complete)
+                           (ReaderStatus.Incomplete)
+                             (ReplCompleteness.Incomplete)
+                           (ReaderStatus.Invalid) (ReplCompleteness.Invalid))
+                         (ReplAnalysisState.SyntaxOnly))))
+
+  (sig word-node! (Fn [(Ref ReaderNode) (Ref String) Int (Ref ReplWord)] ()))
+  (defn word-node! [node source cursor word]
+    (let [start @(Info.pos (ReaderNode.start node))
+          end @(Info.pos (ReaderNode.end node))
+          children (ReaderNode.children node)]
+      (when (and (Int.<= start cursor) (Int.<= cursor end))
+        (if (not (Array.empty? children))
+          (for [i 0 (Array.length children)]
+            (word-node! (Box.peek (Array.unsafe-nth children i))
+                        source
+                        cursor
+                        word))
+          (match (Reader.node-category node)
+            (ReaderCategory.Symbol)
+              (do
+                (ReplWord.set-start! word start)
+                (ReplWord.set-end! word end)
+                (ReplWord.set-prefix! word
+                                      (String.byte-slice source start cursor))
+                (ReplWord.set-name! word (String.byte-slice source start end))
+                (ReplWord.set-active! word true))
+            (ReaderCategory.String) (ReplWord.set-active! word false)
+            (ReaderCategory.Pattern) (ReplWord.set-active! word false)
+            (ReaderCategory.Character) (ReplWord.set-active! word false)
+            (ReaderCategory.Comment) (ReplWord.set-active! word false)
+            (ReaderCategory.Number) (ReplWord.set-active! word false)
+            (ReaderCategory.Boolean) (ReplWord.set-active! word false)
+            _ ())))))
+
+  (defn word [document cursor]
+    (let-do [source (ReaderDocument.source document)
+             position (Int.max 0 (Int.min cursor (String.length source)))
+             word (ReplWord.init position position @"" @"" true)
+             nodes (ReaderDocument.nodes document)]
+      (for [i 0 (Array.length nodes)]
+        (word-node! (Box.peek (Array.unsafe-nth nodes i)) source position &word))
+      word)))

@@ -1,0 +1,185 @@
+(deftype SourceSemanticFact [name String
+                             role String
+                             span SourceSpan])
+(deftype SourceLexicalIdentity
+  (Local [Int])
+  (Cell [Int]))
+(deftype SourceLexicalBinding
+  [name String
+   role String
+   identity SourceLexicalIdentity
+   declaration (Maybe SourceSpan)])
+(deftype SourceCompileEnvironment
+  [key String
+   query (Fn [(Ref String) Bool] (Array SourceLexicalBinding))])
+(deftype SourceContext
+  (Evaluation [])
+  (Quoted [])
+  (Type []))
+(deftype SourceCompileScope
+  [span SourceSpan
+   locals (Array SourceLexicalBinding)
+   environment Int
+   context SourceContext])
+(def *source-observing* false)
+(def *source-observation-id* @"")
+(def *source-semantic-facts* (the (Array SourceSemanticFact) []))
+(def *source-compile-scopes* (the (Array SourceCompileScope) []))
+(def *source-compile-environments* (the (Array SourceCompileEnvironment) []))
+(def *source-compile-environment* -1)
+(def *source-binding-identity* 0)
+
+(defmodule SourceObservations
+  (defn record! [node name role]
+    (when *source-observing*
+      (match (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                             &*source-observation-id*)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (Array.push-back! &*source-semantic-facts*
+                            (SourceSemanticFact.init (String.copy name)
+                                                     (String.copy role)
+                                                     span)))))
+
+  (defn region! [boundary body locals]
+    (when (and *source-observing*
+               (WorkBudget.consume! (Int.inc (Array.length locals))))
+      (match (SurfaceSpan.original-in-source boundary &*source-observation-id*)
+        (Maybe.Nothing) ()
+        (Maybe.Just lower)
+          (match (SurfaceSpan.original-in-source body &*source-observation-id*)
+            (Maybe.Nothing) ()
+            (Maybe.Just upper)
+              (when (Int.<= @(SourceSpan.end &lower) @(SourceSpan.end &upper))
+                (Array.push-back! &*source-compile-scopes*
+                                  (SourceCompileScope.init
+                                    (SourceSpan.init @(SourceSpan.source-id &upper)
+                                                     @(SourceSpan.end &lower)
+                                                     @(SourceSpan.end &upper))
+                                    (Array.copy locals)
+                                    *source-compile-environment*
+                                    (SourceContext.Evaluation))))))))
+  (defn written? [node]
+    (and *source-observing*
+         (Maybe.just?
+           &(SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                            &*source-observation-id*))))
+  (defn begin! [source]
+    (do
+      (set! *source-observing* true)
+      (set! *source-observation-id* (String.copy source))
+      (set! *source-semantic-facts* [])
+      (set! *source-compile-scopes* [])
+      (set! *source-compile-environments* [])
+      (set! *source-compile-environment* -1)
+      (set! *source-binding-identity* 0)))
+
+  (defn binding [node name role]
+    (let-do [identity *source-binding-identity*
+             declaration (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                                         &*source-observation-id*)]
+      (when-do *source-observing*
+        (set! *source-binding-identity* (Int.inc identity))
+        (record! node name role))
+      (SourceLexicalBinding.init (String.copy name)
+                                 (String.copy role)
+                                 (SourceLexicalIdentity.Local identity)
+                                 declaration)))
+
+  (defn reference! [node name]
+    (when (and (written? node) (Int.>= *source-compile-environment* 0))
+      (let [query (SourceCompileEnvironment.query
+              (Array.unsafe-nth &*source-compile-environments*
+                                *source-compile-environment*))
+            bindings (~query name true)]
+        (for [i 0 (Array.length &bindings)]
+          (let [binding (Array.unsafe-nth &bindings i)]
+            (when (String.= name (SourceLexicalBinding.name binding))
+              (record! node name (SourceLexicalBinding.role binding))))))))
+
+  (defn scope! [node locals]
+    (when (and *source-observing*
+               (WorkBudget.consume! (Int.inc (Array.length locals))))
+      (match (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                             &*source-observation-id*)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (Array.push-back! &*source-compile-scopes*
+                            (SourceCompileScope.init span
+                                                     (Array.copy locals)
+                                                     *source-compile-environment*
+                                                     (SourceContext.Evaluation))))))
+
+  (defn opaque! [node]
+    (when *source-observing*
+      (match (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                             &*source-observation-id*)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (Array.push-back! &*source-compile-scopes*
+                            (SourceCompileScope.init span
+                                                     []
+                                                     -1
+                                                     (SourceContext.Quoted))))))
+
+  (defn type-context! [node]
+    (when *source-observing*
+      (match (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                             &*source-observation-id*)
+        (Maybe.Nothing) ()
+        (Maybe.Just span)
+          (Array.push-back! &*source-compile-scopes*
+                            (SourceCompileScope.init span
+                                                     []
+                                                     -1
+                                                     (SourceContext.Type))))))
+
+  (doc type-bindings! "attaches the parameters observed while resolving a type
+signature to its nested type scopes, including partial signatures.")
+  (defn type-bindings! [node bindings]
+    (when *source-observing*
+      (match (SurfaceSpan.original-in-source (SurfaceNode.span node)
+                                             &*source-observation-id*)
+        (Maybe.Nothing) ()
+        (Maybe.Just enclosing)
+          (for [i 0 (Array.length &*source-compile-scopes*)]
+            (let [scope (Array.unsafe-nth &*source-compile-scopes* i)
+                  span (SourceCompileScope.span scope)]
+              (when (and
+                  (Int.<= @(SourceSpan.start &enclosing)
+                          @(SourceSpan.start span))
+                  (and
+                    (Int.>= @(SourceSpan.end &enclosing) @(SourceSpan.end span))
+                    (match-ref (SourceCompileScope.context scope)
+                      (SourceContext.Type) true
+                      _ false)))
+                (SourceCompileScope.set-locals! scope (Array.copy bindings))))))))
+
+  (defn environment-index [key]
+    (let-do [found -1]
+      (for [i 0 (Array.length &*source-compile-environments*)]
+        (when (String.= key
+                        (SourceCompileEnvironment.key
+                          (Array.unsafe-nth &*source-compile-environments* i)))
+          (set! found i)))
+      found))
+
+  (defn select-environment! [index] (set! *source-compile-environment* index))
+
+  (defn add-environment! [key query]
+    (let-do [index (Array.length &*source-compile-environments*)]
+      (Array.push-back! &*source-compile-environments*
+                        (SourceCompileEnvironment.init key query))
+      (select-environment! index)))
+
+  (defn scopes [] (Array.copy &*source-compile-scopes*))
+  (defn environments [] (Array.copy &*source-compile-environments*))
+
+  (defn end! []
+    (let-do [facts (Array.copy &*source-semantic-facts*)]
+      (set! *source-observing* false)
+      (set! *source-semantic-facts* [])
+      (set! *source-compile-scopes* [])
+      (set! *source-compile-environments* [])
+      (set! *source-compile-environment* -1)
+      facts)))

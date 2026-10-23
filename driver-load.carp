@@ -459,7 +459,7 @@
 ; reads a git-referenced module out of the cache, installing the checkout
 ; first when it is missing. A target naming a file of the checkout
 ; (`file-load-target`) reads that file, as the reference does.
-(defn read-git-source [target]
+(defn read-cached-git-source [target]
   (let-do [space (String.index-of target \space)
            name (if (Int.< space 0) @target (String.byte-slice target 0 space))
            file (if (Int.< space 0)
@@ -520,6 +520,80 @@
                       (Maybe.Just (Pair.init @&main-file text))
                     (Result.Error _)
                       (the (Maybe (Pair String String)) (Maybe.Nothing)))))))))
+
+(def *package-overrides* (the (Array (Pair String String)) []))
+
+(doc add-package-override! "maps one exact git-reference load to a local source
+entry point for this driver invocation. Released cache entries remain immutable.")
+(defn parse-package-override [specification]
+  (let [separator (String.index-of specification \=)
+        length (String.length specification)]
+    (if (or (Int.<= separator 0) (Int.>= separator (Int.dec length)))
+      (Result.Error @"expected <git-reference>=<source.carp>")
+      (let [name (String.byte-slice specification 0 separator)
+            path (String.byte-slice specification (Int.inc separator) length)]
+        (if (git-ref? &name)
+          (Result.Success (Pair.init name path))
+          (Result.Error @"package override must name an exact git reference"))))))
+
+(defn add-package-override! [specification]
+  (match (parse-package-override specification)
+    (Result.Error error) (Result.Error error)
+    (Result.Success entry)
+      (match (package-override (Pair.a &entry))
+        (Maybe.Just _) (Result.Error @"duplicate package override")
+        (Maybe.Nothing)
+          (do (Array.push-back! &*package-overrides* entry) (Result.Success ())))))
+
+(private package-override)
+(hidden package-override)
+(defn package-override [name]
+  (let-do [found (the (Maybe String) (Maybe.Nothing))]
+    (for [i 0 (Array.length &*package-overrides*)]
+      (let [entry (Array.unsafe-nth &*package-overrides* i)]
+        (when (String.= (Pair.a entry) name)
+          (set! found (Maybe.Just (String.copy (Pair.b entry)))))))
+    found))
+
+(defn read-git-source [name]
+  (match (package-override name)
+    (Maybe.Nothing) (read-cached-git-source name)
+    (Maybe.Just path)
+      (let [canonical (normalize-path &path)]
+        (match (IO.read-file &canonical)
+          (Result.Success source) (Maybe.Just (Pair.init canonical source))
+          (Result.Error error)
+            (do
+              (IO.errorln
+                &(fmt
+                  "carp-compiler: package override '%s': %s"
+                  &canonical
+                  &error))
+              (the (Maybe (Pair String String)) (Maybe.Nothing)))))))
+
+(doc add-default-package-overrides! "loads newline-separated development
+defaults. Explicit command-line overrides take precedence. Repeated defaults
+keep the first entry; a malformed specification fails the invocation.")
+(defn add-default-package-overrides! [configuration]
+  (let-do [lines (String.lines configuration)
+           failure (the (Maybe String) (Maybe.Nothing))]
+    (for [i 0 (Array.length &lines)]
+      (when (Maybe.nothing? &failure)
+        (let [line (Array.unsafe-nth &lines i)]
+          (unless (String.empty? line)
+            (match (parse-package-override line)
+              (Result.Error error) (set! failure (Maybe.Just error))
+              (Result.Success entry)
+                (when (Maybe.nothing? &(package-override (Pair.a &entry)))
+                  (Array.push-back! &*package-overrides* entry)))))))
+    (match failure
+      (Maybe.Just error) (Result.Error error)
+      (Maybe.Nothing) (Result.Success ()))))
+
+(defn load-env-package-overrides! []
+  (match (IO.getenv "CARP_PACKAGE_OVERRIDES")
+    (Maybe.Nothing) (the (Result () String) (Result.Success ()))
+    (Maybe.Just configuration) (add-default-package-overrides! &configuration)))
 
 ; the directory portion of a path ("." when there is none).
 (defn dir-of [path]

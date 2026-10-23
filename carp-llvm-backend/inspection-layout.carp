@@ -1,0 +1,219 @@
+(load "carp-llvm-backend.carp")
+
+(doc NativeFieldLayout "describes a borrowed field using the generating
+backend's concrete type and byte offset. It owns no native storage.")
+(deftype NativeFieldLayout [name String
+                            type (Box MonoType)
+                            offset Long])
+(deftype NativeVariantLayout
+  [name String
+   tag Int
+   fields (Array NativeFieldLayout)])
+(deftype NativeRepresentation
+  (Signed [Int])
+  (Unsigned [Int])
+  (Real [Int])
+  (Text [])
+  (Character [])
+  (Boolean [])
+  (Unit [])
+  (Pointer [])
+  (Borrow [(Box MonoType)])
+  (Sequence [(Box MonoType) Long Long Long])
+  (Function [Long Long])
+  (Nominal [(Maybe Long) (Array NativeVariantLayout)])
+  (Opaque []))
+(deftype NativeValueLayout
+  [type (Box MonoType)
+   size Long
+   representation NativeRepresentation])
+(deftype NativeClosureLayout [symbol String
+                              captures (Array NativeFieldLayout)])
+(deftype NativeLayoutEnvironment
+  [constructors (Array CoreConstructorDeclaration)
+   foreign-layouts (Array ForeignTypeLayout)])
+
+(defmodule LLVMBackend
+  (doc inspection-environment "copies the layout inputs used by this emission.
+The result contains compiler data and no LLVM handles.")
+  (defn inspection-environment [backend]
+    (NativeLayoutEnvironment.init @(BackendModule.constructors backend)
+                                  (Array.copy &*llvm-foreign-layouts*)))
+
+  (doc inspection-closures "exports names, concrete capture types, and offsets
+from the closure layouts used by the current emission.")
+  (defn inspection-closures [ctx td backend]
+    (let-do [result (the (Array NativeClosureLayout) [])
+             closures (BackendModule.closure-functions backend)]
+      (for [i 0 (Array.length closures)]
+        (let-do [closure (Array.unsafe-nth closures i)
+                 captures (ClosureFunction.captures closure)
+                 layout (llvm-closure-env-type ctx captures)
+                 fields (the (Array NativeFieldLayout) [])]
+          (for [j 0 (Array.length captures)]
+            (let [capture (Array.unsafe-nth captures j)]
+              (Array.push-back! &fields
+                                (NativeFieldLayout.init @(CoreRef.name (Pair.a capture))
+                                                        @(Pair.b capture)
+                                                        (LLVM.offset-of-element td
+                                                                                layout
+                                                                                j)))))
+          (Array.push-back! &result
+                            (NativeClosureLayout.init @(ClosureFunction.symbol closure)
+                                                      fields))))
+      result))
+
+  (private inspection-foreign)
+  (hidden inspection-foreign)
+  (defn inspection-foreign [type]
+    (let [index (ForeignLayouts.index &*llvm-foreign-layouts*
+                                      &(CAbi.type-key type))]
+      (if (Int.< index 0)
+        (NativeRepresentation.Opaque)
+        (let-do [layout (Array.unsafe-nth &*llvm-foreign-layouts* index)
+                 declared (ForeignTypeLayout.fields layout)
+                 fields (the (Array NativeFieldLayout) [])]
+          (for [i 0 (Array.length declared)]
+            (let [field (Array.unsafe-nth declared i)]
+              (Array.push-back! &fields
+                                (NativeFieldLayout.init @(ForeignFieldLayout.name field)
+                                                        @(ForeignFieldLayout.type field)
+                                                        @(ForeignFieldLayout.offset field)))))
+          (if (Array.empty? &fields)
+            (NativeRepresentation.Opaque)
+            (NativeRepresentation.Nominal (Maybe.Nothing)
+                                          [(NativeVariantLayout.init (llvm-instance-name type)
+                                                                     0
+                                                                     fields)]))))))
+
+  (private inspection-nominal)
+  (hidden inspection-nominal)
+  (defn inspection-nominal [ctx td type layout]
+    (let-do [variants (the (Array NativeVariantLayout) [])
+             name (llvm-instance-name type)]
+      (for [i 0 (Array.length &*llvm-backend-constructors*)]
+        (let [constructor (Array.unsafe-nth &*llvm-backend-constructors* i)]
+          (when (llvm-sum-variant-of? constructor &name)
+            (let-do [tag @(CoreConstructorDeclaration.tag constructor)
+                     variant (llvm-variant-struct ctx type tag)
+                     names (CoreConstructorDeclaration.field-names constructor)
+                     arguments (CoreConstructorDeclaration.arguments constructor)
+                     fields (the (Array NativeFieldLayout) [])]
+              (for [j 0 (Array.length arguments)]
+                (let [field-type (llvm-ctor-field-monotype i type j)
+                      label (if (Int.< j (Array.length names))
+                        @(Array.unsafe-nth names j)
+                        (Int.str j))
+                      offset (if (unit-type? &field-type)
+                        0l
+                        (Long.+ (LLVM.offset-of-element td layout 0)
+                                (LLVM.offset-of-element td
+                                                        variant
+                                                        (llvm-ctor-adjusted-index i
+                                                                                  type
+                                                                                  j))))]
+                  (Array.push-back! &fields
+                                    (NativeFieldLayout.init label
+                                                            (Box.init field-type)
+                                                            offset))))
+              (Array.push-back! &variants
+                                (NativeVariantLayout.init
+                                  @(CoreRef.name
+                                    (CoreConstructorDeclaration.reference constructor))
+                                  tag
+                                  fields))))))
+      (if (Array.empty? &variants)
+        (inspection-foreign type)
+        (NativeRepresentation.Nominal
+          (if (Int.= (Array.length &variants) 1)
+            (Maybe.Nothing)
+            (Maybe.Just (LLVM.offset-of-element td layout 1)))
+          variants))))
+
+  (private inspection-representation)
+  (hidden inspection-representation)
+  (defn inspection-representation [ctx td type layout]
+    (match-ref type
+      (MonoType.Integer) (NativeRepresentation.Signed 32)
+      (MonoType.String) (NativeRepresentation.Text)
+      (MonoType.Boolean) (NativeRepresentation.Boolean)
+      (MonoType.Unit) (NativeRepresentation.Unit)
+      (MonoType.Variable _) (NativeRepresentation.Opaque)
+      (MonoType.Reference inner _) (NativeRepresentation.Borrow @inner)
+      (MonoType.Function _ _)
+        (NativeRepresentation.Function (LLVM.offset-of-element td layout 0)
+                                       (LLVM.offset-of-element td layout 1))
+      (MonoType.Named name arguments)
+        (cond
+          (String.= name "Char") (NativeRepresentation.Character)
+          (String.= name "Double") (NativeRepresentation.Real 64)
+          (String.= name "Float") (NativeRepresentation.Real 32)
+          (or (String.= name "Ptr") (String.= name "Pattern"))
+            (NativeRepresentation.Pointer)
+          (Array.contains? &[@"Byte" @"Uint8"] name)
+            (NativeRepresentation.Unsigned 8)
+          (String.= name "Uint16") (NativeRepresentation.Unsigned 16)
+          (String.= name "Uint32") (NativeRepresentation.Unsigned 32)
+          (String.= name "Uint64") (NativeRepresentation.Unsigned 64)
+          (Array.contains? &[@"Int8" @"CChar"] name)
+            (NativeRepresentation.Signed 8)
+          (String.= name "Int16") (NativeRepresentation.Signed 16)
+          (String.= name "Int32") (NativeRepresentation.Signed 32)
+          (Array.contains? &[@"Long" @"Int64"] name)
+            (NativeRepresentation.Signed 64)
+          (and
+            (or (String.= name "Array") (String.= name "StaticArray"))
+            (Int.= (Array.length arguments) 1))
+            (let [element (Array.unsafe-nth arguments 0)
+                  stride (if (unit-type? (Box.peek element))
+                    0l
+                    (LLVM.abi-size-of-type td
+                                           (llvm-lower-type ctx
+                                                            (Box.peek element))))]
+              (NativeRepresentation.Sequence @element
+                                             (LLVM.offset-of-element td layout 0)
+                                             (LLVM.offset-of-element td layout 2)
+                                             stride))
+          (inspection-nominal ctx td type layout))))
+
+  (doc inspection-layout "describes one concrete native type with the same
+lowering and target data used for emission. A private context bounds the
+lifetime of temporary LLVM types. Target data is private too: its layout cache
+contains type pointers and must not outlive this context. Emitter state is
+restored before returning.")
+  (defn inspection-layout [machine environment type]
+    (let-do [saved-constructors (Array.copy &*llvm-backend-constructors*)
+             saved-foreign-layouts (Array.copy &*llvm-foreign-layouts*)
+             saved-names (Array.copy &*llvm-sum-names*)
+             saved-types (Array.copy-map &LLVM.dup &*llvm-sum-types*)
+             saved-data (Array.copy-map &LLVM.dup &*llvm-target-data*)
+             saved-errors (Array.copy &*llvm-backend-errors*)
+             ctx (LLVM.context-create)
+             td (LLVM.create-target-data-layout machine)
+             _constructors (set! *llvm-backend-constructors*
+                                 @(NativeLayoutEnvironment.constructors environment))
+             _foreign-layouts (set! *llvm-foreign-layouts*
+                                    @(NativeLayoutEnvironment.foreign-layouts environment))
+             _names (set! *llvm-sum-names* [])
+             _types (set! *llvm-sum-types* [])
+             _data (set! *llvm-target-data* [td])
+             _errors (set! *llvm-backend-errors* [])
+             layout (llvm-lower-type ctx type)
+             representation (inspection-representation ctx td type layout)
+             size (if (unit-type? type) 0l (LLVM.abi-size-of-type td layout))
+             result (if (Array.empty? &*llvm-backend-errors*)
+               (Result.Success
+                 (NativeValueLayout.init (Box.init @type) size representation))
+               (Result.Error (String.join "
+" &*llvm-backend-errors*)))
+             _restore-constructors (set! *llvm-backend-constructors*
+                                         saved-constructors)
+             _restore-foreign-layouts (set! *llvm-foreign-layouts*
+                                            saved-foreign-layouts)
+             _restore-names (set! *llvm-sum-names* saved-names)
+             _restore-types (set! *llvm-sum-types* saved-types)
+             _restore-data (set! *llvm-target-data* saved-data)
+             _restore-errors (set! *llvm-backend-errors* saved-errors)]
+      (LLVM.dispose-target-data td)
+      (LLVM.context-dispose ctx)
+      result)))

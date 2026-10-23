@@ -1,0 +1,240 @@
+(load "carp-session.carp")
+(load "../carp-surface/editing.carp")
+
+(deftype EditingType [reference CoreRef
+                      text String
+                      type (Box MonoType)])
+(deftype EditingModel
+  [observations ResolutionObservations
+   compile-scopes (Array SourceCompileScope)
+   compile-environments (Array SourceCompileEnvironment)
+   surface-uses (Array SourceSemanticFact)
+   types (Array EditingType)
+   diagnostics (Array Diagnostic)
+   complete Bool])
+
+(doc SessionEditing "builds a transient semantic view with the compiler's
+expander, resolver, and inferencer. The caller serializes access and brackets
+the query with a compile-time checkpoint and a work budget.")
+(defmodule SessionEditing
+  (defn compile-scope-at [model cursor]
+    (let-do [scopes (EditingModel.compile-scopes model)
+             selected (the (Maybe SourceCompileScope) (Maybe.Nothing))
+             width Int.MAX]
+      (for [i 0 (Array.length scopes)]
+        (let [scope (Array.unsafe-nth scopes i)
+              span (SourceCompileScope.span scope)
+              size (Int.- @(SourceSpan.end span) @(SourceSpan.start span))]
+          (when-do (and (Int.<= @(SourceSpan.start span) cursor)
+                        (and (Int.<= cursor @(SourceSpan.end span))
+                             (Int.<= size width)))
+            (set! selected (Maybe.Just (SourceCompileScope.copy scope)))
+            (set! width size))))
+      selected))
+
+  (defn compile-visible [model scope prefix]
+    (if (match-ref (SourceCompileScope.context scope)
+        (SourceContext.Evaluation) true
+        _ false)
+      (let-do [bindings (Array.copy (SourceCompileScope.locals scope))
+               index @(SourceCompileScope.environment scope)
+               seen (the (Set String) (Set.create))
+               visible (the (Array SourceLexicalBinding) [])]
+        (when (Int.>= index 0)
+          (let [query (SourceCompileEnvironment.query
+                  (Array.unsafe-nth
+                    (EditingModel.compile-environments model)
+                    index))
+                globals (~query prefix false)]
+            (set! bindings
+                  (Array.concat &[(Array.copy &globals) (Array.copy &bindings)]))))
+        (for [i (Array.length &bindings) 0 -1]
+          (let [binding (Array.unsafe-nth &bindings (Int.dec i))
+                name (SourceLexicalBinding.name binding)]
+            (when-do (and (String.starts-with? name prefix)
+                          (not (Set.contains? &seen name)))
+              (Set.put! &seen name)
+              (Array.push-back! &visible (SourceLexicalBinding.copy binding)))))
+        visible)
+      (the (Array SourceLexicalBinding) [])))
+
+  (defn function? [model reference]
+    (let-do [found false
+             types (EditingModel.types model)]
+      (for [i 0 (Array.length types)]
+        (let [entry (Array.unsafe-nth types i)]
+          (when (CoreIR.same-ref? reference (EditingType.reference entry))
+            (set! found
+                  (match-ref (Box.peek (EditingType.type entry))
+                    (MonoType.Function _ _) true
+                    _ false)))))
+      found))
+
+  (private inferred-types)
+  (hidden inferred-types)
+  (defn inferred-types [inferred]
+    (let-do [types (the (Array EditingType) [])
+             environment (InferredModule.environment inferred)
+             bindings (InferredModule.binding-types inferred)]
+      (for [i 0 (Array.length environment)]
+        (let [binding (Array.unsafe-nth environment i)]
+          (Array.push-back! &types
+                            (EditingType.init
+                              (CoreRef.copy (SchemeBinding.reference binding))
+                              (Type.render-scheme (SchemeBinding.scheme binding))
+                              @(TypeScheme.body (SchemeBinding.scheme binding))))))
+      (for [i 0 (Array.length bindings)]
+        (let [binding (Array.unsafe-nth bindings i)
+              type (Type.apply (InferredModule.substitution inferred)
+                               (Box.peek (InferredBindingType.type binding)))]
+          (Array.push-back! &types
+                            (EditingType.init
+                              (CoreRef.copy (InferredBindingType.reference binding))
+                              (Type.render &type)
+                              (Box.init type)))))
+      types))
+
+  (defn analyze [session editing roots root-role]
+    (let-do [input (EditingSurfaceModule.input editing)
+             overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)
+             types (inferred-types (SessionOverlay.inferred overlay))
+             diagnostics (the (Array Diagnostic) [])
+             complete false
+             _observe (SourceObservations.begin! (SourceInput.id input))
+             observations (ResolutionObservations.init []
+                                                       []
+                                                       @(ResolveSnapshot.globals (SessionOverlay.resolution overlay))
+                                                       []
+                                                       (ResolveEditingEnvironment.init (Set.create)
+                                                                                       [])
+                                                       [])]
+      (let-do [expansion (MacroExpand.observe-module-against (EditingSurfaceModule.module editing)
+                                                             (Rc.value-ref (SessionOverlay.expansion overlay)))
+               errors (ObservedExpansion.errors &expansion)]
+        (for [i 0 (Array.length errors)]
+          (let [error (Array.unsafe-nth errors i)]
+            (Array.push-back! &diagnostics
+                              (Diagnostic.init @"expand"
+                                               @(CtError.message error)
+                                               (Maybe.Just
+                                                 (SourceSpan.init @(SourceInput.id input)
+                                                                  (SurfaceSpan.byte-start (CtError.span error))
+                                                                  (SurfaceSpan.byte-end (CtError.span error))))))))
+        (match @(ObservedExpansion.result &expansion)
+          (Result.Error error)
+            (Array.push-back! &diagnostics
+                              (Diagnostic.init @"expand"
+                                               @(CtError.message &error)
+                                               (Maybe.Just
+                                                 (SourceSpan.init @(SourceInput.id input)
+                                                                  (SurfaceSpan.byte-start (CtError.span &error))
+                                                                  (SurfaceSpan.byte-end (CtError.span &error))))))
+          (Result.Success expanded)
+            (let-do [sourced (SourcedSurfaceModule.init (SourceInput.copy input)
+                                                        expanded)
+                     allocator (IdAllocator.copy (SessionOverlay.node-allocator overlay))
+                     observed (Resolve.observe-against &sourced
+                                                       &allocator
+                                                       (SessionOverlay.resolution overlay)
+                                                       roots
+                                                       root-role)]
+              (set! observations @(ObservedResolution.observations &observed))
+              (match-ref (ObservedResolution.result &observed)
+                (Result.Error error)
+                  (Array.push-back! &diagnostics
+                                    (Resolve.diagnostic error
+                                                        (SourceInput.id input)))
+                (Result.Success resolved)
+                  (let [origin (Maybe.Just
+                          (SourceSpan.init @(SourceInput.id input)
+                                           0
+                                           (String.length (SourceInput.source input))))]
+                    (match (CarpCompiler.derive-module-for-inference-provenanced resolved
+                                                                                 &allocator
+                                                                                 &origin)
+                      (Result.Error error)
+                        (Array.push-back! &diagnostics
+                                          (Diagnostic.init @(CompileError.phase &error)
+                                                           @(CompileError.message &error)
+                                                           (Maybe.Just
+                                                             (SourceSpan.init @(SourceInput.id input)
+                                                                              0
+                                                                              (String.length (SourceInput.source input))))))
+                      (Result.Success derived)
+                        (match (Infer.module-against-diagnosed (ProvenancedCoreModule.core &derived)
+                                                               (ProvenancedCoreModule.provenance &derived)
+                                                               (SessionOverlay.inferred overlay))
+                          (Result.Error error)
+                            (Array.push-back! &diagnostics error)
+                          (Result.Success inferred)
+                            (do
+                              (set! types (inferred-types &inferred))
+                              (set! complete (Array.empty? &diagnostics))))))))))
+      (EditingModel.init observations
+                         (SourceObservations.scopes)
+                         (SourceObservations.environments)
+                         (SourceObservations.end!)
+                         types
+                         diagnostics
+                         complete)))
+
+  (doc reference-at
+    "returns the identity resolved for an exact written occurrence,
+including a binding declaration outside its body's scope.")
+  (defn reference-at [model start end]
+    (let-do [answer (the (Maybe CoreRef) (Maybe.Nothing))
+             uses (ResolutionObservations.uses (EditingModel.observations model))]
+      (for [i 0 (Array.length uses)]
+        (let [use (Array.unsafe-nth uses i)
+              span (ResolvedSourceUse.span use)]
+          (when (and (Int.= start @(SourceSpan.start span))
+                     (Int.= end @(SourceSpan.end span)))
+            (match-ref (ResolvedSourceUse.reference use)
+              (Maybe.Just reference) (set! answer (Maybe.Just @reference))
+              (Maybe.Nothing) ()))))
+      answer))
+
+  (defn type-of [model reference]
+    (let-do [answer (the (Maybe String) (Maybe.Nothing))
+             types (EditingModel.types model)]
+      (for [i 0 (Array.length types)]
+        (let [entry (Array.unsafe-nth types i)]
+          (when (CoreIR.same-ref? reference (EditingType.reference entry))
+            (set! answer (Maybe.Just @(EditingType.text entry))))))
+      answer))
+
+  (defn role-of [model reference]
+    (let-do [role (if @(CoreRef.global reference) @"global" @"local")
+             bindings (ResolutionObservations.bindings (EditingModel.observations model))]
+      (for [i 0 (Array.length bindings)]
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when (CoreIR.same-ref? reference
+                                  (ResolvedSourceBinding.reference binding))
+            (set! role @(ResolvedSourceBinding.role binding)))))
+      role))
+
+  (doc scope-at
+    "selects the innermost environment actually visited by resolution.
+Equal-sized observations use the later environment, including a zero-width
+missing body after a binding list.")
+  (defn scope-at [model cursor]
+    (let-do [scopes (ResolutionObservations.scopes (EditingModel.observations model))
+             selected (the (Maybe ResolvedSourceScope) (Maybe.Nothing))
+             width Int.MAX
+             priority -1]
+      (for [i 0 (Array.length scopes)]
+        (let [scope (Array.unsafe-nth scopes i)
+              span (ResolvedSourceScope.span scope)
+              start @(SourceSpan.start span)
+              end @(SourceSpan.end span)
+              size (Int.- end start)]
+          (when-do (and (Int.<= start cursor)
+                        (and (Int.<= cursor end)
+                             (or (Int.< size width)
+                                 (and (Int.= size width)
+                                      (Int.>= @(ResolvedSourceScope.priority scope)
+                                              priority)))))
+            (set! selected (Maybe.Just (ResolvedSourceScope.copy scope)))
+            (set! width size)
+            (set! priority @(ResolvedSourceScope.priority scope)))))
+      selected)))

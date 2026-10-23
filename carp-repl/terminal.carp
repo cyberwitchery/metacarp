@@ -1,0 +1,957 @@
+(load "native.carp")
+(load "display.carp")
+(system-include "sys/ioctl.h")
+(system-include "errno.h")
+(system-include "histedit.h")
+(system-include "locale.h")
+(system-include "unistd.h")
+(add-lib "-ledit")
+
+(register-type ReplEditLine "EditLine")
+(register-type ReplHistory "History")
+(register-type ReplHistEvent "HistEvent")
+;; Borrowed views of libedit's UTF-8 buffer. Only libedit owns these strings.
+(register-type ReplNativeText "const char*")
+(register-type ReplNativeLine "const LineInfo")
+(register-type ReplLineInfo
+  "LineInfo"
+  [buffer ReplNativeText
+   cursor ReplNativeText
+   lastchar ReplNativeText])
+
+(deftype ReplRead
+  (Line [String])
+  (End [])
+  (Cancelled [])
+  (Error [String]))
+
+(deftype ReplPresentation
+  [client ReplLanguageClient
+   information String
+   information-source String
+   information-cursor Int
+   replace-count Int
+   pasting Bool
+   rich Bool
+   colors Bool
+   output (Ptr FILE)
+   row Int
+   screen-source String
+   screen-cursor Int
+   screen-information String
+   screen-width Int
+   screen-height Int
+   screen-rows (Array ReplDisplayRow)
+   paint ReplPaint
+   undo (Array (Pair String Int))
+   undoing Bool
+   document String
+   revision Long
+   epoch Long
+   request Long
+   source String
+   analyses (Array ReplAnalysis)
+   pending (Array ReplQuery)
+   pending-cursor Int
+   changed Long
+   dirty Bool
+   queued Bool
+   undo-source String
+   undo-cursor Int])
+
+(deftype ReplEditor
+  [editor (Ptr ReplEditLine)
+   history (Ptr ReplHistory)
+   prompt String
+   needs-more (Fn [(Ref String)] Bool)
+   newline (Fn [(Ref String) Int] ReplEditingReply)
+   cancelled Bool
+   history-path String
+   initial String
+   presentation ReplPresentation])
+
+;; Specializations of libedit's variadic entry points call the system API directly.
+(defmodule ReplEdit
+  (register init
+    (Fn [(Ptr CChar) (Ptr FILE) (Ptr FILE) (Ptr FILE)] (Ptr ReplEditLine))
+    "el_init")
+  (register end (Fn [(Ptr ReplEditLine)] ()) "el_end")
+  (register reset (Fn [(Ptr ReplEditLine)] ()) "el_reset")
+  (register gets (Fn [(Ptr ReplEditLine) (Ptr Int)] ReplNativeText) "el_gets")
+  (register line (Fn [(Ptr ReplEditLine)] (Ptr ReplNativeLine)) "el_line")
+  (register insert (Fn [(Ptr ReplEditLine) (Ptr CChar)] Int) "el_insertstr")
+  (register push (Fn [(Ptr ReplEditLine) (Ptr Int)] ()) "el_wpush")
+  (register get-wide-char (Fn [(Ptr ReplEditLine) (Ptr Int)] Int) "el_wgetc")
+  (register set-text (Fn [(Ptr ReplEditLine) Int (Ptr CChar)] Int) "el_set")
+  (register set-int (Fn [(Ptr ReplEditLine) Int Int] Int) "el_set")
+  (register set-pointer (Fn [(Ptr ReplEditLine) Int (Ptr ())] Int) "el_set")
+  (register set-client
+    (Fn [(Ptr ReplEditLine) Int (Ptr ReplEditor)] Int)
+    "el_set")
+  (register get-client
+    (Fn [(Ptr ReplEditLine) Int (Ptr (Ptr ReplEditor))] Int)
+    "el_get")
+  (register set-two-texts
+    (Fn [(Ptr ReplEditLine) Int (Ptr CChar) (Ptr CChar) (Ptr CChar)] Int)
+    "el_set")
+  (register add-function
+    (Fn [(Ptr ReplEditLine) Int (Ptr CChar) (Ptr CChar) (Ptr ())] Int)
+    "el_set")
+  (register set-history
+    (Fn [(Ptr ReplEditLine) Int (Ptr ()) (Ptr ReplHistory)] Int)
+    "el_set")
+  (register history-init (Fn [] (Ptr ReplHistory)) "history_init")
+  (register history-end (Fn [(Ptr ReplHistory)] ()) "history_end")
+  (register history-int
+    (Fn [(Ptr ReplHistory) (Ptr ReplHistEvent) Int Int] Int)
+    "history")
+  (register history-text
+    (Fn [(Ptr ReplHistory) (Ptr ReplHistEvent) Int (Ptr CChar)] Int)
+    "history")
+  (register history-callback (Ptr ()) "history")
+  (register allocate (Fn [Long] (Ptr a)) "malloc")
+  (register release (Fn [(Ptr a)] ()) "free")
+  (register isatty (Fn [Int] Int) "isatty")
+  (register mkdtemp (Fn [(Ptr CChar)] (Ptr CChar)) "mkdtemp")
+  (register rmdir (Fn [(Ptr CChar)] Int) "rmdir")
+  (register file-error (Fn [(Ptr FILE)] Int) "ferror")
+  (register set-locale (Fn [Int (Ptr CChar)] (Ptr CChar)) "setlocale")
+  (register CTYPE Int "LC_CTYPE")
+  (register PROMPT Int "EL_PROMPT")
+  (register EDITOR Int "EL_EDITOR")
+  (register SIGNAL Int "EL_SIGNAL")
+  (register PREPARE Int "EL_PREP_TERM")
+  (register BIND Int "EL_BIND")
+  (register SETTY Int "EL_SETTY")
+  (register ADDFN Int "EL_ADDFN")
+  (register HIST Int "EL_HIST")
+  (register CLIENTDATA Int "EL_CLIENTDATA")
+  (register HISTORY-SIZE Int "H_SETSIZE")
+  (register HISTORY-UNIQUE Int "H_SETUNIQUE")
+  (register HISTORY-ENTER Int "H_ENTER")
+  (register NORMAL Byte "CC_NORM")
+  (register NEWLINE Byte "CC_NEWLINE")
+  (register REFRESH Byte "CC_REFRESH")
+  (register EDIT-ERROR Byte "CC_ERROR"))
+(doc ReplTerminal
+  "Terminal editing and pipe input, independent of compiler state.")
+(defmodule ReplTerminal
+  (defn interactive? []
+    (and (Int.= (ReplEdit.isatty 0) 1) (Int.= (ReplEdit.isatty 1) 1)))
+
+  (defn scratch []
+    (let [path (String.copy "/tmp/metacarp-repl-XXXXXX")]
+      (if (null? (ReplEdit.mkdtemp (String.cstr &path))) (String.copy "") path)))
+
+  (defn remove-directory [path] (ReplEdit.rmdir (String.cstr path)))
+
+  (private state)
+  (hidden state)
+  (sig state (Fn [(Ptr ReplEditLine)] (Ref ReplEditor)))
+  (defn state [editor]
+    (let-do [data (the (Ptr ReplEditor) (Pointer.from-long 0l))]
+      (ignore
+        (ReplEdit.get-client editor ReplEdit.CLIENTDATA (Pointer.address &data)))
+      (Pointer.to-ref data)))
+
+  (private prompt)
+  (hidden prompt)
+  (defn prompt [editor] (String.cstr (ReplEditor.prompt (state editor))))
+
+  (private bind-key)
+  (hidden bind-key)
+  (defn bind-key [editor key command]
+    (ignore
+      (ReplEdit.set-two-texts editor
+                              ReplEdit.BIND
+                              (String.cstr key)
+                              (String.cstr command)
+                              (Pointer.from-long 0l))))
+
+  ;; These views borrow immutable UTF-8 storage owned by libedit.
+  (private text-view)
+  (hidden text-view)
+  (sig text-view (Fn [(Ref ReplNativeText)] (Ref String)))
+  (defn text-view [text]
+    (Pointer.to-ref (the (Ptr String) (Unsafe.coerce text))))
+
+  (private accept)
+  (hidden accept)
+  (sig accept (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn accept [editor key]
+    (let [info (Pointer.to-ref
+            (the (Ptr ReplLineInfo) (Unsafe.coerce (ReplEdit.line editor))))
+          buffer (text-view (ReplLineInfo.buffer info))
+          end (String.cstr (text-view (ReplLineInfo.lastchar info)))
+          length (Long.to-int
+            (Long.- (Pointer.to-long end) (Pointer.to-long (String.cstr buffer))))
+          source (String.byte-slice buffer 0 length)
+          check @(ReplEditor.needs-more (state editor))]
+      (if (check &source)
+        (insert-newline editor key)
+        (do
+          (bind-key editor "^M" "ed-newline")
+          (let [newline [13 0]]
+            (ReplEdit.push editor
+                           (Pointer.address (Array.unsafe-nth &newline 0))))
+          ReplEdit.NORMAL))))
+
+  (private cancel)
+  (hidden cancel)
+  (sig cancel (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn cancel [editor -key]
+    (do (ReplEditor.set-cancelled! (state editor) true) ReplEdit.NEWLINE))
+
+  (private paste)
+  (hidden paste)
+  (sig paste (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn paste [editor -key]
+    (let-do [presentation (ReplEditor.presentation (state editor))
+             _ (ReplPresentation.set-pasting! presentation true)
+             characters (the (Array Char) [])
+             ending (String.chars "\u001b[201~")
+             matched 0
+             character 0
+             reading true
+             result ReplEdit.REFRESH]
+      (while-do reading
+        (if (Int.<=
+            (ReplEdit.get-wide-char editor (Pointer.address &character))
+            0)
+          (do (set! result ReplEdit.EDIT-ERROR) (set! reading false))
+          (let-do [c (Char.from-int (if (Int.= character 13) 10 character))]
+            (Array.push-back! &characters c)
+            (set! matched
+                  (cond
+                    (Char.= c @(Array.unsafe-nth &ending matched))
+                      (Int.inc matched)
+                    (Char.= c @(Array.unsafe-nth &ending 0)) 1
+                    0))
+            (when (Int.= matched (Array.length &ending)) (set! reading false)))))
+      (ReplPresentation.set-pasting! presentation false)
+      (if (Int.= matched (Array.length &ending))
+        (let [text (String.from-chars
+                &(Array.slice &characters
+                              0
+                              (Int.- (Array.length &characters)
+                                     (Array.length &ending))))]
+          (if (Int.= (ReplEdit.insert editor (String.cstr &text)) 0)
+            result
+            ReplEdit.EDIT-ERROR))
+        result)))
+
+  (doc create
+    "Creates an editor for a TTY. The completeness callback runs only on Enter.")
+  (sig create
+       (Fn
+         [(Fn [(Ref String)] Bool)
+          (Fn [(Ref String) Int] ReplEditingReply)
+          (Ref String)
+          ReplLanguageClient]
+         (Ptr ReplEditor)))
+  (defn create [needs-more newline history-path query]
+    (if (not (interactive?))
+      (Pointer.from-long 0l)
+      (let-do [presentation (new-presentation query)
+               _locale (ReplEdit.set-locale ReplEdit.CTYPE (String.cstr ""))
+               editor (ReplEdit.init (String.cstr "metacarp-repl")
+                                     IO.Raw.stdin
+                                     IO.Raw.stdout
+                                     IO.Raw.stderr)
+               native-history (ReplEdit.history-init)]
+        (if (or (null? editor) (null? native-history))
+          (do
+            (unless (null? editor) (ReplEdit.end editor))
+            (unless (null? native-history) (ReplEdit.history-end native-history))
+            (Pointer.from-long 0l))
+          (let-do [data (Pointer.unsafe-alloc
+                     (ReplEditor.init editor
+                                      native-history
+                                      (String.copy "")
+                                      needs-more
+                                      newline
+                                      false
+                                      (String.copy history-path)
+                                      (String.copy "")
+                                      presentation))
+                   event (the (Ptr ReplHistEvent)
+                              (ReplEdit.allocate
+                                (Pointer.width
+                                  (the (Ptr ReplHistEvent)
+                                       (Pointer.from-long 0l)))))]
+            (ignore
+              (ReplEdit.history-int native-history
+                                    event
+                                    ReplEdit.HISTORY-SIZE
+                                    1000))
+            (ignore
+              (ReplEdit.history-int native-history
+                                    event
+                                    ReplEdit.HISTORY-UNIQUE
+                                    1))
+            (ReplEdit.release event)
+            (when @(ReplPresentation.rich
+                (ReplEditor.presentation (Pointer.to-ref data)))
+              (ignore
+                (ReplEdit.set-output editor
+                                     19
+                                     1
+                                     @(ReplPresentation.output
+                                       (ReplEditor.presentation (Pointer.to-ref data))))))
+            (ignore (ReplEdit.set-client editor ReplEdit.CLIENTDATA data))
+            (ignore
+              (ReplEdit.set-text editor ReplEdit.EDITOR (String.cstr "emacs")))
+            (ignore
+              (ReplEdit.set-pointer editor
+                                    ReplEdit.PROMPT
+                                    (Function.unsafe-ptr &prompt)))
+            (ignore
+              (ReplEdit.set-history editor
+                                    ReplEdit.HIST
+                                    ReplEdit.history-callback
+                                    native-history))
+            (ignore (ReplEdit.set-int editor ReplEdit.SIGNAL 1))
+            (ignore
+              (ReplEdit.set-two-texts editor
+                                      ReplEdit.SETTY
+                                      (String.cstr "-d")
+                                      (String.cstr "-icrnl")
+                                      (Pointer.from-long 0l)))
+            ;; Keep tty control characters from overriding the editor's key bindings.
+            (ignore
+              (ReplEdit.set-two-texts editor
+                                      ReplEdit.SETTY
+                                      (String.cstr "-d")
+                                      (String.cstr "intr=")
+                                      (Pointer.from-long 0l)))
+            (ignore
+              (ReplEdit.set-two-texts editor
+                                      ReplEdit.SETTY
+                                      (String.cstr "-d")
+                                      (String.cstr "eof=")
+                                      (Pointer.from-long 0l)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-accept")
+                                     (String.cstr "submit complete input")
+                                     (Function.unsafe-ptr &accept)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-cancel")
+                                     (String.cstr "discard input")
+                                     (Function.unsafe-ptr &cancel)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-paste")
+                                     (String.cstr "insert bracketed paste")
+                                     (Function.unsafe-ptr &paste)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-initial")
+                                     (String.cstr "insert caller source")
+                                     (Function.unsafe-ptr &insert-initial)))
+            (bind-key editor "^[[999~" "repl-initial")
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-complete")
+                                     (String.cstr "complete symbol")
+                                     (Function.unsafe-ptr &complete)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-doc")
+                                     (String.cstr "documentation at cursor")
+                                     (Function.unsafe-ptr &documentation)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-check")
+                                     (String.cstr "check without executing")
+                                     (Function.unsafe-ptr &check)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-newline")
+                                     (String.cstr "insert newline")
+                                     (Function.unsafe-ptr &insert-newline)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-force")
+                                     (String.cstr "submit incomplete input")
+                                     (Function.unsafe-ptr &force-accept)))
+            (ignore
+              (ReplEdit.set-wide-pointer editor
+                                         ReplEdit.GETCFN
+                                         (Function.unsafe-ptr &read-character)))
+            (ignore
+              (ReplEdit.add-function editor
+                                     ReplEdit.ADDFN
+                                     (String.cstr "repl-undo")
+                                     (String.cstr "undo buffer change")
+                                     (Function.unsafe-ptr &undo)))
+            (bind-key editor "^_" "repl-undo")
+            (bind-key editor "^J" "repl-newline")
+            (bind-key editor "^[^M" "repl-force")
+            (bind-key editor "^[OP" "repl-doc")
+            (bind-key editor "^[[11~" "repl-doc")
+            (bind-key editor "^[OQ" "repl-check")
+            (bind-key editor "^[[12~" "repl-check")
+            (let [bindings [[(String.copy "^M") (String.copy "repl-accept")]
+                            [(String.copy "^J") (String.copy "repl-newline")]
+                            [(String.copy "^C") (String.copy "repl-cancel")]
+                            [(String.copy "^R")
+                             (String.copy "em-inc-search-prev")]
+                            [(String.copy "^W")
+                             (String.copy "ed-delete-prev-word")]
+                            [(String.copy "^I") (String.copy "repl-complete")]
+                            [(String.copy "^D")
+                             (String.copy "em-delete-or-list")]
+                            [(String.copy "^[[A")
+                             (String.copy "ed-prev-history")]
+                            [(String.copy "^[[B")
+                             (String.copy "ed-next-history")]
+                            [(String.copy "^[[C") (String.copy "ed-next-char")]
+                            [(String.copy "^[[D") (String.copy "ed-prev-char")]
+                            [(String.copy "^[[H") (String.copy "ed-move-to-beg")]
+                            [(String.copy "^[[F") (String.copy "ed-move-to-end")]
+                            [(String.copy "^[[3~")
+                             (String.copy "ed-delete-next-char")]
+                            [(String.copy "^[[200~") (String.copy "repl-paste")]]]
+              (for [i 0 (Array.length &bindings)]
+                (let [binding (Array.unsafe-nth &bindings i)]
+                  (bind-key editor
+                            (Array.unsafe-nth binding 0)
+                            (Array.unsafe-nth binding 1)))))
+
+            (load-history data)
+            data)))))
+
+  (private history-source)
+  (hidden history-source)
+  (defn history-source [source]
+    (let-do [end (String.length source)]
+      (while-do (and (Int.> end 0)
+                     (let [last (String.char-at source (Int.dec end))]
+                       (or (Char.= last (Char.from-int 10))
+                           (Char.= last (Char.from-int 13)))))
+        (set! end (Int.dec end)))
+      (String.byte-slice source 0 end)))
+
+  (doc remember
+    "Adds a complete input, including failed submissions, to history.")
+  (defn remember [terminal source]
+    (unless (null? terminal)
+      (let-do [native-history @(ReplEditor.history (Pointer.to-ref terminal))
+               text (history-source source)
+               event (the (Ptr ReplHistEvent)
+                          (ReplEdit.allocate
+                            (Pointer.width
+                              (the (Ptr ReplHistEvent) (Pointer.from-long 0l)))))]
+        (unless (String.empty? &text)
+          (ignore
+            (ReplEdit.history-text native-history
+                                   event
+                                   ReplEdit.HISTORY-ENTER
+                                   (String.cstr &text))))
+        (ReplEdit.release event)
+        (save-history terminal))))
+
+  (defn dispose [terminal]
+    (unless (null? terminal)
+      (let-do [data (Pointer.to-value terminal)]
+        (ReplEdit.end @(ReplEditor.editor &data))
+        (when @(ReplPresentation.rich (ReplEditor.presentation &data))
+          (ignore
+            (IO.Raw.fclose!
+              @(ReplPresentation.output (ReplEditor.presentation &data)))))
+        (ReplEdit.history-end @(ReplEditor.history &data))
+        (Pointer.free terminal))))
+
+  (private read-edited)
+  (hidden read-edited)
+  (defn read-edited [terminal prompt]
+    (if (null? terminal)
+      (ReplRead.Error (String.copy "could not initialize terminal editor"))
+      (let-do [data (Pointer.to-ref terminal)
+               editor @(ReplEditor.editor data)
+               count 0]
+        (ReplEditor.set-prompt! data (String.copy prompt))
+        (ReplEditor.set-cancelled! data false)
+        (ReplPresentation.set-undo! (ReplEditor.presentation data)
+                                    (the (Array (Pair String Int)) []))
+        (ReplPresentation.set-undoing! (ReplEditor.presentation data) false)
+        (ReplPresentation.set-undo-cursor! (ReplEditor.presentation data) -1)
+        (bind-key editor "^M" "repl-accept")
+        (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 1))
+        (prepare-character-input)
+        (unless (String.empty? (ReplEditor.initial data))
+          (let [key [27 91 57 57 57 126 0]]
+            (ReplEdit.push editor (Pointer.address (Array.unsafe-nth &key 0)))))
+        (IO.print "\u001b[?2004h")
+        (IO.Raw.fflush! IO.Raw.stdout)
+        (let-do [line (the (Ptr CChar)
+                           (Unsafe.coerce
+                             (ReplEdit.gets editor (Pointer.address &count))))
+                 result (cond
+                   @(ReplEditor.cancelled data) (ReplRead.Cancelled)
+                   (Int.< count 0) (ReplRead.Error (System.error-text))
+                   (or (null? line) (Int.= count 0)) (ReplRead.End)
+                   (ReplRead.Line (String.from-cstr line)))]
+          (finish-frame editor)
+          (ReplEdit.reset editor)
+          (IO.print "\u001b[?2004l")
+          (IO.Raw.fflush! IO.Raw.stdout)
+          result))))
+
+  (private read-line)
+  (hidden read-line)
+  (defn read-line []
+    (let-do [bytes (the (Array Byte) [])
+             byte 0
+             done false]
+      (while-do (not done)
+        (set! byte (IO.Raw.get-char))
+        (if (or (Int.< byte 0) (Int.= byte 10))
+          (set! done true)
+          (Array.push-back! &bytes (Byte.from-int byte))))
+      (cond
+        (Int./= (ReplEdit.file-error IO.Raw.stdin) 0)
+          (ReplRead.Error (System.error-text))
+        (and (Int.< byte 0) (Int.= (Array.length &bytes) 0)) (ReplRead.End)
+        (ReplRead.Line (String.from-bytes &bytes)))))
+
+  (doc read-input "Edits a whole input on a TTY; frames piped input by line.")
+  (defn read-input [terminal prompt pending]
+    (if (interactive?)
+      (read-edited terminal prompt)
+      (match (read-line)
+        (ReplRead.Line line)
+          (ReplRead.Line
+            (String.concat &[(String.copy pending) line (String.copy "
+")]))
+        other other))))
+
+(defmodule ReplEdit
+  (register mkdir (Fn [(Ptr CChar) Int] Int) "mkdir")
+  (register access (Fn [(Ptr CChar) Int] Int) "access")
+  (register HISTORY-LOAD Int "H_LOAD")
+  (register HISTORY-SAVE Int "H_SAVE"))
+
+(defmodule ReplTerminal
+  (private history-file)
+  (hidden history-file)
+  (defn history-file [terminal operation]
+    (let-do [data (Pointer.to-ref terminal)
+             event (the (Ptr ReplHistEvent)
+                        (ReplEdit.allocate
+                          (Pointer.width
+                            (the (Ptr ReplHistEvent) (Pointer.from-long 0l)))))
+             status (ReplEdit.history-text @(ReplEditor.history data)
+                                           event
+                                           operation
+                                           (String.cstr (ReplEditor.history-path data)))]
+      (ReplEdit.release event)
+      status))
+
+  (private load-history)
+  (hidden load-history)
+  (defn load-history [terminal]
+    (let [path (ReplEditor.history-path (Pointer.to-ref terminal))]
+      (unless (String.empty? path)
+        (let-do [length (String.length path)]
+          (for [i 1 length]
+            (when (Char.= (String.char-at path i) (Char.from-int 47))
+              (ignore
+                (ReplEdit.mkdir (String.cstr &(String.byte-slice path 0 i)) 448))))
+          (when (Int.= (ReplEdit.access (String.cstr path) 0) 0)
+            (when (Int.< (history-file terminal ReplEdit.HISTORY-LOAD) 0)
+              (IO.errorln
+                &(fmt "history: cannot load %s: %s" path &(System.error-text)))))))))
+
+  (private save-history)
+  (hidden save-history)
+  (defn save-history [terminal]
+    (unless (String.empty? (ReplEditor.history-path (Pointer.to-ref terminal)))
+      (when (Int.< (history-file terminal ReplEdit.HISTORY-SAVE) 0)
+        (IO.errorln &(fmt "history: cannot save: %s" &(System.error-text)))))))
+
+(defmodule ReplTerminal
+  (doc seed "Starts the next edit with caller source without submitting it.")
+  (defn seed [terminal source]
+    (unless (null? terminal)
+      (ReplEditor.set-initial! (Pointer.to-ref terminal) (history-source source))))
+
+  (private insert-initial)
+  (hidden insert-initial)
+  (sig insert-initial (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn insert-initial [editor -key]
+    (let-do [data (state editor)]
+      (let-do [presentation (ReplEditor.presentation data)]
+        (ReplEdit.delete editor @(ReplPresentation.replace-count presentation))
+        (ReplPresentation.set-replace-count! presentation 0))
+      (ignore (ReplEdit.insert editor (String.cstr (ReplEditor.initial data))))
+      (ReplEditor.set-initial! data (String.copy ""))
+      ReplEdit.REFRESH)))
+
+(defmodule ReplEdit
+  (register set-wide-pointer
+    (Fn [(Ptr ReplEditLine) Int (Ptr ())] Int)
+    "el_wset")
+  (register delete (Fn [(Ptr ReplEditLine) Int] ()) "el_deletestr")
+  (register resize (Fn [(Ptr ReplEditLine)] ()) "el_resize")
+  (register read (Fn [Int (Ptr Byte) Long] Long) "read")
+  (register errno (Fn [] (Ptr Int)) "__error")
+  (register ioctl (Fn [Int Long (Ptr Byte)] Int) "ioctl")
+  (register WINDOW-SIZE Long "TIOCGWINSZ")
+  (register INTERRUPTED Int "EINTR")
+  (register INVALID-CHARACTER Int "EILSEQ")
+  (register GETCFN Int "EL_GETCFN"))
+
+(defmodule ReplTerminal
+  (private new-presentation)
+  (hidden new-presentation)
+  (defn new-presentation [client]
+    (let [rich (match (IO.getenv "TERM")
+            (Maybe.Just term) (not (String.= &term "dumb"))
+            (Maybe.Nothing) false)
+          colors (match (IO.getenv "NO_COLOR")
+            (Maybe.Just _) false
+            (Maybe.Nothing) true)]
+      (ReplPresentation.init client
+                             @""
+                             @""
+                             -1
+                             0
+                             false
+                             rich
+                             colors
+                             (if rich
+                               (IO.Raw.fopen "/dev/null" "w")
+                               IO.Raw.stdout)
+                             0
+                             @""
+                             -1
+                             @""
+                             0
+                             0
+                             []
+                             (ReplPaint.init @"" [] false)
+                             (the (Array (Pair String Int)) [])
+                             false
+                             @"repl:editing"
+                             0l
+                             -1l
+                             0l
+                             @""
+                             []
+                             []
+                             -1
+                             0l
+                             false
+                             false
+                             @""
+                             -1)))
+
+  (private snapshot)
+  (hidden snapshot)
+  (defn snapshot [editor]
+    (let [info (Pointer.to-ref
+            (the (Ptr ReplLineInfo) (Unsafe.coerce (ReplEdit.line editor))))
+          buffer (text-view (ReplLineInfo.buffer info))
+          start (Pointer.to-long (String.cstr buffer))
+          end (Pointer.to-long
+            (String.cstr (text-view (ReplLineInfo.lastchar info))))
+          cursor (Pointer.to-long
+            (String.cstr (text-view (ReplLineInfo.cursor info))))]
+      (Pair.init
+        (String.byte-slice buffer 0 (Long.to-int (Long.- end start)))
+        (Long.to-int (Long.- cursor start)))))
+
+  (private dimensions)
+  (hidden dimensions)
+  (defn dimensions []
+    (let [size (the (Array Byte) [0b 0b 0b 0b 0b 0b 0b 0b])
+          status (ReplEdit.ioctl 0
+                                 ReplEdit.WINDOW-SIZE
+                                 (Pointer.address (Array.unsafe-nth &size 0)))
+          rows (Int.+
+            (Byte.to-int @(Array.unsafe-nth &size 0))
+            (Int.* 256 (Byte.to-int @(Array.unsafe-nth &size 1))))
+          columns (Int.+
+            (Byte.to-int @(Array.unsafe-nth &size 2))
+            (Int.* 256 (Byte.to-int @(Array.unsafe-nth &size 3))))]
+      (Pair.init
+        (if (and (Int.= status 0) (Int.> columns 8)) columns 80)
+        (if (and (Int.= status 0) (Int.> rows 3)) rows 24))))
+
+  (private clear-frame)
+  (hidden clear-frame)
+  (defn clear-frame [presentation]
+    (String.append
+      &(if (Int.> @(ReplPresentation.row presentation) 0)
+        (fmt "\r\u001b[%dA" @(ReplPresentation.row presentation))
+        @"\r")
+      "\u001b[J"))
+
+  (private draw)
+  (hidden draw)
+  (defn draw [editor source cursor information force]
+    (let-do [data (state editor)
+             presentation (ReplEditor.presentation data)
+             size (dimensions)
+             width @(Pair.a &size)
+             height @(Pair.b &size)]
+      (when (and @(ReplPresentation.rich presentation)
+                 (or force
+                     (or
+                       (String./= source
+                                  (ReplPresentation.screen-source presentation))
+                       (or
+                         (Int./= cursor
+                                 @(ReplPresentation.screen-cursor presentation))
+                         (or
+                           (String./= information
+                                      (ReplPresentation.screen-information presentation))
+                           (or
+                             (Int./= width
+                                     @(ReplPresentation.screen-width presentation))
+                             (Int./= height
+                                     @(ReplPresentation.screen-height presentation))))))))
+        (let-do [frame (ReplDisplay.frame-painted (ReplEditor.prompt data)
+                                                  source
+                                                  cursor
+                                                  width
+                                                  height
+                                                  information
+                                                  @(ReplPresentation.colors presentation)
+                                                  (ReplPresentation.analyses presentation)
+                                                  (ReplPresentation.paint presentation))
+                 resized (and
+                   (Int.> @(ReplPresentation.screen-width presentation) 0)
+                   (or
+                     (Int./= width @(ReplPresentation.screen-width presentation))
+                     (Int./= height
+                             @(ReplPresentation.screen-height presentation))))
+                 update (if resized
+                   (String.append &(clear-frame presentation)
+                                  &(ReplDisplay.patch &[] 0 &frame width))
+                   (ReplDisplay.patch
+                     (ReplPresentation.screen-rows presentation)
+                     @(ReplPresentation.row presentation)
+                     &frame
+                     width))]
+          (IO.print &update)
+          (IO.Raw.fflush! IO.Raw.stdout)
+          (ReplPresentation.set-row! presentation @(ReplFrame.cursor-row &frame))
+          (ReplPresentation.set-screen-rows! presentation
+                                             @(ReplFrame.rows &frame))
+          (ReplPresentation.set-screen-source! presentation (String.copy source))
+          (ReplPresentation.set-screen-cursor! presentation cursor)
+          (ReplPresentation.set-screen-information! presentation
+                                                    (String.copy information))
+          (ReplPresentation.set-screen-width! presentation width)
+          (ReplPresentation.set-screen-height! presentation height)))))
+
+  (private refresh)
+  (hidden refresh)
+  (defn refresh [editor]
+    (let [presentation (ReplEditor.presentation (state editor))
+          current (snapshot editor)
+          source (Pair.a &current)
+          cursor @(Pair.b &current)]
+      (unless-do @(ReplPresentation.pasting presentation)
+        (synchronize-language! editor)
+        (receive-language! editor)
+        (unless (and
+            (String.= source (ReplPresentation.information-source presentation))
+            (Int.= cursor @(ReplPresentation.information-cursor presentation)))
+          (ReplPresentation.set-information! presentation (String.copy "")))
+        (unless (String.= source (ReplPresentation.undo-source presentation))
+          (if @(ReplPresentation.undoing presentation)
+            (ReplPresentation.set-undoing! presentation false)
+            (when (Int.>= @(ReplPresentation.undo-cursor presentation) 0)
+              (let-do [undo (ReplPresentation.undo presentation)]
+                (when (Int.>= (Array.length undo) 100)
+                  (ReplPresentation.set-undo! presentation
+                                              (Array.slice undo
+                                                           1
+                                                           (Array.length undo))))
+                (Array.push-back! (ReplPresentation.undo presentation)
+                                  (Pair.init
+                                    (String.copy
+                                      (ReplPresentation.undo-source presentation))
+                                    @(ReplPresentation.undo-cursor presentation)))))))
+        (draw editor
+              source
+              cursor
+              &(language-feedback presentation)
+              @(ReplPresentation.dirty presentation))
+        (ReplPresentation.set-dirty! presentation false)
+        (ReplPresentation.set-undo-source! presentation (String.copy source))
+        (ReplPresentation.set-undo-cursor! presentation cursor))))
+
+  (private finish-frame)
+  (hidden finish-frame)
+  (defn finish-frame [editor]
+    (let [presentation (ReplEditor.presentation (state editor))
+          current (snapshot editor)
+          source (history-source (Pair.a &current))]
+      (when-do @(ReplPresentation.rich presentation)
+        (draw editor &source (String.length &source) "" true)
+        (IO.print "\r\n")
+        (IO.Raw.fflush! IO.Raw.stdout)
+        (ReplPresentation.set-row! presentation 0)
+        (ReplPresentation.set-screen-rows! presentation [])
+        (ReplPresentation.set-screen-cursor! presentation -1)
+        (ReplPresentation.set-information! presentation (String.copy "")))))
+
+  (private read-character)
+  (hidden read-character)
+  (sig read-character (Fn [(Ptr ReplEditLine) (Ptr Int)] Int))
+  (defn read-character [editor destination]
+    (let-do [_ (refresh editor)
+             first (read-byte editor true)
+             count @(Pair.a &first)
+             byte @(Pair.b &first)
+             remaining (cond
+               (Int.< byte 128) 0
+               (Int.< byte 224) 1
+               (Int.< byte 240) 2
+               3)
+             code (cond
+               (Int.< byte 128) byte
+               (Int.< byte 224) (Int.- byte 192)
+               (Int.< byte 240) (Int.- byte 224)
+               (Int.- byte 240))
+             minimum (cond
+               (Int.< byte 128) 0
+               (Int.< byte 224) 128
+               (Int.< byte 240) 2048
+               65536)
+             valid (or (Int.< byte 128)
+                       (and (Int.>= byte 194) (Int.<= byte 244)))]
+      (cond
+        (Int.= count 2)
+          (do
+            (ReplPresentation.set-queued! (ReplEditor.presentation (state editor))
+                                          false)
+            (ReplEdit.get-wide-char editor destination))
+        (Int.<= count 0) count
+        (do
+          (for [i 0 remaining]
+            (when valid
+              (let [next (read-byte editor false)
+                    value @(Pair.b &next)]
+                (if (and (Int.= @(Pair.a &next) 1)
+                         (and (Int.>= value 128) (Int.<= value 191)))
+                  (set! code (Int.+ (Int.* code 64) (Int.- value 128)))
+                  (set! valid false)))))
+          (if (and valid
+                   (and (Int.>= code minimum)
+                        (and (Int.<= code 1114111)
+                             (or (Int.< code 55296) (Int.> code 57343)))))
+            (do (Pointer.set destination code) 1)
+            (do (Pointer.set (ReplEdit.errno) ReplEdit.INVALID-CHARACTER) -1))))))
+
+  (private documentation)
+  (hidden documentation)
+  (sig documentation (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn documentation [editor -key]
+    (do (ignore (query editor (ReplQuery.Documentation))) ReplEdit.REFRESH))
+
+  (private check)
+  (hidden check)
+  (sig check (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn check [editor -key]
+    (do (ignore (query editor (ReplQuery.Check))) ReplEdit.REFRESH))
+
+  (private insert-newline)
+  (hidden insert-newline)
+  (sig insert-newline (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn insert-newline [editor -key]
+    (let-do [current (snapshot editor)
+             newline @(ReplEditor.newline (state editor))
+             edit (newline (Pair.a &current) @(Pair.b &current))]
+      (apply-edit! editor &edit)
+      ReplEdit.REFRESH))
+
+  (private force-accept)
+  (hidden force-accept)
+  (sig force-accept (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn force-accept [editor -key]
+    (do
+      (bind-key editor "^M" "ed-newline")
+      (let [newline [13 0]]
+        (ReplEdit.push editor (Pointer.address (Array.unsafe-nth &newline 0))))
+      ReplEdit.NORMAL)))
+
+(defmodule ReplEdit
+  (register set-output (Fn [(Ptr ReplEditLine) Int Int (Ptr FILE)] Int) "el_set"))
+
+(system-include "termios.h")
+(register-type ReplTermios "struct termios")
+(defmodule ReplEdit
+  (register tty-get (Fn [Int (Ptr ReplTermios)] Int) "tcgetattr")
+  (register tty-set (Fn [Int Int (Ptr ReplTermios)] Int) "tcsetattr")
+  (register tty-raw (Fn [(Ptr ReplTermios)] ()) "cfmakeraw")
+  (register NOW Int "TCSANOW"))
+
+(defmodule ReplTerminal
+  ;; libedit owns restoration. Disable input translations for our UTF-8 reader
+  ;; so Enter and Ctrl-J remain distinct bytes.
+  (private prepare-character-input)
+  (hidden prepare-character-input)
+  (defn prepare-character-input []
+    (let-do [settings (the (Ptr ReplTermios)
+                           (ReplEdit.allocate
+                             (Pointer.width
+                               (the (Ptr ReplTermios) (Pointer.from-long 0l)))))]
+      (when-do (Int.= (ReplEdit.tty-get 0 settings) 0)
+        (ReplEdit.tty-raw settings)
+        (ignore (ReplEdit.tty-set 0 ReplEdit.NOW settings)))
+      (ReplEdit.release settings))))
+
+(defmodule ReplTerminal
+  (private undo)
+  (hidden undo)
+  (sig undo (Fn [(Ptr ReplEditLine) Int] Byte))
+  (defn undo [editor -key]
+    (let-do [data (state editor)
+             presentation (ReplEditor.presentation data)
+             history (ReplPresentation.undo presentation)]
+      (if (Array.empty? history)
+        ReplEdit.EDIT-ERROR
+        (let-do [previous (Pair.copy
+                   (Array.unsafe-nth history (Int.dec (Array.length history))))
+                 current (snapshot editor)
+                 source (Pair.a &current)
+                 cursor @(Pair.b &current)
+                 moves (Array.length
+                   &(String.chars
+                     &(String.byte-slice source cursor (String.length source))))
+                 backwards (Array.length
+                   &(String.chars
+                     &(String.byte-slice (Pair.a &previous)
+                                         @(Pair.b &previous)
+                                         (String.length (Pair.a &previous)))))
+                 keys (the (Array Int) [])]
+          (ignore (Array.pop-back! history))
+          (ReplEditor.set-initial! data @(Pair.a &previous))
+          (ReplPresentation.set-replace-count! presentation
+                                               (Array.length &(String.chars source)))
+          (ReplPresentation.set-undoing! presentation true)
+          (for [i 0 moves] (Array.push-back! &keys 6))
+          (for [i 0 6]
+            (Array.push-back! &keys @(Array.unsafe-nth &[27 91 57 57 57 126] i)))
+          (for [i 0 backwards] (Array.push-back! &keys 2))
+          (Array.push-back! &keys 0)
+          (ReplEdit.push editor (Pointer.address (Array.unsafe-nth &keys 0)))
+          ReplEdit.REFRESH)))))
+
+(load "terminal-language.carp")

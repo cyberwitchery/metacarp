@@ -1,0 +1,167 @@
+(load "../../service.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(defn report [request state]
+  (ReplLanguageUpdate.Analysis
+    (ReplAnalysis.init
+      (String.copy (ReplLanguageRequest.document request))
+      @(ReplLanguageRequest.revision request)
+      @(ReplLanguageRequest.session request)
+      []
+      []
+      []
+      (ReplCompleteness.Complete)
+      state)))
+
+(defn backend [request cancelled publish]
+  (if (String.= (ReplLanguageRequest.source request) "slow")
+    (let-do [until (Long.+ (ReplNative.now) 1000000000l)]
+      (publish (report request (ReplAnalysisState.SyntaxOnly)))
+      (while-do (and (not (cancelled)) (Long.< (ReplNative.now) until))
+        (System.sleep-micros 1000))
+      (publish (report request (ReplAnalysisState.Ready))))
+    (publish (report request (ReplAnalysisState.Ready)))))
+
+(defn request [worker revision session source]
+  (ReplService.submit! worker
+                       (ReplLanguageRequest.init (ReplQuery.Analyze)
+                                                 @"native:test"
+                                                 revision
+                                                 session
+                                                 revision
+                                                 (String.copy source)
+                                                 0)))
+
+(defn wait-for [worker revision ready]
+  (let-do [until (Long.+ (ReplNative.now) 500000000l)
+           found false
+           stale false]
+    (while-do (and (not found) (Long.< (ReplNative.now) until))
+      (match (ReplService.poll! worker)
+        (Maybe.Nothing) (System.sleep-micros 1000)
+        (Maybe.Just update)
+          (match-ref &update
+            (ReplLanguageUpdate.Analysis analysis)
+              (match-ref (ReplAnalysis.state analysis)
+                (ReplAnalysisState.Ready)
+                  (if (Long.= @(ReplAnalysis.revision analysis) revision)
+                    (set! found ready)
+                    (set! stale true))
+                (ReplAnalysisState.SyntaxOnly)
+                  (when (and (not ready)
+                             (Long.= @(ReplAnalysis.revision analysis) revision))
+                    (set! found true))
+                _ ())
+            _ ())))
+    (and found (not stale))))
+
+(defn cancels-and-discards-stale? []
+  (match (ReplService.create backend)
+    (Result.Error _) false
+    (Result.Success worker)
+      (let-do [session (ReplService.session worker)]
+        (request worker 1l session "slow")
+        (let-do [started (wait-for worker 1l false)]
+          (request worker 2l session "fast")
+          (let-do [fresh (wait-for worker 2l true)]
+            (ReplService.close! worker)
+            (and started fresh))))))
+
+(defn pause-establishes-barrier? []
+  (match (ReplService.create backend)
+    (Result.Error _) false
+    (Result.Success worker)
+      (let-do [session (ReplService.session worker)]
+        (request worker 1l session "slow")
+        (let-do [started (wait-for worker 1l false)
+                 before (ReplNative.now)]
+          (ReplService.pause! worker)
+          (let-do [elapsed (Long.- (ReplNative.now) before)]
+            (ReplService.resume! worker)
+            (let-do [next (ReplService.session worker)]
+              (request worker 2l session "stale-session")
+              (let-do [ignored (match (ReplService.poll! worker)
+                         (Maybe.Nothing) true
+                         _ false)]
+                (request worker 3l next "fresh-session")
+                (let-do [fresh (wait-for worker 3l true)]
+                  (ReplService.close! worker)
+                  (and started
+                       (and ignored
+                            (and fresh
+                                 (and (Long.> next session)
+                                      (Long.< elapsed 500000000l)))))))))))))
+
+(def *worker-test-input-flags* (ReplNative.flags 0 ReplNative.GET-FLAGS 0))
+
+(defn editing-backend [request -cancelled publish]
+  (do
+    (match-ref (ReplLanguageRequest.operation request)
+      (ReplQuery.Complete)
+        (do
+          (publish (report request (ReplAnalysisState.SyntaxOnly)))
+          (System.sleep-micros 50000))
+      _ ())
+    (publish
+      (ReplLanguageUpdate.Editing
+        (ReplEditingResult.init @(ReplLanguageRequest.document request)
+                                @(ReplLanguageRequest.revision request)
+                                @(ReplLanguageRequest.session request)
+                                @(ReplLanguageRequest.request request)
+                                @(ReplLanguageRequest.cursor request)
+                                (ReplEditingReply.init 0 0 [] @"reply"))))))
+
+(defn superseded-editing-reply? []
+  (match (ReplService.create editing-backend)
+    (Result.Error _) false
+    (Result.Success worker)
+      (let-do [epoch (ReplService.session worker)]
+        (ReplService.submit! worker
+                             (ReplLanguageRequest.init (ReplQuery.Complete)
+                                                       @"native:test"
+                                                       1l
+                                                       epoch
+                                                       1l
+                                                       @"same source"
+                                                       0))
+        (let-do [started (wait-for worker 1l false)
+                 until (Long.+ (ReplNative.now) 500000000l)
+                 found false
+                 stale false]
+          (ReplService.submit! worker
+                               (ReplLanguageRequest.init (ReplQuery.Documentation)
+                                                         @"native:test"
+                                                         1l
+                                                         epoch
+                                                         2l
+                                                         @"same source"
+                                                         0))
+          (while-do (and (not found) (Long.< (ReplNative.now) until))
+            (match (ReplService.poll! worker)
+              (Maybe.Nothing) (System.sleep-micros 1000)
+              (Maybe.Just update)
+                (match-ref &update
+                  (ReplLanguageUpdate.Editing result)
+                    (if (Long.= @(ReplEditingResult.request result) 2l)
+                      (set! found true)
+                      (set! stale true))
+                  _ ())))
+          (ReplService.close! worker)
+          (and started (and found (not stale)))))))
+
+(deftest test
+  (assert-true test
+    (superseded-editing-reply?)
+    "a newer cursor query rejects an older editing reply at the same source revision")
+  (assert-true test
+    (cancels-and-discards-stale?)
+    "a new source revision cancels old work and rejects a late reply")
+  (assert-true test
+    (pause-establishes-barrier?)
+    "host access waits for cancellation and invalidates the old session")
+  (assert-equal test
+    *worker-test-input-flags*
+    (ReplNative.flags 0 ReplNative.GET-FLAGS 0)
+    "worker notifications never change inherited input flags"))
