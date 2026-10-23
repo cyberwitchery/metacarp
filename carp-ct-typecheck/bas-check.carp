@@ -1,0 +1,2471 @@
+(load "bas.carp")
+(load "bas-session.carp")
+
+;; The checker over Boolean-algebraic types: builtin types, the lowering of
+;; the evaluator's code, the typer (Simple-sub with MLstruct's tag tests), a
+;; printer, and the top level. See `docs/bas-prototype.md`.
+
+;; ------------------------------------------------------------ value types
+
+(def *bas-syntax* 0)
+(def *bas-syntax-list* 0)
+;; every value: the forms, the functions and macros, and lists and arrays of
+;; values
+(def *bas-value* 0)
+
+(defmodule BVal
+  (defn n [name] (BT.named name))
+  (defn cell [kind car cdr]
+    (BT.inters &[(n kind) (BT.car-fld car) (BT.cdr-fld cdr)]))
+
+  (doc list-of "the list forms of elements `e`, at level `lvl`.")
+  (defn list-of [e lvl]
+    (BT.rec-type lvl
+                 &(fn [self] (BT.union (n "ListNil") (cell "ListCons" e self)))))
+
+  (doc array-of "the array forms of elements `e`, at level `lvl`: an array's
+tail is an array, as the evaluator's `cdr` keeps the kind.")
+  (defn array-of [e lvl]
+    (BT.rec-type lvl
+                 &(fn [self] (BT.union (n "ArrayNil") (cell "ArrayCons" e self)))))
+
+  (defn seq-of [e lvl] (BT.union (list-of e lvl) (array-of e lvl)))
+
+  (doc args-of "argument lists of any length, of elements `e`: what a
+variadic function takes.")
+  (defn args-of [e lvl]
+    (BT.rec-type lvl
+                 &(fn [self] (BT.union (n "ArgsNil") (cell "ArgsCons" e self)))))
+
+  (doc init! "the syntax types, every form the reader makes, and the type of
+every value.")
+  (defn init! []
+    (let-do [synv (BT.fresh-var 0)
+             listv (BT.fresh-var 0)
+             arrayv (BT.fresh-var 0)
+             si (match (BT.get synv) (BTy.Var i) i _ -1)
+             li (match (BT.get listv) (BTy.Var i) i _ -1)
+             ai (match (BT.get arrayv) (BTy.Var i) i _ -1)
+             atoms (BT.unions
+               &[(n "Symbol")
+                 (n "String")
+                 (n "Char")
+                 (n "Number")
+                 (n "Bool")
+                 (n "Pattern")
+                 (n "Dictionary")
+                 (n "Comment")])
+             lst (BT.union (n "ListNil") (cell "ListCons" synv listv))
+             arr (BT.union (n "ArrayNil") (cell "ArrayCons" synv arrayv))
+             body (BT.unions
+               &[atoms lst arr (n "StaticNil") (cell "StaticCons" synv listv)])]
+      (BT.define! si body)
+      (BT.define! li lst)
+      (BT.define! ai arr)
+      (set! *bas-syntax* synv)
+      (set! *bas-syntax-list* listv)
+      (let-do [valv (BT.fresh-var 0)
+               vlistv (BT.fresh-var 0)
+               varrayv (BT.fresh-var 0)
+               vi (match (BT.get valv) (BTy.Var i) i _ -1)
+               vli (match (BT.get vlistv) (BTy.Var i) i _ -1)
+               vai (match (BT.get varrayv) (BTy.Var i) i _ -1)
+               vlst (BT.union (n "ListNil") (cell "ListCons" valv vlistv))
+               varr (BT.union (n "ArrayNil") (cell "ArrayCons" valv varrayv))]
+        (BT.define! vi
+                    (BT.unions
+                      &[atoms
+                        vlst
+                        varr
+                        (n "StaticNil")
+                        (cell "StaticCons" synv listv)
+                        (n "Closure")
+                        (n "Builtin")
+                        (n "Macro")]))
+        (BT.define! vli vlst)
+        (BT.define! vai varr)
+        (set! *bas-value* valv))))
+
+  (doc literal "the type of a form taken as data: a symbol is its own
+literal tag, a list or array form the cells of its elements' types.")
+  (defn literal [node]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.IntLit _) (n "Int")
+      (SurfaceForm.ByteLit _) (n "Byte")
+      (SurfaceForm.LongLit _) (n "Long")
+      (SurfaceForm.FloatLit _) (n "Float")
+      (SurfaceForm.DoubleLit _) (n "Double")
+      (SurfaceForm.BoolLit b) (n (if @b "True" "False"))
+      (SurfaceForm.CharLit _) (n "Char")
+      (SurfaceForm.StringLit _) (n "String")
+      (SurfaceForm.PatternLit _) (n "Pattern")
+      (SurfaceForm.Symbol segments)
+        (BT.tag (BTag.literal (BTag.named "Symbol") &(String.join "." segments)))
+      (SurfaceForm.List items) (cells "ListCons" "ListNil" items 0)
+      (SurfaceForm.Array items) (cells "ArrayCons" "ArrayNil" items 0)
+      (SurfaceForm.StaticArray items) (cells "StaticCons" "StaticNil" items 0)
+      (SurfaceForm.Dictionary _) (n "Dictionary")
+      (SurfaceForm.Comment _) (n "Comment")))
+
+  (doc of-values "the type of a list (`list?`) or array of `items`.")
+  (defn of-values [list? items]
+    (let-do [out (n (if list? "ListNil" "ArrayNil"))
+             i (Array.length items)]
+      (while-do (Int.> i 0)
+        (set! i (Int.dec i))
+        (set! out
+              (cell (if list? "ListCons" "ArrayCons")
+                    (of-value (Box.peek (Array.unsafe-nth items i)))
+                    out)))
+      out))
+
+  (defn of-value [x]
+    (match-ref x
+      (CtValue.Syntax node) (literal (Box.peek node))
+      (CtValue.Collection list? items) (of-values @list? items)
+      (CtValue.Builtin _) (n "Builtin")
+      (CtValue.Closure _) (n "Closure")
+      (CtValue.Macro _) (n "Macro")))
+
+  (private cells)
+  (hidden cells)
+  ;; an array's tail is an array; a static array's, which the evaluator does
+  ;; not take, reads as a list, as in the syntax types
+  (defn cells [cons nil items i]
+    (if (Int.= i (Array.length items))
+      (n nil)
+      (cell cons
+            (literal (Box.peek (Array.unsafe-nth items i)))
+            (if (String.= cons "ArrayCons")
+              (cells cons nil items (Int.inc i))
+              (cells "ListCons" "ListNil" items (Int.inc i)))))))
+
+;; ------------------------------------------------------------ builtins
+
+(doc BLit "a literal a test compares with.")
+(deftype BLit
+  (Boolean [Bool])
+  (Integer [Int])
+  (Sym [String])
+  ;; an answer above `k`, the test `(> (f x) k)`
+  (Above [Int])
+  ;; an answer below `k`, the test `(< (f x) k)`
+  (Below [Int]))
+
+(defmodule BBuiltin
+  (private n)
+  (hidden n)
+  (defn n [name] (BT.named name))
+
+  (doc preimage "the values the one-argument builtin `id` answers `lit` for,
+among those it accepts: `(f x)` is `lit` exactly when `x` has this type. Tests
+narrow by it, and test/bas-builtins.carp checks it against the evaluator.")
+  (defn preimage [id lit]
+    (match-ref lit
+      (BLit.Boolean b)
+      (cond
+        (not @b) (Maybe.Nothing)
+        (or (Int.= id 36) (Int.= id 37)) (Maybe.Just (n "List"))
+        (or (Int.= id 38) (Int.= id 39)) (Maybe.Just (n "Array"))
+        (or (Int.= id 34) (Int.= id 35)) (Maybe.Just (n "Nil"))
+        (Maybe.Nothing))
+      (BLit.Integer k)
+      (if (and (Int.>= @k 0) (or (Int.= id 32) (Int.= id 33)))
+        (Maybe.Just (exactly @k))
+        (Maybe.Nothing))
+      (BLit.Sym s)
+      (if (Int.= id 41) (kind-of s) (Maybe.Nothing))
+      (BLit.Above k)
+      (if (and (Int.>= @k 0) (or (Int.= id 32) (Int.= id 33)))
+        (Maybe.Just (at-least (Int.inc @k)))
+        (Maybe.Nothing))
+      ;; written as the lengths it allows, not as the negation of the ones
+      ;; it does not: a short sequence is below a union of exact lengths,
+      ;; but not provably below `~(at-least k)`, since `{cdr: ⊥}` is not
+      ;; empty
+      (BLit.Below k)
+      (if (and (Int.>= @k 1) (or (Int.= id 32) (Int.= id 33)))
+        (let-do [t (BT.bot)]
+          (for [i 0 @k] (set! t (BT.union t (exactly i))))
+          (Maybe.Just t))
+        (Maybe.Nothing))))
+
+  (doc exactly "the sequences of exactly `k` elements, of any kind: `k`
+cells, each with the next as its tail, then an empty one.")
+  (defn exactly [k]
+    (let-do [t (n "Nil")]
+      (for [_ 0 k] (set! t (BT.inter (n "Cons") (BT.cdr-fld t))))
+      t))
+
+  (doc at-least "the sequences of at least `k` elements: `k` cells, each
+with the next as its tail, then anything.")
+  (defn at-least [k]
+    (let-do [t (BT.top)]
+      (for [_ 0 k] (set! t (BT.inter (n "Cons") (BT.cdr-fld t))))
+      t))
+
+  (doc kind-of "the values `dynamic-type` answers the symbol `name` for.")
+  (defn kind-of [name]
+    (let [names [@"symbol"
+                 @"string"
+                 @"char"
+                 @"int"
+                 @"long"
+                 @"byte"
+                 @"float"
+                 @"double"
+                 @"bool"
+                 @"list"
+                 @"array"
+                 @"static-array"
+                 @"pattern"
+                 @"map"
+                 @"comment"
+                 @"closure"
+                 @"fn"
+                 @"macro"]
+          kinds [@"Symbol"
+                 @"String"
+                 @"Char"
+                 @"Int"
+                 @"Long"
+                 @"Byte"
+                 @"Float"
+                 @"Double"
+                 @"Bool"
+                 @"List"
+                 @"Array"
+                 @"StaticArray"
+                 @"Pattern"
+                 @"Dictionary"
+                 @"Comment"
+                 @"Closure"
+                 @"Builtin"
+                 @"Macro"]]
+      (let-do [found (Maybe.Nothing)]
+        (for [i 0 (Array.length &names)]
+          (when (String.= name (Array.unsafe-nth &names i))
+            (set! found (Maybe.Just (n (Array.unsafe-nth &kinds i))))))
+        found)))
+
+  (private fun)
+  (hidden fun)
+  (doc fun "a builtin's type: the `Builtin` tag and one arrow.")
+  (defn fun [args res] (BT.inter (n "Builtin") (BT.fun (BT.tup args) res)))
+
+  (private v)
+  (hidden v)
+  (defn v [lvl] (BT.fresh-var lvl))
+
+  (private bounded)
+  (hidden bounded)
+  (doc bounded "a fresh variable below `t`.")
+  (defn bounded [lvl t]
+    (let-do [x (v lvl)
+             i (match (BT.get x) (BTy.Var i) i _ -1)]
+      (BT.add-upper! i t)
+      x))
+
+  (private same)
+  (hidden same)
+  (defn same [k t] (Array.replicate k &t))
+
+  (doc type-of "the type of builtin `id` called with `arity` arguments, its
+variables fresh at level `lvl`, or `Nothing` when it is not typed.")
+  (defn type-of [id arity lvl]
+    (let [syn *bas-syntax*
+          num (n "Number")
+          str (n "String")
+          sym (n "Symbol")
+          int (n "Int")
+          bool (n "Bool")
+          unit (n "ListNil")]
+      (cond
+        (Int.= id 0)
+        (Maybe.Just (fun &[] (BVal.array-of str lvl)))
+        (Int.= id 1)
+        (let-do [vs (the (Array Int) [])]
+          (for [i 0 arity] (Array.push-back! &vs (v lvl)))
+          (let-do [out (n "ListNil")
+                   i arity]
+            (while-do (Int.> i 0)
+              (set! i (Int.dec i))
+              (set! out (BVal.cell "ListCons" @(Array.unsafe-nth &vs i) out)))
+            (Maybe.Just (fun &vs out))))
+        ;; an array is made of forms
+        (Int.= id 2)
+        (let-do [vs (the (Array Int) [])]
+          (for [i 0 arity] (Array.push-back! &vs (bounded lvl *bas-syntax*)))
+          (Maybe.Just (fun &vs (BVal.array-of (BT.unions &vs) lvl))))
+        (not (Array.empty? &(BLower.projections id)))
+        ;; car, cdr and their compositions: what the fields hold
+        (let-do [ps (BLower.projections id)
+                 e (v lvl)
+                 arg e
+                 i (Array.length &ps)]
+          (while-do (Int.> i 0)
+            (set! i (Int.dec i))
+            (set! arg (BT.fld @(Array.unsafe-nth &ps i) arg)))
+          (Maybe.Just (fun &[arg] e)))
+        (Int.= id 3)
+        (Maybe.Just (fun &[*bas-syntax*] sym))
+        (Int.= id 4)
+        (Maybe.Just (fun &[(BVal.seq-of syn lvl)] sym))
+        (Int.= id 5)
+        (Maybe.Just (fun &[sym sym] sym))
+        ;; last and all-but-last take a sequence that is not empty
+        (or (Int.= id 22) (Int.= id 23))
+        (let [e (v lvl)]
+          (Maybe.Just (fun &[(BT.inter (BVal.seq-of e lvl) (n "Cons"))] e)))
+        ;; all-but-last keeps the kind, which one arrow cannot say: a sequence
+        ;; of either kind. Lowering it like cons below gains nothing, since the
+        ;; branch for the other kind still answers a sequence of that kind
+        (or (Int.= id 24) (Int.= id 25))
+        (let [e (v lvl)]
+          (Maybe.Just
+            (fun
+              &[(BT.inter (BVal.seq-of e lvl) (n "Cons"))]
+              (BVal.seq-of e lvl))))
+        ;; cons, cons-last and append keep the kind of the sequence they extend; a
+        ;; call is lowered to a test of that kind and one of the single-kind
+        ;; builtins below (`kind-dispatch`). As a value, with no call to
+        ;; decompose: cons answers a cell of either kind, cons-last a sequence
+        ;; of either kind, and append takes lists, the one kind one arrow can
+        ;; give it soundly
+        (or (Int.= id 26) (Int.= id 27))
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun &[e (BVal.seq-of f lvl)]
+                 (BT.union
+                   (BVal.cell "ListCons" e (BVal.list-of f lvl))
+                   (BVal.cell "ArrayCons" e (BVal.array-of f lvl))))))
+        (or (Int.= id 28) (Int.= id 29))
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun &[e (BVal.seq-of f lvl)]
+                 (BT.inter (BVal.seq-of (BT.union e f) lvl) (n "Cons")))))
+        (or (Int.= id 30) (Int.= id 31))
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun
+              &[(BVal.seq-of e lvl) (BVal.seq-of f lvl)]
+              (BVal.seq-of (BT.union e f) lvl))))
+        ;; cons onto a list: the tail is kept exactly
+        (Int.= id 1008)
+        (let [e (v lvl)
+              t (bounded lvl (BVal.list-of (BT.top) lvl))]
+          (Maybe.Just (fun &[e t] (BVal.cell "ListCons" e t))))
+        ;; cons onto an array: the same, an array cell
+        (Int.= id 1009)
+        (let [e (v lvl)
+              t (bounded lvl (BVal.array-of (BT.top) lvl))]
+          (Maybe.Just (fun &[e t] (BVal.cell "ArrayCons" e t))))
+        (Int.= id 1010)
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun &[e (BVal.list-of f lvl)]
+                 (BT.inter (BVal.list-of (BT.union e f) lvl) (n "Cons")))))
+        (Int.= id 1011)
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun &[e (BVal.array-of f lvl)]
+                 (BT.inter (BVal.array-of (BT.union e f) lvl) (n "Cons")))))
+        (Int.= id 1012)
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun
+              &[(BVal.list-of e lvl) (BVal.list-of f lvl)]
+              (BVal.list-of (BT.union e f) lvl))))
+        (Int.= id 1013)
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun
+              &[(BVal.array-of e lvl) (BVal.array-of f lvl)]
+              (BVal.array-of (BT.union e f) lvl))))
+        (or (Int.= id 32) (Int.= id 33))
+        (Maybe.Just (fun &[(BVal.seq-of (BT.top) lvl)] int))
+        (or (Int.= id 34) (Int.= id 35))
+        (Maybe.Just (fun &[(BVal.seq-of (BT.top) lvl)] bool))
+        (and (Int.>= id 36) (Int.<= id 39))
+        (Maybe.Just (fun &[*bas-syntax*] bool))
+        (Int.= id 40)
+        (Maybe.Just (fun &[bool] bool))
+        (Int.= id 41)
+        (Maybe.Just (fun &[(BT.top)] sym))
+        (or (Int.= id 42) (Int.= id 43))
+        (Maybe.Just (fun &[*bas-syntax* *bas-syntax*] bool))
+        (and (Int.>= id 44) (Int.<= id 47))
+        (let [x (bounded lvl num)] (Maybe.Just (fun &(same arity x) x)))
+        (Int.= id 48)
+        (Maybe.Just (fun &[num] int))
+        (or (Int.= id 49) (Int.= id 50))
+        (Maybe.Just (fun &[num num] bool))
+        (Int.= id 51)
+        (Maybe.Just (fun &[str] int))
+        (Int.= id 52)
+        (Maybe.Just (fun &[str (n "Char")] int))
+        (Int.= id 53)
+        (Maybe.Just (fun &[str int] (n "Char")))
+        (Int.= id 54)
+        (Maybe.Just (fun &[str int int] str))
+        (or (Int.= id 55) (Int.= id 56))
+        (Maybe.Just (fun &[str int] str))
+        ;; a string's first character, as a string
+        (Int.= id 57)
+        (Maybe.Just (fun &[str] str))
+        (Int.= id 58)
+        (Maybe.Just (fun &[str] str))
+        (Int.= id 59)
+        (Maybe.Just (fun &[str] bool))
+        ;; a string's characters, each a one-character string
+        (or (Int.= id 60) (Int.= id 61))
+        (Maybe.Just (fun &[str] (BVal.list-of str lvl)))
+        (or (Int.= id 62) (Int.= id 63))
+        (Maybe.Just (fun &[str] (BVal.array-of str lvl)))
+        (Int.= id 64)
+        (Maybe.Just (fun &[str str] str))
+        (or (Int.= id 65) (Int.= id 66))
+        (Maybe.Just (fun &[(BVal.seq-of str lvl)] str))
+        (Int.= id 67)
+        (Maybe.Just (fun &[str] syn))
+        (Int.= id 68)
+        (Maybe.Just (fun &[str] str))
+        (Int.= id 69)
+        (Maybe.Just (fun &[str] str))
+        ;; line, column, file: of a form, or of the call itself with none
+        (or (Int.= id 70) (Int.= id 71))
+        (Maybe.Just (fun &(if (Int.= arity 0) [] [*bas-syntax*]) int))
+        (Int.= id 72)
+        (Maybe.Just (fun &(if (Int.= arity 0) [] [(BT.top)]) str))
+        ;; macro-log takes anything, the build commands forms
+        (Int.= id 73)
+        (Maybe.Just (fun &(same arity (BT.top)) unit))
+        (and (Int.>= id 74) (Int.<= id 77))
+        (Maybe.Just (fun &(same arity *bas-syntax*) unit))
+        (Int.= id 78)
+        (Maybe.Just (fun &(same arity *bas-syntax*) str))
+        (Int.= id 79)
+        (Maybe.Just (fun &[*bas-syntax*] int))
+        (Int.= id 80)
+        (Maybe.Just (fun &(same arity *bas-syntax*) (BT.bot)))
+        (Int.= id 81)
+        (Maybe.Just (fun &[sym] str))
+        (Int.= id 82)
+        (Maybe.Just (fun &[str *bas-syntax*] unit))
+        ;; apply: a function of argument lists of `e`, a sequence of `e`
+        (Int.= id 1000)
+        (let [e (v lvl)
+              r (v lvl)]
+          (Maybe.Just
+            (fun &[(BT.fun (BVal.args-of e lvl) r) (BVal.seq-of e lvl)] r)))
+        ;; eval: anything evaluates to some value
+        (Int.= id 1001)
+        (Maybe.Just (fun &[(BT.top)] *bas-value*))
+        ;; apply of a name it does not call (a builtin, a qualified or an
+        ;; unbound one): the call as a form, of forms
+        (Int.= id 1002)
+        (let [h (v lvl)
+              e (bounded lvl *bas-syntax*)]
+          (Maybe.Just
+            (fun &[h (BVal.seq-of e lvl)]
+                 (BVal.cell "ListCons" h (BVal.list-of e lvl)))))
+        ;; apply of a variable: a closure is called, a form is made the head
+        ;; of a call form
+        ;; expand: a form in, a form out
+        (Int.= id 1004)
+        (Maybe.Just (fun &[*bas-syntax*] *bas-syntax*))
+        ;; concat: the array of both sequences' elements
+        (Int.= id 1005)
+        (let [e (v lvl)
+              f (v lvl)]
+          (Maybe.Just
+            (fun
+              &[(BVal.seq-of e lvl) (BVal.seq-of f lvl)]
+              (BVal.array-of (BT.union e f) lvl))))
+        ;; with-test-internal: a name and forms, answering the forms
+        (Int.= id 1006)
+        (Maybe.Just
+          (fun &[*bas-syntax* (BVal.seq-of *bas-syntax* lvl)] *bas-syntax-list*))
+        (Int.= id 1003)
+        (let [s (bounded lvl *bas-syntax*)
+              e (bounded lvl *bas-syntax*)
+              r (v lvl)]
+          (Maybe.Just
+            (fun
+              &[(BT.union (BT.fun (BVal.args-of e lvl) r) s) (BVal.seq-of e lvl)]
+              (BT.union r (BVal.cell "ListCons" s (BVal.list-of e lvl))))))
+        (Int.= id 83)
+        (Maybe.Just (fun &[str] (config-type "" lvl)))
+        ;; write-file: a path and the text to write
+        (Int.= id 86)
+        (Maybe.Just (fun &[str str] unit))
+        ;; split-on always answers at least one piece
+        (or (Int.= id 84) (Int.= id 85))
+        (Maybe.Just
+          (fun &[str str] (BVal.cell "ArrayCons" str (BVal.array-of str lvl))))
+        (Maybe.Nothing))))
+
+  (doc config-type "what `(Project.get-config key)` answers: the load stack,
+the collected flags as a list of strings, or a setting (a string, a bool or a
+list of strings). `key` empty: any key.")
+  (defn config-type [key lvl]
+    (let [strs (BVal.list-of (n "String") lvl)
+          kind (CtEval.config-kind key)]
+      (cond
+        (String.= key "")
+        (BT.unions
+          &[(n "String") (n "Bool") strs (BVal.array-of (n "String") lvl)])
+        (String.= key "load-stack")
+        (BVal.array-of (n "String") lvl)
+        ;; the evaluator's own table of what each key holds
+        (Int.= kind 0)
+        (n "String")
+        (Int.= kind 1)
+        (n "Bool")
+        (Int.>= kind 2)
+        strs
+        ;; an unknown key is an error
+        (BT.bot))))
+
+  (doc value-type "the type of builtin `id` passed as a value: a variadic
+one takes argument lists of any length, the others their usual arity.")
+  (defn value-type [id lvl]
+    (cond
+      (Int.= id 1)
+        (let [e (v lvl)]
+          (Maybe.Just
+            (BT.inter (n "Builtin")
+                      (BT.fun (BVal.args-of e lvl) (BVal.list-of e lvl)))))
+      (Int.= id 2)
+        (let [e (bounded lvl *bas-syntax*)]
+          (Maybe.Just
+            (BT.inter (n "Builtin")
+                      (BT.fun (BVal.args-of e lvl) (BVal.array-of e lvl)))))
+      (Int.= id 78)
+        (Maybe.Just
+          (BT.inter (n "Builtin")
+                    (BT.fun (BVal.args-of *bas-syntax* lvl) (n "String"))))
+      (or (and (Int.>= id 73) (Int.<= id 77)) (Int.= id 80))
+        (Maybe.Just
+          (BT.inter (n "Builtin")
+                    (BT.fun
+                      (BVal.args-of (if (Int.= id 73) (BT.top) *bas-syntax*) lvl)
+                      (if (Int.= id 80) (BT.bot) (n "ListNil")))))
+      (type-of id (value-arity id) lvl)))
+
+  (doc value-arity "the arity a builtin is used at when passed as a value.")
+  (defn value-arity [id]
+    (cond
+      (or (Int.= id 1) (Int.= id 2) (Int.= id 78)) 1
+      (and (Int.>= id 44) (Int.<= id 47)) 2
+      (and (Int.>= id 26) (Int.<= id 31)) 2
+      (or (Int.= id 5)
+          (Int.= id 86)
+          (Int.= id 42)
+          (Int.= id 43)
+          (Int.= id 49)
+          (Int.= id 50)
+          (Int.= id 52)
+          (Int.= id 64)
+          (Int.= id 84)
+          (Int.= id 85))
+        2
+      (or (Int.= id 55) (Int.= id 56) (Int.= id 53)) 2
+      (Int.= id 54) 3
+      (Int.= id 0) 0
+      1)))
+
+;; ------------------------------------------------------------ expressions
+
+(deftype BE
+  (Lit [Int])
+  ;; builtin id, arity
+  (Prim [Int Int])
+  (Var [Int])
+  (Coll [(Array Int)])
+  ;; parameters, rest parameter (-1: none), body
+  (Lambda [(Array Int) Int Int])
+  ;; a macro's parameters, rest parameter (-1: none), body
+  (Macro [(Array Int) Int Int])
+  (LambdaRec [(Array Int) (Array Int)])
+  (App [Int (Array Int)])
+  ;; condition, then, else
+  (If [Int Int Int])
+  ;; variable, tag type, then, else
+  (IfIs [Int Int Int Int])
+  (Let [Int Int Int])
+  ;; field (0 car, 1 cdr), expression
+  (Field [Int Int])
+  ;; (set! x e): variable, value
+  (SetVar [Int Int])
+  ;; condition, body
+  (While [Int Int])
+  ;; a quoted symbol naming a function: its literal type, and the function
+  (CallableSym [Int Int])
+  ;; an expression whose value must not be of a type: what a call evaluates
+  ;; a callee that is a symbol in, where the locals named would shadow it
+  (Exclude [Int Int])
+  (Fail [String]))
+
+(def *be-exprs* (the (Array BE) []))
+;; the source span each expression was lowered from
+(def *be-spans* (the (Map Int SurfaceSpan) (Map.create)))
+;; the expression being typed, and the one the first failure was found in
+(def *bas-at* (the (Maybe SurfaceSpan) (Maybe.Nothing)))
+(def *bas-failure-at* (the (Maybe SurfaceSpan) (Maybe.Nothing)))
+(def *be-next-var* 0)
+(def *be-global-vars* (the (Map Int Int) (Map.create)))
+(def *be-group-vars* (the (Map Int Int) (Map.create)))
+;; variables some `set!` assigns: never narrowed, one type for their life
+(def *be-mutable* (the (Map Int Bool) (Map.create)))
+;; the shared type of each global holding a value, by cell
+(def *bas-mutable-types* (the (Map Int Int) (Map.create)))
+;; the globals made since the group began, and their values still to type
+(def *bas-created* (the (Array Int) []))
+(def *bas-pending* (the (Array (Pair Int (Pair Int Int))) []))
+;; the global each pending value expression is the value of, for messages
+(def *be-value-cells* (the (Map Int Int) (Map.create)))
+;; the definition each closure value belongs to, by prototype and frame,
+;; and the cells that hold definitions
+(def *bas-closure-defs* (the (Map Long Int) (Map.create)))
+(def *bas-def-cells* (the (Map Int Bool) (Map.create)))
+
+(defmodule BAst
+  (defn reset! []
+    (do
+      (set! *be-exprs* [])
+      (set! *be-spans* (Map.create))
+      (set! *be-next-var* 0)
+      (set! *be-global-vars* (Map.create))
+      (set! *be-group-vars* (Map.create))
+      (set! *be-mutable* (Map.create))
+      (set! *bas-mutable-types* (Map.create))
+      (set! *bas-created* [])
+      (set! *bas-pending* [])))
+
+  (defn mutable? [v] (Map.contains? &*be-mutable* &v))
+
+  (defn node! [e]
+    (let-do [i (Array.length &*be-exprs*)] (Array.push-back! &*be-exprs* e) i))
+
+  (defn get [i] (Array.unsafe-nth &*be-exprs* i))
+
+  (defn fresh-var! []
+    (let-do [v *be-next-var*] (set! *be-next-var* (Int.inc v)) v))
+
+  (defn global-var [cell]
+    (match (Map.get-maybe &*be-global-vars* &cell)
+      (Maybe.Just v) v
+      (Maybe.Nothing)
+        (let-do [v (fresh-var!)] (Map.put! &*be-global-vars* &cell &v) v)))
+
+  (defn lit [t] (node! (BE.Lit t)))
+  (defn var [v] (node! (BE.Var v)))
+  (defn fail [why] (node! (BE.Fail why))))
+
+(defmodule BLower
+  (doc projections "the fields `car`, `cdr` and their compositions read,
+innermost first: 0 is `car`, 1 `cdr`.")
+  (defn projections [builtin]
+    (cond
+      (or (Int.= builtin 18) (Int.= builtin 19)) [1 0 0]
+      (or (Int.= builtin 20) (Int.= builtin 21)) [1 0 1]
+      (or (Int.= builtin 6) (Int.= builtin 7)) [0]
+      (or (Int.= builtin 8) (Int.= builtin 9)) [1]
+      (or (Int.= builtin 10) (Int.= builtin 11)) [1 0]
+      (or (Int.= builtin 12) (Int.= builtin 13)) [1 1 0]
+      (or (Int.= builtin 14) (Int.= builtin 15)) [1 1 1 0]
+      (or (Int.= builtin 16) (Int.= builtin 17)) [1 1]
+      []))
+
+  (doc translate "the expression `ir` lowers to, remembering the span it
+came from (an inner form's span wins when both lower to one expression).")
+  (defn translate [state frame scopes deps ir]
+    (let-do [e (translate-ir state frame scopes deps ir)]
+      (unless (Map.contains? &*be-spans* &e)
+        (Map.put! &*be-spans* &e &(CtIRSpan.of ir)))
+      e))
+
+  (private translate-ir)
+  (hidden translate-ir)
+  (defn translate-ir [state frame scopes deps ir]
+    (match-ref ir
+      (CtIR.Lit node) (BAst.lit (BVal.literal (Box.peek node)))
+      (CtIR.Quote node) (quoted state deps (Box.peek node))
+      (CtIR.Sym name _ _) (name-ref state frame scopes deps name false)
+      (CtIR.ArgSym name _ _) (name-ref state frame scopes deps name true)
+      (CtIR.Coll items _)
+        (BAst.node! (BE.Coll (translate-all state frame scopes deps items)))
+      (CtIR.If c t e _)
+        (test state
+              frame
+              scopes
+              deps
+              (Box.peek c)
+              (translate state frame scopes deps (Box.peek t))
+              (translate state frame scopes deps (Box.peek e)))
+      (CtIR.When c e _)
+        (test state
+              frame
+              scopes
+              deps
+              (Box.peek c)
+              (translate state frame scopes deps (Box.peek e))
+              (BAst.lit (BT.named "ListNil")))
+      (CtIR.And items _) (short-circuit state frame scopes deps items 0 true)
+      (CtIR.Or items _) (short-circuit state frame scopes deps items 0 false)
+      (CtIR.Seq items _) (sequence state frame scopes deps items 0)
+      (CtIR.Let bindings body _)
+        (let-chain state frame scopes deps bindings 0 &[@body])
+      (CtIR.LetDo bindings body _)
+        (let-chain state frame scopes deps bindings 0 body)
+      (CtIR.Cond items form)
+        (cond-chain state frame scopes deps items 0 (Box.peek form))
+      (CtIR.Fn proto _) (lambda state frame scopes deps @proto)
+      (CtIR.CallSym name _ builtin args raws form)
+        (call state frame scopes deps name @builtin args raws (Box.peek form))
+      (CtIR.CallExpr head args _ _)
+        (let [hv (translate state frame scopes deps (Box.peek head))
+              vs (translate-all state frame scopes deps args)]
+          (BAst.node! (BE.App (unshadowed state frame scopes hv) vs)))
+      (CtIR.Fail message _) (BAst.fail @message)
+      (CtIR.While c body _)
+        (let [cv (translate state frame scopes deps (Box.peek c))
+              bv (translate state frame scopes deps (Box.peek body))]
+          (BAst.node! (BE.While cv bv)))
+      (CtIR.SetName name value _)
+        (assignment state frame scopes deps name (Box.peek value))
+      (CtIR.Special op values raws _)
+        (cond
+          ;; a binding's defining form, or the empty list
+          (Int.= @op (CtSpecial.sexpr-op))
+          (BAst.lit *bas-syntax-list*)
+          ;; (members T) and (managed? T) read what the expander recorded
+          ;; about the type T, named by its raw symbol
+          (or (Int.= @op (CtSpecial.members-op))
+              (Int.= @op (CtSpecial.managed-op)))
+          (type-fact state frame @op (Box.peek (Array.unsafe-nth raws 0)))
+          ;; (expand form): a form
+          (and (Int.= @op (CtSpecial.expand-op)) (Int.= 1 (Array.length values)))
+          (BAst.node!
+            (BE.App (BAst.node! (BE.Prim 1004 1))
+                    (translate-all state frame scopes deps values)))
+          ;; (concat xs ys): the array of both
+          (and (Int.= @op (CtSpecial.concat-op)) (Int.= 2 (Array.length values)))
+          (BAst.node!
+            (BE.App (BAst.node! (BE.Prim 1005 2))
+                    (translate-all state frame scopes deps values)))
+          ;; (with-test-internal name forms): the forms, each a form
+          (and (Int.= @op (CtSpecial.with-test-op))
+               (Int.= 2 (Array.length values)))
+          (BAst.node!
+            (BE.App (BAst.node! (BE.Prim 1006 2))
+                    (translate-all state frame scopes deps values)))
+          ;; (eval form): whatever the form evaluates to
+          (and (Int.= @op (CtSpecial.eval-op)) (Int.= 1 (Array.length values)))
+          (BAst.node!
+            (BE.App (BAst.node! (BE.Prim 1001 1))
+                    (translate-all state frame scopes deps values)))
+          (and (Int.= @op (CtSpecial.apply-op))
+               (Int.= 1 (Array.length values))
+               (Int.= 1 (Array.length raws)))
+          (application state
+                       frame
+                       scopes
+                       deps
+                       (Box.peek (Array.unsafe-nth raws 0))
+                       (translate state
+                                  frame
+                                  scopes
+                                  deps
+                                  (Box.peek (Array.unsafe-nth values 0))))
+          (BAst.fail (fmt "special form %d is not typed yet" @op)))
+      (CtIR.Case target branches _)
+        (case-chain state frame scopes deps (Box.peek target) branches)
+      (CtIR.SexprArg _ _) (BAst.fail @"s-expr arguments are not typed yet")))
+
+  (defn translate-all [state frame scopes deps items]
+    (let-do [out (the (Array Int) [])]
+      (for [i 0 (Array.length items)]
+        (Array.push-back! &out
+                          (translate state
+                                     frame
+                                     scopes
+                                     deps
+                                     (Box.peek (Array.unsafe-nth items i)))))
+      out))
+
+  (private case-chain)
+  (hidden case-chain)
+  (doc case-chain "`case`: the target bound to a variable, compared with each
+pattern in turn. A literal symbol or bool pattern is a tag test on it; any
+other pattern is typed and both outcomes kept. The default is the odd last
+form; with none, no match is an error (Nothing).")
+  (defn case-chain [state frame scopes deps target branches]
+    (let-do [x (BAst.fresh-var!)
+             e (translate state frame scopes deps target)
+             n (Array.length branches)
+             out (if (Int.odd? n)
+               (translate state
+                          frame
+                          scopes
+                          deps
+                          (Box.peek (Array.unsafe-nth branches (Int.dec n))))
+               (BAst.lit (BT.bot)))
+             i (if (Int.odd? n) (Int.- n 3) (Int.- n 2))]
+      (while-do (Int.>= i 0)
+        (let-do [p (Box.peek (Array.unsafe-nth branches i))
+                 body (translate state
+                                 frame
+                                 scopes
+                                 deps
+                                 (Box.peek (Array.unsafe-nth branches
+                                                             (Int.inc i))))]
+          (set! out
+                (match (literal-test p)
+                  (Maybe.Just t) (BAst.node! (BE.IfIs x t body out))
+                  (Maybe.Nothing)
+                    (let [pv (translate state frame scopes deps p)
+                          either (BAst.node!
+                            (BE.If (BAst.lit (BT.named "Bool")) body out))]
+                      (BAst.node! (BE.Let (BAst.fresh-var!) pv either)))))
+          (set! i (Int.- i 2))))
+      (BAst.node! (BE.Let x e out))))
+
+  (private assignment)
+  (hidden assignment)
+  (doc assignment "`(set! name value)`: the variable it names is mutable from
+then on, wherever it is read.")
+  (defn assignment [state frame scopes deps name value]
+    (let [e (translate state frame scopes deps value)
+          local (BSession.lookup-local scopes name)]
+      (if (Int.>= local 0)
+        (do
+          (Map.put! &*be-mutable* &local &true)
+          (BAst.node! (BE.SetVar local e)))
+        (let [cell (BSession.resolve state frame name)]
+          (cond
+            (Int.< cell 0)
+              (BAst.fail (fmt "unknown compile-time set! target: %s" name))
+            (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                        &(CtEnv.cell-at cell))
+              (CtValue.Closure _) true
+              (CtValue.Macro _) true
+              _ false)
+              (BAst.fail
+                (fmt "set! of the function binding %s is not typed yet" name))
+            (do
+              ;; the shared variable must exist before the assignment is typed
+              (ignore (mutable-global state deps cell))
+              (BAst.node! (BE.SetVar (BAst.global-var cell) e))))))))
+
+  (private test-tag)
+  (hidden test-tag)
+  (doc test-tag "when `ir` is a test of what a value is, the expression it
+tests and the type it tests for: a one-argument builtin answering `true`, or
+`(= x lit)` with a literal (see `compared`).")
+  (defn test-tag [ir]
+    (match-ref ir
+      (CtIR.CallSym _ _ builtin args _ _)
+        (cond
+          (Int.= 1 (Array.length args))
+          (match (BBuiltin.preimage @builtin &(BLit.Boolean true))
+            (Maybe.Just t)
+              (Maybe.Just (Pair.init (Box.copy (Array.unsafe-nth args 0)) t))
+            (Maybe.Nothing) (Maybe.Nothing))
+          (and
+            (or (Int.= @builtin 42) (Int.= @builtin 43))
+            (Int.= 2 (Array.length args)))
+          (let [a (Box.peek (Array.unsafe-nth args 0))
+                b (Box.peek (Array.unsafe-nth args 1))]
+            (match (compared a b)
+              (Maybe.Just p) (Maybe.Just p)
+              (Maybe.Nothing) (compared b a)))
+          ;; (> (f x) k) or (< k (f x)), and (< (f x) k) or (> k (f x))
+          (and
+            (or (Int.= @builtin 49) (Int.= @builtin 50))
+            (Int.= 2 (Array.length args)))
+          (let [a (Box.peek (Array.unsafe-nth args 0))
+                b (Box.peek (Array.unsafe-nth args 1))
+                greater (Int.= @builtin 49)]
+            (match (integer-of b)
+              (Maybe.Just k)
+                (call-preimage a &(if greater (BLit.Above k) (BLit.Below k)))
+              (Maybe.Nothing)
+                (match (integer-of a)
+                  (Maybe.Just k)
+                    (call-preimage b &(if greater (BLit.Below k) (BLit.Above k)))
+                  (Maybe.Nothing) (Maybe.Nothing))))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private compared)
+  (hidden compared)
+  (doc compared "the test `(= x lit)` makes when `lit` is a literal: when `x`
+is a one-argument builtin call, its argument against the builtin's preimage of
+`lit`; otherwise `x` itself against `lit`'s tag, when the literal has a tag of
+its own.")
+  (defn compared [x lit]
+    (match (literal-of lit)
+      (Maybe.Nothing) (Maybe.Nothing)
+      (Maybe.Just l)
+        (match (call-preimage x &l)
+          (Maybe.Just p) (Maybe.Just p)
+          (Maybe.Nothing)
+            (match (exact-literal &l)
+              (Maybe.Just t) (Maybe.Just (Pair.init (Box.init (CtIR.copy x)) t))
+              (Maybe.Nothing) (Maybe.Nothing)))))
+
+  (private call-preimage)
+  (hidden call-preimage)
+  (defn call-preimage [x l]
+    (match-ref x
+      (CtIR.CallSym _ _ builtin args _ _)
+        (if (Int.= 1 (Array.length args))
+          (match (BBuiltin.preimage @builtin l)
+            (Maybe.Just t)
+              (Maybe.Just (Pair.init (Box.copy (Array.unsafe-nth args 0)) t))
+            (Maybe.Nothing) (Maybe.Nothing))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private literal-of)
+  (hidden literal-of)
+  (defn literal-of [ir]
+    (let [node (match-ref ir
+            (CtIR.Lit node) (Maybe.Just (SurfaceNode.copy (Box.peek node)))
+            (CtIR.Quote node) (Maybe.Just (SurfaceNode.copy (Box.peek node)))
+            _ (the (Maybe SurfaceNode) (Maybe.Nothing)))]
+      (match node
+        (Maybe.Nothing) (Maybe.Nothing)
+        (Maybe.Just nd)
+          (match-ref (SurfaceNode.form &nd)
+            (SurfaceForm.Symbol segments)
+              (Maybe.Just (BLit.Sym (String.join "." segments)))
+            (SurfaceForm.BoolLit b) (Maybe.Just (BLit.Boolean @b))
+            (SurfaceForm.IntLit k) (Maybe.Just (BLit.Integer @k))
+            _ (Maybe.Nothing)))))
+
+  (private exact-literal)
+  (hidden exact-literal)
+  (doc exact-literal "the tag holding exactly the literal `l`, when it has one:
+symbols and bools do, numbers do not.")
+  (defn exact-literal [l]
+    (match-ref l
+      (BLit.Boolean b) (Maybe.Just (BT.named (if @b "True" "False")))
+      (BLit.Sym s) (Maybe.Just (BT.tag (BTag.literal (BTag.named "Symbol") s)))
+      _ (Maybe.Nothing)))
+
+  (private integer-of)
+  (hidden integer-of)
+  (defn integer-of [ir]
+    (match (literal-of ir)
+      (Maybe.Just (BLit.Integer k)) (Maybe.Just k)
+      _ (Maybe.Nothing)))
+
+  (private literal-test)
+  (hidden literal-test)
+  (defn literal-test [ir]
+    (match (literal-of ir)
+      (Maybe.Just l) (exact-literal &l)
+      (Maybe.Nothing) (Maybe.Nothing)))
+
+  (private test)
+  (hidden test)
+  (doc test "a branch on condition `c`: a tag test on a variable when `c`
+is one (MLstruct's `if x = t is T`), otherwise a condition that must be a
+Bool.")
+  (defn test [state frame scopes deps c then else]
+    (match-ref c
+      ;; as a condition, (and a b) is a then b, and (or a b) a else b, so
+      ;; each test narrows what comes after it
+      (CtIR.And items _)
+      (conjunction state frame scopes deps items 0 then else)
+      (CtIR.Or items _)
+      (disjunction state frame scopes deps items 0 then else)
+      _
+      (match (negated c)
+        (Maybe.Just inner)
+          (test state frame scopes deps (Box.peek &inner) else then)
+        (Maybe.Nothing) (tag-or-bool state frame scopes deps c then else))))
+
+  (private conjunction)
+  (hidden conjunction)
+  (defn conjunction [state frame scopes deps items i then else]
+    (if (Int.= i (Array.length items))
+      then
+      (test state
+            frame
+            scopes
+            deps
+            (Box.peek (Array.unsafe-nth items i))
+            (conjunction state frame scopes deps items (Int.inc i) then else)
+            else)))
+
+  (private disjunction)
+  (hidden disjunction)
+  (defn disjunction [state frame scopes deps items i then else]
+    (if (Int.= i (Array.length items))
+      else
+      (test state
+            frame
+            scopes
+            deps
+            (Box.peek (Array.unsafe-nth items i))
+            then
+            (disjunction state frame scopes deps items (Int.inc i) then else))))
+
+  (private negated)
+  (hidden negated)
+  (doc negated "the test `ir` negates, when it is `(not t)`.")
+  (defn negated [ir]
+    (match-ref ir
+      (CtIR.CallSym _ _ builtin args _ _)
+        (if (and (Int.= @builtin 40) (Int.= 1 (Array.length args)))
+          (Maybe.Just (Box.copy (Array.unsafe-nth args 0)))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private tag-or-bool)
+  (hidden tag-or-bool)
+  (defn tag-or-bool [state frame scopes deps c then else]
+    (match (test-tag c)
+      (Maybe.Just p)
+        (let [x (BAst.fresh-var!)
+              e (translate state frame scopes deps (Box.peek (Pair.a &p)))
+              ;; the tested expression names a variable: narrow that one
+              target (match-ref (BAst.get e) (BE.Var v) @v _ -1)
+              narrowed (if (Int.>= target 0)
+                (BAst.node! (BE.IfIs target @(Pair.b &p) then else))
+                (BAst.node!
+                  (BE.Let x e (BAst.node! (BE.IfIs x @(Pair.b &p) then else)))))]
+          ;; the test narrows in addition to being typed: its call still has
+          ;; to accept its arguments
+          (BAst.node!
+            (BE.Let (BAst.fresh-var!)
+                    (translate state frame scopes deps c)
+                    narrowed)))
+      (Maybe.Nothing)
+        (BAst.node! (BE.If (translate state frame scopes deps c) then else))))
+
+  (private short-circuit)
+  (hidden short-circuit)
+  (defn short-circuit [state frame scopes deps items i is-and]
+    (cond
+      (Int.= 0 (Array.length items))
+        (BAst.lit (BT.named (if is-and "True" "False")))
+      (Int.= i (Int.dec (Array.length items)))
+        (translate state frame scopes deps (Box.peek (Array.unsafe-nth items i)))
+      (let [rest (short-circuit state frame scopes deps items (Int.inc i) is-and)
+            stop (BAst.lit (BT.named (if is-and "False" "True")))]
+        (if is-and
+          (test state
+                frame
+                scopes
+                deps
+                (Box.peek (Array.unsafe-nth items i))
+                rest
+                stop)
+          (test state
+                frame
+                scopes
+                deps
+                (Box.peek (Array.unsafe-nth items i))
+                stop
+                rest)))))
+
+  (private sequence)
+  (hidden sequence)
+  (defn sequence [state frame scopes deps items i]
+    (let [n (Array.length items)]
+      (cond
+        (Int.= n 0) (BAst.lit (BT.named "ListNil"))
+        (Int.= i (Int.dec n))
+          (translate state
+                     frame
+                     scopes
+                     deps
+                     (Box.peek (Array.unsafe-nth items i)))
+        (let [e (translate state
+                           frame
+                           scopes
+                           deps
+                           (Box.peek (Array.unsafe-nth items i)))
+              rest (sequence state frame scopes deps items (Int.inc i))]
+          (BAst.node! (BE.Let (BAst.fresh-var!) e rest))))))
+
+  (private let-chain)
+  (hidden let-chain)
+  (defn let-chain [state frame scopes deps bindings i body]
+    (if (Int.= i (Array.length bindings))
+      (sequence state frame scopes deps body 0)
+      (let-do [b (Array.unsafe-nth bindings i)
+               e (translate state frame scopes deps (Box.peek (CtBind.value b)))
+               v (BAst.fresh-var!)
+               inner (Array.push-back @scopes
+                                      (BScope.init [@(CtBind.name b)] [v]))
+               rest (let-chain state frame &inner deps bindings (Int.inc i) body)]
+        (BAst.node! (BE.Let v e rest)))))
+
+  (private cond-chain)
+  (hidden cond-chain)
+  (defn cond-chain [state frame scopes deps items i form]
+    (let [n (Array.length items)]
+      (cond
+        (Int.= i n) (BAst.lit (BVal.literal form))
+        (Int.= i (Int.dec n))
+          (translate state
+                     frame
+                     scopes
+                     deps
+                     (Box.peek (Array.unsafe-nth items i)))
+        (test state
+              frame
+              scopes
+              deps
+              (Box.peek (Array.unsafe-nth items i))
+              (translate state
+                         frame
+                         scopes
+                         deps
+                         (Box.peek (Array.unsafe-nth items (Int.inc i))))
+              (cond-chain state frame scopes deps items (Int.+ i 2) form)))))
+
+  (private type-fact)
+  (hidden type-fact)
+  (doc type-fact "`(members T)` or `(managed? T)`: what the expander recorded
+about the type named by the raw symbol `raw`, which must name a type when the
+code is checked.")
+  (defn type-fact [state frame op raw]
+    (match-ref (SurfaceNode.form raw)
+      (SurfaceForm.Symbol segs)
+        (let [name (String.join "." segs)
+              members? (Int.= op (CtSpecial.members-op))
+              cell (BSession.resolve state
+                                     frame
+                                     &(String.append (if members?
+                                                       "__members_"
+                                                       "__managed_")
+                                                     &name))]
+          (if members?
+            (if (Int.>= cell 0)
+              (BAst.lit *bas-syntax*)
+              (BAst.fail (fmt "members of %s, which is not a type" &name)))
+            (BAst.lit (BT.named (if (Int.>= cell 0) "True" "False")))))
+      _ (BAst.fail @"members and managed? take a type's name")))
+
+  (private application)
+  (hidden application)
+  (doc application "`(apply f xs)`, as the evaluator runs it: `f` stays
+syntax. A builtin, qualified or unbound name makes the call form; a name bound
+to a closure calls it, to a macro expands it to a form, and to anything else
+(a local, a global variable) calls it when it holds a closure and makes the
+call form when it holds a form. A computed `f` is evaluated and called.")
+  (defn application [state frame scopes deps head xs]
+    (match-ref (SurfaceNode.form head)
+      (SurfaceForm.Symbol segs)
+        (let [name (String.join "." segs)
+              symbol (BAst.lit
+                (BT.tag (BTag.literal (BTag.named "Symbol") &name)))
+              local (BSession.lookup-local scopes &name)]
+          (cond
+            (or (String.contains? &name \.)
+                (Int.>= (CtLower.builtin-id &name) 0))
+              (applied 1002 symbol xs)
+            (Int.>= local 0) (applied 1003 (BAst.var local) xs)
+            (let [cell (BSession.resolve state frame &name)]
+              (if (Int.< cell 0)
+                (applied 1002 symbol xs)
+                (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                            &(CtEnv.cell-at cell))
+                  (CtValue.Closure _)
+                  (applied 1000 (global-ref state deps cell) xs)
+                  ;; the expansion, as data, from the forms
+                  (CtValue.Macro _)
+                  (BAst.node!
+                    (BE.Let (BAst.fresh-var!)
+                            (applied 1002 symbol xs)
+                            (BAst.lit *bas-syntax*)))
+                  _
+                  (applied 1003 (global-ref state deps cell) xs))))))
+      _
+        (let [ir (CtLower.lower head &(BSession.scope-names scopes))]
+          (applied 1000 (translate state frame scopes deps &ir) xs))))
+
+  (private applied)
+  (hidden applied)
+  (defn applied [id f xs]
+    (BAst.node! (BE.App (BAst.node! (BE.Prim id 2)) [f xs])))
+
+  (private name-ref)
+  (hidden name-ref)
+  (defn name-ref [state frame scopes deps name as-argument]
+    (let [local (BSession.lookup-local scopes name)]
+      (if (Int.>= local 0)
+        (BAst.var local)
+        (let [cell (BSession.resolve state frame name)]
+          (if (Int.>= cell 0)
+            (global-ref state deps cell)
+            (let [id (CtLower.builtin-id name)]
+              (cond
+                (Int.>= id 0) (BAst.node! (BE.Prim id -1))
+                as-argument
+                  (BAst.lit (BT.tag (BTag.literal (BTag.named "Symbol") name)))
+                (BAst.fail (fmt "unknown compile-time symbol: %s" name)))))))))
+
+  (private global-ref)
+  (hidden global-ref)
+  (doc global-ref "a top-level binding: a function by its variable, typed
+with its definition; any other value by the value its cell holds now. That
+is a snapshot: a later `set!` of the binding is not seen (set! is not typed
+yet).")
+  (doc global-ref "a top-level binding. A function is typed with its
+definition. Any other value is a variable shared by every use, its current
+value and every assignment checked below it: any global may be assigned,
+by code checked later as much as by code seen now, so no use may fix its
+type or narrow it.")
+  (defn global-ref [state deps cell]
+    (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                &(CtEnv.cell-at cell))
+      ;; a definition: typed as one. A closure in any other cell (a local a
+      ;; closure captured) is a value like any other.
+      (CtValue.Closure _)
+      (if (not (Map.contains? &*bas-def-cells* &cell))
+        (mutable-global state deps cell)
+        (do
+          (unless (Array.contains? deps &cell) (Array.push-back! deps cell))
+          (match (Map.get-maybe &*be-group-vars* &cell)
+            (Maybe.Just v) (BAst.var v)
+            (Maybe.Nothing) (BAst.var (BAst.global-var cell)))))
+      (CtValue.Macro _)
+      (BAst.fail @"a macro as a value is not typed yet")
+      _
+      (mutable-global state deps cell)))
+
+  (private mutable-global)
+  (hidden mutable-global)
+  (doc mutable-global "a global holding a value: one variable for all its
+uses, below which its current value (lowered as an expression and typed in
+the group that uses it) and every assignment checked.")
+  (defn mutable-global [state deps cell]
+    (let-do [v (BAst.global-var cell)]
+      (Map.put! &*be-mutable* &v &true)
+      (unless (Map.contains? &*bas-mutable-types* &cell)
+        (let-do [t (BT.fresh-var 0)]
+          ;; registered first: a value that refers to its own global meets
+          ;; the variable rather than lowering itself again
+          (Map.put! &*bas-mutable-types* &cell &t)
+          (Map.put! &*bas-globals* &v &(BScheme.init t -1))
+          (Array.push-back! &*bas-created* cell)
+          (let [e (value-expr state
+                              deps
+                              (CtEnv.peek-cell (CtState.environment state)
+                                               &(CtEnv.cell-at cell)))]
+            (Array.push-back! &*bas-pending* (Pair.init t (Pair.init e cell))))))
+      (BAst.var v)))
+
+  (private value-expr)
+  (hidden value-expr)
+  (doc value-expr "a value as the expression that would make it: a form as
+its literal, a builtin by name, a list or array of the expressions of its
+elements, and a closure as the definition it is the value of, or else as its
+code lowered in the frame it closes over.")
+  (defn value-expr [state deps value]
+    (match-ref value
+      (CtValue.Syntax node) (BAst.lit (BVal.literal (Box.peek node)))
+      (CtValue.Builtin name)
+        (let [id (CtLower.builtin-id name)]
+          (if (Int.>= id 0)
+            (BAst.node! (BE.Prim id -1))
+            (BAst.lit (BT.named "Builtin"))))
+      (CtValue.Macro _) (BAst.lit (BT.named "Macro"))
+      (CtValue.Collection list? items)
+        (let [es (Array.copy-map
+                &(fn [b] (value-expr state deps (Box.peek b)))
+                items)]
+          (if @list?
+            (BAst.node! (BE.App (BAst.node! (BE.Prim 1 (Array.length &es))) es))
+            (BAst.node! (BE.Coll es))))
+      (CtValue.Closure c)
+        (let [closure (Box.peek c)
+              key (BT.pair @(CtClosure.proto closure)
+                           @(FrameId.index (CtClosure.defining-frame closure)))]
+          (match (Map.get-maybe &*bas-closure-defs* &key)
+            (Maybe.Just cell) (global-ref state deps cell)
+            (Maybe.Nothing)
+              (let [proto (Box.peek
+                      (Array.unsafe-nth &*ct-protos* @(CtClosure.proto closure)))]
+                (lambda-of state
+                           (CtClosure.defining-frame closure)
+                           &[]
+                           deps
+                           (CtProto.parameters proto)
+                           (CtProto.rest proto)
+                           (Box.peek (CtProto.body proto))))))))
+
+  (private lambda)
+  (hidden lambda)
+  (defn lambda [state frame scopes deps proto-id]
+    (let [proto (Box.peek (Array.unsafe-nth &*ct-protos* proto-id))]
+      (lambda-of state
+                 frame
+                 scopes
+                 deps
+                 (CtProto.parameters proto)
+                 (CtProto.rest proto)
+                 (Box.peek (CtProto.body proto)))))
+
+  (doc lambda-of "a function of `params` and the rest parameter `rest`, if
+any, with body `body`.")
+  (defn lambda-of [state frame scopes deps params rest body]
+    (let-do [vars (Array.copy-map &(fn [_] (BAst.fresh-var!)) params)
+             names @params
+             r (match-ref rest
+               (Maybe.Just _) (BAst.fresh-var!)
+               (Maybe.Nothing) -1)]
+      (match-ref rest
+        (Maybe.Just name)
+          (do (Array.push-back! &names @name) (Array.push-back! &vars r))
+        (Maybe.Nothing) ())
+      (let [scopes2 (Array.push-back @scopes (BScope.init names @&vars))
+            ir (CtLower.lower body &(BSession.scope-names &scopes2))
+            e (translate state frame &scopes2 deps &ir)]
+        (BAst.node! (BE.Lambda (Array.prefix &vars (Array.length params)) r e)))))
+
+  (doc macro-body "a macro as a function of the forms it is called with.")
+  (defn macro-body [state frame deps params rest body]
+    (match @(BAst.get (lambda-of state frame &[] deps params rest body))
+      (BE.Lambda ps r e) (BAst.node! (BE.Macro ps r e))
+      _ (BAst.fail @"a macro did not lower to a function")))
+
+  (private call)
+  (hidden call)
+  (doc call "a call of the name `name`, in the evaluator's order: a macro
+the name is bound to expands, then a builtin of that name is applied even
+over a binding, then the binding is called.")
+  (defn call [state frame scopes deps name builtin args raws form]
+    (let [local (BSession.lookup-local scopes name)
+          cell (if (Int.>= local 0) -1 (BSession.resolve state frame name))]
+      (match (macro-at state cell)
+        (Maybe.Just closure)
+          (macro-call state frame scopes deps name &closure raws form)
+        (Maybe.Nothing)
+          (cond
+            (Int.>= builtin 0)
+              (builtin-call state frame scopes deps builtin args)
+            (Int.>= local 0)
+              (let [vs (translate-all state frame scopes deps args)]
+                (BAst.node!
+                  (BE.App (unshadowed state frame scopes (BAst.var local)) vs)))
+            (Int.< cell 0)
+              (BAst.fail (fmt "unknown compile-time function: %s" name))
+            (let [f (global-ref state deps cell)
+                  vs (translate-all state frame scopes deps args)]
+              (BAst.node! (BE.App (unshadowed state frame scopes f) vs)))))))
+
+  (private quoted)
+  (hidden quoted)
+  (doc quoted "a quoted form. A symbol that names a builtin or a definition
+holding a closure is also callable as that function, since applying a symbol
+evaluates it (`ct-semantics.md` §5); it names the function the root frame
+binds it to, which `unshadowed` keeps true where it is called.")
+  (defn quoted [state deps node]
+    (let [lit (BVal.literal node)]
+      (match-ref (SurfaceNode.form node)
+        (SurfaceForm.Symbol segs)
+          (match (callable-ref state deps &(String.join "." segs))
+            (Maybe.Just f) (BAst.node! (BE.CallableSym lit f))
+            (Maybe.Nothing) (BAst.lit lit))
+        _ (BAst.lit lit))))
+
+  (private callable-ref)
+  (hidden callable-ref)
+  (defn callable-ref [state deps name]
+    (let [cell (BSession.resolve state (CtState.root state) name)]
+      (if (Int.>= cell 0)
+        (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                    &(CtEnv.cell-at cell))
+          (CtValue.Closure _)
+            (if (Map.contains? &*bas-def-cells* &cell)
+              (Maybe.Just (global-ref state deps cell))
+              (Maybe.Nothing))
+          _ (Maybe.Nothing))
+        (let [id (CtLower.builtin-id name)]
+          (if (Int.>= id 0)
+            (Maybe.Just (BAst.node! (BE.Prim id -1)))
+            (Maybe.Nothing))))))
+
+  (private unshadowed)
+  (hidden unshadowed)
+  (doc unshadowed "the callee `f` of a call made where the locals `scopes`
+bind, in a definition whose frame is `frame`: a symbol it holds is evaluated
+there, so it must not be one of their names. A symbol's arrow is what the
+root binds it to, so under any other frame (a closure a module's
+`defdynamic` made) no symbol may be called.")
+  (defn unshadowed [state frame scopes f]
+    (let-do [t (if (Int.= @(FrameId.index frame)
+                          @(FrameId.index (CtState.root state)))
+               (BT.bot)
+               (BT.named "Symbol"))]
+      (for [i 0 (Array.length scopes)]
+        (let [names (BScope.names (Array.unsafe-nth scopes i))]
+          (for [j 0 (Array.length names)]
+            (set! t
+                  (BT.union t
+                            (BT.tag
+                              (BTag.literal (BTag.named "Symbol")
+                                            (Array.unsafe-nth names j))))))))
+      (if (Int.= t (BT.bot)) f (BAst.node! (BE.Exclude f t)))))
+
+  (private macro-at)
+  (hidden macro-at)
+  (defn macro-at [state cell]
+    (if (Int.< cell 0)
+      (Maybe.Nothing)
+      (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                  &(CtEnv.cell-at cell))
+        (CtValue.Macro closure) (Maybe.Just @(Box.peek closure))
+        _ (Maybe.Nothing))))
+
+  (private macro-call)
+  (hidden macro-call)
+  (doc macro-call "a macro call is typed as its expansion, which is what
+runs: the macro is expanded from the argument syntax by the evaluator, and
+the expansion lowered in the scope of the call.")
+  (defn macro-call [state frame scopes deps name closure raws form]
+    (match (CtEval.expand-ct-macro-args form closure raws state)
+      (Result.Error e)
+        (BAst.fail
+          (fmt "macro %s does not expand: %s" name (CtError.message &e)))
+      (Result.Success node)
+        (let [ir (CtLower.lower &node &(BSession.scope-names scopes))]
+          (translate state frame scopes deps &ir))))
+
+  (private builtin-call)
+  (hidden builtin-call)
+  (defn builtin-call [state frame scopes deps builtin args]
+    (let [vs (translate-all state frame scopes deps args)
+          ps (BLower.projections builtin)]
+      (cond
+        ;; a setting asked for by name answers that setting's type
+        (and (Int.= builtin 83)
+             (Int.= (Array.length &vs) 1)
+             (Maybe.just? &(string-literal (Box.peek (Array.unsafe-nth args 0)))))
+        (BAst.lit
+          (BBuiltin.config-type
+            &(Maybe.from
+              (string-literal (Box.peek (Array.unsafe-nth args 0)))
+              @"")
+            0))
+        (and (Int.= (Array.length &vs) 1) (not (Array.empty? &ps)))
+        (let-do [x @(Array.unsafe-nth &vs 0)]
+          (for [i 0 (Array.length &ps)]
+            (set! x (BAst.node! (BE.Field @(Array.unsafe-nth &ps i) x))))
+          x)
+        ;; cons, cons-last and append act on the kind of one argument
+        (and (Int.= (Array.length &vs) 2) (Maybe.just? &(kind-dispatch builtin)))
+        (dispatched builtin &vs)
+        (BAst.node!
+          (BE.App (BAst.node! (BE.Prim builtin (Array.length &vs))) vs)))))
+
+  (doc kind-dispatch "for a builtin that acts on the kind of one of its two
+arguments: which argument, and the list and array builtins it then is.")
+  (defn kind-dispatch [builtin]
+    (cond
+      (or (Int.= builtin 26) (Int.= builtin 27)) (Maybe.Just [1 1008 1009])
+      (or (Int.= builtin 28) (Int.= builtin 29)) (Maybe.Just [1 1010 1011])
+      (the (Maybe (Array Int)) (Maybe.Nothing))))
+
+  (doc dispatched "`(f a b)` for a kind-dispatching `f`, as the evaluator runs
+it: both arguments bound in order, then a test of the dispatching one's kind
+that narrows it to a list or an array, and the single-kind builtin for each.")
+  (defn dispatched [builtin vs]
+    (let-do [d (Maybe.from (kind-dispatch builtin) [0 0 0])
+             a (BAst.fresh-var!)
+             b (BAst.fresh-var!)
+             on (if (Int.= @(Array.unsafe-nth &d 0) 0) a b)
+             call (fn [id]
+               (BAst.node!
+                 (BE.App (BAst.node! (BE.Prim id 2)) [(BAst.var a) (BAst.var b)])))]
+      (BAst.node!
+        (BE.Let a
+                @(Array.unsafe-nth vs 0)
+                (BAst.node!
+                  (BE.Let b
+                          @(Array.unsafe-nth vs 1)
+                          (BAst.node!
+                            (BE.IfIs on
+                                     (BT.named "List")
+                                     (call @(Array.unsafe-nth &d 1))
+                                     (call @(Array.unsafe-nth &d 2))))))))))
+
+  (private string-literal)
+  (hidden string-literal)
+  (defn string-literal [ir]
+    (match-ref ir
+      (CtIR.Lit node)
+        (match-ref (SurfaceNode.form (Box.peek node))
+          (SurfaceForm.StringLit s) (Maybe.Just @s)
+          _ (Maybe.Nothing))
+      _ (Maybe.Nothing))))
+
+;; ------------------------------------------------------------ the typer
+
+(deftype BScheme
+  [type Int
+   ;; variables above this level are generalized; -1: none
+   lim Int])
+
+(def *bas-globals* (the (Map Int BScheme) (Map.create)))
+
+(defmodule BTyper
+  (defn fail! [msg] (BSolve.fail! msg))
+
+  (doc typeof "Simple-sub's `typeTerm`, with MLstruct's tag tests: the type
+of `e` at level `lvl` under `env`.")
+  (doc typeof "the type of `e`, remembering it as the expression a failure
+found while typing it is reported at, innermost first.")
+  (defn typeof [env lvl e]
+    (let-do [outer @&*bas-at*
+             outer-origin *bv-origin*
+             failed-before *bas-failed*]
+      (match (Map.get-maybe &*be-spans* &e)
+        (Maybe.Just span)
+          (do (set! *bas-at* (Maybe.Just span)) (set! *bv-origin* e))
+        (Maybe.Nothing) ())
+      (let-do [t (typeof-node env lvl e)]
+        (when (and *bas-failed*
+                   (not failed-before)
+                   (Maybe.nothing? &*bas-failure-at*))
+          (set! *bas-failure-at* @&*bas-at*))
+        (set! *bas-at* outer)
+        (set! *bv-origin* outer-origin)
+        t)))
+
+  (private typeof-node)
+  (hidden typeof-node)
+  (defn typeof-node [env lvl e]
+    (if *bas-failed*
+      (BT.bot)
+      (match-ref (BAst.get e)
+        (BE.Lit t)
+        @t
+        (BE.Prim id arity)
+        (match (if (Int.< @arity 0)
+            (BBuiltin.value-type @id lvl)
+            (BBuiltin.type-of @id @arity lvl))
+          (Maybe.Just t) t
+          (Maybe.Nothing)
+            (do (fail! &(fmt "builtin %d is not typed yet" @id)) (BT.bot)))
+        (BE.Var v)
+        (var-type env lvl @v)
+        ;; an array literal is an array of its elements
+        (BE.Coll es)
+        (let-do [ts (Array.copy-map &(fn [e] (typeof env lvl @e)) es)
+                 out (BT.named "ArrayNil")
+                 i (Array.length &ts)]
+          (while-do (Int.> i 0)
+            (set! i (Int.dec i))
+            (set! out (BVal.cell "ArrayCons" @(Array.unsafe-nth &ts i) out)))
+          out)
+        (BE.Lambda ps rest b)
+        (let-do [env2 @env
+                 params (the (Array Int) [])
+                 tail (BT.named "ArgsNil")]
+          (for [i 0 (Array.length ps)]
+            (let-do [x (BT.fresh-var lvl)]
+              (Array.push-back! &params x)
+              (Map.put! &env2 (Array.unsafe-nth ps i) &(BScheme.init x -1))))
+          ;; the rest parameter holds the remaining arguments, as a list when
+          ;; they are all forms and as a collection otherwise
+          (when (Int.>= @rest 0)
+            (let-do [e (BT.fresh-var lvl)]
+              (set! tail (BVal.args-of e lvl))
+              (Map.put! &env2 rest &(BScheme.init (BVal.list-of e lvl) -1))))
+          (BT.inter (BT.named "Closure")
+                    (BT.fun (BT.tup-tail &params tail) (typeof &env2 lvl @b))))
+        (BE.App f args)
+        (let-do [tf (typeof env lvl @f)
+                 ta (Array.copy-map &(fn [a] (typeof env lvl @a)) args)
+                 r (BT.fresh-var lvl)]
+          (BSolve.constrain tf (BT.fun (BT.tup &ta) r))
+          r)
+        (BE.If c a b)
+        (do
+          (BSolve.constrain (typeof env lvl @c) (BT.named "Bool"))
+          (BT.union (typeof env lvl @a) (typeof env lvl @b)))
+        (BE.IfIs x tag a b)
+        (if (BAst.mutable? @x)
+          ;; an assignment may come after the test: no narrowing
+          (BT.union (typeof env lvl @a) (typeof env lvl @b))
+          (if-is env lvl @x @tag @a @b))
+
+        (BE.Let v a b)
+        (let-do [env2 @env
+                 ta (typeof env lvl @a)]
+          (if (BAst.mutable? @v)
+            ;; a mutable variable: one type, below which every value it holds
+            (let-do [t (BT.fresh-var lvl)]
+              (BSolve.constrain ta t)
+              (Map.put! &env2 v &(BScheme.init t -1)))
+            (Map.put! &env2 v &(BScheme.init ta -1)))
+          (typeof &env2 lvl @b))
+        (BE.SetVar v x)
+        (let-do [tx (typeof env lvl @x)]
+          (BSolve.constrain tx (var-type env lvl @v))
+          tx)
+        (BE.CallableSym lit f)
+        (if (match-ref (BAst.get @f)
+            (BE.Var v) (Map.contains? &*bas-failed-defs* v)
+            _ false)
+          ;; a definition that does not check: a symbol, not callable
+          @lit
+          (let-do [tf (typeof env lvl @f)
+                   a (BT.fresh-var lvl)
+                   r (BT.fresh-var lvl)]
+            (BSolve.constrain tf (BT.fun a r))
+            (BT.inter @lit (BT.fun a r))))
+        (BE.Exclude x t)
+        (let-do [tx (typeof env lvl @x)] (BSolve.constrain tx (BT.neg @t)) tx)
+        (BE.While c b)
+        (do
+          (BSolve.constrain (typeof env lvl @c) (BT.named "Bool"))
+          (ignore (typeof env lvl @b))
+          (BT.named "ListNil"))
+        (BE.Field f x)
+        (let-do [r (BT.fresh-var lvl)]
+          (BSolve.constrain (typeof env lvl @x) (BT.fld @f r))
+          r)
+        (BE.Macro ps rest b)
+        ;; a macro takes forms: each parameter is a form of the shape its
+        ;; body needs, and the rest parameter a list of forms
+        (let-do [env2 @env
+                 params (the (Array Int) [])
+                 tail (BT.named "ArgsNil")]
+          (for [i 0 (Array.length ps)]
+            (let-do [x (BT.fresh-var lvl)]
+              (BSolve.constrain x *bas-syntax*)
+              (Array.push-back! &params x)
+              (Map.put! &env2 (Array.unsafe-nth ps i) &(BScheme.init x -1))))
+          (when (Int.>= @rest 0)
+            (let-do [e (BT.fresh-var lvl)]
+              (BSolve.constrain e *bas-syntax*)
+              (set! tail (BVal.args-of e lvl))
+              (Map.put! &env2 rest &(BScheme.init (BVal.list-of e lvl) -1))))
+          ;; what the body answers is the expansion, which must be a form
+          (let-do [result (typeof &env2 lvl @b)]
+            (BSolve.constrain result *bas-syntax*)
+            (BT.inter (BT.named "Macro")
+                      (BT.fun (BT.tup-tail &params tail) result))))
+        (BE.LambdaRec _ _)
+        (do (fail! "nested recursive group") (BT.bot))
+        (BE.Fail why)
+        (do (fail! why) (BT.bot)))))
+  (private if-is)
+  (hidden if-is)
+  (doc if-is "MLstruct's T-If: the scrutinee is `(T & t1) | (t2 & ~T & Obj)`,
+the branches see it as `t1` and `t2`.")
+  (defn if-is [env lvl x tag a b]
+    (let-do [tx (var-type env lvl x)
+             t1 (BT.fresh-var lvl)
+             t2 (BT.fresh-var lvl)
+             env1 @env
+             env2 @env]
+      ;; MLstruct's T-If: the scrutinee is `(T & t1) | (t2 & ~T & Obj)`
+      (BSolve.constrain tx
+                        (BT.union (BT.inter tag t1)
+                                  (BT.inters &[t2 (BT.neg tag) (BT.named "Obj")])))
+      (Map.put! &env1 &x &(BScheme.init t1 -1))
+      (Map.put! &env2 &x &(BScheme.init t2 -1))
+      (BT.union (typeof &env1 lvl a) (typeof &env2 lvl b))))
+
+  (doc var-type "the type of variable `v`: its scheme instantiated. Typing
+never adds expressions: a reference into the expression store must stay
+valid while a node is typed.")
+  (defn var-type [env lvl v]
+    (match (Map.get-maybe env &v)
+      (Maybe.Just sc) (instance &sc lvl)
+      (Maybe.Nothing)
+        (match (Map.get-maybe &*bas-globals* &v)
+          (Maybe.Just sc) (instance &sc lvl)
+          (Maybe.Nothing)
+            (do
+              (fail!
+                &(match (Map.get-maybe &*bas-failed-defs* &v)
+                  (Maybe.Just name) (fmt "uses %s, which does not check" &name)
+                  (Maybe.Nothing) (fmt "unbound variable x%d" v)))
+              (BT.bot)))))
+
+  (defn instance [sc lvl]
+    (if (Int.< @(BScheme.lim sc) 0)
+      @(BScheme.type sc)
+      (BExtrude.freshen-above @(BScheme.lim sc) @(BScheme.type sc) lvl))))
+
+;; ------------------------------------------------------------ printing
+
+(deftype PT
+  (PTop [])
+  (PBot [])
+  (PTag [String])
+  (PVar [Int])
+  (PFn [(Box PT) (Box PT)])
+  (PFld [Int (Box PT)])
+  (POr [(Array (Box PT))])
+  (PAnd [(Array (Box PT))])
+  (PNot [(Box PT)])
+  ;; the coalesced form of a variable at a polarity, built once, by index
+  (PRef [Int]))
+
+(def *bp-progress* (the (Map String Int) (Map.create)))
+;; recursive variables and their bodies
+(def *bp-rec-names* (the (Array Int) []))
+(def *bp-rec-bodies* (the (Array (Box PT)) []))
+(def *bp-rec-pols* (the (Array Bool) []))
+;; polarities each variable is printed at: 1 positive, 2 negative
+(def *bp-pols* (the (Map Int Int) (Map.create)))
+;; coalesced forms by (variable, polarity), shared between occurrences
+(def *bp-memo* (the (Map String Int) (Map.create)))
+(def *bp-bodies* (the (Array (Box PT)) []))
+(def *bp-counted* (the (Map String Bool) (Map.create)))
+(def *bp-rendered* (the (Map Int String) (Map.create)))
+(def *bp-shared-names* (the (Array String) []))
+
+(defmodule BPrint
+  (doc show "`t` as Simple-sub prints types: each variable with its bounds
+coalesced in (`a | lower bounds` where it is produced, `a & upper bounds`
+where it is consumed), a variable reached again inside itself as a recursive
+type, then every variable that ends up at one polarity only dropped: it says
+nothing.")
+  (defn show [t]
+    (do
+      (set! *bp-progress* (Map.create))
+      (set! *bp-rec-names* [])
+      (set! *bp-rec-bodies* [])
+      (set! *bp-rec-pols* [])
+      (set! *bp-pols* (Map.create))
+      (set! *bp-memo* (Map.create))
+      (set! *bp-bodies* [])
+      (set! *bp-counted* (Map.create))
+      (set! *bp-rendered* (Map.create))
+      (set! *bp-shared-names* [])
+      (let-do [main (coalesce t true)
+               recs (the (Array String) [])]
+        (count-pols &main true)
+        (for [i 0 (Array.length &*bp-rec-bodies*)]
+          (count-pols
+            (Box.peek (Array.unsafe-nth &*bp-rec-bodies* i))
+            @(Array.unsafe-nth &*bp-rec-pols* i)))
+        (for [i 0 (Array.length &*bp-rec-names*)]
+          (Array.push-back! &recs
+                            (fmt "a%d = %s"
+                                 @(Array.unsafe-nth &*bp-rec-names* i)
+                                 &(render
+                                   (Box.peek (Array.unsafe-nth &*bp-rec-bodies*
+                                                               i))))))
+        (let-do [m (render &main)]
+          (for [i 0 (Array.length &*bp-shared-names*)]
+            (Array.push-back! &recs @(Array.unsafe-nth &*bp-shared-names* i)))
+          (if (Array.empty? &recs)
+            m
+            (fmt "%s where %s" &m &(String.join ", " &recs)))))))
+
+  (doc dump "every variable reachable from `t` with its raw bounds, for
+debugging the printer.")
+  (defn dump [t]
+    (let-do [todo [t]
+             seen (the (Array Int) [])]
+      (while-do (not (Array.empty? &todo))
+        (let [x (Array.pop-back! &todo)]
+          (unless-do (Array.contains? &seen &x)
+            (Array.push-back! &seen x)
+            (match (BT.get x) (BTy.Var v) (do (IO.errorln &(fmt "a%d (level %d)
+   lo: %s
+   hi: %s" v (BT.var-level v) &(String.join " ;; "
+                                            &(Array.copy-map &(fn [b]
+                                                               (BT.str @b))
+                                                             &(BT.lower v))) &(String.join " ;; "
+                                                                                           &(Array.copy-map &(fn [b]
+                                                                                                              (BT.str @b))
+                                                                                                            &(BT.upper v))))) (let [bs (Array.concat &[(BT.lower v)
+                                                                                                                                                       (BT.upper v)])]
+                    (for [i 0 (Array.length &bs)]
+                      (push-vars @(Array.unsafe-nth &bs i) &todo)))) _
+                (push-vars x &todo)))))))
+
+  (private push-vars)
+  (hidden push-vars)
+  (defn push-vars [t todo]
+    (match (BT.get t)
+      (BTy.Var _) (Array.push-back! todo t)
+      (BTy.Fn a r) (do (push-vars a todo) (push-vars r todo))
+      (BTy.Fld _ x) (push-vars x todo)
+      (BTy.Or a b) (do (push-vars a todo) (push-vars b todo))
+      (BTy.And a b) (do (push-vars a todo) (push-vars b todo))
+      (BTy.Not a) (push-vars a todo)
+      _ ()))
+
+  (defn coalesce [t pol]
+    (match (BT.get t)
+      (BTy.Top) (PT.PTop)
+      (BTy.Bot) (PT.PBot)
+      (BTy.Tag x) (PT.PTag (BTag.name x))
+      (BTy.Fn a r)
+        (PT.PFn (Box.init (coalesce a (not pol))) (Box.init (coalesce r pol)))
+      (BTy.Fld f x) (PT.PFld f (Box.init (coalesce x pol)))
+      (BTy.Or a b)
+        (PT.POr [(Box.init (coalesce a pol)) (Box.init (coalesce b pol))])
+      (BTy.And a b)
+        (PT.PAnd [(Box.init (coalesce a pol)) (Box.init (coalesce b pol))])
+      (BTy.Not a) (PT.PNot (Box.init (coalesce a (not pol))))
+      (BTy.Var v)
+        (let [k (fmt "%d%s" v (if pol "+" "-"))]
+          (cond
+            (Map.contains? &*bp-progress* &k)
+              (do (Map.put! &*bp-progress* &k &1) (PT.PVar v))
+            (Map.contains? &*bp-memo* &k) (PT.PRef (Map.get &*bp-memo* &k))
+            (let-do [bs (if pol (BT.lower v) (BT.upper v))
+                     parts [(Box.init (PT.PVar v))]]
+              (Map.put! &*bp-progress* &k &0)
+              (for [i 0 (Array.length &bs)]
+                (Array.push-back! &parts
+                                  (Box.init (coalesce @(Array.unsafe-nth &bs i)
+                                                      pol))))
+              (let-do [recursive (Int.= (Map.get &*bp-progress* &k) 1)
+                       body (if pol (PT.POr parts) (PT.PAnd parts))]
+                (Map.remove! &*bp-progress* &k)
+                (if recursive
+                  (do
+                    (Array.push-back! &*bp-rec-names* v)
+                    (Array.push-back! &*bp-rec-bodies* (Box.init body))
+                    (Array.push-back! &*bp-rec-pols* pol)
+                    (PT.PVar v))
+                  (let-do [idx (Array.length &*bp-bodies*)]
+                    (Array.push-back! &*bp-bodies* (Box.init body))
+                    (Map.put! &*bp-memo* &k &idx)
+                    (PT.PRef idx)))))))))
+
+  (private count-pols)
+  (hidden count-pols)
+  (defn count-pols [p pol]
+    (match-ref p
+      (PT.PVar v)
+        (Map.put! &*bp-pols*
+                  v
+                  &(Int.bit-or (Map.get-with-default &*bp-pols* v &0)
+                               (if pol 1 2)))
+      (PT.PFn a r)
+        (do (count-pols (Box.peek a) (not pol)) (count-pols (Box.peek r) pol))
+      (PT.PFld _ x) (count-pols (Box.peek x) pol)
+      (PT.POr ts)
+        (for [i 0 (Array.length ts)]
+          (count-pols (Box.peek (Array.unsafe-nth ts i)) pol))
+      (PT.PAnd ts)
+        (for [i 0 (Array.length ts)]
+          (count-pols (Box.peek (Array.unsafe-nth ts i)) pol))
+      (PT.PNot x) (count-pols (Box.peek x) (not pol))
+      (PT.PRef i)
+        (let [k (fmt "%d%s" @i (if pol "+" "-"))]
+          (unless-do (Map.contains? &*bp-counted* &k)
+            (Map.put! &*bp-counted* &k &true)
+            (count-pols (Box.peek (Array.unsafe-nth &*bp-bodies* @i)) pol)))
+      _ ()))
+
+  (private kept?)
+  (hidden kept?)
+  (doc kept? "whether variable `v` says something: it is recursive, or
+occurs at both polarities.")
+  (defn kept? [v]
+    (or (Array.contains? &*bp-rec-names* &v)
+        (Int.= 3 (Map.get-with-default &*bp-pols* &v &0))))
+
+  (private flatten)
+  (hidden flatten)
+  (defn flatten [ts is-or out]
+    (for [i 0 (Array.length ts)]
+      (let [x (Box.peek (Array.unsafe-nth ts i))]
+        (match-ref x
+          (PT.POr us)
+            (if is-or (flatten us is-or out) (Array.push-back! out (render x)))
+          (PT.PAnd us)
+            (if is-or (Array.push-back! out (render x)) (flatten us is-or out))
+          (PT.PVar v)
+            (when (kept? @v)
+              (let [name (fmt "a%d" @v)]
+                (unless (Array.contains? out &name) (Array.push-back! out name))))
+          (PT.PBot) (unless is-or (Array.push-back! out @"Nothing"))
+          (PT.PTop) (when is-or (Array.push-back! out @"Any"))
+          _
+            (let [r (render x)]
+              (unless (Array.contains? out &r) (Array.push-back! out r)))))))
+
+  (defn render [p]
+    (match-ref p
+      (PT.PTop) @"Any"
+      (PT.PBot) @"Nothing"
+      (PT.PTag n) @n
+      (PT.PVar v) (fmt "a%d" @v)
+      (PT.PFn a r)
+        (fmt "(%s -> %s)" &(render (Box.peek a)) &(render (Box.peek r)))
+      (PT.PFld f x)
+        (fmt "{%s: %s}" (if (Int.= @f 0) "car" "cdr") &(render (Box.peek x)))
+      (PT.POr ts)
+        (let-do [parts (the (Array String) [])]
+          (flatten ts true &parts)
+          (cond
+            (Array.contains? &parts "Any") @"Any"
+            (Array.empty? &parts) @"Nothing"
+            (Int.= 1 (Array.length &parts)) @(Array.unsafe-nth &parts 0)
+            (fmt "(%s)" &(String.join " | " &parts))))
+      (PT.PAnd ts)
+        (let-do [parts (the (Array String) [])]
+          (flatten ts false &parts)
+          (cond
+            (Array.contains? &parts "Nothing") @"Nothing"
+            (Array.empty? &parts) @"Any"
+            (Int.= 1 (Array.length &parts)) @(Array.unsafe-nth &parts 0)
+            (fmt "(%s)" &(String.join " & " &parts))))
+      (PT.PNot x) (fmt "~%s" &(render (Box.peek x)))
+      (PT.PRef i) (shared @i))))
+
+(private shared)
+(hidden shared)
+(doc shared "a shared coalesced form: written out where it is short, named
+and written once where it is long.")
+(defn shared [i]
+  (match (Map.get-maybe &*bp-rendered* &i)
+    (Maybe.Just r) r
+    (Maybe.Nothing)
+      (let-do [body (render (Box.peek (Array.unsafe-nth &*bp-bodies* i)))
+               r (if (Int.<= (String.length &body) 60)
+                 body
+                 (do
+                   (Array.push-back! &*bp-shared-names* (fmt "t%d = %s" i &body))
+                   (fmt "t%d" i)))]
+        (Map.put! &*bp-rendered* &i &r)
+        r)))
+
+;; ------------------------------------------------------------ messages
+
+(defmodule BDescribe
+  (doc mismatch "the message for a value of type `lhs` met where `rhs` is
+needed, in the language's words rather than the checker's types.")
+  (defn mismatch [lhs rhs]
+    (fmt "found %s where %s is needed" &(of lhs) &(of rhs)))
+
+  (doc of "`t` as a phrase: the sets of values the language has names for
+(a number, a list or array, a form), single kinds, literal symbols, functions
+by their number of arguments, and a field requirement as a non-empty
+sequence.")
+  (defn of [t] (describe t 0))
+
+  (private describe)
+  (hidden describe)
+  (defn describe [t depth]
+    (cond
+      (Int.= t (BT.top)) @"anything"
+      (Int.= t (BT.bot)) @"nothing"
+      (match (special t) (Maybe.Just name) true (Maybe.Nothing) false)
+        (Maybe.from (special t) @"")
+      (let-do [tags (the (Array Int) [])
+               phrases (the (Array String) [])]
+        (gather t depth &tags &phrases)
+        (join &(Array.concat &[(tag-phrases &tags) phrases])))))
+
+  (private definition-of)
+  (hidden definition-of)
+  (defn definition-of [t] (match (BT.get t) (BTy.Var v) (BT.definition v) _ -1))
+
+  (private special)
+  (hidden special)
+  (doc special "the name of one of the checker's own recursive types, met as
+itself or as its body.")
+  (defn special [t]
+    (cond
+      (or (Int.= t *bas-value*) (Int.= t (definition-of *bas-value*)))
+        (Maybe.Just @"any value")
+      (or (Int.= t *bas-syntax*) (Int.= t (definition-of *bas-syntax*)))
+        (Maybe.Just @"a form")
+      (or (Int.= t *bas-syntax-list*)
+          (Int.= t (definition-of *bas-syntax-list*)))
+        (Maybe.Just @"a list of forms")
+      (Maybe.Nothing)))
+
+  (private conjuncts)
+  (hidden conjuncts)
+  (defn conjuncts [t out]
+    (match (BT.get t)
+      (BTy.And a b) (do (conjuncts a out) (conjuncts b out))
+      _ (Array.push-back! out t)))
+
+  (private gather)
+  (hidden gather)
+  (doc gather "the tags and phrases the disjuncts of `t` stand for.")
+  (defn gather [t depth tags phrases]
+    (match (BT.get t)
+      (BTy.Or a b)
+        (do (gather a depth tags phrases) (gather b depth tags phrases))
+      (BTy.Var v)
+        (match (special t)
+          (Maybe.Just name) (Array.push-back! phrases name)
+          (Maybe.Nothing)
+            (if (and (Int.>= (BT.definition v) 0) (Int.< depth 3))
+              (gather (BT.definition v) (Int.inc depth) tags phrases)
+              (Array.push-back! phrases @"a value")))
+      (BTy.Tag x) (Array.push-back! tags x)
+      (BTy.Top) (Array.push-back! phrases @"anything")
+      (BTy.Bot) ()
+      (BTy.Not x)
+        (Array.push-back! phrases
+                          (fmt "anything but %s" &(describe x (Int.inc depth))))
+      _
+        (let-do [cs (the (Array Int) [])
+                 tag -1
+                 fun -1
+                 field false
+                 neg -1]
+          (conjuncts t &cs)
+          (for [i 0 (Array.length &cs)]
+            (let [c @(Array.unsafe-nth &cs i)]
+              (match (BT.get c)
+                (BTy.Tag x) (set! tag x)
+                (BTy.Fn _ _) (set! fun c)
+                (BTy.Fld _ _) (set! field true)
+                (BTy.Not _) (set! neg c)
+                _ ())))
+          (cond
+            (Int.>= fun 0) (Array.push-back! phrases (function-phrase fun))
+            (Int.>= tag 0) (Array.push-back! tags tag)
+            field (Array.push-back! phrases @"a non-empty list or array")
+            (Int.>= neg 0) (gather neg depth tags phrases)
+            (Array.push-back! phrases @"a value")))))
+
+  (private function-phrase)
+  (hidden function-phrase)
+  (doc function-phrase "a function, by its number of arguments when its
+argument list has a fixed length.")
+  (defn function-phrase [f]
+    (match (BT.get f)
+      (BTy.Fn a _)
+        (let-do [x a
+                 n 0
+                 fixed false
+                 going true]
+          (while-do going
+            (if (Int.= x (BT.named "ArgsNil"))
+              (do (set! fixed true) (set! going false))
+              (let-do [cs (the (Array Int) [])
+                       next -1]
+                (conjuncts x &cs)
+                (for [i 0 (Array.length &cs)]
+                  (match (BT.get @(Array.unsafe-nth &cs i))
+                    (BTy.Fld k y) (when (Int.= k 1) (set! next y))
+                    _ ()))
+                (if (Int.< next 0)
+                  (set! going false)
+                  (do (set! n (Int.inc n)) (set! x next))))))
+          (cond
+            (not fixed) @"a function"
+            (Int.= n 0) @"a function of no arguments"
+            (Int.= n 1) @"a function of 1 argument"
+            (fmt "a function of %d arguments" n)))
+      _ @"a function"))
+
+  (private tag-phrases)
+  (hidden tag-phrases)
+  (doc tag-phrases "names for a set of tags: the closed sets it holds whole
+first, then each tag left.")
+  (defn tag-phrases [tags]
+    (let-do [left (the (Array String) [])
+             out (the (Array String) [])]
+      (for [i 0 (Array.length tags)]
+        (let [name (BTag.name @(Array.unsafe-nth tags i))]
+          (unless (Array.contains? &left &name) (Array.push-back! &left name))))
+      (let [groups [(Pair.init
+                      [@"ListNil" @"ListCons" @"ArrayNil" @"ArrayCons"]
+                      @"a list or array")
+                    (Pair.init [@"ListCons" @"ArrayCons" @"StaticCons"]
+                               @"a non-empty list or array")
+                    (Pair.init [@"ListNil" @"ArrayNil" @"StaticNil"]
+                               @"an empty list or array")
+                    (Pair.init [@"ListNil" @"ListCons"] @"a list")
+                    (Pair.init [@"ArrayNil" @"ArrayCons"] @"an array")
+                    (Pair.init [@"StaticNil" @"StaticCons"] @"a static array")
+                    (Pair.init [@"ListCons" @"ArrayCons"]
+                               @"a non-empty list or array")
+                    (Pair.init [@"ListNil" @"ArrayNil"]
+                               @"an empty list or array")
+                    (Pair.init
+                      [@"Int" @"Long" @"Byte" @"Float" @"Double"]
+                      @"a number")
+                    (Pair.init [@"True" @"False"] @"a bool")
+                    (Pair.init [@"Closure" @"Builtin"] @"a function")]]
+        (for [g 0 (Array.length &groups)]
+          (let [members (Pair.a (Array.unsafe-nth &groups g))]
+            (when-do (Array.all? &(fn [m] (Array.contains? &left m)) members)
+              (Array.push-back! &out @(Pair.b (Array.unsafe-nth &groups g)))
+              (set! left
+                    (Array.copy-filter
+                      &(fn [m] (not (Array.contains? members m)))
+                      &left))))))
+      (for [i 0 (Array.length &left)]
+        (Array.push-back! &out (tag-name (Array.unsafe-nth &left i))))
+      out))
+
+  (private tag-name)
+  (hidden tag-name)
+  (defn tag-name [name]
+    (cond
+      (String.starts-with? name "Symbol:")
+      (fmt "the symbol '%s'" &(String.suffix name 7))
+      (String.= name "Symbol")
+      @"a symbol"
+      (String.= name "String")
+      @"a string"
+      (String.= name "Char")
+      @"a char"
+      (String.= name "Int")
+      @"an Int"
+      (String.= name "Long")
+      @"a Long"
+      (String.= name "Byte")
+      @"a Byte"
+      (String.= name "Float")
+      @"a Float"
+      (String.= name "Double")
+      @"a Double"
+      (String.= name "True")
+      @"true"
+      (String.= name "False")
+      @"false"
+      (String.= name "Pattern")
+      @"a pattern"
+      (String.= name "Dictionary")
+      @"a map"
+      (String.= name "Comment")
+      @"a comment"
+      (String.= name "ListNil")
+      @"the empty list"
+      (String.= name "ListCons")
+      @"a non-empty list"
+      (String.= name "ArrayNil")
+      @"an empty array"
+      (String.= name "ArrayCons")
+      @"a non-empty array"
+      (String.= name "StaticNil")
+      @"an empty static array"
+      (String.= name "StaticCons")
+      @"a non-empty static array"
+      (String.= name "ArgsNil")
+      @"no arguments"
+      (String.= name "ArgsCons")
+      @"arguments"
+      ;; a closure with no arrow: one `eval` may answer, or one whose code
+      ;; did not check
+      (String.= name "Closure")
+      @"a function of unknown type"
+      (String.= name "Builtin")
+      @"a builtin function"
+      (String.= name "Macro")
+      @"a macro"
+      (String.= name "Obj")
+      @"a value"
+      (fmt "a %s" name)))
+
+  (private join)
+  (hidden join)
+  (doc join "`ps` as one phrase: each once, the last joined by \"or\".")
+  (defn join [ps]
+    (let-do [seen (the (Array String) [])]
+      (for [i 0 (Array.length ps)]
+        (let [p (Array.unsafe-nth ps i)]
+          (unless (Array.contains? &seen p) (Array.push-back! &seen @p))))
+      (case (Array.length &seen)
+            0
+            @"nothing"
+            1
+            @(Array.unsafe-nth &seen 0)
+            (String.concat
+              &[(String.join ", "
+                             &(Array.prefix &seen (Int.dec (Array.length &seen))))
+                @" or "
+                @(Array.unsafe-nth &seen (Int.dec (Array.length &seen)))])))))
+
+;; ------------------------------------------------------------ top level
+
+(def *bas-typed* (the (Map Int Int) (Map.create)))
+;; the variables of definitions that failed, with their names
+(def *bas-failed-defs* (the (Map Int String) (Map.create)))
+
+(defmodule BTop
+  (defn init! []
+    (do
+      (BT.reset!)
+      (BVal.init!)
+      (BAst.reset!)
+      (set! *bas-globals* (Map.create))
+      (set! *bas-typed* (Map.create))
+      (set! *bas-failed-defs* (Map.create))))
+
+  (defn member [state d deps]
+    (if @(BDef.macro d)
+      (BLower.macro-body state
+                         (BDef.frame d)
+                         deps
+                         (BDef.params d)
+                         (BDef.rest d)
+                         (Box.peek (BDef.body d)))
+      (BLower.lambda-of state
+                        (BDef.frame d)
+                        &[]
+                        deps
+                        (BDef.params d)
+                        (BDef.rest d)
+                        (Box.peek (BDef.body d)))))
+
+  (doc type-group "types the definitions `ds` at level 1: a recursive group's
+members are fresh variables while it is typed (Simple-sub's `let rec`).
+Their schemes generalize everything above level 0.")
+  (defn type-group [state ds recursive]
+    (let-do [deps (the (Array Int) [])
+             env (the (Map Int BScheme) (Map.create))
+             selves (the (Array Int) [])
+             out (the (Array Int) [])]
+      (set! *be-group-vars* (Map.create))
+      (BT.commit!)
+      (set! *bas-failed* false)
+      (set! *bas-failure* @"")
+      (set! *bas-failure-at* (Maybe.Nothing))
+      (set! *bas-fail-from* -1)
+      (set! *bas-fail-to* -1)
+      (set! *bas-fail-lhs* -1)
+      (set! *bas-fail-rhs* -1)
+      (when recursive
+        (for [i 0 (Array.length ds)]
+          (let-do [v (BAst.fresh-var!)
+                   t (BT.fresh-var 1)]
+            (Map.put! &*be-group-vars* (BDef.cell (Array.unsafe-nth ds i)) &v)
+            (Map.put! &env &v &(BScheme.init t -1))
+            (Array.push-back! &selves t))))
+      (for [i 0 (Array.length ds)]
+        (let-do [e (member state (Array.unsafe-nth ds i) &deps)]
+          (type-pending state &env)
+          (let-do [t (BTyper.typeof &env 1 e)]
+            ;; the definition meets its recursive uses here, outside any
+            ;; expression: what it is comes from its body
+            (when-do recursive
+              (set! *bv-origin* e)
+              (BSolve.constrain t @(Array.unsafe-nth &selves i))
+              (set! *bv-origin* -1))
+            (Array.push-back! &out
+                              (if recursive @(Array.unsafe-nth &selves i) t)))))
+      (when (and *bas-failed* (Maybe.nothing? &*bas-failure-at*))
+        (set! *bas-failure-at* (blamed-span)))
+      (when (and *bas-failed* (Int.>= *bas-fail-lhs* 0))
+        (set! *bas-failure*
+              (String.append
+                &(BDescribe.mismatch *bas-fail-lhs* *bas-fail-rhs*)
+                &(value-origin state))))
+      (if *bas-failed*
+        (do (BT.rollback!) (forget-created!) (Maybe.Nothing))
+        (do (BT.commit!) (set! *bas-created* []) (Maybe.Just out)))))
+
+  (private value-origin)
+  (hidden value-origin)
+  (doc value-origin "where the value of a failure came from, when that is not
+where the failure is reported.")
+  (defn value-origin [state]
+    (match (Map.get-maybe &*be-spans* &*bas-fail-from*)
+      (Maybe.Nothing)
+        (match (Map.get-maybe &*be-value-cells* &*bas-fail-from*)
+          (Maybe.Just cell)
+            (match (BSession.cell-name state cell)
+              (Maybe.Just name)
+                (fmt " (the value comes from the global %s)" &name)
+              (Maybe.Nothing) @"")
+          (Maybe.Nothing) @"")
+      (Maybe.Just from)
+        (let [at (SurfaceSpan.start &from)
+              same (match-ref &*bas-failure-at*
+                (Maybe.Just reported)
+                  (let [r (SurfaceSpan.start reported)]
+                    (and (Int.= @(Info.line at) @(Info.line r))
+                         (Int.= @(Info.col at) @(Info.col r))))
+                (Maybe.Nothing) false)]
+          (cond
+            same
+            @""
+            ;; in another file: name it
+            (match-ref &*bas-failure-at*
+              (Maybe.Just reported)
+                (and
+                  (Int./= @(SurfaceSpan.source reported)
+                          @(SurfaceSpan.source &from))
+                  (not
+                    (String.empty? &(source-name @(SurfaceSpan.source &from)))))
+              (Maybe.Nothing) false)
+            (fmt " (the value comes from %s:%d:%d)"
+                 &(source-name @(SurfaceSpan.source &from))
+                 @(Info.line at)
+                 @(Info.col at))
+            (fmt " (the value comes from %d:%d)" @(Info.line at) @(Info.col at))))))
+
+  (private blamed-span)
+  (hidden blamed-span)
+  (doc blamed-span "where a failure found outside any expression is
+reported: the requirement the value broke, or else where the value came
+from.")
+  (defn blamed-span []
+    (match (Map.get-maybe &*be-spans* &*bas-fail-to*)
+      (Maybe.Just span) (Maybe.Just span)
+      (Maybe.Nothing) (Map.get-maybe &*be-spans* &*bas-fail-from*)))
+
+  (private type-pending)
+  (hidden type-pending)
+  (doc type-pending "types the values of the globals lowering just met, each
+below its global's variable; typing one can meet more.")
+  (defn type-pending [state env]
+    (let-do [i 0]
+      ;; in the order lowering met them: the values a value refers to are
+      ;; met, and typed, before it
+      (while-do (and (Int.< i (Array.length &*bas-pending*)) (not *bas-failed*))
+        (let-do [p @(Array.unsafe-nth &*bas-pending* i)
+                 t @(Pair.a &p)
+                 mark (BT.mark)]
+          ;; the value has no source of its own: what it gives comes from
+          ;; its global
+          (Map.put! &*be-value-cells* (Pair.a (Pair.b &p)) (Pair.b (Pair.b &p)))
+          (set! *bv-origin* @(Pair.a (Pair.b &p)))
+          (BSolve.constrain (BTyper.typeof env 1 @(Pair.a (Pair.b &p))) t)
+          (set! *bv-origin* -1)
+          ;; a value whose code does not check is opaque: its closures have
+          ;; no arrow, so calling one is rejected, and nothing else is lost
+          (when-do *bas-failed*
+            (BT.rollback-to! mark)
+            (set! *bas-failed* false)
+            (set! *bas-failure* @"")
+            (set! *bas-failure-at* (Maybe.Nothing))
+            (BSolve.constrain
+              (BVal.of-value
+                (CtEnv.peek-cell (CtState.environment state)
+                                 &(CtEnv.cell-at @(Pair.b (Pair.b &p)))))
+              t))
+          (set! i (Int.inc i))))
+      (set! *bas-pending* [])))
+
+  (private forget-created!)
+  (hidden forget-created!)
+  (doc forget-created! "forgets the globals made since the group began: their
+values were not typed, or the typing was rolled back, so the next group to
+meet one makes it again.")
+  (defn forget-created! []
+    (do
+      (for [i 0 (Array.length &*bas-created*)]
+        (let-do [cell @(Array.unsafe-nth &*bas-created* i)]
+          (Map.remove! &*bas-mutable-types* &cell)
+          (Map.remove! &*bas-globals* &(BAst.global-var cell))))
+      (set! *bas-created* [])
+      (set! *bas-pending* [])))
+
+  (private closure-definitions)
+  (hidden closure-definitions)
+  (doc closure-definitions "records which definition each closure value is
+the value of, so a closure met in data is typed as that definition.")
+  (defn closure-definitions [state defs]
+    (let-do [cells (Map.keys defs)]
+      (set! *bas-closure-defs* (Map.create))
+      (set! *bas-def-cells* (Map.create))
+      (for [i 0 (Array.length &cells)]
+        (let-do [cell @(Array.unsafe-nth &cells i)]
+          (Map.put! &*bas-def-cells* &cell &true)
+          (match-ref (CtEnv.peek-cell (CtState.environment state)
+                                      &(CtEnv.cell-at cell))
+            (CtValue.Closure c)
+              (Map.put! &*bas-closure-defs*
+                        &(BT.pair @(CtClosure.proto (Box.peek c))
+                                  @(FrameId.index (CtClosure.defining-frame (Box.peek c))))
+                        &cell)
+            _ ())))))
+
+  (doc closure-of "the definitions in `defs` reachable from the cells
+`roots`, each with the cells its code refers to.")
+  (defn closure-of [state defs roots]
+    (let-do [todo @roots
+             graph (the (Map Int (Array Int)) (Map.create))]
+      (while-do (not (Array.empty? &todo))
+        (let [c (Array.pop-back! &todo)]
+          (unless (Map.contains? &graph &c)
+            (match (Map.get-maybe defs &c)
+              (Maybe.Just d)
+                (let-do [deps (the (Array Int) [])]
+                  (ignore (member state &d &deps))
+                  ;; lowering only to find what it refers to
+                  (forget-created!)
+                  (Map.put! &graph &c &deps)
+                  (for [i 0 (Array.length &deps)]
+                    (Array.push-back! &todo @(Array.unsafe-nth &deps i))))
+              (Maybe.Nothing) ()))))
+      graph))
+
+  (defn check [state roots]
+    (let-do [defs (BSession.definitions state)
+             _closures (closure-definitions state &defs)
+             graph (closure-of state &defs roots)
+             groups (BSession.order &graph)
+             out (the (Array BOutcome) [])]
+      (for [g 0 (Array.length &groups)]
+        (let-do [cells (Array.unsafe-nth &groups g)
+                 ds (the (Array BDef) [])
+                 recursive (Int.> (Array.length cells) 1)]
+          ;; every cell of a group is a definition: the graph holds no others
+          (for [i 0 (Array.length cells)]
+            (let [c (Array.unsafe-nth cells i)]
+              (match (Map.get-maybe &defs c)
+                (Maybe.Just d)
+                  (do
+                    (when (Array.contains? &(Map.get &graph c) c)
+                      (set! recursive true))
+                    (Array.push-back! &ds d))
+                (Maybe.Nothing) ())))
+          (unless (Array.all? &(fn [c] (Map.contains? &*bas-typed* c)) cells)
+            (let-do [start (System.nanotime)
+                     result (type-group state &ds recursive)
+                     ms (Double./
+                       (Double.from-long
+                         (Long.- (Uint64.to-long (System.nanotime))
+                                 (Uint64.to-long start)))
+                       1000000.0)]
+              (match result
+                (Maybe.Just ts)
+                  (for [i 0 (Array.length &ds)]
+                    (let-do [d (Array.unsafe-nth &ds i)
+                             t @(Array.unsafe-nth &ts i)]
+                      (Map.put! &*bas-typed* (BDef.cell d) &t)
+                      (Map.put! &*bas-globals*
+                                &(BAst.global-var @(BDef.cell d))
+                                &(BScheme.init t 0))
+                      (Array.push-back! &out
+                                        (BOutcome.init @(BDef.name d)
+                                                       (Maybe.Just t)
+                                                       @""
+                                                       (Maybe.Nothing)
+                                                       ms))))
+                (Maybe.Nothing)
+                  (for [i 0 (Array.length &ds)]
+                    (let-do [d (Array.unsafe-nth &ds i)]
+                      (Map.put! &*bas-failed-defs*
+                                &(BAst.global-var @(BDef.cell d))
+                                (BDef.name d))
+                      (Array.push-back! &out
+                                        (BOutcome.init @(BDef.name d)
+                                                       (Maybe.Nothing)
+                                                       @&*bas-failure*
+                                                       @&*bas-failure-at*
+                                                       ms)))))))))
+      out)))

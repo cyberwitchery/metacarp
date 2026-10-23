@@ -1,0 +1,178 @@
+(load "../carp-ct-eval/carp-ct-eval.carp")
+
+;; What the checker reads from a compile-time session: the definitions bound
+;; in it, the scopes of a definition's code, the cells free names reach, and
+;; the order to type definitions in.
+
+(doc BDef "a compile-time function or macro bound in the session: its cell,
+the name it is bound under, its parameters, its rest parameter if it has one,
+its body, the frame it closes over, and whether it is a macro.")
+(deftype BDef
+  [cell Int
+   name String
+   params (Array String)
+   rest (Maybe String)
+   body (Box SurfaceNode)
+   frame FrameId
+   macro Bool])
+
+(doc BOutcome "what checking a definition gave: its type, or why it has none.")
+(deftype BOutcome
+  [name String
+   type (Maybe Int)
+   failure String
+   ;; the expression the failure was found in, when known
+   at (Maybe SurfaceSpan)
+   millis Double])
+
+(doc BScope "local names in scope and the variables they are bound to.")
+(deftype BScope [names (Array String)
+                 vars (Array Int)])
+
+(def *bs-tarjan-counter* 0)
+
+(defmodule BSession
+  (doc definitions "every compile-time function and macro bound in `state`,
+once per cell, with the name it is bound under (a qualified one when there is
+one).")
+  (defn definitions [state]
+    (let-do [store (CtState.environment state)
+             out (the (Map Int BDef) (Map.create))
+             frames (Array.push-back
+               (Array.copy-map &(fn [m] @(CtModuleFrame.frame m))
+                               (CtState.modules state))
+               @(CtState.root state))]
+      (for [f 0 (Array.length &frames)]
+        (let-do [frame (Array.unsafe-nth &frames f)
+                 bindings (CtEnv.local-bindings store frame)]
+          (for [i 0 (Array.length &bindings)]
+            (let [b (Array.unsafe-nth &bindings i)
+                  cell (CtEnv.cell-index (CtEnvBinding.cell b))]
+              (when (or (not (Map.contains? &out &cell))
+                        (String.contains? (CtEnvBinding.name b) \.))
+                (match-ref (CtEnv.peek-cell store (CtEnvBinding.cell b))
+                  (CtValue.Closure c)
+                    (Map.put! &out
+                              &cell
+                              &(of-closure cell
+                                           (CtEnvBinding.name b)
+                                           (Box.peek c)
+                                           false))
+                  (CtValue.Macro c)
+                    (Map.put! &out
+                              &cell
+                              &(of-closure cell
+                                           (CtEnvBinding.name b)
+                                           (Box.peek c)
+                                           true))
+                  _ ()))))))
+      out))
+
+  (doc cell-name "a name `cell` is bound under, a qualified one when there is
+one, for messages.")
+  (defn cell-name [state cell]
+    (let-do [store (CtState.environment state)
+             found (the (Maybe String) (Maybe.Nothing))
+             frames (Array.push-back
+               (Array.copy-map &(fn [m] @(CtModuleFrame.frame m))
+                               (CtState.modules state))
+               @(CtState.root state))]
+      (for [f 0 (Array.length &frames)]
+        (let [bindings (CtEnv.local-bindings store (Array.unsafe-nth &frames f))]
+          (for [i 0 (Array.length &bindings)]
+            (let [b (Array.unsafe-nth &bindings i)]
+              (when (and
+                  (Int.= cell (CtEnv.cell-index (CtEnvBinding.cell b)))
+                  (or (Maybe.nothing? &found)
+                      (String.contains? (CtEnvBinding.name b) \.)))
+                (set! found (Maybe.Just @(CtEnvBinding.name b))))))))
+      found))
+
+  (private of-closure)
+  (hidden of-closure)
+  (defn of-closure [cell name c macro]
+    (let [proto (Box.peek (Array.unsafe-nth &*ct-protos* @(CtClosure.proto c)))]
+      (BDef.init cell
+                 @name
+                 @(CtProto.parameters proto)
+                 @(CtProto.rest proto)
+                 (Box.init @(Box.peek (CtProto.body proto)))
+                 @(CtClosure.defining-frame c)
+                 macro)))
+
+  (doc lookup-local "the variable `name` is bound to in `scopes`, innermost
+first, or -1.")
+  (defn lookup-local [scopes name]
+    (let-do [found -1
+             i (Int.dec (Array.length scopes))]
+      (while-do (and (Int.< found 0) (Int.>= i 0))
+        (let-do [s (Array.unsafe-nth scopes i)
+                 j (Int.dec (Array.length (BScope.names s)))]
+          (while-do (and (Int.< found 0) (Int.>= j 0))
+            (when (String.= name (Array.unsafe-nth (BScope.names s) j))
+              (set! found @(Array.unsafe-nth (BScope.vars s) j)))
+            (set! j (Int.dec j))))
+        (set! i (Int.dec i)))
+      found))
+
+  (doc scope-names "the names of `scopes`, as the evaluator's lowering takes
+them.")
+  (defn scope-names [scopes] (Array.copy-map &(fn [s] @(BScope.names s)) scopes))
+
+  (doc resolve "the cell a free name reaches from `frame`, as the evaluator
+resolves it, or -1.")
+  (defn resolve [state frame name]
+    (match (CtEval.lookup-status state frame name)
+      (CtEnvLookup.Found cell) (CtEnv.cell-index &cell)
+      _ -1))
+
+  (doc order "the strongly connected groups of `graph`, dependencies first
+(Tarjan).")
+  (defn order [graph]
+    (let-do [index (the (Map Int Int) (Map.create))
+             low (the (Map Int Int) (Map.create))
+             on-stack (the (Map Int Bool) (Map.create))
+             stack (the (Array Int) [])
+             groups (the (Array (Array Int)) [])
+             keys (Array.sort (Map.keys graph))]
+      (set! *bs-tarjan-counter* 0)
+      (for [i 0 (Array.length &keys)]
+        (let [k @(Array.unsafe-nth &keys i)]
+          (unless (Map.contains? &index &k)
+            (strong-connect graph k &index &low &on-stack &stack &groups))))
+      groups))
+
+  (private strong-connect)
+  (hidden strong-connect)
+  (defn strong-connect [graph v index low on-stack stack groups]
+    (do
+      (Map.put! index &v &*bs-tarjan-counter*)
+      (Map.put! low &v &*bs-tarjan-counter*)
+      (set! *bs-tarjan-counter* (Int.inc *bs-tarjan-counter*))
+      (Array.push-back! stack v)
+      (Map.put! on-stack &v &true)
+      (let [succ (Map.get-with-default graph &v &[])]
+        (for [i 0 (Array.length &succ)]
+          (let [w @(Array.unsafe-nth &succ i)]
+            (when (Map.contains? graph &w)
+              (cond
+                (not (Map.contains? index &w))
+                  (do
+                    (strong-connect graph w index low on-stack stack groups)
+                    (Map.put! low
+                              &v
+                              &(Int.min (Map.get low &v) (Map.get low &w))))
+                (Map.get-with-default on-stack &w &false)
+                  (Map.put! low
+                            &v
+                            &(Int.min (Map.get low &v) (Map.get index &w)))
+                ())))))
+      (when (Int.= (Map.get low &v) (Map.get index &v))
+        (let-do [group (the (Array Int) [])
+                 done false]
+          (while-do (not done)
+            (let-do [w (Array.pop-back! stack)]
+              (Map.put! on-stack &w &false)
+              (Array.push-back! &group w)
+              (when (Int.= w v) (set! done true))))
+          (Array.push-back! groups group))))))

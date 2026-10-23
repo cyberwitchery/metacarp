@@ -1,0 +1,193 @@
+(load "../../carp-expand/carp-expand.carp")
+(load "../bas-check.carp")
+(load "Test.carp")
+(use-all Test)
+
+;; checking whole sessions: what the compiler's --check-ct runs on the
+;; compile-time state an expansion leaves
+
+(def program "(defndynamic twice-form [x] (list (quote +) x x))
+(defmacro twice [x] (twice-form x))
+(defndynamic broken [xs] (+ (car xs) \"s\"))
+(defndynamic uses-broken [xs] (broken xs))
+(defmacro bad-unless [c :rest body] (list (quote if) c () (cons (quote do) (+ body 1))))
+(defmacro my-when [c :rest body] (list (quote if) c (cons (quote do) body) ()))
+(defndynamic count-all [:rest xs] (length xs))
+(defndynamic bad-test [] (if (empty? 5) 1 2))
+(defndynamic apply-builtin-is-a-form [] (+ 1 (apply + (quote (1 2)))))
+(defndynamic apply-builtin-form [] (car (apply + (quote (1 2)))))
+(defndynamic apply-local [f] (apply f (quote (1 2))))
+(defndynamic and-narrows [:rest x] (if (and (list? x) (not (empty? x))) (car x) 0))
+(defndynamic or-narrows [:rest x] (if (or (array? x) (empty? x)) 0 (car x)))
+(defndynamic length-narrows [:rest x] (if (> (length x) 0) (car x) 0))
+(deftype Pt [x Int])
+(defndynamic pt-members [] (members Pt))
+(defndynamic param-members [t] (members t))
+(defndynamic inc-it [x] (+ x 1))
+(defdynamic table (list inc-it (fn [y] (* y 2))))
+(defndynamic call-table [] (+ ((car table) 1) ((car (cdr table)) 2)))
+(defndynamic call-table-badly [] ((car table) \"s\"))
+(defndynamic pairs-internal [xs] (if (= (length xs) 0) (list) (if (= (length xs) 1) (car xs) (cons (cadr xs) (pairs-internal (cddr xs))))))
+(defmacro pairs [:rest xs] (pairs-internal xs))
+(defndynamic below-narrows [:rest xs] (if (< (length xs) 2) 0 (cadr xs)))
+(defndynamic above-narrows [:rest xs] (if (< 1 (length xs)) (cadr xs) 0))
+(defndynamic below-wrong [:rest xs] (if (< (length xs) 2) (cadr xs) 0))
+(defndynamic call-it [f] (f))
+(defndynamic call-symbol [] (call-it (quote array)))
+(defndynamic call-nothing [] (call-it (quote no-such-function)))
+(defndynamic call-shadowed [array f] (f))
+(defndynamic use-shadowed [] (call-shadowed 1 (quote array)))
+(defndynamic count-down [n] (if (< n 1) 0 (count-down \"s\")))
+(defndynamic second-of-rest [:rest xs] (car (cdr xs)))
+(defdynamic word \"s\")
+(defndynamic word-plus-one [] (+ 1 word))
+(defndynamic array-tail-is-an-array [] (let [t (cdr [1 2])] (if (list? t) (+ t 1) 0)))
+(defndynamic list-tail-is-a-list [] (let [t (cdr '(1 2))] (if (list? t) (+ t 1) 0)))")
+
+(doc outcomes "every definition of `source` checked, by name: its failure,
+or the empty string when it checks.")
+(defn outcomes [source]
+  (match (Surface.parse source)
+    (Result.Error _) (the (Map String String) (Map.create))
+    (Result.Success m)
+      (match (MacroExpand.prepare-module-with &m &(ExpandConfig.init []))
+        (Result.Error _) (the (Map String String) (Map.create))
+        (Result.Success prepared)
+          (let-do [state (CtState.copy
+                     (ExpandSnapshot.state (PreparedExpansion.snapshot &prepared)))
+                   _init (BTop.init!)
+                   roots (Map.keys &(BSession.definitions &state))
+                   out (the (Map String String) (Map.create))]
+            (let [os (BTop.check &state &roots)]
+              (for [i 0 (Array.length &os)]
+                (let [o (Array.unsafe-nth &os i)]
+                  (Map.put! &out
+                            (BOutcome.name o)
+                            &(if (Maybe.just? (BOutcome.type o))
+                              @""
+                              (String.append (BOutcome.failure o)
+                                             &(match-ref (BOutcome.at o)
+                                               (Maybe.Just at)
+                                                 (fmt " @%d:%d"
+                                                      @(Info.line (SurfaceSpan.start at))
+                                                      @(Info.col (SurfaceSpan.start at)))
+                                               (Maybe.Nothing) @"")))))))
+            out))))
+
+(defn checks? [os name]
+  (match (Map.get-maybe os name)
+    (Maybe.Just msg) (String.empty? &msg)
+    (Maybe.Nothing) false))
+
+(defn fails? [os name]
+  (match (Map.get-maybe os name)
+    (Maybe.Just msg) (not (String.empty? &msg))
+    (Maybe.Nothing) false))
+
+(defn fails-at? [os name at]
+  (match (Map.get-maybe os name)
+    (Maybe.Just msg) (String.ends-with? &msg at)
+    (Maybe.Nothing) false))
+
+(defn fails-with? [os name prefix]
+  (match (Map.get-maybe os name)
+    (Maybe.Just msg) (String.starts-with? &msg prefix)
+    (Maybe.Nothing) false))
+
+(defn main []
+  (let [os (outcomes program)]
+    (with-test t
+      (assert-true t
+        (checks? &os "twice-form")
+        "a function that builds a form checks")
+      (assert-true t
+        (checks? &os "twice")
+        "a macro checks as a function of forms")
+      (assert-true t
+        (fails-with? &os "broken" "found a string where a number is needed")
+        "a type error fails")
+      (assert-true t
+        (fails-at? &os "broken" " @3:26")
+        "a failure is reported at the expression it is found in")
+      (assert-true t
+        (fails-with? &os "uses-broken" "uses broken, which does not check")
+        "a failure names the definition it comes from")
+      (assert-true t
+        (fails-with? &os
+                     "bad-unless"
+                     "found the empty list where a number is needed")
+        "a macro is checked without being called")
+      (assert-true t
+        (checks? &os "my-when")
+        "a macro with a rest parameter checks")
+      (assert-true t
+        (checks? &os "count-all")
+        "a function with a rest parameter checks")
+      (assert-true t
+        (fails-with? &os
+                     "bad-test"
+                     "found an Int where a list or array is needed")
+        "a test still checks its argument")
+      (assert-true t
+        (fails? &os "apply-builtin-is-a-form")
+        "apply of a builtin makes the call form, not its value")
+      (assert-true t
+        (checks? &os "apply-builtin-form")
+        "the call form apply makes is a list")
+      (assert-true t (checks? &os "apply-local") "apply of a local checks")
+      (assert-true t (checks? &os "and-narrows") "a test in an and narrows")
+      (assert-true t (checks? &os "or-narrows") "a test in an or narrows")
+      (assert-true t (checks? &os "length-narrows") "a positive length narrows")
+      (assert-true t
+        (checks? &os "array-tail-is-an-array")
+        "the cdr of an array is an array")
+      (assert-true t
+        (fails? &os "list-tail-is-a-list")
+        "the cdr of a list is a list")
+      (assert-true t (checks? &os "pt-members") "members of a type checks")
+      (assert-true t
+        (fails-with? &os "param-members" "members of t, which is not a type")
+        "members takes the name, not the value of a variable")
+      (assert-true t
+        (checks? &os "call-table")
+        "a closure kept in data is typed from its code")
+      (assert-true t
+        (fails? &os "call-table-badly")
+        "and called with the wrong argument, fails")
+      (assert-true t
+        (checks? &os "pairs")
+        "tests on lengths 0 and 1 make cddr safe")
+      (assert-true t (checks? &os "below-narrows") "a length below n narrows")
+      (assert-true t
+        (checks? &os "above-narrows")
+        "a length above n narrows, written either way round")
+      (assert-true t
+        (fails? &os "below-wrong")
+        "and the branch where it does not hold is not narrowed")
+      (assert-true t
+        (checks? &os "call-symbol")
+        "calling a symbol calls the function it names")
+      (assert-true t
+        (fails? &os "call-nothing")
+        "a symbol that names no function cannot be called")
+      (assert-true t
+        (fails? &os "use-shadowed")
+        "nor one a local of the same name shadows where it is called")
+      (assert-true t
+        (fails-at? &os "count-down" " @32:33")
+        "a failure found at a recursive call is reported there")
+      (assert-true t
+        (fails-with? &os
+                     "count-down"
+                     "found a string where a number is needed (the value comes from 32:43)")
+        "and names where the value came from")
+      (assert-true t
+        (fails-with? &os
+                     "second-of-rest"
+                     "found the empty list where a non-empty list or array is needed")
+        "a field requirement reads as a non-empty sequence")
+      (assert-true t
+        (fails-with? &os
+                     "word-plus-one"
+                     "found a string where a number is needed (the value comes from the global word)")
+        "a value a global holds is named by the global"))))

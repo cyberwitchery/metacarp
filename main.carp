@@ -1,5 +1,6 @@
 (load "carp-compiler.carp")
 (load "driver-load.carp")
+(load "carp-ct-typecheck/bas-check.carp")
 (Project.config "title" "carp-compiler")
 (Project.no-echo)
 ;; the compile-time evaluator recurses deeply through `apply-builtin`'s large
@@ -52,6 +53,12 @@
       "  --no-core             skip the implicit Core load; the source's own")
     (IO.println
       "                        (load \"X.carp\") directives still resolve in Core")
+    (IO.println
+      "  --check-ct[=warn|error]  type-check the program's compile-time code")
+    (IO.println
+      "                        (macros and dynamic functions) and report what")
+    (IO.println
+      "                        does not check; =error fails the compilation")
     (IO.println "  -h, --help            show this help and exit")
     (IO.println "  -v, --version         show version and exit")
     (IO.println "")
@@ -82,34 +89,136 @@
         (IO.errorln &(fmt "carp-compiler: cannot read '%s': %s" input &e))
         (the (Maybe String) (Maybe.Nothing)))))
 
+;; whether to type-check compile-time code: 0 no, 1 report failures as
+;; warnings, 2 as errors that fail the compilation
+(def *check-ct* 0)
+
+(doc ct-own-definition? "whether a compile-time definition is the program's
+own: written outside Core and outside the driver's synthetic root.")
+(defn ct-own-definition? [d core-dir]
+  (let [file (source-name
+          @(SurfaceSpan.source (SurfaceNode.span (Box.peek (BDef.body d)))))]
+    (not
+      (or (String.empty? &file)
+          (String.starts-with? &file core-dir)
+          (String.ends-with? &file "__carp-compiler-main__.carp")))))
+
+(doc check-ct "type-checks the program's compile-time definitions in the
+compile-time state `prepared` left, and reports the ones that do not check.
+A copy of the state is checked, so nothing the checker evaluates reaches the
+compilation. Answers whether the compilation may go on.")
+(defn check-ct [prepared core-dir]
+  (let-do [state (CtState.copy
+             (ExpandSnapshot.state (PreparedExpansion.snapshot prepared)))
+           _init (BTop.init!)
+           defs (BSession.definitions &state)
+           cells (Map.keys &defs)
+           own (the (Map String BDef) (Map.create))
+           roots (the (Array Int) [])
+           failed 0
+           label (if (Int.= *check-ct* 2) "error" "warning")]
+    (for [i 0 (Array.length &cells)]
+      (match (Map.get-maybe &defs (Array.unsafe-nth &cells i))
+        (Maybe.Just d)
+          (when-do (ct-own-definition? &d core-dir)
+            (Array.push-back! &roots @(BDef.cell &d))
+            (Map.put! &own (BDef.name &d) &d))
+        (Maybe.Nothing) ()))
+    (let [outcomes (BTop.check &state &(Array.sort @&roots))]
+      (for [i 0 (Array.length &outcomes)]
+        (let [o (Array.unsafe-nth &outcomes i)]
+          (when (Maybe.nothing? (BOutcome.type o))
+            (match (Map.get-maybe &own (BOutcome.name o))
+              (Maybe.Just d)
+                (let-do [span (match-ref (BOutcome.at o)
+                           (Maybe.Just at) @at
+                           (Maybe.Nothing)
+                             @(SurfaceNode.span (Box.peek (BDef.body &d))))]
+                  (set! failed (Int.inc failed))
+                  (IO.errorln
+                    &(fmt "ct-check %s: %s:%d:%d: %s: %s"
+                          label
+                          &(source-name @(SurfaceSpan.source &span))
+                          @(Info.line (SurfaceSpan.start &span))
+                          @(Info.col (SurfaceSpan.start &span))
+                          (BOutcome.name o)
+                          (BOutcome.failure o))))
+              (Maybe.Nothing) ())))))
+    (when (Int.> failed 0)
+      (IO.errorln
+        &(fmt
+          "ct-check: %d of %d compile-time definitions do not check"
+          failed
+          (Array.length &roots))))
+    (or (Int.= *check-ct* 1) (Int.= failed 0))))
+
+(doc compile-checked "compiles the loaded module like `compile-with-core`,
+expanding it once and type-checking the compile-time state the expansion
+leaves once the C exists.")
+(defn compile-checked [module core-dir library check-names echo roots]
+  (match (MacroExpand.prepare-module-with module
+                                          &(ExpandConfig.init [@"Dynamic"]))
+    (Result.Error error)
+      (do
+        (IO.errorln
+          &(CompileError.render
+            &(CompileError.init (String.copy "expand") @(CtError.message &error))))
+        (the (Maybe String) (Maybe.Nothing)))
+    (Result.Success prepared)
+      (match (if library
+          (CarpCompiler.compile-expanded-library-full @(PreparedExpansion.module &prepared)
+                                                      roots)
+          (CarpCompiler.compile-expanded-full @(PreparedExpansion.module &prepared)
+                                              check-names
+                                              echo))
+        (Result.Error error)
+          (do
+            (IO.errorln &(CompileError.render &error))
+            (the (Maybe String) (Maybe.Nothing)))
+        (Result.Success c)
+          (if (check-ct &prepared core-dir) (Maybe.Just c) (Maybe.Nothing)))))
+
 ; is `node` a `(load "X")` or `(load-once "X")` head symbol?
 (defn compile-with-core [input core-dir no-core library]
   (match (load-with-core input core-dir no-core)
     (Maybe.Nothing) (the (Maybe String) (Maybe.Nothing))
     (Maybe.Just pair)
-      (match (if library
-          (CarpCompiler.compile-module-library-full (Pair.a &pair)
-                                                    &(ExpandConfig.init [@"Dynamic"])
-                                                    &(collect-library-roots (Pair.b &pair)))
-          (CarpCompiler.compile-module-full (Pair.a &pair)
-                                            &(ExpandConfig.init [@"Dynamic"])
-                                            &(collect-check-names (Pair.b &pair))
-                                            (source-echo-enabled? (Pair.b &pair))))
-        (Result.Success c) (Maybe.Just c)
-        (Result.Error error)
-          (do
-            (IO.errorln &(CompileError.render &error))
-            (the (Maybe String) (Maybe.Nothing))))))
+      (if (Int.> *check-ct* 0)
+        (compile-checked (Pair.a &pair)
+                         core-dir
+                         library
+                         &(collect-check-names (Pair.b &pair))
+                         (source-echo-enabled? (Pair.b &pair))
+                         &(collect-library-roots (Pair.b &pair)))
+        (match (if library
+            (CarpCompiler.compile-module-library-full (Pair.a &pair)
+                                                      &(ExpandConfig.init [@"Dynamic"])
+                                                      &(collect-library-roots (Pair.b &pair)))
+            (CarpCompiler.compile-module-full (Pair.a &pair)
+                                              &(ExpandConfig.init [@"Dynamic"])
+                                              &(collect-check-names (Pair.b &pair))
+                                              (source-echo-enabled? (Pair.b &pair))))
+          (Result.Success c) (Maybe.Just c)
+          (Result.Error error)
+            (do
+              (IO.errorln &(CompileError.render &error))
+              (the (Maybe String) (Maybe.Nothing)))))))
 
 (defn produce-c [input core-dir no-core library]
   (match-ref core-dir
     (Maybe.Just dir) (compile-with-core input dir no-core library)
     (Maybe.Nothing)
-      (if library
-        (do
-          (IO.errorln
-            "carp-compiler: --library requires --core <dir> or CARP_DIR")
-          (the (Maybe String) (Maybe.Nothing)))
+      (cond
+        library
+          (do
+            (IO.errorln
+              "carp-compiler: --library requires --core <dir> or CARP_DIR")
+            (the (Maybe String) (Maybe.Nothing)))
+        (Int.> *check-ct* 0)
+          (do
+            (IO.errorln
+              "carp-compiler: --check-ct requires --core <dir> or CARP_DIR")
+            (the (Maybe String) (Maybe.Nothing)))
         (compile-standalone input))))
 
 ; --- emitting / building ---
@@ -602,12 +711,21 @@ substitution applied; node ids alone collide across definitions.")
     ;; C can point back at the Carp each line was written as
     (set! *want-source-map* debug)
     (match (produce-c input core-dir no-core library)
-      (Maybe.Nothing) 1
+      (Maybe.Nothing)
+      1
       (Maybe.Just c)
+      ;; the code's own (build) and (run), as the REPL's, ask for at least
+      ;; that much; a library is only ever C
+      (let [requested (cond
+              (or library (Int.> action 2)) action
+              (CtEval.run-requested?) 2
+              (and (CtEval.build-requested?) (Int.= action 0)) 1
+              action)]
         (cond
-          (Int.= action 1) (build &c core-dir output log-memory optimize debug)
-          (Int.= action 2) (execute &c core-dir log-memory optimize)
-          (emit-c &c output)))))
+          (Int.= requested 1)
+            (build &c core-dir output log-memory optimize debug)
+          (Int.= requested 2) (execute &c core-dir log-memory optimize)
+          (emit-c &c output))))))
 
 (defn main []
   (let-do [args &System.args
@@ -639,6 +757,9 @@ substitution applied; node ids alone collide across definitions.")
           (String.= &arg "--optimize") (set! optimize true)
           (or (String.= &arg "-g") (String.= &arg "--debug")) (set! debug true)
           (String.= &arg "--no-core") (set! no-core true)
+          (or (String.= &arg "--check-ct") (String.= &arg "--check-ct=warn"))
+            (set! *check-ct* 1)
+          (String.= &arg "--check-ct=error") (set! *check-ct* 2)
           (or (String.= &arg "-o") (String.= &arg "--output"))
             (if (Int.< (Int.inc i) n)
               (do
