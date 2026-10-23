@@ -1249,6 +1249,60 @@ counter
         self.assertEqual(result.returncode, 2)
         self.assertIn("needs a directory", result.stderr)
 
+    def test_long_command_output_pages_and_quit_preserves_the_repl(self):
+        with Terminal() as terminal:
+            terminal.resize(8, 60)
+            terminal.send(b":help\r")
+            terminal.until(b"lines 1-")
+            terminal.displayed("q close")
+            idle = len(terminal.raw)
+            terminal.read_for(.25)
+            self.assertEqual(len(terminal.raw), idle, "idle paging must not repaint")
+            before = len(terminal.raw)
+            terminal.send(b" ")
+            terminal.read_for(.15)
+            self.assertNotIn(b"\x1b[J", terminal.raw[before:])
+            terminal.send(b"q")
+            terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_pager_search_and_cancel_return_to_editing(self):
+        with Terminal() as terminal:
+            terminal.resize(8, 60)
+            terminal.send(b":help\r")
+            terminal.until(b"lines 1-")
+            terminal.send(b"/History\r")
+            terminal.displayed("History persists")
+            terminal.resize(12, 42)
+            terminal.displayed("History persists")
+            terminal.send(b"\x03")
+            terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 6 7)", b"13")
+
+    def test_termination_during_paging_restores_terminal_mode(self):
+        with Terminal() as terminal:
+            terminal.resize(8, 60)
+            terminal.send(b":help\r")
+            terminal.until(b"lines 1-")
+            os.kill(terminal.child, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                child, status = os.waitpid(terminal.child, os.WNOHANG)
+                if child:
+                    terminal.child = None
+                    self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGTERM)
+                    break
+                time.sleep(.05)
+            self.assertIsNone(terminal.child, "REPL did not terminate during paging")
+            self.assertEqual(termios.tcgetattr(terminal.master), terminal.initial_terminal)
+
+    def test_pipe_output_never_enters_the_pager(self):
+        result = self.run_repl(":help\n:q\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+        self.assertNotIn("lines 1-", result.stdout)
+        self.assertNotIn("\x1b", result.stdout)
+
     def test_up_down_and_draft_restore(self):
         with Terminal() as terminal:
             terminal.result(b"(Int.+ 40 2)", b"42")

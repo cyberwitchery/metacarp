@@ -282,7 +282,11 @@ Native templates expose their LLVM declarations, with implementation in the
 existing C backend. Focused excerpts may refer to types or metadata available
 in the full module.
 
-Paging and alternate output views remain separate interaction improvements.
+Long command and result output uses a bounded terminal pager with scrolling,
+literal search, and source anchors that survive reflow. It shares the editor's
+frame patching and libedit's input lifecycle, including signal restoration.
+Simple terminals and pipes retain plain output. Rich-view navigation remains
+the next presentation layer.
 
 ## Milestone 5: editable history and export
 

@@ -101,6 +101,17 @@ location is `--history <file>`, `$METACARP_HISTORY`, or
 `$HOME/.local/state/metacarp/history`. `--no-history` or an empty
 `METACARP_HISTORY` disables persistence. Loading history never evaluates it.
 
+## Output
+
+Long command and result output opens a pager in an interactive terminal.
+Space, Page Down, or Ctrl-F advance a page; `b`, Page Up, or Ctrl-B go back.
+Arrows or `j`/`k` move one row. Home/End or `g`/`G` select the first/last page.
+`/` starts a literal Unicode search; Enter accepts it, and `n`/`N` repeat it
+forward/backward. Resizing reflows the same source position. `q`, Escape,
+Ctrl-C, or Ctrl-D close the pager and return to the REPL.
+
+Pipes and simple terminals receive the original output without paging.
+
 ## Session and results
 
 Definitions persist. Compiler errors leave accepted source available. Mixed
