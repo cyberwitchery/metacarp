@@ -23,10 +23,10 @@ fi
 cd "$repo_root"
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/metacarp-repl-check.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT
-for suite in input syntax paint native/display native/pager native/wait native/service; do
+for suite in input syntax paint view-snapshot native/display native/pager native/browser native/wait native/service native/browse; do
   binary="$test_dir/${suite##*/}"
   "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" -b -o "$binary" "carp-repl/test/$suite.carp"
-  "$binary"
+  CARP_DIR="$core_dir" "$binary"
 done
 "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" --optimize -b -o out/metacarp-repl main-repl.carp
 "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" --optimize -b -o out/metacarp main-metacarp.carp

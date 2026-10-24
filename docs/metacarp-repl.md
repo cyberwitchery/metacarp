@@ -285,8 +285,8 @@ in the full module.
 Long command and result output uses a bounded terminal pager with scrolling,
 literal search, and source anchors that survive reflow. It shares the editor's
 frame patching and libedit's input lifecycle, including signal restoration.
-Simple terminals and pipes retain plain output. Rich-view navigation remains
-the next presentation layer.
+Simple terminals and pipes retain plain output. Structured value navigation
+uses the same frame patching and input lifecycle through `:browse`.
 
 ## Milestone 5: editable history and export
 
@@ -368,6 +368,27 @@ providers through ordinary interface dispatch and caches typed queries for the
 current native generation. Custom callbacks remain native user code and must
 bound their own work and allocations. This API belongs to the warm base and
 survives reset.
+
+`:browse N [selectors]` opens a structured viewer over a retained result.
+Up/Down or j/k move through rows, Space/Page Down and b/Page Up change pages,
+and Home/End jump within counted collections. Enter or Right opens the selected
+item; Left, Backspace, or h returns to the parent with its prior selection and
+page. Tab cycles declared views. `[` and `]` scroll wide tables horizontally.
+q, Escape, Ctrl-C, and Ctrl-D close the viewer. Pipes and simple terminals
+receive a bounded plain snapshot.
+
+Text views scroll and request further UTF-8 byte windows at their boundaries.
+Trees retain the displayed child leases until their window changes or the
+handle closes. Bitmap views sample RGBA pixels to the viewport and byte budget;
+color terminals display blocks, and `NO_COLOR` selects a monochrome rendering.
+Partial alpha is composited over black. Native Raw views use recorded fields,
+active sum payloads, sequence elements, and closure captures.
+
+The viewer receives owned pages and opaque generation-checked handles through
+`ReplViewClient`. Native pointers and callbacks stay inside the engine. Closing
+a parent does not invalidate a selected child; dropping its source result or
+retiring the runtime invalidates both. Provider windows are bounded before
+rendering, and an idle viewer does not repaint or invoke providers.
 
 Declaration-producing macros are classified after expansion. A single macro
 form that emits both declarations and runtime expressions is rejected before
@@ -772,3 +793,35 @@ measured startup medians of 1,089.5 / 996.4 ms, first native evaluation of
 1,067.3 / 833.6 ms, and warm evaluation of 308.0 / 270.5 ms. These sequential
 samples were taken on the same busy machine and do not establish a speedup.
 The command integration adds dispatch and reuses the existing drivers.
+
+
+## Structured navigation measurements, 2026-10-24
+
+`:browse` uses owned pages and generation-checked handles for text, tables,
+trees, sampled RGBA images, and native Raw navigation. Closing a viewer
+releases its leases. The terminal retains parent pages and selections, and
+uses the existing frame diff. Compiler workers inherit blocked libedit signals,
+so editor signal handling stays on the editor thread.
+
+Three optimized PTY runs on the same MacBookPro18,2, arm64 macOS 15.8.1,
+with LLVM 23.1.4 gave these medians. Each run measured three warm integer
+expressions. The baseline is the local pager checkpoint `4852837`.
+
+| Measurement | Pager checkpoint | Structured viewer |
+| --- | ---: | ---: |
+| Process ready | 725 ms | 812 ms |
+| First integer expression | 775 ms | 852 ms |
+| Warm integer expression | 227 ms | 253 ms |
+
+Opening the default Raw view of 100 integers took 450 ms; requesting its next
+20-row page took 1.14 ms. These are local end-to-end observations on a busy
+machine, with an 80-column, 24-row terminal, rather than throughput claims.
+The additional warm runtime has a measurable startup and expression cost.
+
+The engine view fixture passes 29 lifetime and navigation assertions and
+reports zero leaks under macOS `leaks -atExit`. Compiler regressions cover
+header ownership on cached template dependencies, references to specialized
+globals, aggregate calling conventions and cached native adapters across incremental
+publications, String
+field derivation without imported deleter declarations, and null storage for
+empty LLVM array literals.

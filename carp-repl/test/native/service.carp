@@ -16,12 +16,19 @@
       state)))
 
 (defn backend [request cancelled publish]
-  (if (String.= (ReplLanguageRequest.source request) "slow")
-    (let-do [until (Long.+ (ReplNative.now) 1000000000l)]
-      (publish (report request (ReplAnalysisState.SyntaxOnly)))
-      (while-do (and (not (cancelled)) (Long.< (ReplNative.now) until))
-        (System.sleep-micros 1000))
-      (publish (report request (ReplAnalysisState.Ready))))
+  (cond
+    (String.= (ReplLanguageRequest.source request) "signal-mask")
+      (publish
+        (report request
+                (if (worker-signals-blocked?)
+                  (ReplAnalysisState.Ready)
+                  (ReplAnalysisState.SyntaxOnly))))
+    (String.= (ReplLanguageRequest.source request) "slow")
+      (let-do [until (Long.+ (ReplNative.now) 1000000000l)]
+        (publish (report request (ReplAnalysisState.SyntaxOnly)))
+        (while-do (and (not (cancelled)) (Long.< (ReplNative.now) until))
+          (System.sleep-micros 1000))
+        (publish (report request (ReplAnalysisState.Ready))))
     (publish (report request (ReplAnalysisState.Ready)))))
 
 (defn request [worker revision session source]
@@ -151,7 +158,47 @@
           (ReplService.close! worker)
           (and started (and found (not stale)))))))
 
+(defn signal-mask-bits []
+  (let-do [mask (the (Ptr ReplNativeSignalSet)
+                     (ReplNative.allocate
+                       (Pointer.width
+                         (the (Ptr ReplNativeSignalSet) (Pointer.from-long 0l)))))
+           signals (ReplNative.terminal-signals)
+           bits (the (Array Int) [])]
+    (ignore
+      (ReplNative.signal-mask ReplNative.SIGNAL-BLOCK
+                              (Pointer.from-long 0l)
+                              mask))
+    (for [i 0 (Array.length &signals)]
+      (Array.push-back! &bits
+                        (ReplNative.signal-member mask
+                                                  @(Array.unsafe-nth &signals i))))
+    (ReplNative.release mask)
+    bits))
+
+(defn worker-signals-blocked? []
+  (let-do [bits (signal-mask-bits)
+           blocked true]
+    (for [i 0 (Array.length &bits)]
+      (unless (Int.= @(Array.unsafe-nth &bits i) 1) (set! blocked false)))
+    blocked))
+
+(defn owns-terminal-signals? []
+  (let-do [before (signal-mask-bits)]
+    (match (ReplService.create backend)
+      (Result.Error _) false
+      (Result.Success worker)
+        (let-do [session (ReplService.session worker)
+                 preserved (= &before &(signal-mask-bits))]
+          (request worker 1l session "signal-mask")
+          (let-do [blocked (wait-for worker 1l true)]
+            (ReplService.close! worker)
+            (and blocked preserved))))))
+
 (deftest test
+  (assert-true test
+    (owns-terminal-signals?)
+    "workers inherit blocked terminal signals and the creator keeps its signal mask")
   (assert-true test
     (superseded-editing-reply?)
     "a newer cursor query rejects an older editing reply at the same source revision")

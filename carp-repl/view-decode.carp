@@ -1,0 +1,181 @@
+(load "inspection.carp")
+(load "view-protocol.carp")
+
+(deftype ReplViewDecoder [jit (Ptr JitSession)
+                          value NativeView
+                          error String])
+
+(doc ReplViewDecode "copies a native reply using the generating publication's
+layouts. Native storage and callbacks are never retained in presentation data.")
+(defmodule ReplViewDecode
+  (defn- fail! [reader error]
+    (when (String.empty? (ReplViewDecoder.error reader))
+      (ReplViewDecoder.set-error! reader error)))
+
+  (defn- at [reader path]
+    (if (not (String.empty? (ReplViewDecoder.error reader)))
+      (the (Maybe NativeView) (Maybe.Nothing))
+      (match (ReplInspect.navigate
+          (Pointer.to-ref @(ReplViewDecoder.jit reader))
+          (ReplViewDecoder.value reader)
+          path)
+        (Result.Error error) (do (fail! reader error) (Maybe.Nothing))
+        (Result.Success view) (Maybe.Just view))))
+
+  (defn- text [reader path limit]
+    (match (at reader path)
+      (Maybe.Nothing) @""
+      (Maybe.Just value)
+        (ReplInspect.render
+          (Pointer.to-ref @(ReplViewDecoder.jit reader))
+          &value
+          &(InspectRequest.init 0 0 0 limit true @"" false))))
+
+  (defn- integer [reader path]
+    (match (at reader path)
+      (Maybe.Nothing) 0
+      (Maybe.Just value) (ReplInspect.int-at @(NativeView.address &value))))
+
+  (defn- long [reader path]
+    (match (at reader path)
+      (Maybe.Nothing) 0l
+      (Maybe.Just value) (ReplInspect.long-at @(NativeView.address &value))))
+
+  (defn- flag [reader path]
+    (match (at reader path)
+      (Maybe.Nothing) false
+      (Maybe.Just value)
+        (Byte./= (ReplInspect.byte-at @(NativeView.address &value)) 0b)))
+
+  (defn- length [reader path limit]
+    (match (at reader path)
+      (Maybe.Nothing) 0
+      (Maybe.Just value)
+        (match (SessionJit.value-layout
+            (Pointer.to-ref @(ReplViewDecoder.jit reader))
+            @(NativeView.publication &value)
+            (Box.peek (NativeView.type &value)))
+          (Result.Error error) (do (fail! reader error) 0)
+          (Result.Success layout)
+            (match-ref (NativeValueLayout.representation &layout)
+              (NativeRepresentation.Sequence _ offset _ _)
+                (let [count (ReplInspect.long-at
+                        (Long.+ @(NativeView.address &value) @offset))]
+                  (if (or (Long.< count 0l) (Long.> count (Long.from-int limit)))
+                    (do (fail! reader @"view reply exceeds its array bound") 0)
+                    (Long.to-int count)))
+              _
+                (do
+                  (fail! reader
+                         @"view reply has an unexpected array representation")
+                  0)))))
+
+  (defn- field [path name]
+    (let-do [answer @path] (Array.push-back! &answer name) answer))
+
+  (defn- strings [reader path limit bytes]
+    (let-do [count (length reader path limit)
+             answer (the (Array String) [])]
+      (for [i 0 count]
+        (Array.push-back! &answer (text reader &(field path (str i)) bytes)))
+      answer))
+
+  (defn- choices [reader]
+    (let-do [path [@"page" @"choices"]
+             count (length reader &path 64)
+             answer (the (Array ReplViewChoice) [])]
+      (for [i 0 count]
+        (let [item (field &path (str i))]
+          (Array.push-back! &answer
+                            (ReplViewChoice.init
+                              (text reader &(field &item @"selector") 256)
+                              (text reader &(field &item @"title") 256)
+                              (text reader &(field &item @"kind") 64)
+                              (integer reader &(field &item @"priority"))))))
+      answer))
+
+  (defn- items [reader]
+    (let-do [path [@"page" @"items"]
+             count (length reader &path 1024)
+             answer (the (Array ReplViewItem) [])]
+      (for [i 0 count]
+        (let [item (field &path (str i))]
+          (Array.push-back! &answer
+                            (ReplViewItem.init (integer reader
+                                                        &(field &item @"index"))
+                                               (strings reader
+                                                        &(field &item @"cells")
+                                                        64
+                                                        65536)
+                                               (flag reader
+                                                     &(field &item @"selectable"))))))
+      answer))
+
+  (defn- image [reader]
+    (let-do [path [@"page" @"image" @"pixels"]
+             count (length reader &path 65536)
+             pixels (the (Array Byte) [])]
+      (match (at reader &path)
+        (Maybe.Nothing) ()
+        (Maybe.Just value)
+          (match (SessionJit.value-layout
+              (Pointer.to-ref @(ReplViewDecoder.jit reader))
+              @(NativeView.publication &value)
+              (Box.peek (NativeView.type &value)))
+            (Result.Error error) (fail! reader error)
+            (Result.Success layout)
+              (match-ref (NativeValueLayout.representation &layout)
+                (NativeRepresentation.Sequence _ _ data-offset stride)
+                  (let [data (ReplInspect.long-at
+                          (Long.+ @(NativeView.address &value) @data-offset))]
+                    (if (and (Int.> count 0) (Long.= data 0l))
+                      (fail! reader @"view reply contains a null pixel buffer")
+                      (for [i 0 count]
+                        (Array.push-back! &pixels
+                                          (ReplInspect.byte-at
+                                            (Long.+ data
+                                                    (Long.* (Long.from-int i)
+                                                            @stride)))))))
+                _
+                  (fail! reader
+                         @"view reply has an unexpected pixel representation"))))
+      (ReplViewImage.init
+        (integer reader &[@"page" @"image" @"width"])
+        (integer reader &[@"page" @"image" @"height"])
+        (integer reader &[@"page" @"image" @"sample-width"])
+        (integer reader &[@"page" @"image" @"sample-height"])
+        pixels)))
+
+  (doc page "decodes before the native result slot is reset. All arrays and
+strings are copied under explicit limits; invalid layouts are diagnostics.")
+  (defn page [jit value generation]
+    (let-do [reader (ReplViewDecoder.init (Pointer.address jit) @value @"")
+             failure (text &reader &[@"error"] 4096)]
+      (if (not (String.empty? &failure))
+        (Result.Error failure)
+        (let-do [epoch (long &reader &[@"page" @"handle" @"generation"])
+                 id (long &reader &[@"page" @"handle" @"id"])
+                 output (ReplViewPage.init (ReplViewHandle.init epoch id)
+                                           (text &reader &[@"page" @"type"] 256)
+                                           (choices &reader)
+                                           (text &reader
+                                                 &[@"page" @"selector"]
+                                                 256)
+                                           (text &reader &[@"page" @"title"] 256)
+                                           (text &reader &[@"page" @"kind"] 64)
+                                           (integer &reader &[@"page" @"total"])
+                                           (integer &reader &[@"page" @"offset"])
+                                           (text &reader
+                                                 &[@"page" @"text"]
+                                                 65536)
+                                           (strings &reader
+                                                    &[@"page" @"columns"]
+                                                    64
+                                                    256)
+                                           (items &reader)
+                                           (image &reader))]
+          (when (Long./= epoch generation)
+            (fail! &reader @"view reply belongs to a retired runtime"))
+          (if (String.empty? (ReplViewDecoder.error &reader))
+            (Result.Success output)
+            (Result.Error @(ReplViewDecoder.error &reader))))))))

@@ -1,0 +1,200 @@
+(load "../../browser.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+(system-include "locale.h")
+(register browser-locale (Fn [Int (Ptr CChar)] (Ptr CChar)) "setlocale")
+(register browser-ctype Int "LC_CTYPE")
+(def *browser-locale* (browser-locale browser-ctype (String.cstr "")))
+
+(def *browser-requests* (the (Array ReplViewRequest) []))
+(defn browser-page [id selector offset count]
+  (let-do [items (the (Array ReplViewItem) [])]
+    (for [i offset (Int.min 8 (Int.+ offset count))]
+      (Array.push-back! &items
+                        (ReplViewItem.init i [(str i) (fmt "value-%d" i)] true)))
+    (ReplViewPage.init (ReplViewHandle.init 1l id)
+                       @"Fixture"
+                       [(ReplViewChoice.init @"items" @"Items" @"columned" 10)
+                        (ReplViewChoice.init @"other" @"Other" @"columned" 20)]
+                       selector
+                       @"Items"
+                       @"columned"
+                       8
+                       offset
+                       @""
+                       [@"#" @"Value"]
+                       items
+                       (ReplViewImage.init 0 0 0 0 []))))
+
+(defn browser-request [request]
+  (do
+    (Array.push-back! &*browser-requests* @request)
+    (Result.Success
+      (match-ref (ReplViewRequest.operation request)
+        (ReplViewOperation.Page selector offset count _ _)
+          (browser-page 1l @selector @offset @count)
+        (ReplViewOperation.Select _ selected)
+          (let-do [page (browser-page 2l @"text" 0 0)]
+            (ReplViewPage.set-kind! &page @"text")
+            (ReplViewPage.set-text! &page (fmt "selected-%d" @selected))
+            page)
+        (ReplViewOperation.Release) (browser-page -1l @"" 0 0)))))
+
+(defn browser-text-request [request]
+  (Result.Success
+    (match-ref (ReplViewRequest.operation request)
+      (ReplViewOperation.Page _ offset _ _ _)
+        (let-do [page (browser-page 6l @"text" @offset 0)]
+          (ReplViewPage.set-kind! &page @"text")
+          (ReplViewPage.set-text! &page @"marker")
+          page)
+      _ (browser-page -1l @"" 0 0))))
+
+(defn browser-tests [initial]
+  (let-do [test @initial
+           browser (ReplBrowser.create (ReplViewClient.init browser-request)
+                                       (browser-page 1l @"items" 0 2))]
+    (ignore (ReplBrowser.step! &browser 302 80 6))
+    (set! test
+          (assert-equal &test
+            0
+            (Array.length &*browser-requests*)
+            "cursor motion within a window does not call its provider"))
+    (ignore (ReplBrowser.step! &browser 302 80 6))
+    (set! test
+          (assert-equal &test
+            2
+            @(ReplViewPage.offset (ReplBrowser.page &browser))
+            "crossing the visible window requests the next source rows"))
+    (ignore (ReplBrowser.step! &browser 13 80 6))
+    (set! test
+          (assert-equal &test
+            "selected-2"
+            (ReplViewPage.text (ReplBrowser.page &browser))
+            "selection uses the source index"))
+    (ignore (ReplBrowser.step! &browser 307 80 6))
+    (set! test
+          (assert-equal &test
+            2
+            @(ReplViewPage.offset (ReplBrowser.page &browser))
+            "returning to a parent preserves its page"))
+    (set! test
+          (assert-true &test
+            (String.contains-string?
+              (ReplFrame.text &(ReplBrowser.frame &browser 80 6 false))
+              "> 2")
+            "returning to a parent preserves its selected row"))
+    (ignore (ReplBrowser.step! &browser 9 80 6))
+    (set! test
+          (assert-equal &test
+            "other"
+            (ReplViewPage.selector (ReplBrowser.page &browser))
+            "Tab switches to the next declared view"))
+    (ReplBrowser.resize! &browser 20 8)
+    (set! test
+          (assert-equal &test
+            4
+            (Array.length (ReplViewPage.items (ReplBrowser.page &browser)))
+            "resize requests the new window size"))
+    (set! test
+          (assert-equal &test
+            8
+            (Array.length
+              (ReplFrame.rows &(ReplBrowser.frame &browser 20 8 false)))
+            "the frame fits the terminal height"))
+    (set! test
+          (assert-false &test
+            (ReplBrowser.step! &browser 3 80 6)
+            "Ctrl-C closes the browser"))
+    (ReplBrowser.close! &browser)
+    (set! test
+          (assert-equal &test
+            0
+            (Array.length (ReplBrowser.stack &browser))
+            "closing releases the navigation stack"))
+    (set! test
+          (assert-true &test
+            (match-ref (ReplViewRequest.operation (Array.unsafe-last &*browser-requests*))
+              (ReplViewOperation.Release) true
+              _ false)
+            "closing releases the root lease"))
+    (let-do [page (browser-page 3l @"image" 0 0)]
+      (ReplViewPage.set-kind! &page @"bitmap")
+      (ReplViewPage.set-image! &page
+                               (ReplViewImage.init 1 1 1 1 [255b 0b 0b 255b]))
+      (let-do [image (ReplBrowser.create (ReplViewClient.init browser-request)
+                                         page)
+               frame (ReplBrowser.frame &image 30 6 true)
+               patch (ReplDisplay.patch &[] 0 &frame 30)
+               plain (ReplBrowser.frame &image 30 6 false)]
+        (set! test
+              (assert-true &test
+                (String.contains-string? &patch "38;2;255;0;0m")
+                "bitmap pixels use explicit RGB cell styles"))
+        (set! test
+              (assert-false &test
+                (String.contains-string? (ReplFrame.text &plain) "\u001b")
+                "colorless bitmap rendering emits plain text"))
+        (ReplBrowser.close! &image)))
+    (let-do [page (browser-page 4l @"items" 0 1)
+             long (String.append
+               &(String.from-chars &(Array.replicate 80 &\a))
+               "TAIL
+\u001b")]
+      (ReplViewPage.set-columns! &page [@"Value"])
+      (ReplViewPage.set-items! &page [(ReplViewItem.init 0 [long] false)])
+      (let-do [wide (ReplBrowser.create (ReplViewClient.init browser-request)
+                                        page)]
+        (for [i 0 10] (ignore (ReplBrowser.step! &wide 93 30 6)))
+        (set! test
+              (assert-true &test
+                (String.contains-string?
+                  (ReplFrame.text &(ReplBrowser.frame &wide 30 6 false))
+                  "TAIL↵^[")
+                "horizontal scrolling keeps long cells and escapes embedded controls"))
+        (ReplBrowser.close! &wide)))
+    (let-do [short (ReplBrowser.create (ReplViewClient.init browser-request)
+                                       (browser-page 1l @"items" 0 1))]
+      (ignore (ReplBrowser.step! &short 302 80 6))
+      (set! test
+            (assert-equal &test
+              1
+              @(ReplViewPage.offset (ReplBrowser.page &short))
+              "a provider limited by its byte budget still advances to the next row"))
+      (ReplBrowser.close! &short))
+    (let-do [page (browser-page 5l @"items" 0 1)]
+      (ReplViewPage.set-columns! &page [@"Value"])
+      (ReplViewPage.set-items! &page [(ReplViewItem.init 0 [@"éx"] false)])
+      (let-do [unicode (ReplBrowser.create (ReplViewClient.init browser-request)
+                                           page)]
+        (ReplViewLocation.set-horizontal!
+          (Array.unsafe-nth (ReplBrowser.stack &unicode) 0)
+          1)
+        (set! test
+              (assert-false &test
+                (String.contains-string?
+                  (ReplFrame.text &(ReplBrowser.frame &unicode 30 6 false))
+                  "́")
+                "horizontal clipping cannot orphan a combining mark"))
+        (ReplBrowser.close! &unicode)))
+    (let-do [page (browser-page 6l @"text" 0 0)]
+      (ReplViewPage.set-kind! &page @"text")
+      (ReplViewPage.set-text! &page @"λx
+marker")
+      (let-do [text (ReplBrowser.create
+                 (ReplViewClient.init browser-text-request)
+                 page)]
+        (ReplViewLocation.set-anchor!
+          (Array.unsafe-nth (ReplBrowser.stack &text) 0)
+          3)
+        (ReplBrowser.resize! &text 40 8)
+        (set! test
+              (assert-equal &test
+                4
+                @(ReplViewPage.offset (ReplBrowser.page &text))
+                "resizing text preserves its visible Unicode source position"))
+        (ReplBrowser.close! &text)))
+    test))
+
+(deftest test (browser-tests test))

@@ -176,10 +176,14 @@ run_llvm() {
     cd carp-llvm-backend
     "$compiler" -c "$core_dir" -x test/carp-llvm-backend.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/carp-session-jit.carp
+    CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/incremental-abi.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/artifacts.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/inspection-layout.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/foreign-layout.carp
   )
+  CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x carp-repl/test/native/browse.carp
+  "$compiler" -c "$core_dir" -x carp-repl/test/view-snapshot.carp
+  "$compiler" -c "$core_dir" -x carp-views/test/views.carp
   "$script_dir/check-llvm-memory.sh"
 }
 

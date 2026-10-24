@@ -1648,6 +1648,18 @@ expression (or the expression's own type when it is not a reference).")
 operand. A slotted local or a global yields its storage directly (real
 aliasing); any other operand is spilled to this site's entry-block slot.")
 (hidden llvm-emit-ref-builtin)
+(hidden llvm-spill-ref)
+(defn llvm-spill-ref [ctx builder mod func id operand]
+  (let [sp (llvm-matchspill-index id)]
+    (if (Int.< sp 0)
+      (do
+        (llvm-emit-error! @"ref site without spill slot in llvm backend")
+        (llvm-dummy-value ctx))
+      (let-do [value (llvm-emit-expr ctx builder mod func operand)
+               ptr (llvm-matchspill-ptr sp)]
+        (ignore (LLVM.build-store builder value ptr))
+        ptr))))
+
 (defn llvm-emit-ref-builtin [ctx builder mod func id arguments]
   (let [operand (Box.peek (Array.unsafe-nth arguments 0))]
     (match-ref operand
@@ -1674,16 +1686,13 @@ aliasing); any other operand is spilled to this site's entry-block slot.")
                     "ref of unslotted local %s in llvm backend"
                     (CoreRef.name reference)))
                 (llvm-dummy-value ctx)))))
-      _
-        (let [sp (llvm-matchspill-index id)]
-          (if (Int.< sp 0)
-            (do
-              (llvm-emit-error! @"ref site without spill slot in llvm backend")
-              (llvm-dummy-value ctx))
-            (let-do [value (llvm-emit-expr ctx builder mod func operand)
-                     ptr (llvm-matchspill-ptr sp)]
-              (ignore (LLVM.build-store builder value ptr))
-              ptr))))))
+      (SpecializedExpr.GlobalValue _ _ _ value-type symbol value)
+        (if @value
+          (llvm-runtime-global mod
+                               symbol
+                               (llvm-lower-type ctx (Box.peek value-type)))
+          (llvm-spill-ref ctx builder mod func id operand))
+      _ (llvm-spill-ref ctx builder mod func id operand))))
 
 (doc llvm-string-literal "a `String*` to static storage holding `text`,
 mirroring the C backend's `({ static String v = \"...\"; &v; })`: a private
@@ -3038,16 +3047,18 @@ the C backend's designated-initializer rendering.")
              (LLVM.pointer-type (LLVM.int8-type ctx) 0)
              &[(LLVM.int64-type ctx)]
              false)
-           data (LLVM.build-call builder
-                                 malloc-fnty
-                                 (llvm-runtime-fn mod
-                                                  &*llvm-malloc-symbol*
-                                                  malloc-fnty)
-                                 &[(LLVM.const-int (LLVM.int64-type ctx)
-                                                   (Long.* (Long.from-int n)
-                                                           element-size)
-                                                   0)]
-                                 (llvm-cstr &@"adata"))]
+           data (if (Int.= n 0)
+             (LLVM.const-null (LLVM.pointer-type (LLVM.int8-type ctx) 0))
+             (LLVM.build-call builder
+                              malloc-fnty
+                              (llvm-runtime-fn mod
+                                               &*llvm-malloc-symbol*
+                                               malloc-fnty)
+                              &[(LLVM.const-int (LLVM.int64-type ctx)
+                                                (Long.* (Long.from-int n)
+                                                        element-size)
+                                                0)]
+                              (llvm-cstr &@"adata")))]
     (for [i 0 n]
       (let [value (llvm-emit-expr ctx
                                   builder
@@ -4523,7 +4534,8 @@ to aggregate calls; materialized supplies template symbols from earlier cells.")
           _ ()))
       ;; a template's dependencies live on the LLVM side (specialized
       ;; deleters/copiers): give the shim their prototypes, as declaration-only
-      ;; intrinsics, so the template definitions compile
+      ;; intrinsics, so the template definitions compile. Dependencies retain
+      ;; header ownership even when their instances are absent from this delta.
       (for [i 0 (Array.length declarations)]
         (match-ref (Array.unsafe-nth declarations i)
           (BackendDeclaration.Template _ _ _ dependencies)
@@ -4542,8 +4554,10 @@ to aggregate calls; materialized supplies template symbols from earlier cells.")
                                                                   (Box.init
                                                                     (MonoType.copy
                                                                       (Box.peek (BackendDependency.signature dep))))
-                                                                  (the (Maybe String)
-                                                                       (Maybe.Nothing)))))))
+                                                                  (if @(BackendDependency.external dep)
+                                                                    (Maybe.Just (String.copy dep-symbol))
+                                                                    (the (Maybe String)
+                                                                         (Maybe.Nothing))))))))
           _ ()))
       (match (let [module &(BackendModule.init filtered
                                                (the (Array (Box SpecializedExpr))
@@ -4705,9 +4719,15 @@ functions, constructors, globals, closures, and closure environment helpers.")
       (for [i 0 (Array.length declarations)]
         (match-ref (Array.unsafe-nth declarations i)
           (BackendDeclaration.Function symbol _ _ _)
-            (Array.push-back! &symbols (String.copy symbol))
+            (do
+              (Array.push-back! &symbols (String.copy symbol))
+              (when (llvm-cimpl? symbol)
+                (Array.push-back! &symbols (fmt "%s_carpimpl" symbol))))
           (BackendDeclaration.Constructor symbol _ _)
-            (Array.push-back! &symbols (String.copy symbol))
+            (do
+              (Array.push-back! &symbols (String.copy symbol))
+              (when (llvm-cimpl? symbol)
+                (Array.push-back! &symbols (fmt "%s_carpimpl" symbol))))
           (BackendDeclaration.Global symbol _ _)
             (Array.push-back! &symbols (String.copy symbol))
           _ ()))
@@ -4742,6 +4762,7 @@ mis-lowered.")
                           backend
                           foreign-layouts
                           predefined
+                          persistent
                           roots-name
                           init-name]
     (do
@@ -4759,6 +4780,20 @@ mis-lowered.")
       (set! *llvm-value-intrinsics* [])
 
       (set! *llvm-cimpl-symbols* [])
+      ; Published implementation and native adapter entries retain their calling
+      ; conventions when later deltas omit the original declarations.
+      (for [i 0 (Array.length predefined)]
+        (let-do [symbol (Array.unsafe-nth predefined i)]
+          (when (String.ends-with? symbol "_carpimpl")
+            (Array.push-back! &*llvm-cimpl-symbols*
+                              (String.byte-slice symbol
+                                                 0
+                                                 (Int.- (String.length symbol) 9))))
+          (when (String.ends-with? symbol "_carpabi")
+            (Array.push-back! &*llvm-cnative-symbols*
+                              (String.byte-slice symbol
+                                                 0
+                                                 (Int.- (String.length symbol) 8))))))
       (set! *llvm-declared-symbols* [])
       (set! *llvm-callable-symbols* [])
       (set! *llvm-invoke-keys* [])
@@ -4796,6 +4831,23 @@ mis-lowered.")
                 (Array.push-back! &*llvm-cnative-symbols* (String.copy symbol)))
             _ ()))
 
+        ; Incremental aggregate callables get the pointer protocol at publication.
+        ; A later cell may call it directly, put it in a template, or let it
+        ; escape as a callback; those uses cannot change an existing ABI.
+        (when persistent
+          (for [i 0 n]
+            (match-ref (Array.unsafe-nth declarations i)
+              (BackendDeclaration.Function symbol signature _ _)
+                (when (and
+                    (llvm-needs-wrapper? (Box.peek signature))
+                    (not (llvm-cimpl? symbol)))
+                  (Array.push-back! &*llvm-cimpl-symbols* (String.copy symbol)))
+              (BackendDeclaration.Constructor symbol signature _)
+                (when (and
+                    (llvm-needs-wrapper? (Box.peek signature))
+                    (not (llvm-cimpl? symbol)))
+                  (Array.push-back! &*llvm-cimpl-symbols* (String.copy symbol)))
+              _ ())))
         (do
           (for [i 0 n]
             (match-ref (Array.unsafe-nth declarations i)
@@ -4925,6 +4977,7 @@ symbols.")
                       backend
                       &(the (Array ForeignTypeLayout) [])
                       predefined
+                      true
                       roots-name
                       init-name))
 
@@ -4946,6 +4999,7 @@ symbols.")
                       backend
                       layouts
                       predefined
+                      true
                       roots-name
                       init-name))
 
@@ -4957,6 +5011,7 @@ symbols.")
                       backend
                       &(the (Array ForeignTypeLayout) [])
                       &(the (Array String) [])
+                      false
                       &(roots-symbol)
                       &(init-symbol)))
 
@@ -4969,6 +5024,7 @@ symbols.")
                       backend
                       layouts
                       &(the (Array String) [])
+                      false
                       &(roots-symbol)
                       &(init-symbol))))
 

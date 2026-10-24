@@ -174,6 +174,27 @@ current native generation. Custom callbacks remain native user code and must
 bound their own work and allocations. This API belongs to the warm base and
 survives reset.
 
+`:browse N [selectors]` opens a structured viewer over a retained result.
+Up/Down or j/k move through rows, Space/Page Down and b/Page Up change pages,
+and Home/End jump within counted collections. Enter or Right opens the selected
+item; Left, Backspace, or h returns to the parent with its prior selection and
+page. Tab cycles declared views. `[` and `]` scroll wide tables horizontally.
+q, Escape, Ctrl-C, and Ctrl-D close the viewer. Pipes and simple terminals
+receive a bounded plain snapshot.
+
+Text views scroll and request further UTF-8 byte windows at their boundaries.
+Trees retain the displayed child leases until their window changes or the
+handle closes. Bitmap views sample RGBA pixels to the viewport and byte budget;
+color terminals display blocks, and `NO_COLOR` selects a monochrome rendering.
+Partial alpha is composited over black. Native Raw views use recorded fields,
+active sum payloads, sequence elements, and closure captures.
+
+The viewer receives owned pages and opaque generation-checked handles through
+`ReplViewClient`. Native pointers and callbacks stay inside the engine. Closing
+a parent does not invalidate a selected child; dropping its source result or
+retiring the runtime invalidates both. Provider windows are bounded before
+rendering, and an idle viewer does not repaint or invoke providers.
+
 Declaration-producing macros are classified after expansion. A single macro
 form that emits both declarations and runtime expressions is rejected before
 commit; use separate top-level forms for those two parts.
@@ -275,6 +296,9 @@ Reader facts arrive before semantic analysis. Cursor queries reuse the current
 analysis. Every reply carries document, source, and session revisions; editing
 replies also carry a request ID and cursor. Superseded replies are discarded.
 The host pauses and drains the worker before accessing its engine.
+The worker inherits blocked terminal signals when it is created, leaving
+libedit’s signal handlers on the editor thread. The creator’s mask is restored
+before creation returns.
 
 Semantic previews have a two-million-unit work budget and a 500 ms deadline.
 They restore compile-time state and never commit source or publish native code.
@@ -298,5 +322,6 @@ scripts/check-repl.sh
 ```
 
 Input and reader-to-editor tests also run in the compiler phase suite.
-Native display and service checks run with the macOS REPL check.
+Native display, browser, and service checks run with the macOS REPL check.
+The shared view runtime and engine handle checks also run in LLVM assurance.
 Session, JIT, C backend, and LLVM backend tests cover the underlying contracts.

@@ -1,0 +1,285 @@
+; Executed inside the value-owning runtime. Replies contain owned data only.
+(deftype ReplViewChildren [object Int
+                           request ViewRequest
+                           children (Array Int)])
+(def *repl-view-children* (the (Array ReplViewChildren) []))
+
+(defmodule ReplView
+  (defn- blank [generation object]
+    (ReplViewPage.init
+      (ReplViewHandle.init generation (Long.from-int object))
+      @""
+      []
+      @""
+      @""
+      @"empty"
+      0
+      0
+      @""
+      []
+      []
+      (ReplViewImage.init 0 0 0 0 [])))
+
+  (defn- failure [generation object text]
+    (ReplViewReply.init (blank generation object) text))
+
+  (defn- release-children! [children]
+    (for [i 0 (Array.length children)]
+      (View.drop-ref! @(Array.unsafe-nth children i))))
+
+  (defn- same-window? [left right]
+    (and
+      (String.= (ViewRequest.selector left) (ViewRequest.selector right))
+      (and
+        (Int.= @(ViewRequest.offset left) @(ViewRequest.offset right))
+        (and
+          (Int.= @(ViewRequest.count left) @(ViewRequest.count right))
+          (and
+            (Int.= @(ViewRequest.depth left) @(ViewRequest.depth right))
+            (Int.= @(ViewRequest.bytes left) @(ViewRequest.bytes right)))))))
+
+  (defn- tree-children! [object view request]
+    (let-do [found -1]
+      (for [i 0 (Array.length &*repl-view-children*)]
+        (let [entry (Array.unsafe-nth &*repl-view-children* i)]
+          (when (and
+              (Int.= object @(ReplViewChildren.object entry))
+              (same-window? (ReplViewChildren.request entry) request))
+            (set! found i))))
+      (if (Int.>= found 0)
+        @(ReplViewChildren.children
+          (Array.unsafe-nth &*repl-view-children* found))
+        (let-do [callback @(ViewSpec.children view)
+                 _forgotten (forget-window! object)
+                 children (callback &0l request)
+                 kept (the (Array Int) [])
+                 limit @(ViewRequest.count request)]
+          (for [i 0 (Array.length &children)]
+            (if (Int.< i limit)
+              (Array.push-back! &kept @(Array.unsafe-nth &children i))
+              (View.drop-ref! @(Array.unsafe-nth &children i))))
+
+          (Array.push-back! &*repl-view-children*
+                            (ReplViewChildren.init object @request @&kept))
+          kept))))
+
+  (doc close "releases cached child leases before the caller's object lease.")
+  (defn- forget-window! [object]
+    (let-do [keep (the (Array ReplViewChildren) [])]
+      (for [i 0 (Array.length &*repl-view-children*)]
+        (let [entry (Array.unsafe-nth &*repl-view-children* i)]
+          (if (Int.= object @(ReplViewChildren.object entry))
+            (release-children! (ReplViewChildren.children entry))
+            (Array.push-back! &keep @entry))))
+      (set! *repl-view-children* keep)))
+
+  (defn close [object] (do (forget-window! object) (View.drop-ref! object)))
+
+  (defn- choices [views]
+    (let-do [answer (the (Array ReplViewChoice) [])]
+      (for [i 0 (Int.min 64 (Array.length views))]
+        (let [view (Array.unsafe-nth views i)]
+          (unless (String.= (ViewSpec.kind view) "empty")
+            (Array.push-back! &answer
+                              (ReplViewChoice.init
+                                (View.slice (ViewSpec.selector view) 0 256)
+                                (View.slice (ViewSpec.title view) 0 256)
+                                (View.slice (ViewSpec.kind view) 0 64)
+                                @(ViewSpec.priority view))))))
+      answer))
+
+  (defn- bitmap [view request columns]
+    (let-do [width @(ViewSpec.width view)
+             height @(ViewSpec.height view)
+             pixels (ViewSpec.pixels view)
+             available (Int./ (Array.length pixels) 4)
+             budget (Int./ @(ViewRequest.bytes request) 4)
+             output (the (Array Byte) [])]
+      (cond
+        (or (Int.< width 0)
+            (or (Int.< height 0)
+                (or
+                  (Int./= (Int.positive-mod (Array.length pixels) 4) 0)
+                  (Long.>
+                    (Long.* (Long.from-int width) (Long.from-int height))
+                    (Long.from-int available)))))
+          (Result.Error @"bitmap dimensions do not describe the RGBA buffer")
+        (or (Int.= width 0)
+            (or (Int.= height 0)
+                (or (Int.<= budget 0)
+                    (or (Int.<= @(ViewRequest.count request) 0)
+                        (Int.< columns 2)))))
+          (Result.Success (ReplViewImage.init width height 0 0 []))
+        (let-do [max-width (Int.max 1
+                                    (Int.min 256
+                                             (Int.min budget (Int./ columns 2))))
+                 max-height (Int.max 1
+                                     (Int.min 256
+                                              (Int.min @(ViewRequest.count request)
+                                                       (Int./ budget max-width))))
+                 scale (Int.max
+                   (Int.inc (Int./ (Int.dec width) max-width))
+                   (Int.inc (Int./ (Int.dec height) max-height)))
+                 sampled-width (Int.inc (Int./ (Int.dec width) scale))
+                 sampled-height (Int.inc (Int./ (Int.dec height) scale))]
+          (for [y 0 sampled-height]
+            (for [x 0 sampled-width]
+              (let [index (Int.* 4
+                                 (Int.+ (Int.* (Int.* y scale) width)
+                                        (Int.* x scale)))]
+                (for [channel 0 4]
+                  (Array.push-back! &output
+                                    @(Array.unsafe-nth pixels
+                                                       (Int.+ index channel)))))))
+          (Result.Success
+            (ReplViewImage.init width height sampled-width sampled-height output))))))
+
+  (defn- listing! [page object view request]
+    (let-do [tree (String.= (ViewSpec.kind view) "tree")
+             children (if tree
+               (tree-children! object view request)
+               (the (Array Int) []))
+             declared (~(ViewSpec.count view) &0l)
+             total (if (and tree (Int.= declared 0))
+               (if (Int.= (Array.length &children) 0) 0 -1)
+               declared)
+             offset @(ViewRequest.offset request)
+             end (if tree
+               (Int.+ offset (Array.length &children))
+               (View.end-index total request))
+             columns (ViewSpec.columns view)
+             headers (the (Array String) [])
+             rows (the (Array ReplViewItem) [])
+             remaining @(ViewRequest.bytes request)]
+      (for [column 0 (Int.min 64 (Array.length columns))]
+        (Array.push-back! &headers
+                          (View.slice
+                            (ViewColumn.title (Array.unsafe-nth columns column))
+                            0
+                            256)))
+      (for [index offset end]
+        (when (Int.> remaining 0)
+          (let-do [cells (the (Array String) [])
+                   count (if (String.= (ViewSpec.kind view) "columned")
+                     (Array.length &headers)
+                     1)]
+            (for [column 0 count]
+              (when (Int.> remaining 0)
+                (let-do [window (ViewRequest.set-bytes @request remaining)
+                         text (if (and tree (Int.= declared 0))
+                           (let [child @(Array.unsafe-nth &children
+                                                          (Int.- index offset))]
+                             (if (View.valid-id? child)
+                               (~(ViewObject.print (Array.unsafe-nth &*view-objects*
+                                                                     child)))
+                               @""))
+                           (View.cell &0l view index column &window))
+                         clipped (View.slice &text 0 remaining)]
+                  (set! remaining (Int.- remaining (String.length &clipped)))
+                  (Array.push-back! &cells clipped))))
+            (Array.push-back! &rows (ReplViewItem.init index cells true)))))
+      (ReplViewPage.set-total! page total)
+      (ReplViewPage.set-offset! page offset)
+      (ReplViewPage.set-columns! page headers)
+      (ReplViewPage.set-items! page rows)))
+
+  (doc snapshot "evaluates only the requested view window and returns bounded,
+owned presentation data. It never selects a listing item while rendering it.")
+  (defn snapshot [generation object request columns]
+    (if (not (View.valid-id? object))
+      (failure generation object @"the inspected object has been released")
+      (let-do [stored (Array.unsafe-nth &*view-objects* object)
+               views (ViewObject.views stored)
+               selected (View.view-index views (ViewRequest.selector request))
+               page (blank generation object)]
+        (if (Int.< selected 0)
+          (failure generation object @"no applicable view")
+          (let-do [view (Array.unsafe-nth views selected)]
+            (ReplViewPage.set-type! &page
+                                    (View.slice (ViewObject.type-name stored)
+                                                0
+                                                256))
+            (ReplViewPage.set-choices! &page (choices views))
+            (ReplViewPage.set-selector! &page @(ViewSpec.selector view))
+            (ReplViewPage.set-title! &page
+                                     (View.slice (ViewSpec.title view) 0 256))
+            (ReplViewPage.set-kind! &page @(ViewSpec.kind view))
+            (cond
+              (String.= (ViewSpec.kind view) "text")
+                (let-do [text (~(ViewSpec.content view) &0l request)]
+                  (ReplViewPage.set-offset! &page @(ViewRequest.offset request))
+                  (ReplViewPage.set-total! &page -1)
+                  (ReplViewPage.set-text! &page
+                                          (View.slice &text
+                                                      0
+                                                      @(ViewRequest.bytes request)))
+                  (ReplViewReply.init page @""))
+              (String.= (ViewSpec.kind view) "bitmap")
+                (match (bitmap view request columns)
+                  (Result.Error error) (failure generation object error)
+                  (Result.Success image)
+                    (do
+                      (ReplViewPage.set-image! &page image)
+                      (ReplViewReply.init page @"")))
+              (do
+                (listing! &page object &@view request)
+                (ReplViewReply.init page @""))))))))
+
+  (doc open "borrows a host-pinned value until close and all child leases end.")
+  (defn- owned-snapshot [generation object request columns]
+    (let-do [reply (snapshot generation object request columns)]
+      (unless (String.empty? (ReplViewReply.error &reply)) (close object))
+      reply))
+
+  (defn open [generation value supplied request columns]
+    (owned-snapshot generation
+                    (View.unsafe-borrow-root value supplied)
+                    request
+                    columns))
+
+  (doc operate
+    "performs a handle operation without rebuilding the root's providers.")
+  (defn operate [generation operation object row request columns]
+    (cond
+      (Int.= operation 4)
+        (do
+          (for [i 0 (Array.length &*repl-view-children*)]
+            (release-children!
+              (ReplViewChildren.children
+                (Array.unsafe-nth &*repl-view-children* i))))
+          (set! *repl-view-children* [])
+          (View.clear!)
+          (set! *view-objects* [])
+          (set! *view-refs* [])
+          (ReplViewReply.init (blank generation -1) @""))
+      (Int.= operation 3)
+        (do (close object) (ReplViewReply.init (blank generation -1) @""))
+      (not (View.valid-id? object))
+        (failure generation object @"the inspected object has been released")
+      (Int.= operation 2)
+        (let-do [views (ViewObject.views
+                   (Array.unsafe-nth &*view-objects* object))
+                 selected (View.view-index views (ViewRequest.selector request))
+                 child -1]
+          (when (Int.>= selected 0)
+            (let [view (Array.unsafe-nth views selected)]
+              (if (String.= (ViewSpec.kind view) "tree")
+                (let-do [children (tree-children! object view request)
+                         index (Int.- row @(ViewRequest.offset request))]
+                  (when-do (and (Int.>= index 0)
+                                (Int.< index (Array.length &children)))
+                    (set! child @(Array.unsafe-nth &children index))
+                    (View.bump-ref! child)))
+                (set! child
+                      (View.send-item object (ViewRequest.selector request) row)))))
+          (if (Int.< child 0)
+            (failure generation object @"this row has no selection")
+            (owned-snapshot generation
+                            child
+                            &(View.request @""
+                                           0
+                                           @(ViewRequest.count request)
+                                           6
+                                           @(ViewRequest.bytes request))
+                            columns)))
+      (snapshot generation object request columns))))

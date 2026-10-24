@@ -1249,6 +1249,81 @@ counter
         self.assertEqual(result.returncode, 2)
         self.assertIn("needs a directory", result.stderr)
 
+    def test_browse_navigation_keeps_parent_state_and_returns_to_editing(self):
+        with Terminal() as terminal:
+            terminal.resize(10, 80)
+            terminal.send(b"[10 20 30 40 50 60 70 80 90 100]\r")
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("[gtRawFor]  depth 1", timeout=15)
+            terminal.send(b"\t")
+            terminal.displayed("[array-items]  depth 1")
+            terminal.send(b"\x1b[B\x1b[B\r")
+            terminal.displayed("depth 2")
+            terminal.displayed("30")
+            terminal.send(b"\x1b[D")
+            terminal.displayed("[array-items]  depth 1")
+            terminal.displayed("> 2 | 30")
+            terminal.send(b" ")
+            terminal.displayed("offset 6")
+            terminal.resize(8, 60)
+            terminal.read_for(.25)
+            terminal.displayed("offset 6")
+            terminal.raw = b""
+            terminal.read_for(.35)
+            self.assertEqual(terminal.raw, b"", "an idle view must not repaint")
+            terminal.send(b"q")
+            terminal.next_prompt()
+            terminal.send(b"(+ 20 22)\r")
+            terminal.until(b"42\r\n")
+            terminal.until("λ> ".encode())
+
+    def test_browse_switches_declared_views_and_ctrl_c_closes(self):
+        with Terminal(color=False) as terminal:
+            terminal.resize(10, 80)
+            terminal.send(b'"hello"\r')
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("[gtRawFor]", timeout=15)
+            terminal.send(b"\t")
+            terminal.displayed("[string-value]")
+            terminal.send(b"\t")
+            terminal.displayed("[string-bytes]")
+            terminal.displayed("104")
+            terminal.send(b"\x03")
+            terminal.next_prompt()
+            terminal.send(b":drop 1\r")
+            terminal.next_prompt()
+
+    def test_browse_renders_native_bitmap_pixels(self):
+        with Terminal() as terminal:
+            terminal.resize(10, 80)
+            terminal.send(b"(deftype BrowseSwatch [])\r")
+            terminal.next_prompt()
+            terminal.send(b'(defview swatch [x BrowseSwatch] (do (ignore x) (=> (View.bitmap) (View.extent 1 1) (View.pixels [255b 0b 0b 255b]))))\r')
+            terminal.next_prompt()
+            terminal.send(b"(BrowseSwatch.init)\r")
+            terminal.next_prompt()
+            terminal.raw = b""
+            terminal.send(b":browse 1\r")
+            terminal.displayed("1 x 1 RGBA", timeout=15)
+            terminal.until_style(b"\x1b[38;2;255;0;0m")
+            terminal.send(b"q")
+            terminal.next_prompt()
+
+    def test_browse_accepts_native_selectors(self):
+        result = self.run_repl("[10 20 30]\n:browse 1 1\n:q\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Int : Raw", result.stdout)
+        self.assertIn("\n20\n", result.stdout)
+
+    def test_browse_pipe_is_bounded_plain_output(self):
+        result = self.run_repl("[10 20 30]\n:browse 1\n:q\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("gtRawFor", result.stdout)
+        self.assertRegex(result.stdout, r">\s*0\s*\|\s*Int\s*\|\s*10")
+        self.assertNotIn("\x1b", result.stdout)
+
     def test_long_command_output_pages_and_quit_preserves_the_repl(self):
         with Terminal() as terminal:
             terminal.resize(8, 60)
@@ -1264,6 +1339,23 @@ counter
             self.assertNotIn(b"\x1b[J", terminal.raw[before:])
             terminal.send(b"q")
             terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_repeated_resize_keeps_editing_and_paging_usable(self):
+        with Terminal() as terminal:
+            for cycle in range(8):
+                terminal.send(b"x")
+                terminal.displayed("λ> x")
+                terminal.resize(8 + cycle % 3, 60 + cycle % 5)
+                terminal.read_for(.03)
+                terminal.send(b"\x03")
+                terminal.next_prompt()
+                terminal.send(b":help\r")
+                terminal.until(b"lines 1-")
+                terminal.resize(9 + cycle % 3, 62 + cycle % 5)
+                terminal.read_for(.03)
+                terminal.send(b"q")
+                terminal.until("λ> ".encode())
             terminal.result(b"(Int.+ 20 22)", b"42")
 
     def test_pager_search_and_cancel_return_to_editing(self):

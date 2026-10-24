@@ -1,0 +1,146 @@
+(load "inspection.carp")
+(load "view-protocol.carp")
+
+(doc ReplViewNative "supplies Raw views from the publication's actual layouts.
+Children remain borrowed from the pinned result; no address reaches the client.")
+(defmodule ReplViewNative
+  (doc choices "adds the host's Raw view once, preserving provider order.")
+  (defn choices [page]
+    (let-do [choices (ReplViewPage.choices page)
+             found false]
+      (for [i 0 (Array.length choices)]
+        (when (String.=
+            (ReplViewChoice.selector (Array.unsafe-nth choices i))
+            "gtRawFor")
+          (set! found true)))
+      (unless found
+        (Array.push-back! choices
+                          (ReplViewChoice.init @"gtRawFor" @"Raw" @"columned" 90)))))
+
+  (doc page "copies a bounded window of native fields or sequence elements.
+Opaque environments stay opaque; scalar values render as bounded text.")
+  (defn- text-slice [text offset bytes]
+    (let-do [length (String.length text)
+             start (Int.max 0 (Int.min length offset))
+             end 0]
+      (while (and (Int.< start length)
+                  (Int.=
+                    (Int.bit-and (Char.to-int (String.char-at text start)) 192)
+                    128))
+        (set! start (Int.inc start)))
+      (set! end (Int.+ start (Int.min (Int.max 0 bytes) (Int.- length start))))
+      (while (and (Int.< end length)
+                  (and (Int.> end start)
+                       (Int.=
+                         (Int.bit-and (Char.to-int (String.char-at text end))
+                                      192)
+                         128)))
+        (set! end (Int.dec end)))
+      (String.byte-slice text start end)))
+
+  (defn- text-window [jit view layout request]
+    (match-ref (NativeValueLayout.representation layout)
+      (NativeRepresentation.Text)
+        (let-do [output (InspectOutput.init []
+                                            @(InspectRequest.bytes request)
+                                            false)]
+          (ReplInspect.text! &output
+                             @(NativeView.address view)
+                             @(InspectRequest.offset request))
+          (String.concat (InspectOutput.parts &output)))
+      _
+        (let [whole (ReplInspect.render jit
+                                        view
+                                        &(InspectRequest.set-offset
+                                          (InspectRequest.set-bytes @request
+                                                                    65536)
+                                          0))]
+          (text-slice &whole
+                      @(InspectRequest.offset request)
+                      @(InspectRequest.bytes request)))))
+
+  (defn page [jit original handle request]
+    (match (ReplInspect.dereference original)
+      (Result.Error error) (Result.Error error)
+      (Result.Success view)
+        (match (SessionJit.value-layout jit
+                                        @(NativeView.publication &view)
+                                        (Box.peek (NativeView.type &view)))
+          (Result.Error error) (Result.Error error)
+          (Result.Success layout)
+            (let-do [page (ReplViewPage.init @handle
+                                             (Type.render (Box.peek (NativeView.type &view)))
+                                             []
+                                             @"gtRawFor"
+                                             @"Raw"
+                                             @"text"
+                                             -1
+                                             @(InspectRequest.offset request)
+                                             @""
+                                             []
+                                             []
+                                             (ReplViewImage.init 0 0 0 0 []))
+                     total -1
+                     fields (the (Array NativeFieldLayout) [])
+                     items (the (Array ReplViewItem) [])
+                     remaining @(InspectRequest.bytes request)]
+              (choices &page)
+              (match-ref (NativeValueLayout.representation &layout)
+                (NativeRepresentation.Sequence _ length-offset _ _)
+                  (let [length (ReplInspect.long-at
+                          (Long.+ @(NativeView.address &view) @length-offset))]
+                    (set! total
+                          (Long.to-int
+                            (Long.max 0l
+                                      (Long.min length (Long.from-int Int.MAX))))))
+                representation
+                  (match (ReplInspect.children jit &view representation)
+                    (Result.Error _) ()
+                    (Result.Success children)
+                      (do
+                        (set! fields @(NativeChildren.fields &children))
+                        (set! total (Array.length &fields)))))
+              (if (Int.< total 0)
+                (ReplViewPage.set-text! &page
+                                        (text-window jit &view &layout request))
+                (do
+                  (ReplViewPage.set-kind! &page @"columned")
+                  (ReplViewPage.set-total! &page total)
+                  (ReplViewPage.set-columns! &page [@"Field" @"Type" @"Value"])
+                  (for [i
+                        @(InspectRequest.offset request)
+                        (Int.min total
+                                 (Int.+ @(InspectRequest.offset request)
+                                        @(InspectRequest.count request)))]
+                    (when (Int.> remaining 0)
+                      (match (ReplInspect.child jit &view &(str i))
+                        (Result.Error error)
+                          (do
+                            (Array.push-back! &items
+                                              (ReplViewItem.init i
+                                                                 [@"" @"" error]
+                                                                 false))
+                            (set! remaining 0))
+                        (Result.Success child)
+                          (let-do [name (if (Int.< i (Array.length &fields))
+                                     @(NativeFieldLayout.name (Array.unsafe-nth &fields
+                                                                                i))
+                                     (str i))
+                                   summary (ReplInspect.render jit
+                                                               &child
+                                                               &(InspectRequest.set-offset
+                                                                 (InspectRequest.set-bytes @request
+                                                                                           remaining)
+                                                                 0))]
+                            (set! remaining
+                                  (Int.max 0
+                                           (Int.- remaining
+                                                  (String.length &summary))))
+                            (Array.push-back! &items
+                                              (ReplViewItem.init i
+                                                                 [name
+                                                                  (Type.render (Box.peek (NativeView.type &child)))
+                                                                  summary]
+                                                                 true))))))
+                  (ReplViewPage.set-items! &page items)))
+              (Result.Success page))))))
