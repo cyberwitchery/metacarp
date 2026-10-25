@@ -1,0 +1,259 @@
+; Compiler-owned expanded submissions. The journal continues to hold caller text.
+(defmodule ReplEngine
+  (defn- scoped-expanded-runtime [session source values]
+    (let-do [overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)
+             globals (ResolveSnapshot.globals (SessionOverlay.resolution overlay))
+             names (the (Array String) [])]
+      (for [i 0 (Array.length globals)]
+        (Array.push-back! &names @(CoreRef.name (Array.unsafe-nth globals i))))
+      (match (ReplValues.scoped-runtime-module values source &names)
+        (Result.Error error) (Result.Error error)
+        (Result.Success module)
+          (Result.Success
+            (SourcedSurfaceModule.init @(SourcedSurfaceModule.input source)
+                                       module)))))
+
+  (defn- prepare-expanded-result [engine session jit source values]
+    (match (scoped-expanded-runtime session source values)
+      (Result.Error error) (Result.Error error)
+      (Result.Success prepared-source)
+        (let [input (SourcedSurfaceModule.input &prepared-source)
+              body (SourcedSurfaceModule.module &prepared-source)]
+          (match (ReplValues.runtime-module values input body)
+            (Result.Error error) (Result.Error error)
+            (Result.Success runtime)
+              (do
+                (ReplEngineState.set-prepared-input! engine [@&runtime])
+                (match (Session.infer-expanded-cell session &runtime)
+                  (Result.Error error) (Result.Error error)
+                  (Result.Success report)
+                    (let-do [original (SessionTypedEntity.type
+                               (Array.unsafe-nth (CellReport.forms &report) 0))
+                             copied-string (String.= original "(Ref String)")
+                             type (if copied-string @"String" @original)
+                             type-info (if copied-string
+                               (Box.init (MonoType.String))
+                               @(Array.unsafe-nth (CellReport.root-types &report)
+                                                  0))
+                             display (and (not (String.= &type "()"))
+                                          (not (String.= &type "Unit")))
+                             retain (and display
+                                         (not (String.starts-with? &type "(Ref ")))
+                             validation (if (and display (not retain))
+                               (match (Session.lower-expanded-cell-with-known-namespaced session
+                                                                                         &runtime
+                                                                                         false
+                                                                                         &[]
+                                                                                         "")
+                                 (Result.Error error) (Result.Error error)
+                                 (Result.Success _) (Result.Success ()))
+                               (Result.Success ()))
+                             slot (if display
+                               (ReplValues.allocate)
+                               (Pointer.from-long 0l))
+                             compiled (match validation
+                               (Result.Error error) (Result.Error error)
+                               (Result.Success _)
+                                 (match (if copied-string
+                                     (ReplValues.splice-module input
+                                                               "(String.copy __repl_body__)"
+                                                               body)
+                                     (Result.Success @&prepared-source))
+                                   (Result.Error error) (Result.Error error)
+                                   (Result.Success copied)
+                                     (match (if display
+                                         (ReplValues.capture-module values
+                                                                    input
+                                                                    (SourcedSurfaceModule.module &copied)
+                                                                    slot)
+                                         (Result.Success @&runtime))
+                                       (Result.Error error) (Result.Error error)
+                                       (Result.Success captured)
+                                         (SessionJit.compile-expanded-cell jit
+                                                                           session
+                                                                           &captured))))]
+                      (match compiled
+                        (Result.Error error)
+                          (do
+                            (unless (null? slot) (ReplValues.discard-slot slot))
+                            (Result.Error error))
+                        (Result.Success address)
+                          (Result.Success
+                            (ReplPreparedResult.init address
+                                                     slot
+                                                     type
+                                                     type-info
+                                                     (Int.dec @(JitSession.serial jit))
+                                                     retain))))))))))
+
+  (defn- commit-expanded-input [engine candidate definitions]
+    (let-do [invalidate (mixed-needs-reset? engine definitions)
+             had-code (not
+               (Array.empty? (JitSession.code (ReplEngineState.jit engine))))
+             error (if invalidate
+               (do
+                 (clear-browse! engine)
+                 (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+                 (ReplValues.clear! (ReplEngineState.results engine))
+                 (ReplEngineState.set-generation! engine
+                                                  (Int.inc @(ReplEngineState.generation engine)))
+                 (SessionJit.reset-code! (ReplEngineState.jit engine)))
+               @"")]
+      (if (String.empty? &error)
+        (do
+          (ReplEngineState.set-session! engine candidate)
+          (Result.Success
+            (committed-message definitions (and invalidate had-code))))
+        (Result.Error (diagnostic error)))))
+
+  (defn- evaluate-expanded-mixed [engine candidate submission]
+    (let [definitions (PreparedSessionInput.definitions &submission)
+          runtime (PreparedSessionInput.runtime &submission)]
+      (if (mixed-needs-reset? engine definitions)
+        (let-do [old (ReplEngineState.jit engine)
+                 staged (SessionJit.create (JitSession.core-dir old)
+                                           (JitSession.scratch old))]
+          (JitSession.set-serial! &staged (Int.inc @(JitSession.serial old)))
+          (JitSession.set-generation! &staged
+                                      (Int.inc @(JitSession.generation old)))
+          (match (prepare-expanded-result engine &candidate &staged runtime &[])
+            (Result.Error error)
+              (do
+                (JitSession.set-serial! old
+                                        (Int.inc @(JitSession.serial &staged)))
+                (SessionJit.dispose &staged)
+                (Result.Error error))
+            (Result.Success ready)
+              (do
+                (clear-browse! engine)
+                (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+                (ReplValues.clear! (ReplEngineState.results engine))
+                (SessionJit.dispose old)
+                (ReplEngineState.set-jit! engine staged)
+                (ReplEngineState.set-session! engine candidate)
+                (ReplEngineState.set-generation! engine
+                                                 (Int.inc @(ReplEngineState.generation engine)))
+                (match (run-prepared engine &ready)
+                  (Result.Error error) (Result.Error error)
+                  (Result.Success text)
+                    (Result.Success
+                      (String.append
+                        "[native state reset after definition commit]
+"
+                        &text))))))
+        (match (prepare-expanded-result engine
+                                        &candidate
+                                        (ReplEngineState.jit engine)
+                                        runtime
+                                        (ReplEngineState.results engine))
+          (Result.Error error) (Result.Error error)
+          (Result.Success ready)
+            (do
+              (ReplEngineState.set-session! engine candidate)
+              (run-prepared engine &ready))))))
+
+  (defn- evaluate-expanded-input [engine input]
+    (let-do [candidate @(ReplEngineState.session engine)]
+      (match (Session.prepare-input &candidate input)
+        (Result.Error error) (Result.Error error)
+        (Result.Success prepared)
+          (do
+            (ReplEngineState.set-prepared-input! engine
+                                                 [@(PreparedSessionInput.runtime &prepared)])
+            (cond
+              (and
+                (not @(PreparedSessionInput.declarations &prepared))
+                (not
+                  (and
+                    (Int.> @(ReplEngineState.editing engine) 0)
+                    (active-input? engine (SourceInput.id input)))))
+                (match (prepare-expanded-result engine
+                                                (ReplEngineState.session engine)
+                                                (ReplEngineState.jit engine)
+                                                (PreparedSessionInput.runtime &prepared)
+                                                (ReplEngineState.results engine))
+                  (Result.Error error) (Result.Error error)
+                  (Result.Success ready) (run-prepared engine &ready))
+              (Array.empty?
+                (SurfaceModule.forms
+                  (SourcedSurfaceModule.module (PreparedSessionInput.runtime &prepared))))
+                (commit-expanded-input engine
+                                       candidate
+                                       (PreparedSessionInput.definitions &prepared))
+              (evaluate-expanded-mixed engine candidate prepared))))))
+
+  (defn- editing-check-expanded [engine input]
+    (let-do [candidate @(ReplEngineState.session engine)]
+      (match (Session.prepare-input &candidate input)
+        (Result.Error error)
+          (fmt "%s: %s" (Diagnostic.phase &error) (Diagnostic.message &error))
+        (Result.Success submission)
+          (let-do [runtime (PreparedSessionInput.runtime &submission)
+                   definitions (PreparedSessionInput.definitions &submission)
+                   values (if (and
+                       @(PreparedSessionInput.declarations &submission)
+                       (mixed-needs-reset? engine definitions))
+                     (the (Array ReplValue) [])
+                     @(ReplEngineState.results engine))]
+            (if (Array.empty?
+                (SurfaceModule.forms (SourcedSurfaceModule.module runtime)))
+              (definition-lines definitions)
+              (match (match (scoped-expanded-runtime &candidate runtime &values)
+                  (Result.Error error) (Result.Error error)
+                  (Result.Success scoped)
+                    (ReplValues.runtime-module &values
+                                               input
+                                               (SourcedSurfaceModule.module &scoped)))
+                (Result.Error error)
+                  (fmt "%s: %s"
+                       (Diagnostic.phase &error)
+                       (Diagnostic.message &error))
+                (Result.Success checked)
+                  (match (Session.lower-expanded-cell-with-known-namespaced &candidate
+                                                                            &checked
+                                                                            false
+                                                                            &[]
+                                                                            "")
+                    (Result.Error error)
+                      (fmt "%s: %s"
+                           (Diagnostic.phase &error)
+                           (Diagnostic.message &error))
+                    (Result.Success _)
+                      (match (Session.infer-expanded-cell &candidate &checked)
+                        (Result.Error error)
+                          (fmt "%s: %s"
+                               (Diagnostic.phase &error)
+                               (Diagnostic.message &error))
+                        (Result.Success report)
+                          (let-do [lines (definition-lines definitions)
+                                   roots (CellReport.forms &report)]
+                            (for [i 0 (Array.length roots)]
+                              (do
+                                (unless (String.empty? &lines)
+                                  (set! lines (String.append &lines "
+")))
+                                (set! lines
+                                      (String.append &lines
+                                                     (SessionTypedEntity.type (Array.unsafe-nth roots
+                                                                                                i))))))
+                            lines)))))))))
+
+  (defn- expanded-dependencies [engine source]
+    (let [input (SourcedSurfaceModule.input source)]
+      (match (ReplValues.splice-module input
+                                       "(defn __repl_dependencies [] __repl_body__)"
+                                       (SourcedSurfaceModule.module source))
+        (Result.Error _) (Maybe.Nothing)
+        (Result.Success probe)
+          (let [overlay (Array.unsafe-nth
+                  (CompilerSession.overlay (ReplEngineState.session engine))
+                  0)
+                allocator @(SessionOverlay.node-allocator
+                  (Array.unsafe-nth
+                    (CompilerSession.overlay (ReplEngineState.session engine))
+                    0))]
+            (match (Resolve.module-with-provenance-against &probe
+                                                           &allocator
+                                                           (SessionOverlay.resolution overlay))
+              (Result.Error _) (Maybe.Nothing)
+              (Result.Success resolved) (Maybe.Just resolved)))))))

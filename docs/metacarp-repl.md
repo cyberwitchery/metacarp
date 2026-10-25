@@ -390,9 +390,35 @@ a parent does not invalidate a selected child; dropping its source result or
 retiring the runtime invalidates both. Provider windows are bounded before
 rendering, and an idle viewer does not repaint or invoke providers.
 
-Declaration-producing macros are classified after expansion. A single macro
-form that emits both declarations and runtime expressions is rejected before
-commit; use separate top-level forms for those two parts.
+A macro can emit declarations and runtime expressions in one top-level
+sequence. The compiler prepares one expanded syntax tree, commits its declaration
+projection, then executes its runtime roots once. Type, ownership, or native
+publication errors leave the previous session intact. Rebuilding accepted
+source restores declarations without executing its runtime roots. History and
+export retain the original invocation.
+
+```clojure
+(defmacro define-and-call [name value]
+  `(do (defn %name [] %value) (%name)))
+
+(define-and-call answer 42)
+; 42, retained as _1
+(answer)
+; 42
+```
+
+F2 checks the same prepared syntax without committing or executing it. Loading
+an exported source sequence in the REPL explicitly executes its runtime parts.
+Module-scoped output keeps its namespace, imports, private access, and source
+coordinates. The terminal adapter materializes those runtime roots as transient
+functions; they never enter the committed source or definition list.
+
+Three alternating optimized PTY runs on the same Mac compared the structured
+viewer checkpoint with prepared submissions. Median startup was 791 ms versus
+790 ms, first integer evaluation 828 ms versus 824 ms, and warm evaluation
+245 ms versus 242 ms. A first invocation that defined and called a function
+through a mixed-output macro took 975 ms. These runs show no measurable change
+to ordinary evaluation latency at this sample size.
 
 ## Platform boundary
 
@@ -800,8 +826,10 @@ The command integration adds dispatch and reuses the existing drivers.
 `:browse` uses owned pages and generation-checked handles for text, tables,
 trees, sampled RGBA images, and native Raw navigation. Closing a viewer
 releases its leases. The terminal retains parent pages and selections, and
-uses the existing frame diff. Compiler workers inherit blocked libedit signals,
-so editor signal handling stays on the editor thread.
+uses the existing frame diff. Compiler workers inherit blocked terminal signals.
+The terminal loop processes pending signals synchronously during input and
+paging, restoring terminal mode before termination or suspension. Libedit's
+asynchronous handlers depend on its builtin reader and are disabled here.
 
 Three optimized PTY runs on the same MacBookPro18,2, arm64 macOS 15.8.1,
 with LLVM 23.1.4 gave these medians. Each run measured three warm integer

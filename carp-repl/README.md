@@ -195,9 +195,25 @@ a parent does not invalidate a selected child; dropping its source result or
 retiring the runtime invalidates both. Provider windows are bounded before
 rendering, and an idle viewer does not repaint or invoke providers.
 
-Declaration-producing macros are classified after expansion. A single macro
-form that emits both declarations and runtime expressions is rejected before
-commit; use separate top-level forms for those two parts.
+A macro can emit declarations and runtime expressions in one top-level
+sequence. The compiler prepares one expanded syntax tree, commits its declaration
+projection, then executes its runtime roots once. Type, ownership, or native
+publication errors leave the previous session intact. Rebuilding accepted
+source restores declarations without executing its runtime roots. History and
+export retain the original invocation.
+
+```clojure
+(defmacro define-and-call [name value]
+  `(do (defn %name [] %value) (%name)))
+
+(define-and-call answer 42)
+; 42, retained as _1
+(answer)
+; 42
+```
+
+F2 checks the same prepared syntax without committing or executing it. Loading
+an exported source sequence in the REPL explicitly executes its runtime parts.
 
 ## Queries and editable source
 
@@ -296,9 +312,12 @@ Reader facts arrive before semantic analysis. Cursor queries reuse the current
 analysis. Every reply carries document, source, and session revisions; editing
 replies also carry a request ID and cursor. Superseded replies are discarded.
 The host pauses and drains the worker before accessing its engine.
-The worker inherits blocked terminal signals when it is created, leaving
-libedit’s signal handlers on the editor thread. The creator’s mask is restored
-before creation returns.
+The worker inherits blocked terminal signals when it is created. While editing
+or paging, the terminal loop consumes those signals synchronously. It updates
+the layout on resize and restores terminal mode before delegating termination
+or suspension to the original signal disposition. Libedit's asynchronous signal
+handlers are disabled because their rearming depends on its builtin reader.
+The caller's signal mask is restored when input finishes.
 
 Semantic previews have a two-million-unit work budget and a 500 ms deadline.
 They restore compile-time state and never commit source or publish native code.

@@ -915,16 +915,189 @@ visits
         self.assertIn("answer : (Fn [] Int)", result.stdout)
         self.assertIn("\n42\n", result.stdout)
 
-    def test_mixed_macro_expansion_is_rejected_atomically(self):
-        result = self.run_repl('''(defmacro mixed [] `(do (defn from-mixed [] 1) 42))
+    def test_mixed_macro_commits_declarations_and_runs_roots_once(self):
+        result = self.run_repl('''(defmacro mixed [] `(do (defn from-mixed [] 41) (IO.println "macro-effect") (Int.inc (from-mixed))))
 (mixed)
+(Int.+ _1 1)
+(defn unrelated-after-mixed [] 7)
 (from-mixed)
-(Int.+ 20 22)
 :q
 ''')
-        self.assertIn("both declarations and expressions", result.stderr)
-        self.assertIn("unknown binding from-mixed", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("macro-effect\n"), 1, result.stdout)
+        self.assertIn("\n42\n43\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("41\n"), result.stdout)
+
+    def test_failed_mixed_macro_preserves_definitions_and_live_values(self):
+        result = self.run_repl('''(def counter 0)
+(defmacro broken-mixed [] `(do (defn leaked-mixed [] 9) (IO.println "must-not-run") (Int.+ true 1)))
+(set! counter 7)
+(broken-mixed)
+counter
+(leaked-mixed)
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("must-not-run", result.stdout)
+        self.assertIn("infer:", result.stderr)
+        self.assertIn("unknown binding leaked-mixed", result.stderr)
+        self.assertTrue(result.stdout.endswith("7\n"), result.stdout)
+
+    def test_mixed_macro_uses_one_expansion_for_generated_names(self):
+        result = self.run_repl('''(defmacro fresh-mixed [] (let [name (gensym)] `(do (defn %name [] 42) (%name))))
+(fresh-mixed)
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("42\n"), result.stdout)
+
+    def test_mixed_macro_check_does_not_execute_or_commit(self):
+        with Terminal() as terminal:
+            terminal.send(b'(defmacro checked-mixed [] `(do (defn checked-answer [] 42) (IO.println "must-not-run") (checked-answer)))\r')
+            terminal.next_prompt()
+            terminal.raw = b""
+            terminal.send(b"(checked-mixed)\x1bOQ")
+            terminal.until(b"checked-answer : (Fn [] Int)")
+            self.assertNotIn(b"\r\nmust-not-run\r\n", terminal.raw)
+            terminal.send(b"\x03")
+            terminal.next_prompt()
+            terminal.send(b"(checked-answer)\r")
+            terminal.until(b"unknown binding checked-answer")
+            terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_mixed_macro_can_commit_types_functions_and_macros(self):
+        result = self.run_repl('''(defmacro bundle [] `(do (deftype MixedBox [value Int]) (defn make-mixed-box [] (MixedBox.init 42)) (defmacro bundled-answer [] 43) (make-mixed-box)))
+(bundle)
+:defs
+:inspect 1 value
+(bundled-answer)
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("MixedBox : type", result.stdout)
+        self.assertIn("make-mixed-box : (Fn [] MixedBox)", result.stdout)
+        self.assertIn("bundled-answer : macro", result.stdout)
+        self.assertIn("_1 value : (Ref Int)\n42", result.stdout)
+        self.assertTrue(result.stdout.endswith("43\n"), result.stdout)
+
+    def test_top_level_sequences_support_mixed_macro_output(self):
+        result = self.run_repl('''(defmacro sequenced [] `(do (defn from-sequence [] 42) (from-sequence)))
+(do (sequenced))
+(do (defn direct-sequence [] 43) (direct-sequence))
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("42\n43\n"), result.stdout)
+
+    def test_failed_mixed_macro_native_publication_is_atomic(self):
+        result = self.run_repl('''(def counter 0)
+(defmacro absent-mixed [] `(do (register absent-generated (Fn [] Int) "metacarp_repl_missing_generated_symbol") (IO.println "must-not-run") (absent-generated)))
+(set! counter 7)
+(absent-mixed)
+counter
+:defs
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("jit:", result.stderr)
+        self.assertNotIn("must-not-run", result.stdout)
+        self.assertNotIn("absent-generated :", result.stdout)
+        self.assertIn("\n7\n", result.stdout)
+
+    def test_mixed_macro_history_edits_and_export_preserve_caller_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active = Path(directory, "active.carp")
+            removed = Path(directory, "removed.carp")
+            result = self.run_repl(f'''(defmacro history-bundle [n] `(do (defn history-answer [] %n) (IO.println "export-effect") (history-answer)))
+  (history-bundle 42)
+:edit 2
+  (history-bundle 43)
+:export {active}
+:edit 2
+45
+(history-answer)
+:export {removed}
+:q
+''')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.count("export-effect\n"), 2, result.stdout)
+            self.assertIn("unknown binding history-answer", result.stderr)
+            exported = active.read_text()
+            self.assertIn("\n  (history-bundle 43)\n", exported)
+            self.assertNotIn("(history-bundle 42)", exported)
+            self.assertEqual(exported.count("(defn history-answer"), 1)
+            self.assertNotIn("(history-bundle 43)", removed.read_text())
+            replay = self.run_repl(exported + "(history-answer)\n:q\n")
+            self.assertEqual(replay.stderr, "")
+            self.assertEqual(replay.stdout.count("export-effect\n"), 1, replay.stdout)
+            self.assertTrue(replay.stdout.endswith("43\n43\n"), replay.stdout)
+
+    def test_runtime_macro_can_use_live_results_and_return_an_owned_string(self):
+        result = self.run_repl('''(defmacro passthrough [form] form)
+[10 20]
+(passthrough (Array.length _1))
+"abc"
+(passthrough _3)
+:inspect 4
+:results
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("\n2\n", result.stdout)
+        self.assertIn("_4 : String\nabc\n", result.stdout)
+        self.assertIn("_1 : (Array Int)", result.stdout)
+        self.assertIn("_4 : String", result.stdout)
+
+    def test_mixed_macro_preserves_module_scope_without_replaying_effects(self):
+        result = self.run_repl('''(defmacro scoped-bundle [] `(defmodule ScopedBundle (private secret) (defn secret [] 41) (defn answer [] (secret)) (defn __repl_scope_0 [] 100) (IO.println "scoped-effect") (Int.inc (secret))))
+(scoped-bundle)
+(defn after-scoped [] 9)
+(ScopedBundle.answer)
+(ScopedBundle.__repl_scope_0)
+:inspect 1
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("scoped-effect\n"), 1, result.stdout)
         self.assertIn("\n42\n", result.stdout)
+        self.assertIn("\n41\n100\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("_1 : Int\n42\n"), result.stdout)
+
+    def test_mixed_macro_preserves_nested_module_imports_and_live_aliases(self):
+        result = self.run_repl('''(defmodule MixedSource (defn answer [] 41))
+(defmacro imported-bundle [] `(defmodule MixedImports (use MixedSource) (defn value [] (answer)) (defmodule Inner (IO.println "nested-effect") (Int.+ (Array.length _1) (MixedImports.value)))))
+[10]
+(imported-bundle)
+(defn after-imports [] 0)
+(MixedImports.value)
+:inspect 2
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("nested-effect\n"), 1, result.stdout)
+        self.assertTrue(result.stdout.endswith("_2 : Int\n42\n"), result.stdout)
+
+    def test_mixed_macro_mutates_native_globals_only_when_executed(self):
+        result = self.run_repl('''(def counter 0)
+(defmacro mutate-and-define [] `(do (defn after-mutation [] 42) (set! counter (Int.inc counter)) counter))
+(set! counter 7)
+(mutate-and-define)
+(defn after-macro [] 9)
+counter
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("8\n"), 2, result.stdout)
+        self.assertTrue(result.stdout.endswith("8\n"), result.stdout)
 
     def test_view_queries_refresh_bounds_and_source_between_results(self):
         result = self.run_repl('''(deftype Tag [value Int])
@@ -1553,6 +1726,16 @@ counter
             terminal.displayed(b"2)")
             terminal.resize(12, 24)
             terminal.result(b"\x1b[D\x1b[D\x1b[3~3\x05", b"43")
+
+    def test_continue_and_resize_signals_preserve_the_edited_buffer(self):
+        with Terminal() as terminal:
+            terminal.send(b"(Int.+ 40 2)")
+            terminal.displayed("λ> (Int.+ 40 2)")
+            for _ in range(6):
+                os.kill(terminal.child, signal.SIGCONT)
+                terminal.resize(12, 80)
+                terminal.read_for(.04)
+            terminal.result(b"", b"42")
 
     def test_termination_restores_terminal_mode(self):
         with Terminal() as terminal:

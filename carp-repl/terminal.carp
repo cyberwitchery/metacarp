@@ -71,7 +71,8 @@
    initial String
    presentation ReplPresentation
    output-source (Ptr String)
-   output-browser (Ptr ReplBrowser)])
+   output-browser (Ptr ReplBrowser)
+   signal-mask (Ptr ReplNativeSignalSet)])
 
 ;; Specializations of libedit's variadic entry points call the system API directly.
 (defmodule ReplEdit
@@ -278,6 +279,7 @@
                                       (String.copy "")
                                       presentation
                                       (Pointer.from-long 0l)
+                                      (Pointer.from-long 0l)
                                       (Pointer.from-long 0l)))
                    event (the (Ptr ReplHistEvent)
                               (ReplEdit.allocate
@@ -315,7 +317,7 @@
                                     ReplEdit.HIST
                                     ReplEdit.history-callback
                                     native-history))
-            (ignore (ReplEdit.set-int editor ReplEdit.SIGNAL 1))
+            (ignore (ReplEdit.set-int editor ReplEdit.SIGNAL 0))
             (ignore
               (ReplEdit.set-two-texts editor
                                       ReplEdit.SETTY
@@ -480,6 +482,73 @@
 
   (private read-edited)
   (hidden read-edited)
+  (defn- read-native [editor count]
+    (match (ReplNative.block-terminal-signals)
+      (Result.Error status)
+        (do
+          (Pointer.set count -1)
+          (Pointer.set (ReplEdit.errno) status)
+          (the ReplNativeText
+               (Unsafe.coerce (the (Ptr CChar) (Pointer.from-long 0l)))))
+      (Result.Success previous)
+        (let-do [data (state editor)]
+          (ReplEditor.set-signal-mask! data previous)
+          (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 1))
+          (prepare-character-input)
+          (let-do [line (ReplEdit.gets editor count)]
+            (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 0))
+            (ReplEditor.set-signal-mask! data (Pointer.from-long 0l))
+            (ignore
+              (ReplNative.signal-mask ReplNative.SIGNAL-SET
+                                      previous
+                                      (Pointer.from-long 0l)))
+            (ReplNative.release previous)
+            line))))
+
+  ; The custom reader owns signal processing as well as rendering. Libedit's
+  ; handlers depend on its builtin reader rearming them after EINTR.
+  (defn- receive-signals [editor]
+    (let-do [data (state editor)
+             signal (ReplNative.pending-terminal-signal @(ReplEditor.signal-mask data))]
+      (while-do (Int./= signal 0)
+        (cond
+          (Int.= signal ReplNative.SIGNAL-RESIZE) (ReplEdit.resize editor)
+          (Int.= signal ReplNative.SIGNAL-CONTINUE)
+            (do
+              (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 1))
+              (prepare-character-input)
+              (ReplEdit.resize editor)
+              (ReplPresentation.set-dirty! (ReplEditor.presentation data) true))
+          (do
+            ; Restore terminal state before delegating to the original disposition.
+            ; After a suspended process continues, keep editing the same buffer.
+            (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 0))
+            (IO.print "\u001b[?2004l")
+            (IO.Raw.fflush! IO.Raw.stdout)
+            (let-do [blocked (the (Ptr ReplNativeSignalSet)
+                                  (ReplNative.allocate
+                                    (Pointer.width
+                                      (the (Ptr ReplNativeSignalSet)
+                                           (Pointer.from-long 0l)))))]
+              (ignore
+                (ReplNative.signal-mask ReplNative.SIGNAL-SET
+                                        @(ReplEditor.signal-mask data)
+                                        blocked))
+              (ignore (ReplNative.raise-signal signal))
+              (ignore
+                (ReplNative.signal-mask ReplNative.SIGNAL-SET
+                                        blocked
+                                        (Pointer.from-long 0l)))
+              (ReplNative.release blocked))
+            (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 1))
+            (prepare-character-input)
+            (ReplEdit.resize editor)
+            (IO.print "\u001b[?2004h")
+            (IO.Raw.fflush! IO.Raw.stdout)
+            (ReplPresentation.set-dirty! (ReplEditor.presentation data) true)))
+        (set! signal
+              (ReplNative.pending-terminal-signal @(ReplEditor.signal-mask data))))))
+
   (defn read-edited [terminal prompt]
     (if (null? terminal)
       (ReplRead.Error (String.copy "could not initialize terminal editor"))
@@ -493,8 +562,6 @@
         (ReplPresentation.set-undoing! (ReplEditor.presentation data) false)
         (ReplPresentation.set-undo-cursor! (ReplEditor.presentation data) -1)
         (bind-key editor "^M" "repl-accept")
-        (ignore (ReplEdit.set-int editor ReplEdit.PREPARE 1))
-        (prepare-character-input)
         (unless (String.empty? (ReplEditor.initial data))
           (let [key [27 91 57 57 57 126 0]]
             (ReplEdit.push editor (Pointer.address (Array.unsafe-nth &key 0)))))
@@ -502,7 +569,7 @@
         (IO.Raw.fflush! IO.Raw.stdout)
         (let-do [line (the (Ptr CChar)
                            (Unsafe.coerce
-                             (ReplEdit.gets editor (Pointer.address &count))))
+                             (read-native editor (Pointer.address &count))))
                  result (cond
                    @(ReplEditor.cancelled data) (ReplRead.Cancelled)
                    (Int.< count 0) (ReplRead.Error (System.error-text))
@@ -712,6 +779,13 @@
              size (dimensions)
              width @(Pair.a &size)
              height @(Pair.b &size)]
+      (when-do (or
+          (Int./= width @(ReplPresentation.screen-width presentation))
+          (Int./= height @(ReplPresentation.screen-height presentation)))
+        (ReplEdit.resize editor)
+        (unless-do @(ReplPresentation.rich presentation)
+          (ReplPresentation.set-screen-width! presentation width)
+          (ReplPresentation.set-screen-height! presentation height)))
       (when (and @(ReplPresentation.rich presentation)
                  (or force
                      (or

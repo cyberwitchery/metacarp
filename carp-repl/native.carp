@@ -12,6 +12,9 @@
   (register signal-mask
     (Fn [Int (Ptr ReplNativeSignalSet) (Ptr ReplNativeSignalSet)] Int)
     "pthread_sigmask")
+  (register signal-pending (Fn [(Ptr ReplNativeSignalSet)] Int) "sigpending")
+  (register signal-wait (Fn [(Ptr ReplNativeSignalSet) (Ptr Int)] Int) "sigwait")
+  (register raise-signal (Fn [Int] Int) "raise")
   (register SIGNAL-BLOCK Int "SIG_BLOCK")
   (register SIGNAL-SET Int "SIG_SETMASK")
   (register SIGNAL-INTERRUPT Int "SIGINT")
@@ -114,9 +117,9 @@ analysis policy are implemented in Carp.")
   (doc now "reads the monotonic system clock in nanoseconds.")
   (defn now [] (clock MONOTONIC))
 
-  (doc thread-create-worker "creates a compiler worker with terminal signals
-blocked from its first instruction. Restores the creator's mask before return.")
-  (defn thread-create-worker [thread attributes callback context]
+  (doc block-terminal-signals "blocks terminal signals and returns the caller's
+previous mask. The caller must restore and release the returned mask.")
+  (defn block-terminal-signals []
     (let-do [mask (the (Ptr ReplNativeSignalSet)
                        (allocate
                          (Pointer.width
@@ -126,20 +129,56 @@ blocked from its first instruction. Restores the creator's mask before return.")
                              (Pointer.width
                                (the (Ptr ReplNativeSignalSet)
                                     (Pointer.from-long 0l)))))
+             signals (terminal-signals)]
+      (ignore (signal-empty mask))
+      (for [i 0 (Array.length &signals)]
+        (ignore (signal-add mask @(Array.unsafe-nth &signals i))))
+      (let-do [status (signal-mask SIGNAL-BLOCK mask previous)]
+        (release mask)
+        (if (Int.= status 0)
+          (Result.Success previous)
+          (do (release previous) (Result.Error status))))))
+
+  (doc pending-terminal-signal
+    "consumes one terminal signal newly blocked by the current scope.
+Signals already blocked in previous remain owned by the caller. Zero means no
+owned signal is pending; no asynchronous handler is installed.")
+  (defn pending-terminal-signal [previous]
+    (let-do [pending (the (Ptr ReplNativeSignalSet)
+                          (allocate
+                            (Pointer.width
+                              (the (Ptr ReplNativeSignalSet)
+                                   (Pointer.from-long 0l)))))
+             selection (the (Ptr ReplNativeSignalSet)
+                            (allocate
+                              (Pointer.width
+                                (the (Ptr ReplNativeSignalSet)
+                                     (Pointer.from-long 0l)))))
              signals (terminal-signals)
-             _empty (signal-empty mask)
-             _filled (for [i 0 (Array.length &signals)]
-               (ignore (signal-add mask @(Array.unsafe-nth &signals i))))
-             blocked (signal-mask SIGNAL-BLOCK mask previous)
-             status (if (Int.= blocked 0)
-               (let-do [created (thread-create thread
-                                               attributes
-                                               callback
-                                               context)]
-                 (ignore
-                   (signal-mask SIGNAL-SET previous (Pointer.from-long 0l)))
-                 created)
-               blocked)]
-      (release previous)
-      (release mask)
-      status)))
+             found 0]
+      (ignore (signal-pending pending))
+      (for [i 0 (Array.length &signals)]
+        (when (and
+            (and (Int.= found 0)
+                 (Int.=
+                   (signal-member previous @(Array.unsafe-nth &signals i))
+                   0))
+            (Int.= (signal-member pending @(Array.unsafe-nth &signals i)) 1))
+          (let-do [signal @(Array.unsafe-nth &signals i)]
+            (ignore (signal-empty selection))
+            (ignore (signal-add selection signal))
+            (ignore (signal-wait selection (Pointer.address &found))))))
+      (release selection)
+      (release pending)
+      found))
+
+  (doc thread-create-worker "creates a compiler worker with terminal signals
+blocked from its first instruction. Restores the creator's mask before return.")
+  (defn thread-create-worker [thread attributes callback context]
+    (match (block-terminal-signals)
+      (Result.Error status) status
+      (Result.Success previous)
+        (let-do [created (thread-create thread attributes callback context)]
+          (ignore (signal-mask SIGNAL-SET previous (Pointer.from-long 0l)))
+          (release previous)
+          created))))

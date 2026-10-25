@@ -1,5 +1,7 @@
 (load "../carp-source/carp-source.carp")
 (load "../carp-types/carp-types.carp")
+(load "../carp-surface/carp-surface.carp")
+(load "../carp-session/input-syntax.carp")
 
 ; The native result and its release callback live in the same JIT generation.
 ; The host releases both before invalidating that generation.
@@ -124,8 +126,8 @@ channel address for the next invocation. Clears the native callback first.")
  (do
   (Pointer.set (the (Ptr Long) (Pointer.from-long %sl)) (Pointer.to-long __repl_storage))
   (Pointer.set (the (Ptr (Fn [Long] ())) (Pointer.from-long %sl))
-   (fn [unused] (let-do [owned (Pointer.to-value __repl_storage)]
-     (Pointer.free __repl_storage) (ignore owned))))))" &(Long.str
+   (fn [unused] (let [owned (Pointer.to-value __repl_storage)]
+     (do (Pointer.free __repl_storage) (let [_ owned] ())))))))" &(Long.str
                      (Pointer.to-long
                        (Pointer.address (ReplValueSlot.address channel)))) &(Long.str
                      (Pointer.to-long
@@ -133,4 +135,185 @@ channel address for the next invocation. Clears the native callback first.")
         (SourceInput.init (String.copy (SourceInput.id input))
                           (String.concat
                             &[begin (String.copy (SourceInput.source input)) end]))
-        (String.length &begin)))))
+        (String.length &begin))))
+
+  (defn- splice-node [node body]
+    (if (match-ref (SurfaceNode.form node)
+        (SurfaceForm.Symbol segments)
+          (and (Int.= (Array.length segments) 1)
+               (String.= (Array.unsafe-nth segments 0) "__repl_body__"))
+        _ false)
+      @body
+      (let [form (match-ref (SurfaceNode.form node)
+              (SurfaceForm.List items)
+                (let-do [children (the (Array (Box SurfaceNode)) [])]
+                  (for [i 0 (Array.length items)]
+                    (Array.push-back! &children
+                                      (Box.init
+                                        (splice-node (Box.peek (Array.unsafe-nth items
+                                                                                 i))
+                                                     body))))
+                  (SurfaceForm.List children))
+              (SurfaceForm.Array items)
+                (let-do [children (the (Array (Box SurfaceNode)) [])]
+                  (for [i 0 (Array.length items)]
+                    (Array.push-back! &children
+                                      (Box.init
+                                        (splice-node (Box.peek (Array.unsafe-nth items
+                                                                                 i))
+                                                     body))))
+                  (SurfaceForm.Array children))
+              form @form)]
+        (SurfaceNode.generated (SurfaceSpan.anywhere) form))))
+
+  (doc splice-module "parses only host-owned scaffolding, then inserts expanded
+caller syntax directly. Its original source spans never pass through a printer.")
+  (defn splice-module [input template module]
+    (let-do [nodes [(Box.init
+                      (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                             (SurfaceForm.Symbol [@"do"])))]
+             declarations (the (Array (Box SurfaceNode)) [])
+             forms (SurfaceModule.forms module)]
+      (for [i 0 (Array.length forms)]
+        (let [node (Box.peek (Array.unsafe-nth forms i))]
+          (Array.push-back!
+            (if (SessionSyntax.declaration? node) &declarations &nodes)
+            (Box.init @node))))
+      (let [body (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                        (SurfaceForm.List nodes))
+            generated (SourceInput.init @"repl:scaffold" @template)]
+        (match (Surface.parse-input-diagnosed &generated)
+          (Result.Error error) (Result.Error error)
+          (Result.Success parsed)
+            (let-do [result declarations
+                     scaffold (SurfaceModule.forms (SourcedSurfaceModule.module &parsed))]
+              (for [i 0 (Array.length scaffold)]
+                (Array.push-back! &result
+                                  (Box.init
+                                    (splice-node (Box.peek (Array.unsafe-nth scaffold
+                                                                             i))
+                                                 &body))))
+              (Result.Success
+                (SourcedSurfaceModule.init @input (SurfaceModule.init result))))))))
+
+  (doc runtime-module "checks expanded runtime roots against live aliases.")
+  (defn runtime-module [values input module]
+    (let [template (runtime-input values
+                                  &(SourceInput.init @(SourceInput.id input)
+                                                     @"__repl_body__"))]
+      (splice-module input (SourceInput.source &template) module)))
+
+  (defn- generated-symbol [name]
+    (SurfaceNode.generated (SurfaceSpan.anywhere)
+                           (SurfaceForm.Symbol (String.split-by name &[\.]))))
+
+  (defn- scoped-name [scope name]
+    (if (String.empty? scope) @name (fmt "%s.%s" scope name)))
+
+  (defn- runtime-scopes [values input forms scope names counter]
+    (let-do [declarations (the (Array (Box SurfaceNode)) [])
+             roots (the (Array (Box SurfaceNode)) [])
+             failure (the (Maybe Diagnostic) (Maybe.Nothing))]
+      (for [i 0 (Array.length forms)]
+        (when (Maybe.nothing? &failure)
+          (let [node (Box.peek (Array.unsafe-nth forms i))]
+            (if (String.= &(SessionSyntax.head node) "defmodule")
+              (match-ref (SurfaceNode.form node)
+                (SurfaceForm.List items)
+                  (let-do [local (SessionSyntax.symbol-name (Box.peek (Array.unsafe-nth items
+                                                                                        1)))
+                           nested (scoped-name scope &local)]
+                    (match (runtime-scopes values
+                                           input
+                                           &(Array.slice items
+                                                         2
+                                                         (Array.length items))
+                                           &nested
+                                           names
+                                           counter)
+                      (Result.Error error) (set! failure (Maybe.Just error))
+                      (Result.Success parts)
+                        (let-do [number @(Array.unsafe-nth counter 0)
+                                 helper (fmt "__repl_scope_%d" number)
+                                 full (scoped-name &nested &helper)]
+                          (while-do (Array.contains? names &full)
+                            (set! number (Int.inc number))
+                            (set! helper (fmt "__repl_scope_%d" number))
+                            (set! full (scoped-name &nested &helper)))
+                          (Array.aset! counter 0 (Int.inc number))
+                          (Array.push-back! names @&full)
+                          (match (runtime-module values
+                                                 input
+                                                 &(SurfaceModule.init @(Pair.b &parts)))
+                            (Result.Error error)
+                              (set! failure (Maybe.Just error))
+                            (Result.Success body)
+                              (let-do [expressions [(Box.init (generated-symbol "do"))]
+                                       body-forms (SurfaceModule.forms (SourcedSurfaceModule.module &body))
+                                       module-forms [@(Array.unsafe-nth items 0)
+                                                     @(Array.unsafe-nth items 1)]
+                                       children (Pair.a &parts)]
+                                (for [j 0 (Array.length body-forms)]
+                                  (Array.push-back! &expressions
+                                                    @(Array.unsafe-nth body-forms
+                                                                       j)))
+                                (for [j 0 (Array.length children)]
+                                  (Array.push-back! &module-forms
+                                                    @(Array.unsafe-nth children
+                                                                       j)))
+                                (Array.push-back! &module-forms
+                                                  (Box.init
+                                                    (SurfaceNode.generated @(SurfaceNode.span node)
+                                                                           (SurfaceForm.List
+                                                                             [(Box.init (generated-symbol "defn"))
+                                                                              (Box.init (generated-symbol &helper))
+                                                                              (Box.init
+                                                                                (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                                                                                       (SurfaceForm.Array [])))
+                                                                              (Box.init
+                                                                                (SurfaceNode.generated (SurfaceSpan.anywhere)
+                                                                                                       (SurfaceForm.List expressions)))]))))
+                                (Array.push-back! &declarations
+                                                  (Box.init
+                                                    (SurfaceNode.generated @(SurfaceNode.span node)
+                                                                           (SurfaceForm.List module-forms))))
+                                (Array.push-back! &roots
+                                                  (Box.init
+                                                    (SurfaceNode.generated @(SurfaceNode.span node)
+                                                                           (SurfaceForm.List [(Box.init (generated-symbol &full))])))))))))
+                _ ())
+              (Array.push-back!
+                (if (SessionSyntax.declaration? node) &declarations &roots)
+                (Box.init @node))))))
+      (match failure
+        (Maybe.Just error) (Result.Error error)
+        (Maybe.Nothing) (Result.Success (Pair.init declarations roots)))))
+
+  (doc scoped-runtime-module "materializes module-scoped roots as transient
+functions in their original namespaces. Helpers receive the same result aliases
+as ordinary roots and use names absent from the compiler's visible globals.")
+  (defn scoped-runtime-module [values source globals]
+    (let-do [names @globals
+             counter [0]]
+      (match (runtime-scopes values
+                             (SourcedSurfaceModule.input source)
+                             (SurfaceModule.forms (SourcedSurfaceModule.module source))
+                             ""
+                             &names
+                             &counter)
+        (Result.Error error) (Result.Error error)
+        (Result.Success parts)
+          (let-do [forms @(Pair.a &parts)
+                   roots (Pair.b &parts)]
+            (for [i 0 (Array.length roots)]
+              (Array.push-back! &forms @(Array.unsafe-nth roots i)))
+            (Result.Success (SurfaceModule.init forms))))))
+
+  (doc capture-module "captures already expanded roots with the ordinary typed
+result channel, preserving the caller's syntax and diagnostic coordinates.")
+  (defn capture-module [values input module slot]
+    (let [template (capture-input values
+                                  &(SourceInput.init @(SourceInput.id input)
+                                                     @"__repl_body__")
+                                  slot)]
+      (splice-module input (SourceInput.source (Pair.a &template)) module))))
