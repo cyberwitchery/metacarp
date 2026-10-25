@@ -123,15 +123,21 @@ Implemented:
 - Reader-backed continuation, located diagnostics, and prompt-free pipe mode.
 - Atomic source updates; failed replacements preserve the accepted definition.
 - Mixed submissions stage declarations and native publication before once-only
-  execution. A replacement uses a separate JIT while preparing its transaction.
-- Unrelated runtime additions retain published globals and result handles.
+  execution. ABI boundary changes use a separate JIT while preparing their
+  transaction; ordinary revisions restore their binding policy on failure.
+- Ordinary function and value revisions retain unrelated globals and results.
+- Invalidation follows resolved body changes and emitted LLVM/C dependencies,
+  including concrete interface implementations and ABI helpers.
 - Retained scalar, string, array, record, and closure results.
 - Recovery after returned compiler and native-publication diagnostics.
 - Borrow checks on top-level roots as well as function bodies, including moves,
   escaping local references, and borrowed closure captures.
 
 Source acceptance and compilation of polymorphic instances remain separate.
-Compile-time declarations and replacements reset native state, with a notice.
+Type, interface, foreign, and compile-time definition changes reset native state,
+with a notice. Ordinary revisions keep old code for historical values. Editing
+an input preserves its unchanged initializers; a new value declaration explicitly
+initializes its binding again.
 Runtime I/O and mutations begin after preparation and cannot be rolled back.
 Native crashes, nontermination, and execution interrupts remain outside the
 compiler-error recovery contract. The current terminal integration targets macOS.
@@ -266,8 +272,11 @@ in the host become external declarations. Previously published support is also
 imported; native template definitions remain owned by the session. Function
 imports preserve their type, calling convention, and ABI attributes.
 
-Replacement and reset retire C and LLVM code, materialization caches, and their
-artifacts together. Independent JIT sessions can publish the same native symbol
+ABI boundary changes and reset retire C and LLVM code, materialization caches,
+and their artifacts together. Ordinary revisions publish new binding symbols;
+current inspection selects active specializations while historical values keep
+their original publications. View queries are renewed when their emitted
+dependencies change. Independent JIT sessions can publish the same native symbol
 with different bodies and retire them independently. Source origins still come
 from the active compiler declaration's provenance; shadowed definitions cannot
 relabel emitted code. Inspection reads retained data without compiling,
@@ -853,3 +862,31 @@ globals, aggregate calling conventions and cached native adapters across increme
 publications, String
 field derivation without imported deleter declarations, and null storage for
 empty LLVM array literals.
+
+## Native binding revision measurements, 2026-10-25
+
+Ordinary revisions keep historical publications resident and version only the
+affected bindings. Resolved body comparison preserves lexical binding identity
+and names used by inspection. ABI comparison uses declaration deltas; inherited
+builtins and dispatch declarations stay in the warm compiler context. LLVM
+pointer-ABI bodies carry their original binding ownership for dependency
+traversal. Native version namespaces cannot collide with generated source names.
+
+Three alternating optimized PTY runs compared the mixed-submission checkpoint
+`766b177` with binding revisions on the same busy Mac. These are medians of
+local observations, with three warm integer evaluations per session.
+
+| Measurement | Mixed submissions | Binding revisions |
+| --- | ---: | ---: |
+| Process ready | 785 ms | 749 ms |
+| First integer expression | 814 ms | 768 ms |
+| Warm integer expression | 240 ms | 229 ms |
+| Add a function | 335 ms | 322 ms |
+| Replace a function | 363 ms | 357 ms |
+| Evaluate the replaced function | 759 ms | 482 ms |
+
+Ordinary commits snapshot user definitions and their IR. Copying the full warm
+session added about 60–70 ms to declaration commits in an earlier measurement.
+Historical values, closure storage, native template state, view leases, and
+current provider queries are covered by regression checks. Failed publication
+restores the previous specialization and binding policy.

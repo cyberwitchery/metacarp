@@ -119,11 +119,19 @@ declarations and expressions are prepared before native execution: successful
 submissions commit declarations and execute runtime roots once. Native
 preparation failure preserves the previous semantic and runtime state.
 
-New unrelated runtime functions and values preserve native globals and result
-handles. Replacement, compile-time declarations, removal, and reset invalidate
-native state and release retained values before retiring their code. The REPL
-reports native resets. Declarations can still fail when first specialized;
-acceptance does not compile every possible polymorphic instance.
+Function and value revisions preserve unrelated native globals and result
+handles. The compiler compares resolved bodies and ABI declarations, then follows
+the emitted LLVM and C dependency graphs to invalidate affected specializations.
+Changed bindings receive fresh symbols. Historical values and view handles keep
+their original code; future inspection queries use current provider versions.
+Published versions stay resident until reset.
+
+Editing an input preserves its unchanged value initializers. Submitting a new
+value declaration explicitly initializes that binding again. Type, interface,
+foreign, and compile-time definition changes retain a conservative reset boundary.
+Reset releases retained values before retiring their code. The REPL reports
+native resets. Declarations can still fail when first specialized; acceptance
+does not compile every possible polymorphic instance.
 
 The final non-Unit value is retained in one of 32 live slots, with a monotonic
 `_N` alias; `_` names the newest. Scalars are copied into expression scope.
@@ -268,8 +276,8 @@ artifacts and materialization caches only after publication and lookup succeed.
 A failed publication removes both modules. Inspection neither recompiles nor
 reads scratch files.
 
-C support belongs to its JIT session and native generation. Replacement and
-reset retire C code, LLVM code, caches, and artifacts together. A discarded
+C support belongs to its JIT session and native generation. ABI boundary changes
+and reset retire C code, LLVM code, caches, and artifacts together. A discarded
 staged session cannot leave native definitions in another session. The next
 successful call compiles the active template definition. Included runtime
 implementations use explicit compiler annotations to import existing host or

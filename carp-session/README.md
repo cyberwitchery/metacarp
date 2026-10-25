@@ -16,6 +16,10 @@ carp-session itself stays free of libLLVM). `Session.create` loads and checks
 Core once; subsequent cells and definition rebuilds reuse the warm Core
 expansion, resolution, and inference snapshots.
 
+Committed overlays store declaration deltas. Builtins and dispatch declarations
+inherited for inference remain in the warm base or their owning earlier input;
+explicit native declarations and overrides remain in the new delta.
+
 `Session.prepare-input` supports hosts whose submissions can combine
 committed declarations and transient runtime roots, including a single macro
 that produces both. Call it on a candidate session. It returns a

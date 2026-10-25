@@ -412,9 +412,9 @@ class ReplTests(unittest.TestCase):
         result = self.run_repl("(def x 1)\n(println* x)\n:edit 1\n(def x 2)\n(println* x)\n:llvm x\n:q\n")
         self.assertEqual(result.stderr, "")
         self.assertIn("; source repl:1 revision 3", result.stdout)
-        self.assertIn("generation 1", result.stdout)
-        self.assertIn("store i32 2, ptr @C1_x__I", result.stdout)
-        self.assertNotIn("store i32 1, ptr @C1_x__I", result.stdout)
+        self.assertIn("generation 0", result.stdout)
+        self.assertRegex(result.stdout, r"store i32 2, ptr @carp_session_resident\d+_x95__C1_x__I")
+        self.assertNotIn("store i32 1", result.stdout)
 
     def test_documentation_at_a_parameter_declaration_uses_its_identity(self):
         with Terminal() as terminal:
@@ -775,7 +775,8 @@ counter
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr.count("preview this revision"), 2, result.stderr)
         self.assertIn("3  dependent", result.stdout)
-        self.assertIn("inputs removed; native state reset", result.stdout)
+        self.assertIn("inputs removed; expressions were not replayed", result.stdout)
+        self.assertNotIn("native state reset", result.stdout)
         self.assertIn("counter : Int", result.stdout)
         self.assertNotIn("dependent :", result.stdout.split("inputs removed", 1)[1])
         self.assertIn("resolve:", result.stderr)
@@ -1283,7 +1284,229 @@ counter
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout, "42\n42\n")
 
-    def test_owned_results_survive_additions_and_are_released_on_replacement(self):
+    def test_replacement_preserves_unrelated_globals_and_historical_values(self):
+        result=self.run_repl('''(def counter 0)
+(defn base [] 41)
+(defn answer [] (Int.inc (base)))
+(set! counter 7)
+[10 20]
+(fn [] (base))
+(answer)
+(defn base [] 42)
+(answer)
+counter
+:inspect 1
+(@_2)
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertNotIn('native state reset',result.stdout)
+        self.assertIn('\n43\n7\n_1 : (Array Int)\n[10 20]\n41\n',result.stdout)
+
+    def test_global_replacement_refreshes_dependents_and_preserves_unrelated_state(self):
+        result=self.run_repl('''(def unrelated 0)
+(def base 10)
+(defn answer [] (Int.inc base))
+(set! unrelated 7)
+(answer)
+(def base 20)
+(answer)
+unrelated
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertNotIn('native state reset',result.stdout)
+        self.assertTrue(result.stdout.endswith('21\n7\n'),result.stdout)
+
+    def test_replacement_preserves_native_template_static_state(self):
+        result=self.run_repl('''(deftemplate stable-counter (Fn [] Int) "int $NAME(void)" "$DECL { static int calls; return ++calls; }")
+(defn base [] 41)
+(stable-counter)
+(base)
+(defn base [] 42)
+(base)
+(stable-counter)
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertNotIn('native state reset',result.stdout)
+        self.assertTrue(result.stdout.endswith('42\n2\n'),result.stdout)
+
+    def test_failed_mixed_publication_restores_active_native_versions(self):
+        result=self.run_repl('''(register missing-target (Fn [] Int) "metacarp_missing_invalidation_target")
+(defn base [] 41)
+(defn answer [] (base))
+[10 20]
+(answer)
+(do (defn base [] 42) (missing-target))
+(answer)
+:inspect 1
+:q
+''')
+        self.assertIn('jit:',result.stderr)
+        self.assertTrue(result.stdout.endswith('41\n_1 : (Array Int)\n[10 20]\n'),result.stdout)
+
+    def test_inspection_uses_current_binding_without_compiling_old_generations(self):
+        result=self.run_repl('''(defn answer [] 41)
+(answer)
+(defn answer [] 42)
+:llvm answer
+(answer)
+(IO.println "LATEST-IR")
+:llvm answer
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertIn('not compiled yet',result.stdout)
+        latest=result.stdout.split('LATEST-IR\n')[-1]
+        self.assertIn('ret i32 42',latest)
+        self.assertNotIn('ret i32 41',latest)
+
+    def test_edit_preserves_unchanged_initializers_in_the_same_input(self):
+        result = self.run_repl('''(do (def counter 0) (defn answer [] 41))
+(set! counter 7)
+(answer)
+:edit 1
+(do (def counter 0) (defn answer [] 42))
+(answer)
+counter
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("42\n7\n"), result.stdout)
+
+    def test_native_revision_names_cannot_collide_with_source_names(self):
+        result = self.run_repl('''(defn resident3_target [] 99)
+(defn target [] 1)
+(resident3_target)
+(target)
+(defn target [] 2)
+(target)
+(resident3_target)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("2\n99\n"), result.stdout)
+
+    def test_repeating_a_value_declaration_initializes_that_binding_again(self):
+        result = self.run_repl('''(def counter 0)
+(set! counter 7)
+(def counter 0)
+counter
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("0\n"), result.stdout)
+
+    def test_revision_follows_concrete_interface_implementation_edges(self):
+        result = self.run_repl('''(definterface revised-score (Fn [(Ref a)] Int))
+(deftype RevisedRecord [value Int])
+(defn record-score [value] @(RevisedRecord.value value))
+(implements revised-score record-score)
+(defn read-score [value] (revised-score value))
+(RevisedRecord.init 41)
+(read-score _1)
+(defn record-score [value] (Int.inc @(RevisedRecord.value value)))
+(read-score _1)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("42\n"), result.stdout)
+
+    def test_revision_updates_all_polymorphic_instances(self):
+        result = self.run_repl('''(def calls 0)
+(defn marked [value] (do (set! calls (Int.inc calls)) value))
+(marked 10)
+(marked @"old")
+calls
+(defn marked [value] (do (set! calls (Int.+ calls 10)) value))
+(marked 20)
+(marked @"new")
+calls
+:inspect 2
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertIn("\n2\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("22\n_2 : String\nold\n"), result.stdout)
+
+    def test_revisions_can_switch_between_functions_and_function_values(self):
+        result = self.run_repl('''(defn selected [] 41)
+(defn call-selected [] (selected))
+(call-selected)
+(def selected (fn [] 42))
+(call-selected)
+(defn selected [] 43)
+(call-selected)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        values = re.findall(r"^\d+$", result.stdout, re.M)
+        self.assertEqual(values, ["41", "42", "43"], result.stdout)
+        self.assertNotIn("native state reset", result.stdout)
+
+    def test_signature_revisions_preserve_historical_function_types(self):
+        result = self.run_repl('''(defn answer [] 41)
+(defn call-answer [] (answer))
+(fn [] (answer))
+(call-answer)
+(defn answer [] @"new")
+(call-answer)
+(@_1)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("new\n41\n"), result.stdout)
+
+    def test_global_revisions_keep_storage_used_by_historical_closures(self):
+        result = self.run_repl('''(def xs [1 2])
+(fn [] (Array.length &xs))
+(def xs [10 20 30])
+(Array.length &xs)
+(@_1)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("3\n2\n"), result.stdout)
+
+    def test_revision_initializes_affected_globals_once(self):
+        result = self.run_repl('''(def calls 0)
+(defn base [] 41)
+(def value (do (set! calls (Int.inc calls)) (base)))
+value
+calls
+(defn base [] 42)
+value
+calls
+calls
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        values = re.findall(r"^\d+$", result.stdout, re.M)
+        self.assertEqual(values, ["41", "1", "42", "2", "2"], result.stdout)
+
+    def test_view_queries_follow_redefined_provider_dependencies(self):
+        result = self.run_repl('''(deftype RevisedBadge [])
+(defn badge-label [] @"before")
+(defview revised-badge [value RevisedBadge] (do (ignore value) (=> (View.text) (View.content (badge-label)))))
+(RevisedBadge.init)
+:inspect 1
+:browse 1
+(defn badge-label [] @"after")
+:inspect 1
+:browse 1
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertEqual(re.findall(r"^(before|after)$", result.stdout, re.M),
+                         ["before", "before", "before", "after", "after"], result.stdout)
+
+    def test_owned_results_survive_additions_and_replacement(self):
         result = self.run_repl('''(Int.+ 40 2)
 (Int.+ _ 1)
 (String.copy "kept")
@@ -1300,7 +1523,8 @@ counter
         self.assertIn("42\n43\nkept\n_3 : String\nkept", result.stdout)
         self.assertIn("_1 : Int", result.stdout)
         self.assertIn("_3 : String", result.stdout)
-        self.assertIn("no live result _3", result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
         self.assertTrue(result.stdout.endswith("42\n"), result.stdout)
 
     def test_result_release_preserves_older_values(self):

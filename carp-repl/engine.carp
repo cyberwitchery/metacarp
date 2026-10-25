@@ -114,42 +114,17 @@ ReplEngine operations and receives display text or structured diagnostics.")
   (private commit)
   (hidden commit)
   (defn commit [engine input single]
-    (let [previous (Session.definitions (ReplEngineState.session engine))
-          committed (if single
-            (Session.upsert-cell (ReplEngineState.session engine) input)
-            (Session.upsert-input (ReplEngineState.session engine) input))]
+    (let-do [previous (capture-native-world (ReplEngineState.session engine))
+             committed (if single
+               (Session.upsert-cell (ReplEngineState.session engine) input)
+               (Session.upsert-input (ReplEngineState.session engine) input))]
       (match committed
         (Result.Error error) (Result.Error error)
         (Result.Success definitions)
-          (let-do [invalidate (Int.> @(ReplEngineState.editing engine) 0)
-                   had-code (not
-                     (Array.empty?
-                       (JitSession.code (ReplEngineState.jit engine))))]
-            (for [i 0 (Array.length &definitions)]
-              (let-do [definition (Array.unsafe-nth &definitions i)]
-                (match-ref (SessionDefInfo.kind definition)
-                  (SessionDefKind.Function) ()
-                  (SessionDefKind.Value) ()
-                  _ (set! invalidate true))
-                (for [j 0 (Array.length &previous)]
-                  (when (String.= (SessionDefInfo.name definition)
-                                  (SessionDefInfo.name (Array.unsafe-nth &previous
-                                                                         j)))
-                    (set! invalidate true)))))
-            (let [error (if invalidate
-                    (do
-                      (ReplEngineState.set-generation! engine
-                                                       (Int.inc @(ReplEngineState.generation engine)))
-                      (do
-                        (clear-browse! engine)
-                        (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
-                        (ReplValues.clear! (ReplEngineState.results engine)))
-                      (SessionJit.reset-code! (ReplEngineState.jit engine)))
-                    (String.copy ""))]
-              (if (String.empty? &error)
-                (Result.Success
-                  (committed-message &definitions (and invalidate had-code)))
-                (Result.Error (diagnostic error))))))))
+          (apply-native-revision engine
+                                 &previous
+                                 (ReplEngineState.session engine)
+                                 &definitions))))
 
   (private runtime-input)
   (hidden runtime-input)
@@ -828,24 +803,7 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
               (ReplEngineState.set-next-result! engine (Int.inc number))
               (Array.push-back! (ReplEngineState.results engine) value))
             (ReplValues.release &value))
-          answer))))
-
-  (private mixed-needs-reset?)
-  (hidden mixed-needs-reset?)
-  (defn mixed-needs-reset? [engine definitions]
-    (let-do [previous (Session.definitions (ReplEngineState.session engine))
-             reset (Int.> @(ReplEngineState.editing engine) 0)]
-      (for [i 0 (Array.length definitions)]
-        (let-do [definition (Array.unsafe-nth definitions i)]
-          (match-ref (SessionDefInfo.kind definition)
-            (SessionDefKind.Function) ()
-            (SessionDefKind.Value) ()
-            _ (set! reset true))
-          (for [j 0 (Array.length &previous)]
-            (when (String.= (SessionDefInfo.name definition)
-                            (SessionDefInfo.name (Array.unsafe-nth &previous j)))
-              (set! reset true)))))
-      reset)))
+          answer)))))
 
 (defmodule ReplEngine
   (private prepare-result)
@@ -1008,7 +966,8 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
         (diagnostic (fmt "preview this revision with :remove %d first" number)))
       (let-do [entries (ReplEngineState.entries engine)
                impact (removal-impact engine number)
-               ids (the (Array String) [])]
+               ids (the (Array String) [])
+               candidate @(ReplEngineState.session engine)]
         (ReplEngineState.set-pending-remove! engine 0)
         (for [i 0 (Array.length &impact)]
           (let [entry (Array.unsafe-nth entries
@@ -1019,29 +978,25 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
                      (not (Array.empty? (ReplEntry.definitions entry))))
                 (and (active-input? engine id) (not (Array.contains? &ids id))))
               (Array.push-back! &ids (String.copy id)))))
-        (match (Session.remove-inputs (ReplEngineState.session engine) &ids)
+        (match (Session.remove-inputs &candidate &ids)
           (Result.Error error) (Result.Error error)
           (Result.Success _)
-            (let-do [_released (do
-                       (clear-browse! engine)
-                       (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
-                       (ReplValues.clear! (ReplEngineState.results engine)))
-                     error (SessionJit.reset-code! (ReplEngineState.jit engine))]
-              (ReplEngineState.set-generation! engine
-                                               (Int.inc @(ReplEngineState.generation engine)))
-              (for [i 0 (Array.length &impact)]
-                (let-do [entry (Array.unsafe-nth entries
-                                                 (Int.dec @(Array.unsafe-nth &impact
-                                                                             i)))]
-                  (ReplEntry.set-stale! entry true)
-                  (when (Array.contains? &ids
-                                         (SourceInput.id (ReplEntry.input entry)))
-                    (ReplEntry.set-status! entry (String.copy "removed")))))
-              (if (String.empty? &error)
-                (Result.Success
-                  (String.copy
-                    "inputs removed; native state reset; expressions were not replayed"))
-                (Result.Error (diagnostic error)))))))))
+            (match (commit-candidate engine candidate &[])
+              (Result.Error error) (Result.Error error)
+              (Result.Success status)
+                (do
+                  (for [i 0 (Array.length &impact)]
+                    (let-do [entry (Array.unsafe-nth entries
+                                                     (Int.dec @(Array.unsafe-nth &impact
+                                                                                 i)))]
+                      (ReplEntry.set-stale! entry true)
+                      (when (Array.contains? &ids
+                                             (SourceInput.id (ReplEntry.input entry)))
+                        (ReplEntry.set-status! entry @"removed"))))
+                  (Result.Success
+                    (String.append
+                      "inputs removed; expressions were not replayed"
+                      &status)))))))))
 
 (defmodule ReplEngine
   (defn editing-check [engine source]
@@ -1149,7 +1104,13 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
              queries (ReplEngineState.view-queries engine)
              index -1]
       (for [i 0 (Array.length queries)]
-        (when (String.= &key (ReplViewQuery.key (Array.unsafe-nth queries i)))
+        (when (and
+            (String.= &key (ReplViewQuery.key (Array.unsafe-nth queries i)))
+            (not
+              (Array.contains?
+                (JitSession.retired (ReplEngineState.jit engine))
+                (ReplPreparedResult.publication
+                  (ReplViewQuery.prepared (Array.unsafe-nth queries i))))))
           (set! index i)))
       (if (>= index 0)
         (let-do [channel (Pointer.to-ref
@@ -1252,4 +1213,5 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
                       answer))))))))
 
 (load "engine-browse.carp")
+(load "engine-invalidation.carp")
 (load "engine-expanded.carp")

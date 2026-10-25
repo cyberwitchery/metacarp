@@ -1,0 +1,129 @@
+; Semantic boundaries remain conservative; ordinary native binding revisions
+; preserve unrelated storage and the code owned by historical results.
+(deftype ReplNativeWorld [core CoreModule
+                          definitions (Array SessionDefInfo)])
+
+(defmodule ReplEngine
+  (defn- capture-native-world [session]
+    (let [overlay (Array.unsafe-nth (CompilerSession.overlay session) 0)]
+      (ReplNativeWorld.init @(SessionOverlay.core overlay)
+                            @(SessionOverlay.definitions overlay))))
+
+  (defn- definition-at [definitions name]
+    (let-do [found -1]
+      (for [i 0 (Array.length definitions)]
+        (when (String.= name
+                        (SessionDefInfo.name (Array.unsafe-nth definitions i)))
+          (set! found i)))
+      found))
+
+  (defn- ordinary-definition? [definition]
+    (match-ref (SessionDefInfo.kind definition)
+      (SessionDefKind.Function) true
+      (SessionDefKind.Value) true
+      _ false))
+
+  (defn- native-change-needs-reset? [previous candidate definitions]
+    (let-do [next (Array.unsafe-nth (CompilerSession.overlay candidate) 0)
+             before (ReplNativeWorld.definitions previous)
+             after (SessionOverlay.definitions next)
+             reset (not
+               (CoreIR.equivalent-native-context? (ReplNativeWorld.core previous)
+                                                  (SessionOverlay.core next)))]
+      (for [i 0 (Array.length definitions)]
+        (unless (ordinary-definition? (Array.unsafe-nth definitions i))
+          (set! reset true)))
+      (for [i 0 (Array.length before)]
+        (let-do [old (Array.unsafe-nth before i)
+                 at (definition-at after (SessionDefInfo.name old))]
+          (unless (ordinary-definition? old)
+            (if (Int.< at 0)
+              (set! reset true)
+              (let [current (Array.unsafe-nth after at)]
+                (when (or
+                    (String./=
+                      (SourceInput.id (SessionDefInfo.source old))
+                      (SourceInput.id (SessionDefInfo.source current)))
+                    (String./=
+                      (SourceInput.source (SessionDefInfo.source old))
+                      (SourceInput.source (SessionDefInfo.source current))))
+                  (set! reset true)))))))
+      reset))
+
+  (defn- native-changed-bindings [previous candidate definitions editing]
+    (let-do [next (Array.unsafe-nth (CompilerSession.overlay candidate) 0)
+             before (ReplNativeWorld.definitions previous)
+             after (SessionOverlay.definitions next)
+             names (the (Array String) [])]
+      ; A new value declaration explicitly initializes that binding again.
+      ; Editing a multi-definition input preserves its unchanged initializers.
+      (when (Int.= editing 0)
+        (for [i 0 (Array.length definitions)]
+          (let [definition (Array.unsafe-nth definitions i)]
+            (match-ref (SessionDefInfo.kind definition)
+              (SessionDefKind.Value)
+                (Array.push-back! &names @(SessionDefInfo.name definition))
+              _ ()))))
+      (for [i 0 (Array.length before)]
+        (let [name (SessionDefInfo.name (Array.unsafe-nth before i))]
+          (when (and (Int.< (definition-at after name) 0)
+                     (not (Array.contains? &names name)))
+            (Array.push-back! &names @name))))
+      (for [i 0 (Array.length after)]
+        (let-do [definition (Array.unsafe-nth after i)
+                 name (SessionDefInfo.name definition)
+                 at (definition-at before name)
+                 changed (Int.< at 0)]
+          (when (and (ordinary-definition? definition) (Int.>= at 0))
+            (set! changed
+                  (or
+                    (String./=
+                      (SessionDefInfo.scheme (Array.unsafe-nth before at))
+                      (SessionDefInfo.scheme definition))
+                    (not
+                      (CoreIR.equivalent-definition? (ReplNativeWorld.core previous)
+                                                     (SessionOverlay.core next)
+                                                     name)))))
+          (when (and changed (not (Array.contains? &names name)))
+            (Array.push-back! &names @name))))
+      names))
+
+  (defn- revise-native! [engine previous candidate definitions]
+    (let-do [overlay (Array.unsafe-nth (CompilerSession.overlay candidate) 0)
+             jit (ReplEngineState.jit engine)
+             plan (SessionJit.plan-revision jit
+                                            (ResolveSnapshot.globals (SessionOverlay.resolution overlay))
+                                            &(native-changed-bindings previous
+                                                                      candidate
+                                                                      definitions
+                                                                      @(ReplEngineState.editing engine)))]
+      (SessionJit.use-revision! jit &plan)))
+
+  (defn- apply-native-revision [engine previous candidate definitions]
+    (let-do [invalidate (native-change-needs-reset? previous
+                                                    candidate
+                                                    definitions)
+             had-code (not
+               (Array.empty? (JitSession.code (ReplEngineState.jit engine))))
+             error (if invalidate
+               (do
+                 (clear-browse! engine)
+                 (ReplViewQueries.clear! (ReplEngineState.view-queries engine))
+                 (ReplValues.clear! (ReplEngineState.results engine))
+                 (ReplEngineState.set-generation! engine
+                                                  (Int.inc @(ReplEngineState.generation engine)))
+                 (SessionJit.reset-code! (ReplEngineState.jit engine)))
+               (do (revise-native! engine previous candidate definitions) @""))]
+      (if (String.empty? &error)
+        (Result.Success
+          (committed-message definitions (and invalidate had-code)))
+        (Result.Error (diagnostic error)))))
+
+  (defn- commit-candidate [engine candidate definitions]
+    (let [previous (capture-native-world (ReplEngineState.session engine))]
+      (match (apply-native-revision engine &previous &candidate definitions)
+        (Result.Error error) (Result.Error error)
+        (Result.Success answer)
+          (do
+            (ReplEngineState.set-session! engine candidate)
+            (Result.Success answer))))))
