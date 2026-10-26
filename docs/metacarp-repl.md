@@ -54,16 +54,20 @@ semantic reply replaces it, including partial and unavailable results. The
 cache contains ranges and presentation categories, with no binding identities,
 types, or scopes. Completion, docs, and diagnostics cannot query it.
 
-Automatic analysis runs on one serialized compiler worker. The editor sends
-requests and polls structured replies through a narrow protocol. A wakeup pipe
-integrates with terminal input; only the service's own pipe is nonblocking.
+Automatic analysis runs on one serialized compiler service thread inside the
+execution process. The editor sends requests and polls owned replies through a
+narrow protocol. A stable wake descriptor integrates protocol replies, native
+PTY output, and process exit with terminal input. Private transport pipes are
+nonblocking; native stdio has its own terminal.
 The worker has one pending request and bounded reply slots. A newer source
 revision cancels work; stale source, session, cursor, and request IDs cannot
 alter the current buffer. Cursor-only queries reuse the cached analysis.
 
 ```text
 terminal.carp + terminal-language.carp + display.carp
-    | protocol.carp: requests, ranges, pairs, diagnostics, editing replies
+    | remote.carp: process supervision, owned source checkpoints
+    | worker-protocol.carp: framed commands, language replies, view pages
+execution process: engine.carp + LLVM JIT + native values and callbacks
 service.carp: serialized worker, cancellation barrier, wakeup pipe
     | language.carp: cached revision-specific compiler adapter
 Reader.read-syntax -> Surface editing tree -> expansion
@@ -95,8 +99,9 @@ inference, type solving, compile-time lowering, and every VM instruction.
 Size-growing VM builtins also charge for produced data. A 500 ms monotonic
 deadline uses those cooperative cancellation points. Automatic previews refuse
 compile-time file reads; explicit F2 permits them under the same work limits.
-These bounds do not interrupt blocking filesystem operations or arbitrary
-native execution. Buffers over 256 KiB report analysis unavailable.
+These cooperative bounds do not stop a blocked native call. Explicit
+cancellation can instead terminate the execution process after the compiler
+service's cancellation grace period. Buffers over 256 KiB report analysis unavailable.
 
 Reader facts are published first. Semantic results distinguish ready, partial,
 and unavailable states; diagnostics appear after 450 ms of quiet. Incomplete
@@ -130,6 +135,8 @@ Implemented:
   including concrete interface implementations and ABI helpers.
 - Retained scalar, string, array, record, and closure results.
 - Recovery after returned compiler and native-publication diagnostics.
+- Source and journal recovery after native interruption, crashes, and unexpected
+  execution-process exit; explicit declaration rebuilding through `:reinit`.
 - Borrow checks on top-level roots as well as function bodies, including moves,
   escaping local references, and borrowed closure captures.
 
@@ -139,8 +146,22 @@ with a notice. Ordinary revisions keep old code for historical values. Editing
 an input preserves its unchanged initializers; a new value declaration explicitly
 initializes its binding again.
 Runtime I/O and mutations begin after preparation and cannot be rolled back.
-Native crashes, nontermination, and execution interrupts remain outside the
-compiler-error recovery contract. The current terminal integration targets macOS.
+The terminal supervises a fresh executable started through `posix_spawn`.
+Ctrl-C during native execution terminates its process group, including ordinary
+native children, and discards all native values and view handles. Accepted source
+and the journal remain available. `:reinit` rebuilds declarations explicitly,
+including while the current worker is healthy. It releases retained values and
+stops that worker before starting its replacement. Mixed runtime roots and past
+expressions are not replayed. Global initialization
+runs again when the rebuilt native state is used. Checkpoint acknowledgements
+precede native execution and cleanup callbacks, so a committed mixed macro keeps
+its declarations even if its runtime body never returns.
+
+Each worker has an independent scratch directory and a parent lifeline. Cleanup
+removes known compiler artifacts through a physical directory traversal, retaining
+unknown files. The current terminal integration targets macOS: libedit, terminal
+signal handling, spawn flags, kqueue wakeups, and native process/PTY primitives
+live behind the terminal and process interfaces.
 
 ## Milestone 2: terminal editing
 
@@ -890,3 +911,39 @@ session added about 60–70 ms to declaration commits in an earlier measurement.
 Historical values, closure storage, native template state, view leases, and
 current provider queries are covered by regression checks. Failed publication
 restores the previous specialization and binding policy.
+
+
+## Native interruption measurements, 2026-10-26
+
+The terminal supervises a separate execution process. Owned source checkpoints
+are acknowledged before native execution and cleanup callbacks. Interrupting
+that process discards native values and view handles, retains accepted source
+and the journal, and requires explicit `:reinit`. Past expression effects and
+the runtime roots of mixed submissions are not replayed.
+
+Three alternating optimized PTY pairs compared the binding-revision checkpoint
+`6fa0496` with process supervision on the same busy Mac. Each session included
+three warm integer evaluations. These are medians of local observations.
+
+| Measurement | Binding revisions | Process supervision |
+| --- | ---: | ---: |
+| Process ready | 774 ms | 804 ms |
+| First integer expression | 795 ms | 827 ms |
+| Warm integer expression | 236 ms | 243 ms |
+| Add a function | 333 ms | 342 ms |
+| Replace a function | 368 ms | 369 ms |
+| Evaluate the replaced function | 494 ms | 492 ms |
+
+For this small workload, allow roughly 1–2 seconds for startup or first native
+execution and 0.25–0.5 seconds for warm expressions, with additional headroom
+under load. Three pairs do not establish latency bounds.
+
+The final rebuilt host passes all 157 terminal and screen scenarios, 10 command
+tests, and 230 native assertions. Coverage includes native loops, blocking input,
+crashes, interrupted mixed macros and history edits, blocked view callbacks,
+child cleanup, parent death, public arguments, and stderr redirection. The
+compiler phase suite passes 626 assertions, and generation 2 and generation 3
+emit identical C. All 165 reference programs pass both the ordinary and sanitizer
+runs; the compiler leak check reports zero bytes. LLVM validation passes 238
+assertions and all 16 memory scenarios. Balance, lint, formatting, and whitespace
+checks pass.

@@ -1,0 +1,141 @@
+; PTY traffic is separate from compiler messages. The terminal is the sole
+; reader of the real TTY; native stdio uses the worker's controlling terminal.
+(defmodule ReplRemoteHost
+  (defn- process [remote] (Array.unsafe-nth (ReplRemote.process remote) 0))
+
+  (defn- write-output! [bytes count]
+    (let-do [at 0]
+      (while-do (Int.< at count)
+        (let [written (ReplNative.write 1
+                                        (Pointer.address (Array.unsafe-nth bytes
+                                                                           at))
+                                        (Long.from-int (Int.- count at)))]
+          (cond
+            (Long.> written 0l) (set! at (Int.+ at (Long.to-int written)))
+            (Int.=
+              (Pointer.to-value (ReplTransportNative.errno))
+              ReplTransportNative.INTERRUPTED)
+              ()
+            (set! at count))))))
+
+  (defn read-output! [remote]
+    (let-do [bytes @(ReplRemote.orphan-output remote)]
+      (ReplRemote.set-orphan-output! remote [])
+      (when (and (online? remote) @(ReplRemote.tty remote))
+        (let-do [buffer (Array.replicate 4096 &0b)
+                 reading true]
+          (for [i 0 16]
+            (when reading
+              (let [count (ReplNative.read @(ReplProcess.master (process remote))
+                                           (Pointer.address (Array.unsafe-nth &buffer
+                                                                              0))
+                                           4096l)]
+                (if (Long.> count 0l)
+                  (for [at 0 (Long.to-int count)]
+                    (Array.push-back! &bytes @(Array.unsafe-nth &buffer at)))
+                  (set! reading false)))))))
+      bytes))
+  (defn output! [remote]
+    (let [bytes (read-output! remote)]
+      (write-output! &bytes (Array.length &bytes))))
+
+  (defn take-byte! [remote]
+    (let [queued (ReplRemote.queued remote)]
+      (if (Array.empty? queued)
+        -1
+        (let-do [byte (Byte.to-int @(Array.unsafe-nth queued 0))
+                 rest (Array.slice queued 1 (Array.length queued))]
+          (ReplRemote.set-queued! remote rest)
+          byte)))))
+
+(defmodule ReplRemoteHost
+  (defn flush-input! [remote]
+    (when (and (online? remote) @(ReplRemote.tty remote))
+      (let-do [input (ReplRemote.native-input remote)
+               start @(ReplRemote.native-at remote)
+               remaining (Int.- (Array.length input) start)]
+        (when (Int.> remaining 0)
+          (let [written (ReplNative.write @(ReplProcess.master (process remote))
+                                          (Pointer.address (Array.unsafe-nth input
+                                                                             start))
+                                          (Long.from-int remaining))]
+            (when (Long.> written 0l)
+              (let-do [end (Int.+ start (Long.to-int written))]
+                (if (Int.= end (Array.length input))
+                  (do
+                    (ReplRemote.set-native-input! remote [])
+                    (ReplRemote.set-native-at! remote 0))
+                  (ReplRemote.set-native-at! remote end)))))))))
+
+  (defn input! [remote forward]
+    (let-do [interrupted false
+             buffer (Array.replicate 4096 &0b)]
+      (when (and @(ReplRemote.tty remote)
+                 (Int.> (ReplTransport.wait &[0] -1 0) 0))
+        (let [count (ReplNative.read 0
+                                     (Pointer.address (Array.unsafe-nth &buffer
+                                                                        0))
+                                     4096l)]
+          (when (Long.> count 0l)
+            (for [i 0 (Long.to-int count)]
+              (let [byte @(Array.unsafe-nth &buffer i)]
+                (cond
+                  (Byte.= byte 3b) (set! interrupted true)
+                  (Byte.= byte 26b)
+                    (ignore (ReplNative.raise-signal ReplNative.SIGNAL-STOP))
+                  (and (not interrupted) (and forward (online? remote)))
+                    (Array.push-back! (ReplRemote.native-input remote) byte)
+                  (Array.push-back! (ReplRemote.queued remote) byte)))))))
+      (when forward (flush-input! remote))
+      interrupted))
+
+  (defn reclaim-input! [remote]
+    (when (and (online? remote) @(ReplRemote.tty remote))
+      (let-do [slave @(ReplProcess.slave (process remote))
+               previous (the (Ptr ReplProcessTermios)
+                             (ReplNative.allocate
+                               (Pointer.width
+                                 (the (Ptr ReplProcessTermios)
+                                      (Pointer.from-long 0l)))))
+               raw (the (Ptr ReplProcessTermios)
+                        (ReplNative.allocate
+                          (Pointer.width
+                            (the (Ptr ReplProcessTermios) (Pointer.from-long 0l)))))
+               flags (ReplNative.flags slave ReplNative.GET-FLAGS 0)
+               saved (and
+                 (Int.= (ReplProcessNative.tty-get slave previous) 0)
+                 (Int.= (ReplProcessNative.tty-get slave raw) 0))]
+        (when (and saved (Int.>= flags 0))
+          (let-do [canonical (ReplProcessHost.canonical? previous)]
+            (ReplProcessNative.tty-raw raw)
+            (when-do (Int.=
+                (ReplProcessNative.tty-set slave ReplProcessNative.NOW raw)
+                0)
+              (when (ReplTransport.nonblocking! slave)
+                (let-do [buffer (Array.replicate 4096 &0b)
+                         reading true]
+                  (while-do reading
+                    (let [count (ReplNative.read slave
+                                                 (Pointer.address (Array.unsafe-nth &buffer
+                                                                                    0))
+                                                 4096l)]
+                      (if (Long.> count 0l)
+                        (for [i 0 (Long.to-int count)]
+                          (let [byte @(Array.unsafe-nth &buffer i)]
+                            (Array.push-back! (ReplRemote.queued remote)
+                                              (if (and canonical
+                                                       (Byte.= byte 10b))
+                                                13b
+                                                byte))))
+                        (set! reading false))))))
+              (ignore (ReplNative.flags slave ReplNative.SET-FLAGS flags))
+              (ignore
+                (ReplProcessNative.tty-set slave ReplProcessNative.NOW previous)))))
+        (ReplNative.release previous)
+        (ReplNative.release raw)
+        (let [pending (ReplRemote.native-input remote)]
+          (for [i @(ReplRemote.native-at remote) (Array.length pending)]
+            (Array.push-back! (ReplRemote.queued remote)
+                              @(Array.unsafe-nth pending i))))
+        (ReplRemote.set-native-input! remote [])
+        (ReplRemote.set-native-at! remote 0)))))

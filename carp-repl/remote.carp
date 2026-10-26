@@ -1,0 +1,404 @@
+(load "worker-protocol.carp")
+(load "commands.carp")
+(load "scratch.carp")
+(load "wake.carp")
+(load "process-native.carp")
+
+; Parent-owned state. A lost worker leaves an owned source checkpoint and no
+; usable native handles. Starting a process never restores source implicitly.
+(deftype ReplRemote
+  [process (Array ReplProcess)
+   channel (Array ReplChannel)
+   checkpoint ReplCheckpoint
+   updates (Array ReplLanguageUpdate)
+   effects (Array ReplConsoleEffect)
+   replies (Array ReplWorkerReply)
+   retired (Array (Pair Int String))
+   epoch Long
+   session Long
+   editing Int
+   problem String
+   program String
+   arguments (Array String)
+   tty Bool
+   queued (Array Byte)
+   native-input (Array Byte)
+   native-at Int
+   negotiating Bool
+   orphan-output (Array Byte)
+   core String
+   root String
+   directory String
+   wake Int
+   public-arguments (Array String)
+   pending-language (Array ReplLanguageRequest)
+   language-inflight Bool
+   language-serial Long])
+
+(defmodule ReplRemoteHost
+  (defn create [program arguments core root tty]
+    (let-do [public-arguments (the (Array String) [])]
+      (for [i 0 (StaticArray.length &System.args)]
+        (Array.push-back! &public-arguments
+                          @(StaticArray.unsafe-nth &System.args i)))
+      (ReplRemote.init []
+                       []
+                       (ReplCheckpoints.empty)
+                       []
+                       []
+                       []
+                       []
+                       0l
+                       0l
+                       0
+                       @""
+                       @program
+                       @arguments
+                       tty
+                       []
+                       []
+                       0
+                       false
+                       []
+                       @core
+                       @root
+                       @""
+                       (ReplWake.create)
+                       public-arguments
+                       []
+                       false
+                       0l)))
+
+  (defn online? [remote] (not (Array.empty? (ReplRemote.process remote))))
+
+  (defn- reap! [remote]
+    (let-do [kept (the (Array (Pair Int String)) [])
+             status 0
+             pids (ReplRemote.retired remote)]
+      (for [i 0 (Array.length pids)]
+        (let [item (Array.unsafe-nth pids i)]
+          (if (Int.=
+              (ReplProcessNative.wait @(Pair.a item)
+                                      (Pointer.address &status)
+                                      ReplProcessNative.NO-WAIT)
+              0)
+            (Array.push-back! &kept @item)
+            (ReplScratch.clean (Pair.b item)))))
+      (ReplRemote.set-retired! remote kept)))
+
+  (defn fail! [remote message]
+    (do
+      (when (online? remote)
+        (let-do [process (Array.unsafe-nth (ReplRemote.process remote) 0)]
+          (ReplProcessHost.terminate! process)
+          (if (ReplProcessHost.exited? process)
+            (ReplScratch.clean (ReplRemote.directory remote))
+            (Array.push-back! (ReplRemote.retired remote)
+                              (Pair.init @(ReplProcess.pid process)
+                                         @(ReplRemote.directory remote))))
+          (ReplRemote.set-orphan-output! remote (read-output! remote))
+          (ReplProcessHost.close! process)))
+      (ReplRemote.set-process! remote [])
+      (ReplRemote.set-channel! remote [])
+      (ReplRemote.set-updates! remote [])
+      (ReplRemote.set-pending-language! remote [])
+      (ReplRemote.set-language-inflight! remote false)
+      (ReplRemote.set-replies! remote [])
+      (ReplRemote.set-session! remote 0l)
+      (ReplRemote.set-epoch! remote (Long.inc @(ReplRemote.epoch remote)))
+      (ReplRemote.set-native-input! remote [])
+      (ReplRemote.set-native-at! remote 0)
+      (ReplRemote.set-editing! remote 0)
+      (ReplRemote.set-problem! remote @message)
+      (ReplCheckpoints.invalidate! (ReplRemote.checkpoint remote))
+      (reap! remote)))
+
+  (defn- channel [remote] (Array.unsafe-nth (ReplRemote.channel remote) 0))
+
+  (defn send! [remote request]
+    (do
+      (match-ref request
+        (ReplWorkerRequest.Language _) ()
+        _ (ReplRemote.set-pending-language! remote []))
+      (when (online? remote)
+        (ReplTransport.send! (channel remote) &(ReplWire.encode request)))))
+
+  (defn- update-session! [remote update]
+    (match-ref update
+      (ReplLanguageUpdate.Analysis analysis)
+        (let-do [current (Long.= @(ReplAnalysis.session analysis)
+                                 @(ReplRemote.session remote))]
+          (when current
+            (ReplAnalysis.set-session! analysis @(ReplRemote.epoch remote)))
+          current)
+      (ReplLanguageUpdate.Editing editing)
+        (let-do [current (Long.= @(ReplEditingResult.session editing)
+                                 @(ReplRemote.session remote))]
+          (when current
+            (ReplEditingResult.set-session! editing @(ReplRemote.epoch remote)))
+          current)))
+
+  (defn- receive! [remote reply]
+    (match reply
+      (ReplWorkerReply.LanguageAccepted serial)
+        (when (Long.= serial @(ReplRemote.language-serial remote))
+          (ReplRemote.set-language-inflight! remote false))
+      (ReplWorkerReply.Checkpoint checkpoint)
+        (let-do [byte 1b]
+          (ReplRemote.set-checkpoint! remote checkpoint)
+          (when (Long./=
+              (ReplNative.write
+                @(ReplProcess.acknowledgement
+                  (Array.unsafe-nth (ReplRemote.process remote) 0))
+                (Pointer.address &byte)
+                1l)
+              1l)
+            (fail! remote "worker checkpoint acknowledgement failed")))
+      (ReplWorkerReply.Language update)
+        (when (update-session! remote &update)
+          (Array.push-back! (ReplRemote.updates remote) update))
+      (ReplWorkerReply.Effect effect)
+        (Array.push-back! (ReplRemote.effects remote) effect)
+      (ReplWorkerReply.Failure message) (fail! remote &message)
+      (ReplWorkerReply.Ready revision)
+        (do
+          (ReplRemote.set-session! remote revision)
+          (ReplRemote.set-epoch! remote (Long.inc @(ReplRemote.epoch remote)))
+          (Array.push-back! (ReplRemote.replies remote)
+                            (ReplWorkerReply.Ready revision)))
+      (ReplWorkerReply.Done editing)
+        (do
+          (ReplRemote.set-editing! remote editing)
+          (Array.push-back! (ReplRemote.replies remote)
+                            (ReplWorkerReply.Done editing)))
+      other (Array.push-back! (ReplRemote.replies remote) other)))
+
+  (defn pump! [remote]
+    (do
+      (do
+        (do
+          (ReplWake.acknowledge! @(ReplRemote.wake remote))
+          (reap! remote)
+          (when-do (online? remote)
+            (ReplTransport.pump! (channel remote))
+            (let-do [receiving true]
+              (while-do (and receiving (online? remote))
+                (match (ReplTransport.poll! (channel remote))
+                  (Result.Error message) (fail! remote &message)
+                  (Result.Success (Maybe.Nothing)) (set! receiving false)
+                  (Result.Success (Maybe.Just bytes))
+                    (if @(ReplRemote.negotiating remote)
+                      (match (the (Result (Array String) String)
+                                  (ReplWire.decode &bytes))
+                        (Result.Error message) (fail! remote &message)
+                        (Result.Success schema)
+                          (if (ReplWorkerProtocol.compatible? &schema)
+                            (do
+                              (ReplTransport.send! (channel remote)
+                                                   &(ReplWire.encode
+                                                     &(ReplWorkerStart.init schema
+                                                                            @(ReplRemote.public-arguments remote))))
+                              (ReplRemote.set-negotiating! remote false))
+                            (fail! remote
+                                   "REPL worker protocol does not match this executable")))
+                      (match (the (Result ReplWorkerReply String)
+                                  (ReplWire.decode &bytes))
+                        (Result.Error message) (fail! remote &message)
+                        (Result.Success reply) (receive! remote reply))))))))
+        (when (and (online? remote) (Array.empty? (ReplRemote.replies remote)))
+          (when (ReplProcessHost.finished?
+              (Array.unsafe-nth (ReplRemote.process remote) 0))
+            (fail! remote "REPL worker exited"))))
+      (send-language! remote)))
+
+  (defn poll-reply! [remote]
+    (let [replies (ReplRemote.replies remote)]
+      (if (Array.empty? replies)
+        (Maybe.Nothing)
+        (let-do [reply @(Array.unsafe-nth replies 0)
+                 rest (Array.slice replies 1 (Array.length replies))]
+          (ReplRemote.set-replies! remote rest)
+          (Maybe.Just reply)))))
+
+  (defn wait [remote milliseconds]
+    (when (online? remote)
+      (let [channel (channel remote)]
+        (ignore
+          (ReplTransport.wait &[@(ReplRemote.wake remote)]
+                              (if (ReplTransport.pending? channel)
+                                @(ReplChannel.writer channel)
+                                -1)
+                              milliseconds)))))
+
+  (defn start! [remote]
+    (cond
+      (Int.< @(ReplRemote.wake remote) 0)
+        (Result.Error @"could not create worker notification queue")
+      (online? remote) (Result.Error @"REPL worker is already running")
+      (let-do [epoch (Long.inc @(ReplRemote.epoch remote))
+               directory (fmt "%s/worker-%s"
+                              (ReplRemote.root remote)
+                              &(Long.str epoch))
+               arguments @(ReplRemote.arguments remote)]
+        (reap! remote)
+        (ReplRemote.set-epoch! remote epoch)
+        (ReplRemote.set-directory! remote @&directory)
+        (Array.push-back! &arguments @"--repl-worker")
+        (Array.push-back! &arguments @(ReplRemote.core remote))
+        (Array.push-back! &arguments @&directory)
+        (Array.push-back! &arguments (if @(ReplRemote.tty remote) @"1" @"0"))
+        (if (Int./= (ReplScratchNative.mkdir (String.cstr &directory) 448) 0)
+          (Result.Error @"could not create worker scratch directory")
+          (match (ReplProcessHost.start (ReplRemote.program remote)
+                                        &arguments
+                                        @(ReplRemote.tty remote))
+            (Result.Error error)
+              (do
+                (ReplScratch.clean (ReplRemote.directory remote))
+                (Result.Error error))
+            (Result.Success process)
+              (let-do [channel (ReplTransport.create @(ReplProcess.reader &process)
+                                                     @(ReplProcess.writer &process))
+                       configured (and
+                         (and
+                           (ReplTransport.private-writer! @(ReplProcess.acknowledgement &process))
+                           (ReplTransport.private-writer! @(ReplProcess.lifeline &process)))
+                         (and
+                           (ReplWake.descriptor @(ReplRemote.wake remote)
+                                                @(ReplProcess.reader &process))
+                           (and
+                             (or
+                               (ReplWake.process @(ReplRemote.wake remote)
+                                                 @(ReplProcess.pid &process))
+                               (ReplProcessHost.finished? &process))
+                             (or (not @(ReplRemote.tty remote))
+                                 (ReplWake.descriptor @(ReplRemote.wake remote)
+                                                      @(ReplProcess.master &process))))))]
+                (ReplRemote.set-process! remote [process])
+                (ReplRemote.set-channel! remote [channel])
+                (ReplRemote.set-problem! remote @"")
+                (ReplRemote.set-negotiating! remote true)
+
+                (ReplRemote.set-updates! remote [])
+                (ReplRemote.set-pending-language! remote [])
+                (ReplRemote.set-language-inflight! remote false)
+                (ReplRemote.set-replies! remote [])
+                (if configured
+                  (Result.Success ())
+                  (do
+                    (fail! remote "could not configure worker supervision")
+                    (Result.Error @(ReplRemote.problem remote))))))))))
+
+  (defn session [remote] @(ReplRemote.epoch remote))
+
+  (defn- unavailable! [remote request]
+    (let-do [reason @"execution worker is stopped; use :reinit"
+             cursor @(ReplLanguageRequest.cursor request)
+             source (ReplLanguageRequest.source request)
+             host (ReplCommands.command? source)]
+      (Array.push-back! (ReplRemote.updates remote)
+                        (ReplLanguageUpdate.Analysis
+                          (ReplAnalysis.init @(ReplLanguageRequest.document request)
+                                             @(ReplLanguageRequest.revision request)
+                                             @(ReplLanguageRequest.session request)
+                                             (if host
+                                               [(ReplCommands.highlight source)]
+                                               [])
+                                             []
+                                             []
+                                             (ReplCompleteness.Unknown)
+                                             (ReplAnalysisState.Unavailable @&reason))))
+      (match-ref (ReplLanguageRequest.operation request)
+        (ReplQuery.Analyze) ()
+        _
+          (Array.push-back! (ReplRemote.updates remote)
+                            (ReplLanguageUpdate.Editing
+                              (ReplEditingResult.init @(ReplLanguageRequest.document request)
+                                                      @(ReplLanguageRequest.revision request)
+                                                      @(ReplLanguageRequest.session request)
+                                                      @(ReplLanguageRequest.request request)
+                                                      cursor
+                                                      (if (and host
+                                                               (ReplCommands.at-head? source
+                                                                                      cursor))
+                                                        (ReplCommands.reply (ReplLanguageRequest.operation request)
+                                                                            source
+                                                                            cursor)
+                                                        (ReplEditingReply.init cursor
+                                                                               cursor
+                                                                               []
+                                                                               reason))))))))
+  (defn- send-language! [remote]
+    (when (and (online? remote)
+               (and
+                 (not @(ReplRemote.language-inflight remote))
+                 (not (Array.empty? (ReplRemote.pending-language remote)))))
+      (let-do [request (Array.pop-back! (ReplRemote.pending-language remote))]
+        (ReplLanguageRequest.set-session! &request @(ReplRemote.session remote))
+        (ReplRemote.set-language-serial! remote
+                                         @(ReplLanguageRequest.request &request))
+        (ReplRemote.set-language-inflight! remote true)
+        (send! remote &(ReplWorkerRequest.Language request))
+        (ReplTransport.flush! (channel remote)))))
+
+  (defn language-request! [remote request]
+    (if (online? remote)
+      (do
+        (ReplRemote.set-pending-language! remote [request])
+        (send-language! remote))
+      (unavailable! remote &request)))
+
+  (defn poll-language! [remote]
+    (do
+      (pump! remote)
+      (let [updates (ReplRemote.updates remote)]
+        (if (Array.empty? updates)
+          (Maybe.Nothing)
+          (let-do [update @(Array.unsafe-nth updates 0)
+                   rest (Array.slice updates 1 (Array.length updates))]
+            (ReplRemote.set-updates! remote rest)
+            (Maybe.Just update))))))
+
+  (defn language-client [pointer]
+    (ReplLanguageClient.init
+      (fn [request] (language-request! (Pointer.to-ref pointer) request))
+      (fn [] (poll-language! (Pointer.to-ref pointer)))
+      (fn [] (session (Pointer.to-ref pointer)))
+      @(ReplRemote.wake (Pointer.to-ref pointer))))
+
+  (defn finish! [remote]
+    (when (online? remote)
+      (let-do [process (Array.unsafe-nth (ReplRemote.process remote) 0)
+               byte 1b
+               until (Long.+ (ReplNative.now) 1000000000l)]
+        (ignore
+          (ReplNative.write @(ReplProcess.lifeline process)
+                            (Pointer.address &byte)
+                            1l))
+        (while-do (and
+            (not (ReplProcessHost.finished? process))
+            (Long.< (ReplNative.now) until))
+          (System.sleep-micros 1000))
+        (ReplProcessHost.terminate! process)
+        (if (ReplProcessHost.exited? process)
+          (ReplScratch.clean (ReplRemote.directory remote))
+          (Array.push-back! (ReplRemote.retired remote)
+                            (Pair.init @(ReplProcess.pid process)
+                                       @(ReplRemote.directory remote))))
+        (ReplProcessHost.close! process)
+        (ReplRemote.set-process! remote [])
+        (ReplRemote.set-channel! remote []))))
+  (defn dispose [remote]
+    (let-do [until (Long.+ (ReplNative.now) 1000000000l)]
+      (fail! remote "REPL closed")
+      (while-do (and
+          (not (Array.empty? (ReplRemote.retired remote)))
+          (Long.< (ReplNative.now) until))
+        (reap! remote)
+        (unless (Array.empty? (ReplRemote.retired remote))
+          (System.sleep-micros 1000)))
+      (when (Int.>= @(ReplRemote.wake remote) 0)
+        (ignore (ReplNative.close @(ReplRemote.wake remote))))
+      (ReplRemote.set-wake! remote -1))))
+
+(load "remote-io.carp")

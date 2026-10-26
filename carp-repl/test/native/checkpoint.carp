@@ -1,0 +1,88 @@
+(load "../../engine.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+(register checkpoint-test-temp (Fn [(Ptr CChar)] (Ptr CChar)) "mkdtemp")
+(register checkpoint-test-rmdir (Fn [(Ptr CChar)] Int) "rmdir")
+
+(defn checkpoint-tests [initial engine]
+  (let-do [test @initial
+           original (SourceInput.init @"checkpoint:original" @"(def held 1)")
+           accepted (Session.upsert-cell (ReplEngineState.session engine)
+                                         &original)]
+    (set! test
+          (assert-true &test
+            (Result.success? &accepted)
+            "the source checkpoint fixture commits its original declaration"))
+    (ReplEngineState.set-entries! engine
+                                  [(ReplEntry.init 1
+                                                   @&original
+                                                   @"ok"
+                                                   [@"held"]
+                                                   []
+                                                   false)])
+    (ReplEngineState.set-pending-input! engine
+                                        [(SourceInput.init @(SourceInput.id &original)
+                                                           @"(blocked-edit)")])
+    (ReplEngineState.set-editing! engine 1)
+    (let [snapshot (ReplEngine.checkpoint engine
+                                          (ReplEngineState.session engine))]
+      (set! test
+            (assert-true &test
+              (and
+                (Int.= (Array.length (ReplCheckpoint.entries &snapshot)) 2)
+                (Array.empty?
+                  (ReplEntry.definitions
+                    (Array.unsafe-nth (ReplCheckpoint.entries &snapshot) 1))))
+              "an interrupted unaccepted edit has no definitions and preserves its previous journal entry")))
+    (let-do [replacement (SourceInput.init @"checkpoint:replacement"
+                                           @"(def held 2)")
+             committed (Session.upsert-cell (ReplEngineState.session engine)
+                                            &replacement)]
+      (set! test
+            (assert-true &test
+              (Result.success? &committed)
+              "the replacement declaration is accepted before its runtime phase"))
+      (ReplEngineState.set-editing! engine 0)
+      (ReplEngineState.set-pending-input! engine [replacement])
+      (let [snapshot (ReplEngine.checkpoint engine
+                                            (ReplEngineState.session engine))]
+        (set! test
+              (assert-true &test
+                (and
+                  (String.=
+                    (ReplEntry.status
+                      (Array.unsafe-nth (ReplCheckpoint.entries &snapshot) 0))
+                    "superseded")
+                  (Array.contains?
+                    (ReplEntry.definitions
+                      (Array.unsafe-nth (ReplCheckpoint.entries &snapshot) 1))
+                    "held"))
+                "a committed interrupted replacement supersedes the old source and retains its declarations"))))
+    test))
+
+(defn main []
+  (let-do [test (Test.State.init 0 0)
+           root @"/tmp/metacarp-checkpoint-test-XXXXXX"
+           core (match (IO.getenv "CARP_DIR")
+             (Maybe.Just value) value
+             (Maybe.Nothing) @"/missing-core")]
+    (if (null? (checkpoint-test-temp (String.cstr &root)))
+      (set! test
+            (assert-true &test
+              false
+              "the checkpoint fixture creates its scratch directory"))
+      (match (ReplEngine.create &core &root)
+        (Result.Error error)
+          (set! test
+                (assert-equal &test
+                  "a working engine"
+                  (Diagnostic.message &error)
+                  "the checkpoint fixture loads Core"))
+        (Result.Success engine)
+          (do
+            (set! test (checkpoint-tests &test &engine))
+            (ReplEngine.dispose &engine))))
+    (ignore (checkpoint-test-rmdir (String.cstr &root)))
+    (Test.print-test-results &test)
+    @(Test.State.failed &test)))

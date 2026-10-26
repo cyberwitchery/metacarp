@@ -1,4 +1,5 @@
 (load "../carp-session/carp-input.carp")
+(load "checkpoint.carp")
 (load "input.carp")
 (load "values.carp")
 (load "view-query.carp")
@@ -27,7 +28,10 @@ ReplEngine operations and receives display text or structured diagnostics.")
    browse-queries (Array ReplBrowseQuery)
    browse-owners (Array ReplBrowseOwner)
    next-browse Long
-   prepared-input (Array SourcedSurfaceModule)])
+   prepared-input (Array SourcedSurfaceModule)
+   checkpoint (Array (Fn [ReplCheckpoint] ()))
+   pending-input (Array SourceInput)
+   pending-dependencies (Array String)])
 
 (defmodule ReplEngine
   (defn- input-mask [parsed]
@@ -61,6 +65,9 @@ ReplEngine operations and receives display text or structured diagnostics.")
                                 []
                                 []
                                 1l
+                                []
+                                []
+                                []
                                 []))))
 
   (doc dispose "releases the native session before the host drops its state.")
@@ -121,10 +128,12 @@ ReplEngine operations and receives display text or structured diagnostics.")
       (match committed
         (Result.Error error) (Result.Error error)
         (Result.Success definitions)
-          (apply-native-revision engine
-                                 &previous
-                                 (ReplEngineState.session engine)
-                                 &definitions))))
+          (do
+            (checkpoint! engine)
+            (apply-native-revision engine
+                                   &previous
+                                   (ReplEngineState.session engine)
+                                   &definitions)))))
 
   (private runtime-input)
   (hidden runtime-input)
@@ -720,7 +729,13 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
                (next-input engine source))
              _current (ReplEngineState.set-last-input! engine
                                                        (String.copy (SourceInput.id &input)))
+             _pending (do
+               (ReplEngineState.set-pending-input! engine [@&input])
+               (ReplEngineState.set-pending-dependencies! engine [])
+               (checkpoint! engine))
              dependencies (input-dependencies engine &input)
+             _dependencies (ReplEngineState.set-pending-dependencies! engine
+                                                                      @&dependencies)
              before-generation @(ReplEngineState.generation engine)
              answer (evaluate-input engine &input)
              succeeded (Result.success? &answer)
@@ -773,6 +788,8 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
       (if (and succeeded (Int.> editing 0))
         (Array.aset! entries (Int.dec editing) entry)
         (Array.push-back! entries entry))
+      (ReplEngineState.set-pending-input! engine [])
+      (ReplEngineState.set-pending-dependencies! engine [])
       answer)))
 
 (defmodule ReplEngine
@@ -780,6 +797,7 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
   (hidden run-prepared)
   (defn run-prepared [engine prepared]
     (let-do [slot @(ReplPreparedResult.slot prepared)]
+      (checkpoint! engine)
       (ignore (LLVM.call-i32 @(ReplPreparedResult.address prepared)))
       (SessionJit.executed! (ReplEngineState.jit engine)
                             @(ReplPreparedResult.address prepared))
@@ -894,6 +912,17 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
 
   (private removal-impact)
   (hidden removal-impact)
+  (defn accepted-entry? [engine entry]
+    (let [inputs (SessionOverlay.inputs
+            (Array.unsafe-nth
+              (CompilerSession.overlay (ReplEngineState.session engine))
+              0))]
+      (and
+        (ReplCheckpoints.accepted? inputs (ReplEntry.input entry))
+        (and
+          (not (Array.empty? (ReplEntry.definitions entry)))
+          (or (String.= (ReplEntry.status entry) "ok")
+              (String.= (ReplEntry.status entry) "interrupted"))))))
   (defn removal-impact [engine number]
     (let-do [entries (ReplEngineState.entries engine)
              selected (Array.unsafe-nth entries (Int.dec number))
@@ -925,13 +954,8 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
       (cond
         (or (Int.< number 1) (Int.> number (Array.length entries)))
           (Result.Error (diagnostic (fmt "no input %d" number)))
-        (let [entry (Array.unsafe-nth entries (Int.dec number))]
-          (or
-            (String./= (ReplEntry.status entry) "ok")
-            (or
-              (Array.empty? (ReplEntry.definitions entry))
-              (not
-                (active-input? engine (SourceInput.id (ReplEntry.input entry)))))))
+        (not
+          (accepted-entry? engine (Array.unsafe-nth entries (Int.dec number))))
           (Result.Error
             (diagnostic (fmt "input %d has no active definitions" number)))
         (let-do [impact (removal-impact engine number)
@@ -973,10 +997,9 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
           (let [entry (Array.unsafe-nth entries
                                         (Int.dec @(Array.unsafe-nth &impact i)))
                 id (SourceInput.id (ReplEntry.input entry))]
-            (when (and
-                (and (String.= (ReplEntry.status entry) "ok")
-                     (not (Array.empty? (ReplEntry.definitions entry))))
-                (and (active-input? engine id) (not (Array.contains? &ids id))))
+            (when (and (accepted-entry? engine entry)
+                       (and (active-input? engine id)
+                            (not (Array.contains? &ids id))))
               (Array.push-back! &ids (String.copy id)))))
         (match (Session.remove-inputs &candidate &ids)
           (Result.Error error) (Result.Error error)
@@ -1213,5 +1236,6 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
                       answer))))))))
 
 (load "engine-browse.carp")
+(load "engine-checkpoint.carp")
 (load "engine-invalidation.carp")
 (load "engine-expanded.carp")

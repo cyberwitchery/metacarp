@@ -1,0 +1,388 @@
+(load "transport.carp")
+(system-include "spawn.h")
+(system-include "sys/wait.h")
+(system-include "sys/ioctl.h")
+(system-include "util.h")
+(system-include "termios.h")
+(system-include "crt_externs.h")
+(system-include "mach-o/dyld.h")
+(register-type ReplSpawnActions "posix_spawn_file_actions_t")
+(register-type ReplSpawnAttributes "posix_spawnattr_t")
+(register-type ReplProcessWindow "struct winsize")
+(register-type ReplProcessExit "siginfo_t" [si_pid Int])
+(register-type ReplProcessTTYFlags "tcflag_t")
+(register-type ReplProcessTermios "struct termios" [c_lflag ReplProcessTTYFlags])
+
+(defmodule ReplProcessNative
+  (register actions-init
+    (Fn [(Ptr ReplSpawnActions)] Int)
+    "posix_spawn_file_actions_init")
+  (register actions-destroy
+    (Fn [(Ptr ReplSpawnActions)] Int)
+    "posix_spawn_file_actions_destroy")
+  (register actions-dup
+    (Fn [(Ptr ReplSpawnActions) Int Int] Int)
+    "posix_spawn_file_actions_adddup2")
+  (register attributes-init
+    (Fn [(Ptr ReplSpawnAttributes)] Int)
+    "posix_spawnattr_init")
+  (register attributes-destroy
+    (Fn [(Ptr ReplSpawnAttributes)] Int)
+    "posix_spawnattr_destroy")
+  (register attributes-flags
+    (Fn [(Ptr ReplSpawnAttributes) Int] Int)
+    "posix_spawnattr_setflags")
+  (register attributes-mask
+    (Fn [(Ptr ReplSpawnAttributes) (Ptr ReplNativeSignalSet)] Int)
+    "posix_spawnattr_setsigmask")
+  (register attributes-default
+    (Fn [(Ptr ReplSpawnAttributes) (Ptr ReplNativeSignalSet)] Int)
+    "posix_spawnattr_setsigdefault")
+  (do
+    (register SPAWN-SESSION Int "POSIX_SPAWN_SETSID")
+    (register SPAWN-CLOSE Int "POSIX_SPAWN_CLOEXEC_DEFAULT")
+    (register SPAWN-MASK Int "POSIX_SPAWN_SETSIGMASK")
+    (register SPAWN-DEFAULT Int "POSIX_SPAWN_SETSIGDEF"))
+  (register spawn
+    (Fn
+      [(Ptr Int)
+       (Ptr CChar)
+       (Ptr ReplSpawnActions)
+       (Ptr ReplSpawnAttributes)
+       (Ptr (Ptr CChar))
+       (Ptr (Ptr CChar))]
+      Int)
+    "posix_spawn")
+  (register executable-path
+    (Fn [(Ptr CChar) (Ptr Uint32)] Int)
+    "_NSGetExecutablePath")
+  (register environment (Fn [] (Ptr (Ptr (Ptr CChar)))) "_NSGetEnviron")
+  (register openpty
+    (Fn [(Ptr Int) (Ptr Int) (Ptr CChar) (Ptr ReplProcessTermios) (Ptr ())] Int)
+    "openpty")
+  (register tty-get (Fn [Int (Ptr ReplProcessTermios)] Int) "tcgetattr")
+  (register tty-set (Fn [Int Int (Ptr ReplProcessTermios)] Int) "tcsetattr")
+  (register tty-raw (Fn [(Ptr ReplProcessTermios)] ()) "cfmakeraw")
+  (register NOW Int "TCSANOW")
+  (register CANONICAL Int "ICANON")
+  (register copy-bytes (Fn [(Ptr a) (Ptr b) Long] (Ptr ())) "memcpy")
+  (register ioctl (Fn [Int Long (Ptr ())] Int) "ioctl")
+  (register CLAIM-TTY Long "TIOCSCTTY")
+  (register GET-SIZE Long "TIOCGWINSZ")
+  (register window-control (Fn [Int Long (Ptr ReplProcessWindow)] Int) "ioctl")
+  (register SET-SIZE Long "TIOCSWINSZ")
+  (register DUP-CLOSE Int "F_DUPFD_CLOEXEC")
+  (register kill (Fn [Int Int] Int) "kill")
+  (register KILL Int "SIGKILL")
+  (register STOP Int "SIGSTOP")
+  (register wait (Fn [Int (Ptr Int) Int] Int) "waitpid")
+  (register NO-WAIT Int "WNOHANG")
+  (register EXITED Int "WEXITED")
+  (register KEEP-WAITABLE Int "WNOWAIT")
+  (register WAIT-PID Int "P_PID")
+  (register probe (Fn [Int Uint32 (Ptr ReplProcessExit) Int] Int) "waitid")
+  (register process-id (Fn [] Int) "getpid")
+  (register session-id (Fn [Int] Int) "getsid")
+  (register group-id (Fn [] Int) "getpgrp")
+  (register GET-FD Int "F_GETFD")
+  (register terminal-name (Fn [Int] (Ptr CChar)) "ttyname")
+  (register isatty (Fn [Int] Int) "isatty")
+  (register set-buffer (Fn [(Ptr FILE) (Ptr CChar) Int Long] Int) "setvbuf")
+  (register UNBUFFERED Int "_IONBF"))
+
+(deftype ReplProcess
+  [pid Int
+   reader Int
+   writer Int
+   acknowledgement Int
+   lifeline Int
+   master Int
+   slave Int
+   reaped Bool])
+
+(defmodule ReplProcessHost
+  (def request-fd 193)
+  (def reply-fd 194)
+  (def acknowledgement-fd 195)
+  (def lifeline-fd 196)
+
+  (defn canonical? [settings]
+    (let-do [bits (Uint64.from-long 0l)
+             source (Pointer.address
+               (ReplProcessTermios.c_lflag (Pointer.to-ref settings)))
+             count (Pointer.width source)]
+      (assert (Long.= count (Pointer.width (Pointer.address &bits))))
+      (ignore
+        (ReplProcessNative.copy-bytes (Pointer.address &bits) source count))
+      (Uint64./=
+        (Uint64.bit-and bits
+                        (Uint64.from-long
+                          (Long.from-int ReplProcessNative.CANONICAL)))
+        (Uint64.from-long 0l))))
+  (defn executable []
+    (let-do [size (Uint32.from-long 4096l)
+             buffer (Array.replicate 4096 &0b)]
+      (if (Int.=
+          (ReplProcessNative.executable-path
+            (the (Ptr CChar)
+                 (Unsafe.coerce (Pointer.address (Array.unsafe-nth &buffer 0))))
+            (Pointer.address &size))
+          0)
+        (Result.Success
+          (String.from-cstr
+            (the (Ptr CChar)
+                 (Unsafe.coerce (Pointer.address (Array.unsafe-nth &buffer 0))))))
+        (let-do [large (Array.replicate (Long.to-int (Uint32.to-long size)) &0b)]
+          (if (Int.=
+              (ReplProcessNative.executable-path
+                (the (Ptr CChar)
+                     (Unsafe.coerce
+                       (Pointer.address (Array.unsafe-nth &large 0))))
+                (Pointer.address &size))
+              0)
+            (Result.Success
+              (String.from-cstr
+                (the (Ptr CChar)
+                     (Unsafe.coerce
+                       (Pointer.address (Array.unsafe-nth &large 0))))))
+            (Result.Error @"cannot locate REPL executable"))))))
+
+  (defn- close-fds! [fds]
+    (for [i 0 (Array.length fds)]
+      (when (Int.>= @(Array.unsafe-nth fds i) 0)
+        (ignore (ReplNative.close @(Array.unsafe-nth fds i))))))
+
+  (defn- pipe! [owned]
+    (let-do [fds [-1 -1]
+             status (ReplNative.pipe (Pointer.address (Array.unsafe-nth &fds 0)))]
+      (when (Int.= status 0)
+        (for [i 0 2] (Array.push-back! owned @(Array.unsafe-nth &fds i))))
+      status))
+
+  (defn- install! [actions sources targets duplicates]
+    (let-do [status 0]
+      ; Relocate every source before making spawn actions: targets may already
+      ; be in use in a host with many open descriptors.
+      (for [i 0 (Array.length sources)]
+        (when (Int.= status 0)
+          (let-do [fd (ReplNative.flags @(Array.unsafe-nth sources i)
+                                        ReplProcessNative.DUP-CLOSE
+                                        200)]
+            (if (Int.< fd 0) (set! status -1) (Array.push-back! duplicates fd)))))
+      (when (Int.= status 0)
+        (for [i 0 (Array.length sources)]
+          (when (Int.= status 0)
+            (set! status
+                  (ReplProcessNative.actions-dup actions
+                                                 @(Array.unsafe-nth duplicates i)
+                                                 @(Array.unsafe-nth targets i))))))
+      status))
+
+  (defn resize! [process]
+    (when (Int.>= @(ReplProcess.master process) 0)
+      (let-do [size (the (Ptr ReplProcessWindow)
+                         (ReplNative.allocate
+                           (Pointer.width
+                             (the (Ptr ReplProcessWindow) (Pointer.from-long 0l)))))]
+        (when (Int.=
+            (ReplProcessNative.window-control 0 ReplProcessNative.GET-SIZE size)
+            0)
+          (ignore
+            (ReplProcessNative.window-control @(ReplProcess.master process)
+                                              ReplProcessNative.SET-SIZE
+                                              size)))
+        (ReplNative.release size))))
+
+  (defn- same-terminal? [left right]
+    (let [first (ReplProcessNative.terminal-name left)]
+      (if (null? first)
+        false
+        (let [name (String.from-cstr first)
+              second (ReplProcessNative.terminal-name right)]
+          (and (not (null? second)) (String.= &name &(String.from-cstr second)))))))
+
+  (defn start [program arguments tty]
+    (let-do [terminal-error (and tty (same-terminal? 1 2))
+             owned (the (Array Int) [])
+             duplicates (the (Array Int) [])
+             status 0
+             master -1
+             slave -1
+             pid -1
+             actions (the (Ptr ReplSpawnActions)
+                          (ReplNative.allocate
+                            (Pointer.width
+                              (the (Ptr ReplSpawnActions) (Pointer.from-long 0l)))))
+             attributes (the (Ptr ReplSpawnAttributes)
+                             (ReplNative.allocate
+                               (Pointer.width
+                                 (the (Ptr ReplSpawnAttributes)
+                                      (Pointer.from-long 0l)))))
+             mask (the (Ptr ReplNativeSignalSet)
+                       (ReplNative.allocate
+                         (Pointer.width
+                           (the (Ptr ReplNativeSignalSet) (Pointer.from-long 0l)))))
+             defaults (the (Ptr ReplNativeSignalSet)
+                           (ReplNative.allocate
+                             (Pointer.width
+                               (the (Ptr ReplNativeSignalSet)
+                                    (Pointer.from-long 0l)))))
+             actions-ready (Int.= (ReplProcessNative.actions-init actions) 0)
+             attributes-ready (Int.=
+               (ReplProcessNative.attributes-init attributes)
+               0)]
+      (unless (and actions-ready attributes-ready) (set! status -1))
+      (for [i 0 4] (when (Int.= status 0) (set! status (pipe! &owned))))
+      (when (and tty (Int.= status 0))
+        (let-do [settings (the (Ptr ReplProcessTermios)
+                               (ReplNative.allocate
+                                 (Pointer.width
+                                   (the (Ptr ReplProcessTermios)
+                                        (Pointer.from-long 0l)))))
+                 got (Int.= (ReplProcessNative.tty-get 0 settings) 0)]
+          (set! status
+                (if got
+                  (ReplProcessNative.openpty (Pointer.address &master)
+                                             (Pointer.address &slave)
+                                             (Pointer.from-long 0l)
+                                             settings
+                                             (Pointer.from-long 0l))
+                  -1))
+          (ReplNative.release settings)))
+      (when (Int.= status 0)
+        (let-do [sources [(if tty slave 0)
+                          (if tty slave 1)
+                          (if terminal-error slave 2)
+                          @(Array.unsafe-nth &owned 0)
+                          @(Array.unsafe-nth &owned 3)
+                          @(Array.unsafe-nth &owned 4)
+                          @(Array.unsafe-nth &owned 6)]
+                 targets [0
+                          1
+                          2
+                          request-fd
+                          reply-fd
+                          acknowledgement-fd
+                          lifeline-fd]]
+          (ignore (ReplNative.signal-empty mask))
+          (ignore (ReplNative.signal-empty defaults))
+          (let [signals (ReplNative.terminal-signals)]
+            (for [i 0 (Array.length &signals)]
+              (ignore
+                (ReplNative.signal-add defaults @(Array.unsafe-nth &signals i)))))
+          (set! status (install! actions &sources &targets &duplicates))
+          (when (Int.= status 0)
+            (set! status
+                  (ReplProcessNative.attributes-flags attributes
+                                                      (Int.bit-or ReplProcessNative.SPAWN-SESSION
+                                                                  (Int.bit-or ReplProcessNative.SPAWN-CLOSE
+                                                                              (Int.bit-or ReplProcessNative.SPAWN-MASK
+                                                                                          ReplProcessNative.SPAWN-DEFAULT))))))
+          (when (Int.= status 0)
+            (set! status (ReplProcessNative.attributes-mask attributes mask)))
+          (when (Int.= status 0)
+            (set! status
+                  (ReplProcessNative.attributes-default attributes defaults)))
+          (when (Int.= status 0)
+            (let-do [argv (the (Array (Ptr CChar)) [])]
+              (Array.push-back! &argv (String.cstr program))
+              (for [i 0 (Array.length arguments)]
+                (Array.push-back! &argv
+                                  (String.cstr (Array.unsafe-nth arguments i))))
+              (Array.push-back! &argv (Pointer.from-long 0l))
+              (set! status
+                    (ReplProcessNative.spawn (Pointer.address &pid)
+                                             (String.cstr program)
+                                             actions
+                                             attributes
+                                             (Pointer.address (Array.unsafe-nth &argv
+                                                                                0))
+                                             (Pointer.to-value (ReplProcessNative.environment))))))))
+      (when actions-ready (ignore (ReplProcessNative.actions-destroy actions)))
+      (when attributes-ready
+        (ignore (ReplProcessNative.attributes-destroy attributes)))
+      (ReplNative.release mask)
+      (ReplNative.release defaults)
+      (ReplNative.release actions)
+      (ReplNative.release attributes)
+      (close-fds! &duplicates)
+      (if (Int./= status 0)
+        (do
+          (close-fds! &owned)
+          (close-fds! &[master slave])
+          (Result.Error (fmt "could not start REPL worker (%d)" status)))
+        (let-do [process (ReplProcess.init pid
+                                           @(Array.unsafe-nth &owned 2)
+                                           @(Array.unsafe-nth &owned 1)
+                                           @(Array.unsafe-nth &owned 5)
+                                           @(Array.unsafe-nth &owned 7)
+                                           master
+                                           slave
+                                           false)]
+          (close-fds!
+            &[@(Array.unsafe-nth &owned 0)
+              @(Array.unsafe-nth &owned 3)
+              @(Array.unsafe-nth &owned 4)
+              @(Array.unsafe-nth &owned 6)])
+          (when tty (ignore (ReplTransport.nonblocking! master)))
+          (resize! &process)
+          (Result.Success process)))))
+
+  (defn finished? [process]
+    (if @(ReplProcess.reaped process)
+      true
+      (let-do [info (the (Ptr ReplProcessExit)
+                         (ReplNative.allocate
+                           (Pointer.width
+                             (the (Ptr ReplProcessExit) (Pointer.from-long 0l)))))]
+        (ReplProcessExit.set-si_pid! (Pointer.to-ref info) 0)
+        (let-do [status (ReplProcessNative.probe ReplProcessNative.WAIT-PID
+                                                 (Uint32.from-long
+                                                   (Long.from-int @(ReplProcess.pid process)))
+                                                 info
+                                                 (Int.bit-or ReplProcessNative.NO-WAIT
+                                                             (Int.bit-or ReplProcessNative.EXITED
+                                                                         ReplProcessNative.KEEP-WAITABLE)))
+                 done (and (Int.= status 0)
+                           (Int.=
+                             @(ReplProcessExit.si_pid (Pointer.to-ref info))
+                             @(ReplProcess.pid process)))]
+          (ReplNative.release info)
+          done))))
+  (defn exited? [process]
+    (if @(ReplProcess.reaped process)
+      true
+      (let-do [status 0
+               result (ReplProcessNative.wait @(ReplProcess.pid process)
+                                              (Pointer.address &status)
+                                              ReplProcessNative.NO-WAIT)]
+        (when (Int.= result @(ReplProcess.pid process))
+          (ReplProcess.set-reaped! process true))
+        @(ReplProcess.reaped process))))
+
+  (defn terminate! [process]
+    (unless-do @(ReplProcess.reaped process)
+      ; Keep the leader waitable until after killing its group. Its PID then cannot
+      ; be reused between observing exit and cleaning up ordinary child processes.
+      (ignore
+        (ReplProcessNative.kill (Int.neg @(ReplProcess.pid process))
+                                ReplProcessNative.KILL))
+      (ignore
+        (ReplProcessNative.kill @(ReplProcess.pid process)
+                                ReplProcessNative.KILL))))
+
+  (defn close! [process]
+    (do
+      (close-fds!
+        &[@(ReplProcess.reader process)
+          @(ReplProcess.writer process)
+          @(ReplProcess.acknowledgement process)
+          @(ReplProcess.lifeline process)
+          @(ReplProcess.master process)
+          @(ReplProcess.slave process)])
+      (ReplProcess.set-reader! process -1)
+      (ReplProcess.set-writer! process -1)
+      (ReplProcess.set-acknowledgement! process -1)
+      (ReplProcess.set-lifeline! process -1)
+      (ReplProcess.set-master! process -1)
+      (ReplProcess.set-slave! process -1))))

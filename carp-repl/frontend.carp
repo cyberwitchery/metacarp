@@ -1,0 +1,240 @@
+(load "remote.carp")
+(load "terminal.carp")
+
+(defmodule ReplFrontend
+  (defn- reset-display []
+    (do
+      (IO.print "\u001b[0m\u001b[?25h\u001b[?1049l")
+      (IO.Raw.fflush! IO.Raw.stdout)))
+
+  (defn- group-signal! [remote signal]
+    (when (ReplRemoteHost.online? remote)
+      (ignore
+        (ReplProcessNative.kill
+          (Int.neg
+            @(ReplProcess.pid (Array.unsafe-nth (ReplRemote.process remote) 0)))
+          signal))))
+
+  (defn- signal! [remote terminal signal owner settings raw]
+    (cond
+      (Int.= signal ReplNative.SIGNAL-INTERRUPT)
+        (ReplRemoteHost.fail! remote "interrupted")
+      (or (Int.= signal ReplNative.SIGNAL-RESIZE)
+          (Int.= signal ReplNative.SIGNAL-CONTINUE))
+        (do
+          (when (ReplRemoteHost.online? remote)
+            (ReplProcessHost.resize!
+              (Array.unsafe-nth (ReplRemote.process remote) 0)))
+          (unless (null? terminal)
+            (ReplEdit.resize @(ReplEditor.editor (Pointer.to-ref terminal)))))
+      (do
+        (when (Int.= signal ReplNative.SIGNAL-STOP)
+          (group-signal! remote ReplProcessNative.STOP))
+        (when raw
+          (if (and (not (null? terminal))
+                   (not
+                     (null? @(ReplEditor.signal-mask (Pointer.to-ref terminal)))))
+            (ignore
+              (ReplEdit.set-int
+                @(ReplEditor.editor (Pointer.to-ref terminal))
+                ReplEdit.PREPARE
+                0))
+            (ignore (ReplProcessNative.tty-set 0 ReplProcessNative.NOW settings))))
+        (reset-display)
+        (let-do [blocked (the (Ptr ReplNativeSignalSet)
+                              (ReplNative.allocate
+                                (Pointer.width
+                                  (the (Ptr ReplNativeSignalSet)
+                                       (Pointer.from-long 0l)))))]
+          (ignore (ReplNative.signal-mask ReplNative.SIGNAL-SET owner blocked))
+          (ignore (ReplNative.raise-signal signal))
+          (ignore
+            (ReplNative.signal-mask ReplNative.SIGNAL-SET
+                                    blocked
+                                    (Pointer.from-long 0l)))
+          (ReplNative.release blocked))
+        (when (Int.= signal ReplNative.SIGNAL-STOP)
+          (group-signal! remote ReplNative.SIGNAL-CONTINUE))
+        (when-do raw
+          (when (and (not (null? terminal))
+                     (not
+                       (null?
+                         @(ReplEditor.signal-mask (Pointer.to-ref terminal)))))
+            (ignore
+              (ReplEdit.set-int
+                @(ReplEditor.editor (Pointer.to-ref terminal))
+                ReplEdit.PREPARE
+                1)))
+          (let-do [current (the (Ptr ReplProcessTermios)
+                                (ReplNative.allocate
+                                  (Pointer.width
+                                    (the (Ptr ReplProcessTermios)
+                                         (Pointer.from-long 0l)))))]
+            (when-do (Int.= (ReplProcessNative.tty-get 0 current) 0)
+              (ReplProcessNative.tty-raw current)
+              (ignore
+                (ReplProcessNative.tty-set 0 ReplProcessNative.NOW current)))
+            (ReplNative.release current))))))
+
+  (defn await [remote terminal forward timeout accept-input]
+    (match (ReplNative.block-terminal-signals)
+      (Result.Error _) (Result.Error @"cannot establish worker signal scope")
+      (Result.Success previous)
+        (let-do [settings (the (Ptr ReplProcessTermios)
+                               (ReplNative.allocate
+                                 (Pointer.width
+                                   (the (Ptr ReplProcessTermios)
+                                        (Pointer.from-long 0l)))))
+                 current (the (Ptr ReplProcessTermios)
+                              (ReplNative.allocate
+                                (Pointer.width
+                                  (the (Ptr ReplProcessTermios)
+                                       (Pointer.from-long 0l)))))
+                 raw (and @(ReplRemote.tty remote)
+                          (and
+                            (Int.= (ReplProcessNative.tty-get 0 settings) 0)
+                            (Int.= (ReplProcessNative.tty-get 0 current) 0)))
+                 owner (if (and (not (null? terminal))
+                                (not
+                                  (null?
+                                    @(ReplEditor.signal-mask (Pointer.to-ref terminal)))))
+                   @(ReplEditor.signal-mask (Pointer.to-ref terminal))
+                   previous)
+                 answers (the (Array ReplWorkerReply) [])
+                 until (if (Long.> timeout 0l)
+                   (Long.+ (ReplNative.now) timeout)
+                   0l)]
+          (IO.Raw.fflush! IO.Raw.stdout)
+          (IO.Raw.fflush! IO.Raw.stderr)
+          (when-do raw
+            (ReplProcessNative.tty-raw current)
+            (ignore (ReplProcessNative.tty-set 0 ReplProcessNative.NOW current)))
+          (while-do (and (ReplRemoteHost.online? remote) (Array.empty? &answers))
+            (let-do [signal (ReplNative.pending-terminal-signal owner)]
+              (while-do (Int./= signal 0)
+                (if (and (not accept-input)
+                         (Int.= signal ReplNative.SIGNAL-INTERRUPT))
+                  (Array.push-back! (ReplRemote.queued remote) 3b)
+                  (signal! remote terminal signal owner settings raw))
+                (set! signal (ReplNative.pending-terminal-signal owner))))
+            (when (and accept-input (ReplRemoteHost.input! remote forward))
+              (ReplRemoteHost.fail! remote "interrupted"))
+            (when-do (ReplRemoteHost.online? remote)
+              (ReplRemoteHost.pump! remote)
+              (ignore (ReplRemoteHost.output! remote))
+              (match (ReplRemoteHost.poll-reply! remote)
+                (Maybe.Nothing) ()
+                (Maybe.Just reply) (Array.push-back! &answers reply))
+              (when (and (Long.> until 0l) (Long.>= (ReplNative.now) until))
+                (ReplRemoteHost.fail! remote
+                                      "language service did not stop after cancellation"))
+              (when (and (Array.empty? &answers) (ReplRemoteHost.online? remote))
+                (ReplRemoteHost.wait remote 10))))
+          (when forward (ReplRemoteHost.reclaim-input! remote))
+          (when raw
+            (ignore (ReplProcessNative.tty-set 0 ReplProcessNative.NOW settings)))
+          (ReplNative.release settings)
+          (ReplNative.release current)
+          (ignore
+            (ReplNative.signal-mask ReplNative.SIGNAL-SET
+                                    previous
+                                    (Pointer.from-long 0l)))
+          (ReplNative.release previous)
+          (if (Array.empty? &answers)
+            (do
+              (when @(ReplRemote.tty remote) (reset-display))
+              (Result.Error @(ReplRemote.problem remote)))
+            (Result.Success @(Array.unsafe-nth &answers 0))))))
+
+  (defn request [remote terminal request forward timeout]
+    (do
+      (ReplRemoteHost.send! remote request)
+      (await remote terminal forward timeout true)))
+  (defn resume! [remote terminal]
+    (do
+      (ReplRemoteHost.send! remote &(ReplWorkerRequest.Resume))
+      (await remote terminal false 0l false)))
+
+  (defn view-client [pointer terminal]
+    (ReplViewClient.init
+      (fn [request]
+        (let [remote (Pointer.to-ref pointer)]
+          (match (ReplFrontend.request remote
+                                       terminal
+                                       &(ReplWorkerRequest.View @request)
+                                       false
+                                       0l)
+            (Result.Error error)
+              (do
+                (when (and (not (ReplRemoteHost.online? remote))
+                           (not (null? terminal)))
+                  (ReplEditor.set-cancelled! (Pointer.to-ref terminal) true))
+                (Result.Error error))
+            (Result.Success (ReplWorkerReply.Page page)) (Result.Success page)
+            (Result.Success (ReplWorkerReply.ViewError error))
+              (Result.Error error)
+            _ (Result.Error @"unexpected view response"))))))
+
+  (defn effects! [remote terminal]
+    (let-do [effects @(ReplRemote.effects remote)
+             _clear (ReplRemote.set-effects! remote [])
+             pointer (Pointer.address remote)]
+      (for [i 0 (Array.length &effects)]
+        (match-ref (Array.unsafe-nth &effects i)
+          (ReplConsoleEffect.Output text) (ReplTerminal.output terminal text)
+          (ReplConsoleEffect.Diagnostic diagnostic source)
+            (repl-error diagnostic source)
+          (ReplConsoleEffect.Seed source) (ReplTerminal.seed terminal source)
+          (ReplConsoleEffect.Browse page)
+            (ReplTerminal.browse terminal (view-client pointer terminal) @page)))))
+
+  (defn report! [remote terminal answer]
+    (do
+      (effects! remote terminal)
+      (match answer
+        (Result.Success _)
+          (unless (ReplRemoteHost.online? remote)
+            (IO.errorln
+              "repl: execution worker stopped; native values were discarded. Source is retained. Use :reinit to rebuild declarations."))
+        (Result.Error message)
+          (IO.errorln
+            &(fmt
+              "repl: %s; native values were discarded. Source is retained. Use :reinit to rebuild declarations."
+              &message)))))
+
+  (defn start! [remote terminal]
+    (match (ReplRemoteHost.start! remote)
+      (Result.Error error) (Result.Error error)
+      (Result.Success _)
+        (match (await remote terminal false 0l true)
+          (Result.Success (ReplWorkerReply.Ready _)) (Result.Success ())
+          (Result.Error error) (Result.Error error)
+          _ (Result.Error @"unexpected worker startup response"))))
+
+  (defn- stop! [remote terminal]
+    (if (ReplRemoteHost.online? remote)
+      (match (request remote terminal &(ReplWorkerRequest.Shutdown) true 0l)
+        (Result.Error error) (Result.Error error)
+        (Result.Success _)
+          (do (ReplRemoteHost.finish! remote) (Result.Success ())))
+      (Result.Success ())))
+
+  (defn reinitialize! [remote terminal]
+    (match (stop! remote terminal)
+      (Result.Error error)
+        (report! remote terminal (the (Result () String) (Result.Error error)))
+      (Result.Success _)
+        (let-do [_invalidate (ReplCheckpoints.invalidate! (ReplRemote.checkpoint remote))
+                 checkpoint @(ReplRemote.checkpoint remote)]
+          (match (start! remote terminal)
+            (Result.Error error) (IO.errorln &error)
+            (Result.Success _)
+              (report! remote
+                       terminal
+                       (request remote
+                                terminal
+                                &(ReplWorkerRequest.Restore checkpoint)
+                                true
+                                0l))))))
+
+  (defn shutdown! [remote terminal] (ignore (stop! remote terminal))))

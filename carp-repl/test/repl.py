@@ -3,11 +3,13 @@
 import errno
 import argparse
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import signal
 import struct
 import subprocess
@@ -31,9 +33,10 @@ COMMAND = [BINARY, *([options.subcommand] if options.subcommand else [])]
 
 
 class Terminal:
-    def __init__(self, *options, color=True):
+    def __init__(self, *options, color=True, stderr_path=None):
         self.options = options
         self.color = color
+        self.stderr_path = stderr_path
 
     def __enter__(self):
         self.child, self.master = pty.fork()
@@ -43,6 +46,10 @@ class Terminal:
             os.environ.pop("NO_COLOR", None)
             if not self.color:
                 os.environ["NO_COLOR"] = "1"
+            if self.stderr_path is not None:
+                descriptor = os.open(self.stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.dup2(descriptor, 2)
+                os.close(descriptor)
             os.execv(BINARY, [*COMMAND, "--core", CORE, *self.options])
         self.initial_terminal = termios.tcgetattr(self.master)
         self.buffer = b""
@@ -587,6 +594,197 @@ class ReplTests(unittest.TestCase):
             terminal.send(b"\x03")
             terminal.next_prompt()
             terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_reinitialize_live_worker_restores_declared_initializers(self):
+        result = self.run_repl("(def x 10)\n(set! x 11)\nx\n:reinit\nx\n:q\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "x : Int\n11\n10\n")
+
+    def test_reinitialize_live_worker_discards_results_without_replaying_runtime_roots(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def counter 0)", b"counter : Int")
+            terminal.send(b"(defmacro install [] `(do (defn installed [] 42) (set! counter (Int.inc counter)) (installed)))\r")
+            terminal.next_prompt()
+            terminal.result(b"(install)", b"42")
+            terminal.result(b"counter", b"1")
+            terminal.result(b"[10 20]", b"[10 20]")
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.send(b":inspect 3\r")
+            terminal.until(b"no live result _3")
+            terminal.until("λ> ".encode())
+            terminal.result(b"counter", b"0")
+            terminal.result(b"(installed)", b"42")
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"counter", b"0")
+            terminal.send(b":history\r")
+            history = terminal.until("λ> ".encode())
+            self.assertNotIn(b"interrupted", history)
+
+    def test_native_loop_interrupt_retains_source_and_requires_reinitialization(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(b'(do (println* "native-loop-started") (while true ()))\r')
+            terminal.until(b"native-loop-started\r\n")
+            started = time.monotonic()
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            self.assertLess(time.monotonic() - started, 2)
+            terminal.result(b":defs", b"retained : Int")
+            terminal.send(b"(Int.* retained 2)\r")
+            terminal.until(b"execution worker is stopped")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
+    def test_native_program_arguments_preserve_the_public_invocation(self):
+        with Terminal("--no-history") as terminal:
+            terminal.result(b"(StaticArray.length &System.args)", str(len(COMMAND) + 3).encode())
+            terminal.result(b"(String.copy (StaticArray.unsafe-nth &System.args 0))", BINARY.encode())
+            terminal.result(b"(String.copy (StaticArray.unsafe-nth &System.args (Int.dec (StaticArray.length &System.args))))", b"--no-history")
+
+    def test_native_stderr_preserves_redirection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            errors = Path(directory) / "native.stderr"
+            with Terminal(stderr_path=errors) as terminal:
+                terminal.result(b'(do (IO.errorln "native-stderr-marker") 42)', b"42")
+                self.assertEqual(errors.read_text(), "native-stderr-marker\n")
+                self.assertNotIn(b"native-stderr-marker\r\n", terminal.raw)
+
+    def test_interrupting_a_mixed_macro_keeps_accepted_declarations_without_replaying_effects(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def counter 0)", b"counter : Int")
+            terminal.send(b'(defmacro install-and-spin [] `(do (defn installed [] 42) (set! counter (Int.inc counter)) (println* "mixed-native-started") (while true ())))\r')
+            terminal.next_prompt()
+            terminal.send(b"(install-and-spin)\r")
+            terminal.until(b"mixed-native-started\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.+ counter (installed))", b"42")
+            terminal.send(b":history\r")
+            terminal.until(b"interrupted, stale")
+            terminal.until("λ> ".encode())
+
+    def test_native_stdin_is_interactive_and_a_blocking_read_can_be_interrupted(self):
+        with Terminal() as terminal:
+            terminal.send('(do (println* "native-input-started") (String.= &(IO.get-line) "Grüße\\n"))\r'.encode())
+            terminal.until(b"native-input-started\r\n")
+            terminal.send("Grüße\r".encode())
+            terminal.until(b"true\r\n")
+            terminal.until("λ> ".encode())
+            terminal.send(b'(do (println* "native-read-blocked") (IO.get-line))\r')
+            terminal.until(b"native-read-blocked\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+
+    def test_native_crash_preserves_the_terminal_and_source(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(b'(register crash-worker (Fn [] ()) "abort")\r')
+            terminal.next_prompt()
+            terminal.send(b"(crash-worker)\r")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
+    def test_interrupt_kills_native_children_that_ignore_sigint(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            pidfile = Path(directory) / "native-child.pid"
+            command = f"trap '' INT; echo $$ > {shlex.quote(str(pidfile))}; while :; do :; done"
+            terminal.send(f"(System.system {json.dumps(command)})\r".encode())
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                terminal.read_for(.02)
+            self.assertTrue(pidfile.exists(), f"the native child installed its signal disposition: {terminal.buffer!r}")
+            child = int(pidfile.read_text())
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(.01)
+            else:
+                self.fail("the native child survived worker interruption")
+
+    def test_a_blocked_explicit_preview_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            fifo = Path(directory) / "preview.fifo"
+            os.mkfifo(fifo, 0o600)
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(f"(defmacro blocked-preview [] (read-file {json.dumps(str(fifo))}))\r".encode())
+            terminal.next_prompt()
+            terminal.send(b"(blocked-preview)\x1bOQ")
+            terminal.read_for(.15)
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
+    def test_execution_children_stop_when_the_terminal_process_dies(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            pidfile = Path(directory) / "orphan-child.pid"
+            command = f"echo $$ > {shlex.quote(str(pidfile))}; while :; do :; done"
+            terminal.send(f"(System.system {json.dumps(command)})\r".encode())
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                terminal.read_for(.02)
+            self.assertTrue(pidfile.exists(), "the execution child started")
+            child = int(pidfile.read_text())
+            os.kill(terminal.child, signal.SIGKILL)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(.01)
+            else:
+                self.fail("the execution child outlived the terminal's lifeline")
+
+    def test_an_interrupted_edit_keeps_the_previously_accepted_source(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            fifo = Path(directory) / "edit.fifo"
+            exported = Path(directory) / "accepted.carp"
+            os.mkfifo(fifo, 0o600)
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(f"(defmacro blocked-edit [] (read-file {json.dumps(str(fifo))}))\r".encode())
+            terminal.next_prompt()
+            terminal.send(b":edit 1\r")
+            terminal.until("λ[1]> ".encode())
+            terminal.send(b"\x01\x0b(blocked-edit)\r")
+            terminal.read_for(.15)
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(f":export {exported}\r".encode())
+            terminal.until(b"exported ")
+            terminal.until("λ> ".encode())
+            source = exported.read_text()
+            self.assertIn("(def retained 21)", source)
+            self.assertNotIn("\n(blocked-edit)", source)
+            terminal.send(b":history\r")
+            terminal.until(b"interrupted, stale")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
 
     def test_automatic_analysis_requires_an_explicit_compile_time_read(self):
         with Terminal() as terminal:
@@ -1691,6 +1889,53 @@ counter
             terminal.next_prompt()
             terminal.send(b":drop 1\r")
             terminal.next_prompt()
+
+    def test_interrupting_a_native_view_callback_returns_to_the_editor(self):
+        with Terminal() as terminal:
+            terminal.send(b"(deftype BlockingBrowser [])\r")
+            terminal.next_prompt()
+            terminal.send(b'(defview blocking-send [value BlockingBrowser] (do (ignore value) (=> (View.list) (View.items (fn [] 1)) (View.item-format (fn [i] (do (ignore i) @"open"))) (View.send (fn [i] (do (ignore i) (println* "native-view-started") (while true ()) -1))))))\r')
+            terminal.next_prompt()
+            terminal.send(b"(BlockingBrowser.init)\r")
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("depth 1", timeout=15)
+            for _ in range(4):
+                if "[blocking-send]" in terminal.screen.text(False):
+                    break
+                terminal.send(b"\t")
+                terminal.read_for(.05)
+            terminal.displayed("[blocking-send]")
+            terminal.send(b"\r")
+            terminal.until(b"native-view-started\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_keystrokes_during_a_native_view_callback_are_retained(self):
+        with Terminal() as terminal:
+            terminal.send(b"(deftype DelayedBrowser [])\r")
+            terminal.next_prompt()
+            terminal.send(b'(defview delayed-send [value DelayedBrowser] (do (ignore value) (=> (View.list) (View.items (fn [] 1)) (View.item-format (fn [i] (do (ignore i) @"open"))) (View.send (fn [i] (do (ignore i) (println* "native-view-delayed") (System.sleep-micros 250000) (view-register 7)))))))\r')
+            terminal.next_prompt()
+            terminal.send(b"(DelayedBrowser.init)\r")
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("depth 1", timeout=15)
+            for _ in range(4):
+                if "[delayed-send]" in terminal.screen.text(False):
+                    break
+                terminal.send(b"\t")
+                terminal.read_for(.05)
+            terminal.displayed("[delayed-send]")
+            terminal.send(b"\r")
+            terminal.until(b"native-view-delayed\r\n")
+            terminal.send(b"q(Int.+ 20 22)\r")
+            terminal.until(b"42\r\n")
+            terminal.until("λ> ".encode())
 
     def test_browse_renders_native_bitmap_pixels(self):
         with Terminal() as terminal:

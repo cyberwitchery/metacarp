@@ -1,0 +1,94 @@
+(load "native.carp")
+(system-include "sys/event.h")
+(register-type ReplWakeEvent "struct kevent")
+(register-type ReplWakeTimeout "struct timespec" [tv_sec Long
+                                                  tv_nsec Long])
+(defmodule ReplWakeNative
+  (register create (Fn [] Int) "kqueue")
+  (register set
+    (Fn [(Ptr ReplWakeEvent) Uint64 Int Int Int Long (Ptr ())] ())
+    "EV_SET")
+  (register event
+    (Fn
+      [Int (Ptr ReplWakeEvent) Int (Ptr ReplWakeEvent) Int (Ptr ReplWakeTimeout)]
+      Int)
+    "kevent")
+  (register READ Int "EVFILT_READ")
+  (register PROCESS Int "EVFILT_PROC")
+  (register ADD Int "EV_ADD")
+  (register ENABLE Int "EV_ENABLE")
+  (register ONCE Int "EV_ONESHOT")
+  (register EXIT Int "NOTE_EXIT")
+  (register SET-FD Int "F_SETFD")
+  (register CLOSE-ON-EXEC Int "FD_CLOEXEC"))
+
+; One stable descriptor survives worker replacement. The editor's existing wake
+; interface stays unchanged; read-ready PTY data and child exit also wake it.
+; The queue is level triggered, so bounded reads cannot lose a notification.
+(defmodule ReplWake
+  (defn create []
+    (let [queue (ReplWakeNative.create)]
+      (cond
+        (Int.< queue 0) -1
+        (Int.>= queue ReplNative.FD-LIMIT)
+          (do (ignore (ReplNative.close queue)) -1)
+        (Int.=
+          (ReplNative.flags queue
+                            ReplWakeNative.SET-FD
+                            ReplWakeNative.CLOSE-ON-EXEC)
+          0)
+          queue
+        (do (ignore (ReplNative.close queue)) -1))))
+
+  (defn- watch [queue identifier filter flags notes]
+    (let-do [change (the (Ptr ReplWakeEvent)
+                         (ReplNative.allocate
+                           (Pointer.width
+                             (the (Ptr ReplWakeEvent) (Pointer.from-long 0l)))))]
+      (ReplWakeNative.set change
+                          (Uint64.from-long (Long.from-int identifier))
+                          filter
+                          flags
+                          notes
+                          0l
+                          (Pointer.from-long 0l))
+      (let-do [status (ReplWakeNative.event queue
+                                            change
+                                            1
+                                            (Pointer.from-long 0l)
+                                            0
+                                            (Pointer.from-long 0l))]
+        (ReplNative.release change)
+        (Int.= status 0))))
+
+  (defn descriptor [queue fd]
+    (watch queue
+           fd
+           ReplWakeNative.READ
+           (Int.bit-or ReplWakeNative.ADD ReplWakeNative.ENABLE)
+           0))
+
+  (defn process [queue pid]
+    (watch queue
+           pid
+           ReplWakeNative.PROCESS
+           (Int.bit-or ReplWakeNative.ADD ReplWakeNative.ONCE)
+           ReplWakeNative.EXIT))
+
+  (defn acknowledge! [queue]
+    (when (Int.>= queue 0)
+      (let-do [event (the (Ptr ReplWakeEvent)
+                          (ReplNative.allocate
+                            (Pointer.width
+                              (the (Ptr ReplWakeEvent) (Pointer.from-long 0l)))))
+               timeout (the (Ptr ReplWakeTimeout)
+                            (ReplNative.allocate
+                              (Pointer.width
+                                (the (Ptr ReplWakeTimeout)
+                                     (Pointer.from-long 0l)))))]
+        (ReplWakeTimeout.set-tv_sec! (Pointer.to-ref timeout) 0l)
+        (ReplWakeTimeout.set-tv_nsec! (Pointer.to-ref timeout) 0l)
+        (ignore
+          (ReplWakeNative.event queue (Pointer.from-long 0l) 0 event 1 timeout))
+        (ReplNative.release event)
+        (ReplNative.release timeout)))))

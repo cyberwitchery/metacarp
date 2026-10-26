@@ -309,8 +309,19 @@ effects and displayed results.
 ## Boundaries and validation
 
 The terminal knows buffer text, cursor positions, and structured query replies.
-It has no compiler or JIT state. `protocol.carp` defines the narrow interface;
-`service.carp` runs one serialized compiler worker; `language.carp` adapts
+It has no compiler or JIT state. `protocol.carp` defines the language interface;
+`worker-protocol.carp` carries owned commands, language replies, view pages,
+and source checkpoints across a process boundary. Codecs come from the same
+record and sum declarations. The native view prelude uses their plain type
+declarations, without the host's transport or callbacks.
+
+`remote.carp` supervises a fresh executable started with `posix_spawn`.
+The execution process owns the engine, compiler service thread, JIT, native
+values, and view callbacks. Private pipes carry framed messages; a separate
+PTY carries native stdin and terminal output; separately redirected stderr is
+preserved. A stable wake descriptor covers
+protocol replies, PTY output, and worker exit across process replacement.
+`service.carp` serializes compiler access inside that process; `language.carp` adapts
 the shared reader and compiler observations. `display.carp` renders supplied
 ranges and pairs. It does not recognize language syntax. `engine.carp` adapts
 Session and SessionJit; `values.carp` owns typed result channels;
@@ -319,8 +330,8 @@ Session and SessionJit; `values.carp` owns typed result channels;
 Reader facts arrive before semantic analysis. Cursor queries reuse the current
 analysis. Every reply carries document, source, and session revisions; editing
 replies also carry a request ID and cursor. Superseded replies are discarded.
-The host pauses and drains the worker before accessing its engine.
-The worker inherits blocked terminal signals when it is created. While editing
+The execution process pauses and drains the service before accessing its engine.
+The service thread inherits blocked terminal signals when it is created. While editing
 or paging, the terminal loop consumes those signals synchronously. It updates
 the layout on resize and restores terminal mode before delegating termination
 or suspension to the original signal disposition. Libedit's asynchronous signal
@@ -335,12 +346,29 @@ Buffers over 256 KiB report analysis unavailable. Incomplete and failed
 analysis retain reader facts and available scope facts; unknown types stay
 unknown. Quiet diagnostics appear after 450 ms.
 
-Compiler recovery cannot undo runtime I/O, native crashes, or nontermination.
-Ctrl-C cancels editing; interrupting arbitrary native execution is a separate
-problem. Type completion and docs use a separate compiler-owned type namespace,
-including pending declarations, parameters, and declaration generations. Automatic analysis has cooperative compiler
-limits; these do not isolate native execution or make blocking filesystem
-operations interruptible.
+Ctrl-C cancels editing. During execution or a native inspection callback, it
+terminates the worker's process group and returns to the editor. A crash or
+unexpected worker exit uses the same recovery path. Native values and view
+handles are discarded; accepted source and the journal stay in the parent.
+`:history`, `:defs`, and export remain available while execution is stopped.
+
+Use `:reinit` to discard native state and rebuild accepted declarations in a
+fresh worker. It also works while execution is healthy: the current worker
+releases its retained values and stops before its replacement starts. Source
+and history remain; live results and mutations are discarded. Reinitialization
+discards the runtime roots of mixed submissions and never replays past expression
+effects. Global initializers run again when the rebuilt native state is first
+used. Source checkpoints are acknowledged before native execution or cleanup
+callbacks begin, including after a mixed macro has committed declarations.
+Each worker has its own scratch directory. Cleanup removes compiler artifacts
+without following symlinks or removing unknown files. A parent lifeline stops
+the worker's execution group if the terminal process exits unexpectedly.
+
+Runtime I/O already performed cannot be undone. Type completion and docs use a
+separate compiler-owned type namespace, including pending declarations,
+parameters, and declaration generations. Automatic analysis retains its
+cooperative limits; cancellation of a blocked native preview can terminate the
+execution worker after its cancellation grace period.
 
 Run the input, reader-to-editor, display, service, process, and real PTY tests:
 
