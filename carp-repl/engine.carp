@@ -25,7 +25,7 @@ ReplEngine operations and receives display text or structured diagnostics.")
    pending-remove Int
    pending-revision Int
    view-queries (Array ReplViewQuery)
-   browse-queries (Array ReplBrowseQuery)
+   browse-queries (Array ReplViewQuery)
    browse-owners (Array ReplBrowseOwner)
    next-browse Long
    prepared-input (Array SourcedSurfaceModule)
@@ -694,25 +694,16 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
   (doc export
     "Writes active source in the session's replay order, or the full transcript.")
   (defn export [engine path transcript]
-    (let-do [parts (the (Array String) [])]
-      (unless transcript
-        (let [overlay (Array.unsafe-nth
-                (CompilerSession.overlay (ReplEngineState.session engine))
-                0)
-              inputs (SessionOverlay.inputs overlay)]
-          (for [i 0 (Array.length inputs)]
-            (Array.push-back! &parts
-                              (String.copy
-                                (SourceInput.source (Array.unsafe-nth inputs i)))))))
-      (let [text (if transcript
-              (ReplJournal.transcript (ReplEngineState.events engine))
-              (String.append &(String.join "
-
-" &parts) "
-"))]
-        (match (IO.write-file &text path)
-          (Result.Error error) (Result.Error (diagnostic error))
-          (Result.Success _) (Result.Success (fmt "exported %s" path))))))
+    (let [overlay (Array.unsafe-nth
+            (CompilerSession.overlay (ReplEngineState.session engine))
+            0)]
+      (match (IO.write-file
+          &(ReplJournal.source (SessionOverlay.inputs overlay)
+                               (ReplEngineState.events engine)
+                               transcript)
+          path)
+        (Result.Error error) (Result.Error (diagnostic error))
+        (Result.Success _) (Result.Success (fmt "exported %s" path)))))
 
   (doc submit
     "Evaluates or replaces one journal input; failed edits preserve active source.")
@@ -746,48 +737,31 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
                (the (Array String) []))
              affected (if succeeded
                (ReplJournal.affected entries &definitions)
-               (the (Array Int) []))
-             number (if (and succeeded (Int.> editing 0))
-               editing
-               (Int.inc (Array.length entries)))
-             entry (ReplEntry.init number
-                                   input
-                                   (String.copy (if succeeded "ok" "error"))
-                                   definitions
-                                   dependencies
-                                   false)]
-      (Array.push-back! (ReplEngineState.events engine) (ReplEntry.copy &entry))
+               (the (Array Int) []))]
       (when (Int./= before-generation @(ReplEngineState.generation engine))
         (for [i 0 (Array.length entries)]
-          (let [previous (Array.unsafe-nth entries i)]
-            (ReplEntry.set-stale! previous true))))
-
-      (when succeeded
-        (for [i 0 (Array.length entries)]
-          (let [previous (Array.unsafe-nth entries i)]
-            (when-do (and
-                (String.= (ReplEntry.status previous) "ok")
-                (and
-                  (not (Array.empty? (ReplEntry.definitions previous)))
-                  (or
-                    (not
-                      (active-input? engine
-                                     (SourceInput.id (ReplEntry.input previous))))
-                    (and
-                      (String.=
-                        (SourceInput.id (ReplEntry.input previous))
-                        (SourceInput.id (ReplEntry.input &entry)))
-                      (Int./= @(ReplEntry.number previous) number)))))
-              (ReplEntry.set-status! previous (String.copy "superseded"))
-              (ReplEntry.set-stale! previous true)))))
-      (ReplEngineState.set-editing! engine 0)
+          (ReplEntry.set-stale! (Array.unsafe-nth entries i) true)))
       (for [i 0 (Array.length &affected)]
         (ReplEntry.set-stale!
           (Array.unsafe-nth entries (Int.dec @(Array.unsafe-nth &affected i)))
           true))
-      (if (and succeeded (Int.> editing 0))
-        (Array.aset! entries (Int.dec editing) entry)
-        (Array.push-back! entries entry))
+      (ReplJournal.record! entries
+                           (ReplEngineState.events engine)
+                           (ReplEntry.init 0
+                                           input
+                                           (String.copy (if succeeded
+                                                          "ok"
+                                                          "error"))
+                                           definitions
+                                           dependencies
+                                           false)
+                           (if succeeded editing 0))
+      (ReplJournal.supersede! entries
+                              (SessionOverlay.inputs
+                                (Array.unsafe-nth
+                                  (CompilerSession.overlay (ReplEngineState.session engine))
+                                  0)))
+      (ReplEngineState.set-editing! engine 0)
       (ReplEngineState.set-pending-input! engine [])
       (ReplEngineState.set-pending-dependencies! engine [])
       answer)))
@@ -918,7 +892,7 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
               (CompilerSession.overlay (ReplEngineState.session engine))
               0))]
       (and
-        (ReplCheckpoints.accepted? inputs (ReplEntry.input entry))
+        (ReplJournal.accepted? inputs (ReplEntry.input entry))
         (and
           (not (Array.empty? (ReplEntry.definitions entry)))
           (or (String.= (ReplEntry.status entry) "ok")
@@ -1119,37 +1093,44 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
       (Session.upsert-input candidate declarations))))
 
 (defmodule ReplEngine
-  (defn- view-query! [engine view request selected]
+  (defn- view-query! [engine queries view request provider browsing columns]
     (let-do [key (fmt "%s/%d/%s"
                       &(Type.render (Box.peek (NativeView.type view)))
-                      @(CoreRef.id selected)
-                      (CoreRef.name selected))
-             queries (ReplEngineState.view-queries engine)
+                      @(CoreRef.id provider)
+                      (CoreRef.name provider))
              index -1]
       (for [i 0 (Array.length queries)]
-        (when (and
-            (String.= &key (ReplViewQuery.key (Array.unsafe-nth queries i)))
-            (not
-              (Array.contains?
-                (JitSession.retired (ReplEngineState.jit engine))
-                (ReplPreparedResult.publication
-                  (ReplViewQuery.prepared (Array.unsafe-nth queries i))))))
-          (set! index i)))
-      (if (>= index 0)
+        (let [query (Array.unsafe-nth queries i)]
+          (when (and
+              (String.= &key (ReplViewQuery.key query))
+              (not
+                (Array.contains?
+                  (JitSession.retired (ReplEngineState.jit engine))
+                  (ReplPreparedResult.publication (ReplViewQuery.prepared query)))))
+            (set! index i))))
+      (if (Int.>= index 0)
         (let-do [channel (Pointer.to-ref
                    @(ReplViewQuery.input (Array.unsafe-nth queries index)))]
           (ReplViewInput.set-source! channel @(NativeView.address view))
           (ReplViewInput.set-request! channel @request)
+          (ReplViewInput.set-columns! channel columns)
           (Result.Success index))
         (let [channel (Pointer.unsafe-alloc
-                (ReplViewInput.init @(NativeView.address view) @request))]
+                (ReplViewInput.init @(NativeView.address view)
+                                    @request
+                                    (Long.from-int @(ReplEngineState.generation engine))
+                                    0
+                                    -1
+                                    0
+                                    columns))]
           (match (prepare-result engine
                                  (ReplEngineState.session engine)
                                  (ReplEngineState.jit engine)
                                  &(SourceInput.init @"repl:view"
                                                     (ReplViewQueries.source channel
                                                                             &(Type.render (Box.peek (NativeView.type view)))
-                                                                            (CoreRef.name selected)))
+                                                                            (CoreRef.name provider)
+                                                                            browsing))
                                  &[])
             (Result.Error error)
               (do (ReplViewQueries.discard-input channel) (Result.Error error))
@@ -1176,64 +1157,37 @@ the last evaluated cell. Fresh C-backend compilation is an explicit render-c.")
             (Maybe.Nothing)
               (Result.Success
                 (ReplInspect.render (ReplEngineState.jit engine) &view request))
-            (Maybe.Just selected)
-              (match (view-query! engine &view request &selected)
+            (Maybe.Just provider)
+              (match (view-query! engine
+                                  (ReplEngineState.view-queries engine)
+                                  &view
+                                  request
+                                  &provider
+                                  false
+                                  80)
                 (Result.Error error) (Result.Error error)
                 (Result.Success index)
                   (let [query (Array.unsafe-nth (ReplEngineState.view-queries engine)
                                                 index)
-                        prepared (ReplViewQuery.prepared query)]
-                    (let-do [_run (ignore
-                               (LLVM.call-i32 @(ReplPreparedResult.address prepared)))
-                             value (ReplValue.init 0
-                                                   @"ReplViewPresentation"
-                                                   @(ReplPreparedResult.type-info prepared)
-                                                   @(ReplPreparedResult.publication prepared)
-                                                   @(ReplPreparedResult.slot prepared))
-                             result-view (NativeView.init
-                               @(ReplValueSlot.address
-                                 (Pointer.to-ref @(ReplValue.slot &value)))
-                               @(ReplValue.type-info &value)
-                               @(ReplValue.publication &value)
-                               false)
-                             available (ReplInspect.navigate (ReplEngineState.jit engine)
-                                                             &result-view
-                                                             &[@"available"])
-                             text (ReplInspect.navigate (ReplEngineState.jit engine)
-                                                        &result-view
-                                                        &[@"text"])
-                             answer (match available
-                               (Result.Error error)
-                                 (Result.Error (diagnostic error))
-                               (Result.Success flag)
-                                 (if (=
-                                     (ReplInspect.byte-at @(NativeView.address &flag))
-                                     (Byte.from-int 0))
-                                   (if (String.empty? (InspectRequest.view request))
-                                     (Result.Success
-                                       (ReplInspect.render (ReplEngineState.jit engine)
-                                                           &view
-                                                           request))
-                                     (Result.Error
-                                       (diagnostic
-                                         (fmt "no applicable view %s"
-                                              (InspectRequest.view request)))))
-                                   (match text
-                                     (Result.Error error)
-                                       (Result.Error (diagnostic error))
-                                     (Result.Success output)
-                                       (let [rendered (ReplInspect.render (ReplEngineState.jit engine)
-                                                                          &output
-                                                                          &(InspectRequest.init 0
-                                                                                                @(InspectRequest.count request)
-                                                                                                @(InspectRequest.depth request)
-                                                                                                @(InspectRequest.bytes request)
-                                                                                                true
-                                                                                                @""
-                                                                                                false))]
-                                         (Result.Success rendered)))))]
-                      (ReplValues.reset-slot! @(ReplPreparedResult.slot prepared))
-                      answer))))))))
+                        bytes @(InspectRequest.bytes request)]
+                    (match (ReplViewQueries.invoke! (ReplEngineState.jit engine)
+                                                    query
+                                                    (fn [jit value]
+                                                      (ReplViewDecode.presentation jit
+                                                                                   value
+                                                                                   bytes)))
+                      (Result.Error error) (Result.Error (diagnostic error))
+                      (Result.Success (Maybe.Just text)) (Result.Success text)
+                      (Result.Success (Maybe.Nothing))
+                        (if (String.empty? (InspectRequest.view request))
+                          (Result.Success
+                            (ReplInspect.render (ReplEngineState.jit engine)
+                                                &view
+                                                request))
+                          (Result.Error
+                            (diagnostic
+                              (fmt "no applicable view %s"
+                                   (InspectRequest.view request)))))))))))))
 
 (load "engine-browse.carp")
 (load "engine-checkpoint.carp")

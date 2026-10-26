@@ -623,6 +623,22 @@ class ReplTests(unittest.TestCase):
             history = terminal.until("λ> ".encode())
             self.assertNotIn(b"interrupted", history)
 
+    def test_export_path_validation_is_identical_when_execution_is_stopped(self):
+        with Terminal() as terminal:
+            for command in (b":export", b":export-transcript"):
+                terminal.send(command + b"\r")
+                terminal.until(b"expected an export path")
+                terminal.until("λ> ".encode())
+            terminal.send(b'(do (println* "export-validation-loop") (while true ()))\r')
+            terminal.until(b"export-validation-loop\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            for command in (b":export", b":export-transcript"):
+                terminal.send(command + b"\r")
+                terminal.until(b"expected an export path")
+                terminal.until("λ> ".encode())
+
     def test_native_loop_interrupt_retains_source_and_requires_reinitialization(self):
         with Terminal() as terminal:
             terminal.result(b"(def retained 21)", b"retained : Int")

@@ -1,55 +1,40 @@
 ; Loaded by engine.carp. Compiler and native ownership stay behind the view client.
 (defmodule ReplEngine
-  (defn- browse-call! [engine index operation object row request columns]
+  (defn- browse-call! [engine index operation object row request columns decode]
     (let-do [query (Array.unsafe-nth (ReplEngineState.browse-queries engine)
                                      index)
-             channel (Pointer.to-ref @(ReplBrowseQuery.input query))
-             prepared (ReplBrowseQuery.prepared query)]
-      (ReplBrowseInput.set-generation! channel
-                                       (Long.from-int @(ReplEngineState.generation engine)))
-      (ReplBrowseInput.set-operation! channel operation)
-      (ReplBrowseInput.set-object! channel object)
-      (ReplBrowseInput.set-row! channel row)
-      (ReplBrowseInput.set-request! channel @request)
-      (ReplBrowseInput.set-columns! channel columns)
-      (ignore (LLVM.call-i32 @(ReplPreparedResult.address prepared)))))
+             channel (Pointer.to-ref @(ReplViewQuery.input query))]
+      (ReplViewInput.set-generation! channel
+                                     (Long.from-int @(ReplEngineState.generation engine)))
+      (ReplViewInput.set-operation! channel operation)
+      (ReplViewInput.set-object! channel object)
+      (ReplViewInput.set-row! channel row)
+      (ReplViewInput.set-request! channel @request)
+      (ReplViewInput.set-columns! channel columns)
+      (ReplViewQueries.invoke! (ReplEngineState.jit engine) query decode)))
 
   (defn- browse-page! [engine index operation object row request columns]
-    (let-do [_run (browse-call! engine
-                                index
-                                operation
-                                object
-                                row
-                                request
-                                columns)
-             prepared (ReplBrowseQuery.prepared
-               (Array.unsafe-nth (ReplEngineState.browse-queries engine) index))
-             slot @(ReplPreparedResult.slot prepared)
-             value (NativeView.init
-               @(ReplValueSlot.address (Pointer.to-ref slot))
-               @(ReplPreparedResult.type-info prepared)
-               @(ReplPreparedResult.publication prepared)
-               false)
-             answer (ReplViewDecode.page (ReplEngineState.jit engine)
-                                         &value
-                                         (Long.from-int @(ReplEngineState.generation engine)))]
-      (ReplValues.reset-slot! slot)
-      answer))
+    (let [generation (Long.from-int @(ReplEngineState.generation engine))]
+      (browse-call! engine
+                    index
+                    operation
+                    object
+                    row
+                    request
+                    columns
+                    (fn [jit value] (ReplViewDecode.page jit value generation)))))
 
   (defn- browse-release! [engine owner]
-    (let-do [index @(ReplBrowseOwner.query owner)]
-      (when-do (Int.>= index 0)
+    (let [index @(ReplBrowseOwner.query owner)]
+      (when (Int.>= index 0)
         (browse-call! engine
                       index
                       3
                       @(ReplBrowseOwner.object owner)
                       0
                       (ReplBrowseOwner.request owner)
-                      @(ReplBrowseOwner.columns owner))
-        (ReplValues.reset-slot!
-          @(ReplPreparedResult.slot
-            (ReplBrowseQuery.prepared
-              (Array.unsafe-nth (ReplEngineState.browse-queries engine) index)))))))
+                      @(ReplBrowseOwner.columns owner)
+                      (fn [-jit -value] ())))))
 
   (defn- clear-browse! [engine]
     (let-do [owners (ReplEngineState.browse-owners engine)]
@@ -57,13 +42,15 @@
         (browse-release! engine (Array.unsafe-nth owners (Int.dec i))))
       (ReplEngineState.set-browse-owners! engine [])
       (when (Int.> (Array.length (ReplEngineState.browse-queries engine)) 0)
-        (let-do [index 0]
-          (browse-call! engine index 4 -1 0 &(ReplInspect.defaults) 80)
-          (ReplValues.reset-slot!
-            @(ReplPreparedResult.slot
-              (ReplBrowseQuery.prepared
-                (Array.unsafe-nth (ReplEngineState.browse-queries engine) index))))))
-      (ReplViewQueries.clear-browse-queries! (ReplEngineState.browse-queries engine))))
+        (browse-call! engine
+                      0
+                      4
+                      -1
+                      0
+                      &(ReplInspect.defaults)
+                      80
+                      (fn [-jit -value] ())))
+      (ReplViewQueries.clear! (ReplEngineState.browse-queries engine))))
 
   (defn- close-result-views! [engine number]
     (let-do [owners (ReplEngineState.browse-owners engine)
@@ -77,55 +64,6 @@
           (when (Int.< @(ReplBrowseOwner.result owner) number)
             (Array.push-back! &keep @owner))))
       (ReplEngineState.set-browse-owners! engine keep)))
-
-  (defn- browse-query! [engine view provider request columns]
-    (let-do [key (fmt "%s/%d/%s"
-                      &(Type.render (Box.peek (NativeView.type view)))
-                      @(CoreRef.id provider)
-                      (CoreRef.name provider))
-             queries (ReplEngineState.browse-queries engine)
-             index -1]
-      (for [i 0 (Array.length queries)]
-        (when (and
-            (String.= &key (ReplBrowseQuery.key (Array.unsafe-nth queries i)))
-            (not
-              (Array.contains?
-                (JitSession.retired (ReplEngineState.jit engine))
-                (ReplPreparedResult.publication
-                  (ReplBrowseQuery.prepared (Array.unsafe-nth queries i))))))
-          (set! index i)))
-      (if (Int.>= index 0)
-        (do
-          (ReplBrowseInput.set-source!
-            (Pointer.to-ref
-              @(ReplBrowseQuery.input (Array.unsafe-nth queries index)))
-            @(NativeView.address view))
-          (Result.Success index))
-        (let [channel (Pointer.unsafe-alloc
-                (ReplBrowseInput.init @(NativeView.address view)
-                                      @request
-                                      (Long.from-int @(ReplEngineState.generation engine))
-                                      0
-                                      -1
-                                      0
-                                      columns))]
-          (match (prepare-result engine
-                                 (ReplEngineState.session engine)
-                                 (ReplEngineState.jit engine)
-                                 &(SourceInput.init @"repl:browse"
-                                                    (ReplViewQueries.browse-source channel
-                                                                                   &(Type.render (Box.peek (NativeView.type view)))
-                                                                                   (CoreRef.name provider)))
-                                 &[])
-            (Result.Error error)
-              (do
-                (let [-owned (Pointer.to-value channel)] (Pointer.free channel))
-                (Result.Error @(Diagnostic.message &error)))
-            (Result.Success prepared)
-              (do
-                (Array.push-back! queries
-                                  (ReplBrowseQuery.init key channel prepared))
-                (Result.Success (Int.dec (Array.length queries)))))))))
 
   (defn- keep-view! [engine page result query original request columns]
     (let-do [serial @(ReplEngineState.next-browse engine)
@@ -159,8 +97,15 @@ returned handle owns a registration, which must be released by the client.")
                                         -1l)
                                       request)
                (Maybe.Just provider)
-                 (match (browse-query! engine view &provider request columns)
-                   (Result.Error error) (Result.Error error)
+                 (match (view-query! engine
+                                     (ReplEngineState.browse-queries engine)
+                                     view
+                                     request
+                                     &provider
+                                     true
+                                     columns)
+                   (Result.Error error)
+                     (Result.Error @(Diagnostic.message &error))
                    (Result.Success index)
                      (do
                        (set! query index)
