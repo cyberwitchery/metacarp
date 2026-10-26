@@ -1,0 +1,192 @@
+(load "engine.carp")
+(load "commands.carp")
+(load "worker-protocol.carp")
+
+(deftype ReplConsole [emit (Fn [ReplConsoleEffect] ())])
+(defmodule ReplConsole
+  (defn send [console effect]
+    (let [emit @(ReplConsole.emit console)] (emit effect)))
+  (defn print [console text]
+    (unless (String.empty? text) (send console (ReplConsoleEffect.Output @text))))
+  (defn error [console diagnostic source]
+    (send console (ReplConsoleEffect.Diagnostic @diagnostic @source)))
+  (defn answer [console engine answer source]
+    (match answer
+      (Result.Success text) (print console &text)
+      (Result.Error diagnostic)
+        (error console
+               &diagnostic
+               &(ReplEngine.error-source engine &diagnostic source)))))
+
+(defn repl-help-text [command]
+  (String.concat
+    &[(fmt "usage: %s [--core <dir>] [--history <file> | --no-history]" command)
+      @"
+
+Core defaults to $CARP_DIR/core. Requires macOS, LLVM, and clang.
+
+"
+      (ReplCommands.help)
+      @"
+
+Enter submits complete input; incomplete input continues on a new line.
+Ctrl-J inserts a newline; Alt-Enter forces submission for a diagnostic.
+Up/Down recall history; arrows, Home/End, Ctrl-A/E, Ctrl-W/K/Y edit.
+Ctrl-R searches history. Ctrl-_ undoes buffer changes.
+Tab completes the symbol at the cursor; F1 shows docs; F2 checks without
+executing. Feedback disappears when its source or cursor changes.
+Pasted newlines stay editable. Ctrl-C cancels; Ctrl-D exits an empty prompt.
+NO_COLOR disables highlighting.
+
+History persists at $METACARP_HISTORY, or under $XDG_STATE_HOME/metacarp
+(default $HOME/.local/state/metacarp). Loading history never evaluates it.
+Owned results have _1, _2, ... aliases; _ is the newest, with 32 live slots.
+Owned aliases borrow their values; scalar aliases copy. Use @ to copy an owner.
+Function and value revisions preserve unrelated native globals and live results.
+Historical values keep their published code until reset. Type, interface,
+foreign, and compile-time definition changes reset native state.
+Compiler failures preserve accepted definitions; runtime effects cannot roll back.
+Ctrl-C during execution discards native values and retains accepted source.
+Use :reinit to rebuild declarations explicitly; past expressions are not replayed."]))
+
+(defn repl-engine-command [engine source console]
+  (let-do [input (ReplCommands.parse source)
+           command (ReplCommandInput.name &input)
+           argument @(ReplCommandInput.arguments &input)
+           arguments (String.words &argument)
+           name (String.join " " &arguments)]
+    (cond
+      (String.= command ":reset")
+        (ReplConsole.answer console engine (ReplEngine.reset engine) &argument)
+      (String.= command ":type")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.type-of engine &argument)
+                            &argument)
+      (String.= command ":expand")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.expand engine &argument)
+                            &argument)
+      (String.= command ":expand-1")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.expand-once engine &argument)
+                            &argument)
+      (String.= command ":ownership")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.ownership engine &name)
+                            &argument)
+      (String.= command ":c")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.emit-c engine &argument)
+                            &argument)
+      (String.= command ":c-render")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.render-c engine &argument)
+                            &argument)
+      (String.= command ":llvm")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.emit-llvm engine &argument)
+                            &argument)
+      (String.= command ":doc")
+        (ReplConsole.answer console
+                            engine
+                            (ReplEngine.documentation engine &name)
+                            &argument)
+      (String.= command ":complete")
+        (ReplConsole.print console &(ReplEngine.complete engine &name))
+      (String.= command ":results")
+        (ReplConsole.print console &(ReplEngine.results engine))
+      (String.= command ":browse")
+        (match (if (Array.empty? &arguments)
+            (Maybe.Nothing)
+            (ReplInput.nonnegative-int (Array.unsafe-nth &arguments 0)))
+          (Maybe.Nothing)
+            (ReplConsole.error console
+                               &(Diagnostic.init @"repl"
+                                                 (String.copy "repl: expected a result number")
+                                                 (Maybe.Nothing))
+                               "")
+          (Maybe.Just number)
+            (match (ReplEngine.open-view engine
+                                         number
+                                         &(Array.slice &arguments
+                                                       1
+                                                       (Array.length &arguments))
+                                         80
+                                         20)
+              (Result.Error error)
+                (ReplConsole.error console
+                                   &(Diagnostic.init @"repl"
+                                                     error
+                                                     (Maybe.Nothing))
+                                   "")
+              (Result.Success page)
+                (ReplConsole.send console (ReplConsoleEffect.Browse page))))
+      (or (String.= command ":inspect") (String.= command ":drop"))
+        (match (if (Array.empty? &arguments)
+            (Maybe.Nothing)
+            (ReplInput.nonnegative-int (Array.unsafe-nth &arguments 0)))
+          (Maybe.Just number)
+            (ReplConsole.answer console
+                                engine
+                                (if (String.= command ":inspect")
+                                  (ReplEngine.inspect-path engine
+                                                           number
+                                                           &(Array.slice &arguments
+                                                                         1
+                                                                         (Array.length &arguments)))
+                                  (ReplEngine.drop-result engine number))
+                                &argument)
+          (Maybe.Nothing)
+            (ReplConsole.error console
+                               &(Diagnostic.init @"repl"
+                                                 (String.copy "repl: expected a result number")
+                                                 (Maybe.Nothing))
+                               ""))
+
+      (or (String.= command ":edit") (String.= command ":replay"))
+        (match (ReplInput.nonnegative-int &name)
+          (Maybe.Nothing)
+            (ReplConsole.error console
+                               &(Diagnostic.init @"repl"
+                                                 (String.copy "repl: expected an input number")
+                                                 (Maybe.Nothing))
+                               "")
+          (Maybe.Just number)
+            (match (ReplEngine.begin-edit engine number)
+              (Result.Error error) (ReplConsole.error console &error &argument)
+              (Result.Success previous)
+                (if (String.= command ":edit")
+                  (ReplConsole.send console (ReplConsoleEffect.Seed previous))
+                  (ReplConsole.answer console
+                                      engine
+                                      (ReplEngine.submit engine &previous)
+                                      &previous))))
+      (or (String.= command ":remove") (String.= command ":remove!"))
+        (match (ReplInput.nonnegative-int &name)
+          (Maybe.Nothing)
+            (ReplConsole.error console
+                               &(Diagnostic.init @"repl"
+                                                 (String.copy "repl: expected an input number")
+                                                 (Maybe.Nothing))
+                               "")
+          (Maybe.Just number)
+            (ReplConsole.answer console
+                                engine
+                                (if (String.= command ":remove")
+                                  (ReplEngine.preview-remove engine number)
+                                  (ReplEngine.remove-entry engine number))
+                                &argument))
+
+      (ReplConsole.error console
+                         &(Diagnostic.init @"repl"
+                                           (fmt "unknown command %s; use :help"
+                                                command)
+                                           (Maybe.Nothing))
+                         ""))))

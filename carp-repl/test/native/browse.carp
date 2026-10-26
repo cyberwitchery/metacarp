@@ -1,0 +1,486 @@
+(load "../../engine.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+(register browse-temp (Fn [(Ptr CChar)] (Ptr CChar)) "mkdtemp")
+(register browse-rmdir (Fn [(Ptr CChar)] Int) "rmdir")
+
+(defn browse-core []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Nothing) @"/missing-test-core"
+    (Maybe.Just root)
+      (if (String.ends-with? &root "/core") root (String.append &root "/core"))))
+
+(defn native-fallback-tests [engine initial]
+  (let-do [test @initial
+           number @(ReplEngineState.next-result engine)
+           accepted (ReplEngine.submit engine
+                                       "(let [label @\"capture\" xs [10 20]] (fn [n] (Int.+ n (Int.+ (String.length &label) (Array.length &xs)))))")]
+    (set! test
+          (assert-true &test
+            (Result.success? &accepted)
+            "the fallback fixture retains a capturing closure"))
+    (match (ReplEngine.open-view engine number &[] 80 8)
+      (Result.Error error)
+        (set! test
+              (assert-equal &test
+                "a native Raw view"
+                &error
+                "closures without a view provider use their published layout"))
+      (Result.Success page)
+        (let-do [handle @(ReplViewPage.handle &page)
+                 items (ReplViewPage.items &page)
+                 selected -1]
+          (set! test
+                (assert-equal &test
+                  "gtRawFor"
+                  (ReplViewPage.selector &page)
+                  "the fallback is the native Raw view"))
+          (set! test
+                (assert-equal &test
+                  2
+                  (Array.length items)
+                  "Raw exposes the actual closure capture count"))
+          (for [i 0 (Array.length items)]
+            (when (String.=
+                (Array.unsafe-nth
+                  (ReplViewItem.cells (Array.unsafe-nth items i))
+                  0)
+                "label")
+              (set! selected i)))
+          (set! test
+                (assert-true &test
+                  (Int.>= selected 0)
+                  "capture names come from the generating publication"))
+          (match (ReplEngine.view-request engine
+                                          &(ReplViewRequest.init @&handle
+                                                                 (ReplViewOperation.Select @"gtRawFor"
+                                                                                           selected)))
+            (Result.Error error)
+              (set! test
+                    (assert-equal &test
+                      "a string child view"
+                      &error
+                      "native Raw selection uses the capture's actual address"))
+            (Result.Success child)
+              (do
+                (set! test
+                      (assert-equal &test
+                        "capture"
+                        (ReplViewPage.text &child)
+                        "a native child uses its ordinary view provider"))
+                (ignore
+                  (ReplEngine.view-request engine
+                                           &(ReplViewRequest.init @&handle
+                                                                  (ReplViewOperation.Release))))
+                (set! test
+                      (assert-true &test
+                        (Result.success?
+                          &(ReplEngine.view-request engine
+                                                    &(ReplViewRequest.init @(ReplViewPage.handle &child)
+                                                                           (ReplViewOperation.Page @""
+                                                                                                   0
+                                                                                                   8
+                                                                                                   80
+                                                                                                   100))))
+                        "a Raw child remains pinned after its parent handle closes"))
+                (ignore
+                  (ReplEngine.view-request engine
+                                           &(ReplViewRequest.init @(ReplViewPage.handle &child)
+                                                                  (ReplViewOperation.Release))))))))
+    test))
+
+(defn native-tree-tests [engine initial]
+  (let-do [test @initial
+           number @(ReplEngineState.next-result engine)
+           source "(deftype BrowseBranch [])
+(defview browse-children [value BrowseBranch]
+  (do (ignore value)
+    (=> (View.tree)
+        (View.children (fn [] [(view-register 10) (view-register 20) (view-register 30)])))))
+(BrowseBranch.init)"
+           accepted (ReplEngine.submit engine source)
+           passed (and (Result.success? &accepted)
+                       (match (ReplEngine.open-view engine number &[] 80 2)
+                         (Result.Error error) (do (IO.errorln &error) false)
+                         (Result.Success page)
+                           (let-do [handle @(ReplViewPage.handle &page)
+                                    selected (ReplEngine.view-request engine
+                                                                      &(ReplViewRequest.init @&handle
+                                                                                             (ReplViewOperation.Select @"browse-children"
+                                                                                                                       1)))
+                                    valid (match-ref &selected
+                                      (Result.Error error)
+                                        (do (IO.errorln error) false)
+                                      (Result.Success child)
+                                        (String.= (ReplViewPage.text child) "20"))]
+                             (match selected
+                               (Result.Error _) ()
+                               (Result.Success child)
+                                 (ignore
+                                   (ReplEngine.view-request engine
+                                                            &(ReplViewRequest.init @(ReplViewPage.handle &child)
+                                                                                   (ReplViewOperation.Release)))))
+                             (ignore
+                               (ReplEngine.view-request engine
+                                                        &(ReplViewRequest.init handle
+                                                                               (ReplViewOperation.Release))))
+                             valid)))]
+    (assert-true &test
+      passed
+      "a native tree can register, render, and select children while its registry grows")))
+
+(defn native-summary-tests [engine initial]
+  (let-do [test @initial
+           sources [@"[@\"first\" @\"second\"]" @"[[10 20] [30 40]]"]
+           expected [@"second" @"[30 40]"]]
+    (for [i 0 (Array.length &sources)]
+      (let-do [number @(ReplEngineState.next-result engine)
+               accepted (ReplEngine.submit engine (Array.unsafe-nth &sources i))
+               actual (match accepted
+                 (Result.Error error) @(Diagnostic.message &error)
+                 (Result.Success _)
+                   (match (ReplEngine.open-view engine number &[] 80 8)
+                     (Result.Error error) error
+                     (Result.Success root)
+                       (let-do [handle @(ReplViewPage.handle &root)
+                                rendered (match (ReplEngine.view-request engine
+                                                                         &(ReplViewRequest.init @&handle
+                                                                                                (ReplViewOperation.Page @"gtRawFor"
+                                                                                                                        1
+                                                                                                                        2
+                                                                                                                        80
+                                                                                                                        100)))
+                                  (Result.Error error) error
+                                  (Result.Success page)
+                                    @(Array.unsafe-nth
+                                      (ReplViewItem.cells
+                                        (Array.unsafe-nth (ReplViewPage.items &page)
+                                                          0))
+                                      2))]
+                         (ignore
+                           (ReplEngine.view-request engine
+                                                    &(ReplViewRequest.init handle
+                                                                           (ReplViewOperation.Release))))
+                         rendered)))]
+        (set! test
+              (assert-equal &test
+                (Array.unsafe-nth &expected i)
+                &actual
+                "paging Raw rows does not offset the contents of each value"))))
+    test))
+
+(defn native-text-tests [engine initial]
+  (let-do [test @initial
+           number @(ReplEngineState.next-result engine)
+           accepted (ReplEngine.submit engine "@\"λxabcdef\"")]
+    (set! test
+          (assert-true &test
+            (Result.success? &accepted)
+            "the text fixture retains a native string"))
+    (match (ReplEngine.open-view engine number &[] 80 8)
+      (Result.Error error)
+        (set! test
+              (assert-equal &test
+                "a native text view"
+                &error
+                "a string opens its declared views"))
+      (Result.Success page)
+        (let-do [handle @(ReplViewPage.handle &page)
+                 expected [@"λx" @"abc" @"def" @""]]
+          (for [i 0 (Array.length &expected)]
+            (match (ReplEngine.view-request engine
+                                            &(ReplViewRequest.init @&handle
+                                                                   (ReplViewOperation.Page @"gtRawFor"
+                                                                                           (Int.* i
+                                                                                                  3)
+                                                                                           2
+                                                                                           80
+                                                                                           3)))
+              (Result.Error error)
+                (set! test
+                      (assert-equal &test
+                        "a native text window"
+                        &error
+                        "native text paging succeeds"))
+              (Result.Success slice)
+                (set! test
+                      (assert-equal &test
+                        (Array.unsafe-nth &expected i)
+                        (ReplViewPage.text &slice)
+                        "native text windows contain only source bytes and reach their end"))))
+          (ignore
+            (ReplEngine.view-request engine
+                                     &(ReplViewRequest.init handle
+                                                            (ReplViewOperation.Release))))))
+    test))
+
+(defn native-revision-tests [engine initial]
+  (let-do [test @initial
+           definition (ReplEngine.submit engine
+                                         "(defn browse-revised-count [] 1)")
+           call (ReplEngine.submit engine "(browse-revised-count)")
+           number @(ReplEngineState.next-result engine)
+           value (ReplEngine.submit engine "[10 20]")]
+    (set! test
+          (assert-true &test
+            (and (Result.success? &definition)
+                 (and (Result.success? &call) (Result.success? &value)))
+            "the revision fixture materializes a definition and an owned value"))
+    (match (ReplEngine.open-view engine number &[] 80 2)
+      (Result.Error error)
+        (set! test
+              (assert-equal &test
+                "a structured page"
+                &error
+                "the revision fixture opens a native view"))
+      (Result.Success root)
+        (let-do [generation @(ReplEngineState.generation engine)
+                 queries (Array.length (ReplEngineState.browse-queries engine))
+                 revision (ReplEngine.submit engine
+                                             "(defn browse-revised-count [] 2)")
+                 handle @(ReplViewPage.handle &root)]
+          (set! test
+                (assert-true &test
+                  (and (Result.success? &revision)
+                       (Int.= generation @(ReplEngineState.generation engine)))
+                  "an ordinary binding revision keeps the native generation live"))
+          (set! test
+                (assert-true &test
+                  (Result.success?
+                    &(ReplEngine.view-request engine
+                                              &(ReplViewRequest.init @&handle
+                                                                     (ReplViewOperation.Page @"array-items"
+                                                                                             0
+                                                                                             2
+                                                                                             80
+                                                                                             4096))))
+                  "a retained view handle remains usable after an unrelated revision"))
+          (match (ReplEngine.open-view engine number &[] 80 2)
+            (Result.Error error)
+              (set! test
+                    (assert-equal &test
+                      "a second structured page"
+                      &error
+                      "a new view can reuse its unaffected query"))
+            (Result.Success second)
+              (do
+                (set! test
+                      (assert-equal &test
+                        queries
+                        (Array.length (ReplEngineState.browse-queries engine))
+                        "an unrelated revision preserves the compiled view query"))
+                (ignore
+                  (ReplEngine.view-request engine
+                                           &(ReplViewRequest.init @(ReplViewPage.handle &second)
+                                                                  (ReplViewOperation.Release))))))
+          (ignore
+            (ReplEngine.view-request engine
+                                     &(ReplViewRequest.init handle
+                                                            (ReplViewOperation.Release))))))
+    test))
+
+(defn browse-tests [initial]
+  (let-do [test @initial
+           core (browse-core)
+           scratch @"/tmp/metacarp-view-test-XXXXXX"]
+    (ignore (browse-temp (String.cstr &scratch)))
+    (match (ReplEngine.create &core &scratch)
+      (Result.Error error)
+        (set! test
+              (assert-equal &test
+                "a working engine"
+                (Diagnostic.message &error)
+                "the view fixture loads Core"))
+      (Result.Success engine)
+        (do
+          (set! test
+                (assert-true &test
+                  (Result.success? &(ReplEngine.submit &engine "[10 20 30 40]"))
+                  "the source result is retained"))
+          (match (ReplEngine.open-view &engine 1 &[] 80 2)
+            (Result.Error error)
+              (set! test
+                    (assert-equal &test
+                      "a structured page"
+                      &error
+                      "the JIT returns a structured view reply"))
+            (Result.Success first)
+              (let-do [root @(ReplViewPage.handle &first)]
+                (set! test
+                      (assert-equal &test
+                        4
+                        @(ReplViewPage.total &first)
+                        "a decoded page keeps its total count"))
+                (set! test
+                      (assert-equal &test
+                        2
+                        (Array.length (ReplViewPage.items &first))
+                        "the native window is bounded"))
+                (match (ReplEngine.view-request &engine
+                                                &(ReplViewRequest.init @&root
+                                                                       (ReplViewOperation.Page @"array-items"
+                                                                                               2
+                                                                                               2
+                                                                                               80
+                                                                                               4096)))
+                  (Result.Error error)
+                    (set! test
+                          (assert-equal &test
+                            "the next page"
+                            &error
+                            "a retained handle changes its window"))
+                  (Result.Success next)
+                    (do
+                      (set! test
+                            (assert-equal &test
+                              2
+                              @(ReplViewItem.index
+                                (Array.unsafe-nth (ReplViewPage.items &next) 0))
+                              "paging uses the requested source index"))
+                      (set! test
+                            (assert-equal &test
+                              "30"
+                              (Array.unsafe-nth
+                                (ReplViewItem.cells
+                                  (Array.unsafe-nth (ReplViewPage.items &next) 0))
+                                1)
+                              "cells are copied out of native result storage"))))
+                (match (ReplEngine.view-request &engine
+                                                &(ReplViewRequest.init @&root
+                                                                       (ReplViewOperation.Select @"array-items"
+                                                                                                 2)))
+                  (Result.Error error)
+                    (set! test
+                          (assert-equal &test
+                            "the selected value"
+                            &error
+                            "selection calls the declared provider"))
+                  (Result.Success selected)
+                    (let-do [child @(ReplViewPage.handle &selected)]
+                      (set! test
+                            (assert-equal &test
+                              "30"
+                              (ReplViewPage.text &selected)
+                              "selection follows the original live value"))
+                      (ignore
+                        (ReplEngine.view-request &engine
+                                                 &(ReplViewRequest.init @&root
+                                                                        (ReplViewOperation.Release))))
+                      (set! test
+                            (assert-true &test
+                              (Result.error?
+                                &(ReplEngine.view-request &engine
+                                                          &(ReplViewRequest.init @&root
+                                                                                 (ReplViewOperation.Page @""
+                                                                                                         0
+                                                                                                         2
+                                                                                                         80
+                                                                                                         100))))
+                              "released handles are refused"))
+                      (set! test
+                            (assert-true &test
+                              (Result.success?
+                                &(ReplEngine.view-request &engine
+                                                          &(ReplViewRequest.init @&child
+                                                                                 (ReplViewOperation.Page @""
+                                                                                                         0
+                                                                                                         2
+                                                                                                         80
+                                                                                                         100))))
+                              "a child survives closing its parent handle"))
+                      (ignore (ReplEngine.drop-result &engine 1))
+                      (set! test
+                            (assert-true &test
+                              (Result.error?
+                                &(ReplEngine.view-request &engine
+                                                          &(ReplViewRequest.init @&child
+                                                                                 (ReplViewOperation.Page @""
+                                                                                                         0
+                                                                                                         2
+                                                                                                         80
+                                                                                                         100))))
+                              "dropping the source retires dependent handles before releasing storage"))
+                      (set! test
+                            (assert-equal &test
+                              "30"
+                              (ReplViewPage.text &selected)
+                              "an owned presentation survives native slot reuse and result release"))))))
+          (set! test
+                (assert-true &test
+                  (Result.success? &(ReplEngine.submit &engine "42"))
+                  "the engine continues after view release"))
+          (match (ReplEngine.open-view &engine 2 &[] 80 2)
+            (Result.Error error)
+              (set! test
+                    (assert-equal &test
+                      "a second page"
+                      &error
+                      "a later result has an independent handle"))
+            (Result.Success page)
+              (let-do [handle @(ReplViewPage.handle &page)]
+                (match (ReplEngine.view-request &engine
+                                                &(ReplViewRequest.init @&handle
+                                                                       (ReplViewOperation.Page @"gtRawFor"
+                                                                                               1
+                                                                                               2
+                                                                                               80
+                                                                                               4096)))
+                  (Result.Error error)
+                    (set! test
+                          (assert-equal &test
+                            "a scalar text window"
+                            &error
+                            "scalar paging succeeds"))
+                  (Result.Success slice)
+                    (set! test
+                          (assert-equal &test
+                            "2"
+                            (ReplViewPage.text &slice)
+                            "native scalar views apply byte offsets")))
+                (match (ReplEngine.view-request &engine
+                                                &(ReplViewRequest.init @&handle
+                                                                       (ReplViewOperation.Page @"gtRawFor"
+                                                                                               2
+                                                                                               2
+                                                                                               80
+                                                                                               4096)))
+                  (Result.Error error)
+                    (set! test
+                          (assert-equal &test
+                            "the end of scalar text"
+                            &error
+                            "scalar paging reaches its end"))
+                  (Result.Success slice)
+                    (set! test
+                          (assert-equal &test
+                            ""
+                            (ReplViewPage.text &slice)
+                            "native scalar views end rather than repeating")))
+                (ignore (ReplEngine.reset &engine))
+                (set! test
+                      (assert-true &test
+                        (Result.error?
+                          &(ReplEngine.view-request &engine
+                                                    &(ReplViewRequest.init handle
+                                                                           (ReplViewOperation.Page @""
+                                                                                                   0
+                                                                                                   2
+                                                                                                   80
+                                                                                                   100))))
+                        "reset rejects handles from the retired native generation"))
+                (set! test
+                      (assert-equal &test
+                        "42"
+                        (ReplViewPage.text &page)
+                        "decoded snapshots remain owned after the JIT generation is destroyed"))))
+          (set! test (native-summary-tests &engine &test))
+          (set! test (native-text-tests &engine &test))
+          (set! test (native-fallback-tests &engine &test))
+          (set! test (native-tree-tests &engine &test))
+          (set! test (native-revision-tests &engine &test))
+          (ReplEngine.dispose &engine)))
+    (ignore (browse-rmdir (String.cstr &scratch)))
+    test))
+
+(deftest test (browse-tests test))

@@ -1,0 +1,82 @@
+(load "../../process-native.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(register process-test-dup Int "F_DUPFD")
+(register process-test-session (Fn [Int] Int) "getsid")
+(register process-test-group (Fn [Int] Int) "getpgid")
+(defn spawned-worker? []
+  (let [leaked (ReplNative.flags 0 process-test-dup 223)]
+    (match (ReplProcessHost.start "/bin/sh"
+                                  &[@"-c"
+                                    (fmt
+                                      "test ! -e /dev/fd/%d && printf worker >&194; while :; do :; done"
+                                      leaked)]
+                                  false)
+      (Result.Error error)
+        (do (ignore (ReplNative.close leaked)) (IO.errorln &error) false)
+      (Result.Success process)
+        (let-do [ready false
+                 _closed (ReplNative.close leaked)
+                 bytes (Array.replicate 6 &0b)
+                 _flags (ReplTransport.nonblocking! @(ReplProcess.reader &process))
+                 until (Long.+ (ReplNative.now) 1000000000l)
+                 count 0l]
+          (while-do (and (Long.< count 6l) (Long.< (ReplNative.now) until))
+            (let [received (ReplNative.read @(ReplProcess.reader &process)
+                                            (Pointer.address
+                                              (Array.unsafe-nth &bytes
+                                                                (Long.to-int count)))
+                                            (Long.- 6l count))]
+              (if (Long.> received 0l)
+                (set! count (Long.+ count received))
+                (System.sleep-micros 1000))))
+          (set! ready
+                (and (Long.= count 6l)
+                     (and
+                       (String.= &(String.from-bytes &bytes) "worker")
+                       (and
+                         (Int.=
+                           (process-test-session @(ReplProcess.pid &process))
+                           @(ReplProcess.pid &process))
+                         (Int.=
+                           (process-test-group @(ReplProcess.pid &process))
+                           @(ReplProcess.pid &process))))))
+          (ReplProcessHost.terminate! &process)
+          (set! until (Long.+ (ReplNative.now) 1000000000l))
+          (while-do (and (not (ReplProcessHost.exited? &process))
+                         (Long.< (ReplNative.now) until))
+            (System.sleep-micros 1000))
+          (ReplProcessHost.close! &process)
+          (and ready @(ReplProcess.reaped &process))))))
+(defn detects-exit-with-open-channel? []
+  (match (ReplProcessHost.start "/bin/sh" &[@"-c" @"sleep 20 & exit 0"] false)
+    (Result.Error _) false
+    (Result.Success process)
+      (let-do [reader @(ReplProcess.reader &process)
+               _flags (ReplTransport.nonblocking! reader)
+               until (Long.+ (ReplNative.now) 1000000000l)
+               byte 0b]
+        (while-do (and
+            (not (ReplProcessHost.finished? &process))
+            (Long.< (ReplNative.now) until))
+          (System.sleep-micros 1000))
+        (let-do [detected (ReplProcessHost.finished? &process)
+                 held-open (Long.<
+                   (ReplNative.read reader (Pointer.address &byte) 1l)
+                   0l)]
+          (ReplProcessHost.terminate! &process)
+          (ignore (ReplProcessHost.exited? &process))
+          (ReplProcessHost.close! &process)
+          (and detected held-open)))))
+(deftest test
+  (assert-true test
+    (Result.success? &(ReplProcessHost.executable))
+    "the worker executable is resolved without PATH lookup")
+  (assert-true test
+    (spawned-worker?)
+    "a fresh session inherits only declared descriptors and can be terminated")
+  (assert-true test
+    (detects-exit-with-open-channel?)
+    "worker exit is detected even when a child holds the reply descriptor open"))

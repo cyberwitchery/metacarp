@@ -3,11 +3,13 @@
 import errno
 import argparse
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import signal
 import struct
 import subprocess
@@ -31,9 +33,10 @@ COMMAND = [BINARY, *([options.subcommand] if options.subcommand else [])]
 
 
 class Terminal:
-    def __init__(self, *options, color=True):
+    def __init__(self, *options, color=True, stderr_path=None):
         self.options = options
         self.color = color
+        self.stderr_path = stderr_path
 
     def __enter__(self):
         self.child, self.master = pty.fork()
@@ -43,6 +46,10 @@ class Terminal:
             os.environ.pop("NO_COLOR", None)
             if not self.color:
                 os.environ["NO_COLOR"] = "1"
+            if self.stderr_path is not None:
+                descriptor = os.open(self.stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.dup2(descriptor, 2)
+                os.close(descriptor)
             os.execv(BINARY, [*COMMAND, "--core", CORE, *self.options])
         self.initial_terminal = termios.tcgetattr(self.master)
         self.buffer = b""
@@ -412,9 +419,9 @@ class ReplTests(unittest.TestCase):
         result = self.run_repl("(def x 1)\n(println* x)\n:edit 1\n(def x 2)\n(println* x)\n:llvm x\n:q\n")
         self.assertEqual(result.stderr, "")
         self.assertIn("; source repl:1 revision 3", result.stdout)
-        self.assertIn("generation 1", result.stdout)
-        self.assertIn("store i32 2, ptr @C1_x__I", result.stdout)
-        self.assertNotIn("store i32 1, ptr @C1_x__I", result.stdout)
+        self.assertIn("generation 0", result.stdout)
+        self.assertRegex(result.stdout, r"store i32 2, ptr @carp_session_resident\d+_x95__C1_x__I")
+        self.assertNotIn("store i32 1", result.stdout)
 
     def test_documentation_at_a_parameter_declaration_uses_its_identity(self):
         with Terminal() as terminal:
@@ -587,6 +594,213 @@ class ReplTests(unittest.TestCase):
             terminal.send(b"\x03")
             terminal.next_prompt()
             terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_reinitialize_live_worker_restores_declared_initializers(self):
+        result = self.run_repl("(def x 10)\n(set! x 11)\nx\n:reinit\nx\n:q\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "x : Int\n11\n10\n")
+
+    def test_reinitialize_live_worker_discards_results_without_replaying_runtime_roots(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def counter 0)", b"counter : Int")
+            terminal.send(b"(defmacro install [] `(do (defn installed [] 42) (set! counter (Int.inc counter)) (installed)))\r")
+            terminal.next_prompt()
+            terminal.result(b"(install)", b"42")
+            terminal.result(b"counter", b"1")
+            terminal.result(b"[10 20]", b"[10 20]")
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.send(b":inspect 3\r")
+            terminal.until(b"no live result _3")
+            terminal.until("λ> ".encode())
+            terminal.result(b"counter", b"0")
+            terminal.result(b"(installed)", b"42")
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"counter", b"0")
+            terminal.send(b":history\r")
+            history = terminal.until("λ> ".encode())
+            self.assertNotIn(b"interrupted", history)
+
+    def test_export_path_validation_is_identical_when_execution_is_stopped(self):
+        with Terminal() as terminal:
+            for command in (b":export", b":export-transcript"):
+                terminal.send(command + b"\r")
+                terminal.until(b"expected an export path")
+                terminal.until("λ> ".encode())
+            terminal.send(b'(do (println* "export-validation-loop") (while true ()))\r')
+            terminal.until(b"export-validation-loop\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            for command in (b":export", b":export-transcript"):
+                terminal.send(command + b"\r")
+                terminal.until(b"expected an export path")
+                terminal.until("λ> ".encode())
+
+    def test_native_loop_interrupt_retains_source_and_requires_reinitialization(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(b'(do (println* "native-loop-started") (while true ()))\r')
+            terminal.until(b"native-loop-started\r\n")
+            started = time.monotonic()
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            self.assertLess(time.monotonic() - started, 2)
+            terminal.result(b":defs", b"retained : Int")
+            terminal.send(b"(Int.* retained 2)\r")
+            terminal.until(b"execution worker is stopped")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
+    def test_native_program_arguments_preserve_the_public_invocation(self):
+        with Terminal("--no-history") as terminal:
+            terminal.result(b"(StaticArray.length &System.args)", str(len(COMMAND) + 3).encode())
+            terminal.result(b"(String.copy (StaticArray.unsafe-nth &System.args 0))", BINARY.encode())
+            terminal.result(b"(String.copy (StaticArray.unsafe-nth &System.args (Int.dec (StaticArray.length &System.args))))", b"--no-history")
+
+    def test_native_stderr_preserves_redirection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            errors = Path(directory) / "native.stderr"
+            with Terminal(stderr_path=errors) as terminal:
+                terminal.result(b'(do (IO.errorln "native-stderr-marker") 42)', b"42")
+                self.assertEqual(errors.read_text(), "native-stderr-marker\n")
+                self.assertNotIn(b"native-stderr-marker\r\n", terminal.raw)
+
+    def test_interrupting_a_mixed_macro_keeps_accepted_declarations_without_replaying_effects(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def counter 0)", b"counter : Int")
+            terminal.send(b'(defmacro install-and-spin [] `(do (defn installed [] 42) (set! counter (Int.inc counter)) (println* "mixed-native-started") (while true ())))\r')
+            terminal.next_prompt()
+            terminal.send(b"(install-and-spin)\r")
+            terminal.until(b"mixed-native-started\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.+ counter (installed))", b"42")
+            terminal.send(b":history\r")
+            terminal.until(b"interrupted, stale")
+            terminal.until("λ> ".encode())
+
+    def test_native_stdin_is_interactive_and_a_blocking_read_can_be_interrupted(self):
+        with Terminal() as terminal:
+            terminal.send('(do (println* "native-input-started") (String.= &(IO.get-line) "Grüße\\n"))\r'.encode())
+            terminal.until(b"native-input-started\r\n")
+            terminal.send("Grüße\r".encode())
+            terminal.until(b"true\r\n")
+            terminal.until("λ> ".encode())
+            terminal.send(b'(do (println* "native-read-blocked") (IO.get-line))\r')
+            terminal.until(b"native-read-blocked\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+
+    def test_native_crash_preserves_the_terminal_and_source(self):
+        with Terminal() as terminal:
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(b'(register crash-worker (Fn [] ()) "abort")\r')
+            terminal.next_prompt()
+            terminal.send(b"(crash-worker)\r")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
+    def test_interrupt_kills_native_children_that_ignore_sigint(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            pidfile = Path(directory) / "native-child.pid"
+            command = f"trap '' INT; echo $$ > {shlex.quote(str(pidfile))}; while :; do :; done"
+            terminal.send(f"(System.system {json.dumps(command)})\r".encode())
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                terminal.read_for(.02)
+            self.assertTrue(pidfile.exists(), f"the native child installed its signal disposition: {terminal.buffer!r}")
+            child = int(pidfile.read_text())
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(.01)
+            else:
+                self.fail("the native child survived worker interruption")
+
+    def test_a_blocked_explicit_preview_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            fifo = Path(directory) / "preview.fifo"
+            os.mkfifo(fifo, 0o600)
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(f"(defmacro blocked-preview [] (read-file {json.dumps(str(fifo))}))\r".encode())
+            terminal.next_prompt()
+            terminal.send(b"(blocked-preview)\x1bOQ")
+            terminal.read_for(.15)
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
+    def test_execution_children_stop_when_the_terminal_process_dies(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            pidfile = Path(directory) / "orphan-child.pid"
+            command = f"echo $$ > {shlex.quote(str(pidfile))}; while :; do :; done"
+            terminal.send(f"(System.system {json.dumps(command)})\r".encode())
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                terminal.read_for(.02)
+            self.assertTrue(pidfile.exists(), "the execution child started")
+            child = int(pidfile.read_text())
+            os.kill(terminal.child, signal.SIGKILL)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(.01)
+            else:
+                self.fail("the execution child outlived the terminal's lifeline")
+
+    def test_an_interrupted_edit_keeps_the_previously_accepted_source(self):
+        with tempfile.TemporaryDirectory() as directory, Terminal() as terminal:
+            fifo = Path(directory) / "edit.fifo"
+            exported = Path(directory) / "accepted.carp"
+            os.mkfifo(fifo, 0o600)
+            terminal.result(b"(def retained 21)", b"retained : Int")
+            terminal.send(f"(defmacro blocked-edit [] (read-file {json.dumps(str(fifo))}))\r".encode())
+            terminal.next_prompt()
+            terminal.send(b":edit 1\r")
+            terminal.until("λ[1]> ".encode())
+            terminal.send(b"\x01\x0b(blocked-edit)\r")
+            terminal.read_for(.15)
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(f":export {exported}\r".encode())
+            terminal.until(b"exported ")
+            terminal.until("λ> ".encode())
+            source = exported.read_text()
+            self.assertIn("(def retained 21)", source)
+            self.assertNotIn("\n(blocked-edit)", source)
+            terminal.send(b":history\r")
+            terminal.until(b"interrupted, stale")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.* retained 2)", b"42")
+
 
     def test_automatic_analysis_requires_an_explicit_compile_time_read(self):
         with Terminal() as terminal:
@@ -775,7 +989,8 @@ counter
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr.count("preview this revision"), 2, result.stderr)
         self.assertIn("3  dependent", result.stdout)
-        self.assertIn("inputs removed; native state reset", result.stdout)
+        self.assertIn("inputs removed; expressions were not replayed", result.stdout)
+        self.assertNotIn("native state reset", result.stdout)
         self.assertIn("counter : Int", result.stdout)
         self.assertNotIn("dependent :", result.stdout.split("inputs removed", 1)[1])
         self.assertIn("resolve:", result.stderr)
@@ -915,16 +1130,189 @@ visits
         self.assertIn("answer : (Fn [] Int)", result.stdout)
         self.assertIn("\n42\n", result.stdout)
 
-    def test_mixed_macro_expansion_is_rejected_atomically(self):
-        result = self.run_repl('''(defmacro mixed [] `(do (defn from-mixed [] 1) 42))
+    def test_mixed_macro_commits_declarations_and_runs_roots_once(self):
+        result = self.run_repl('''(defmacro mixed [] `(do (defn from-mixed [] 41) (IO.println "macro-effect") (Int.inc (from-mixed))))
 (mixed)
+(Int.+ _1 1)
+(defn unrelated-after-mixed [] 7)
 (from-mixed)
-(Int.+ 20 22)
 :q
 ''')
-        self.assertIn("both declarations and expressions", result.stderr)
-        self.assertIn("unknown binding from-mixed", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("macro-effect\n"), 1, result.stdout)
+        self.assertIn("\n42\n43\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("41\n"), result.stdout)
+
+    def test_failed_mixed_macro_preserves_definitions_and_live_values(self):
+        result = self.run_repl('''(def counter 0)
+(defmacro broken-mixed [] `(do (defn leaked-mixed [] 9) (IO.println "must-not-run") (Int.+ true 1)))
+(set! counter 7)
+(broken-mixed)
+counter
+(leaked-mixed)
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("must-not-run", result.stdout)
+        self.assertIn("infer:", result.stderr)
+        self.assertIn("unknown binding leaked-mixed", result.stderr)
+        self.assertTrue(result.stdout.endswith("7\n"), result.stdout)
+
+    def test_mixed_macro_uses_one_expansion_for_generated_names(self):
+        result = self.run_repl('''(defmacro fresh-mixed [] (let [name (gensym)] `(do (defn %name [] 42) (%name))))
+(fresh-mixed)
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("42\n"), result.stdout)
+
+    def test_mixed_macro_check_does_not_execute_or_commit(self):
+        with Terminal() as terminal:
+            terminal.send(b'(defmacro checked-mixed [] `(do (defn checked-answer [] 42) (IO.println "must-not-run") (checked-answer)))\r')
+            terminal.next_prompt()
+            terminal.raw = b""
+            terminal.send(b"(checked-mixed)\x1bOQ")
+            terminal.until(b"checked-answer : (Fn [] Int)")
+            self.assertNotIn(b"\r\nmust-not-run\r\n", terminal.raw)
+            terminal.send(b"\x03")
+            terminal.next_prompt()
+            terminal.send(b"(checked-answer)\r")
+            terminal.until(b"unknown binding checked-answer")
+            terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_mixed_macro_can_commit_types_functions_and_macros(self):
+        result = self.run_repl('''(defmacro bundle [] `(do (deftype MixedBox [value Int]) (defn make-mixed-box [] (MixedBox.init 42)) (defmacro bundled-answer [] 43) (make-mixed-box)))
+(bundle)
+:defs
+:inspect 1 value
+(bundled-answer)
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("MixedBox : type", result.stdout)
+        self.assertIn("make-mixed-box : (Fn [] MixedBox)", result.stdout)
+        self.assertIn("bundled-answer : macro", result.stdout)
+        self.assertIn("_1 value : (Ref Int)\n42", result.stdout)
+        self.assertTrue(result.stdout.endswith("43\n"), result.stdout)
+
+    def test_top_level_sequences_support_mixed_macro_output(self):
+        result = self.run_repl('''(defmacro sequenced [] `(do (defn from-sequence [] 42) (from-sequence)))
+(do (sequenced))
+(do (defn direct-sequence [] 43) (direct-sequence))
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("42\n43\n"), result.stdout)
+
+    def test_failed_mixed_macro_native_publication_is_atomic(self):
+        result = self.run_repl('''(def counter 0)
+(defmacro absent-mixed [] `(do (register absent-generated (Fn [] Int) "metacarp_repl_missing_generated_symbol") (IO.println "must-not-run") (absent-generated)))
+(set! counter 7)
+(absent-mixed)
+counter
+:defs
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("jit:", result.stderr)
+        self.assertNotIn("must-not-run", result.stdout)
+        self.assertNotIn("absent-generated :", result.stdout)
+        self.assertIn("\n7\n", result.stdout)
+
+    def test_mixed_macro_history_edits_and_export_preserve_caller_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active = Path(directory, "active.carp")
+            removed = Path(directory, "removed.carp")
+            result = self.run_repl(f'''(defmacro history-bundle [n] `(do (defn history-answer [] %n) (IO.println "export-effect") (history-answer)))
+  (history-bundle 42)
+:edit 2
+  (history-bundle 43)
+:export {active}
+:edit 2
+45
+(history-answer)
+:export {removed}
+:q
+''')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.count("export-effect\n"), 2, result.stdout)
+            self.assertIn("unknown binding history-answer", result.stderr)
+            exported = active.read_text()
+            self.assertIn("\n  (history-bundle 43)\n", exported)
+            self.assertNotIn("(history-bundle 42)", exported)
+            self.assertEqual(exported.count("(defn history-answer"), 1)
+            self.assertNotIn("(history-bundle 43)", removed.read_text())
+            replay = self.run_repl(exported + "(history-answer)\n:q\n")
+            self.assertEqual(replay.stderr, "")
+            self.assertEqual(replay.stdout.count("export-effect\n"), 1, replay.stdout)
+            self.assertTrue(replay.stdout.endswith("43\n43\n"), replay.stdout)
+
+    def test_runtime_macro_can_use_live_results_and_return_an_owned_string(self):
+        result = self.run_repl('''(defmacro passthrough [form] form)
+[10 20]
+(passthrough (Array.length _1))
+"abc"
+(passthrough _3)
+:inspect 4
+:results
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("\n2\n", result.stdout)
+        self.assertIn("_4 : String\nabc\n", result.stdout)
+        self.assertIn("_1 : (Array Int)", result.stdout)
+        self.assertIn("_4 : String", result.stdout)
+
+    def test_mixed_macro_preserves_module_scope_without_replaying_effects(self):
+        result = self.run_repl('''(defmacro scoped-bundle [] `(defmodule ScopedBundle (private secret) (defn secret [] 41) (defn answer [] (secret)) (defn __repl_scope_0 [] 100) (IO.println "scoped-effect") (Int.inc (secret))))
+(scoped-bundle)
+(defn after-scoped [] 9)
+(ScopedBundle.answer)
+(ScopedBundle.__repl_scope_0)
+:inspect 1
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("scoped-effect\n"), 1, result.stdout)
         self.assertIn("\n42\n", result.stdout)
+        self.assertIn("\n41\n100\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("_1 : Int\n42\n"), result.stdout)
+
+    def test_mixed_macro_preserves_nested_module_imports_and_live_aliases(self):
+        result = self.run_repl('''(defmodule MixedSource (defn answer [] 41))
+(defmacro imported-bundle [] `(defmodule MixedImports (use MixedSource) (defn value [] (answer)) (defmodule Inner (IO.println "nested-effect") (Int.+ (Array.length _1) (MixedImports.value)))))
+[10]
+(imported-bundle)
+(defn after-imports [] 0)
+(MixedImports.value)
+:inspect 2
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("nested-effect\n"), 1, result.stdout)
+        self.assertTrue(result.stdout.endswith("_2 : Int\n42\n"), result.stdout)
+
+    def test_mixed_macro_mutates_native_globals_only_when_executed(self):
+        result = self.run_repl('''(def counter 0)
+(defmacro mutate-and-define [] `(do (defn after-mutation [] 42) (set! counter (Int.inc counter)) counter))
+(set! counter 7)
+(mutate-and-define)
+(defn after-macro [] 9)
+counter
+:q
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("8\n"), 2, result.stdout)
+        self.assertTrue(result.stdout.endswith("8\n"), result.stdout)
 
     def test_view_queries_refresh_bounds_and_source_between_results(self):
         result = self.run_repl('''(deftype Tag [value Int])
@@ -1110,7 +1498,229 @@ counter
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout, "42\n42\n")
 
-    def test_owned_results_survive_additions_and_are_released_on_replacement(self):
+    def test_replacement_preserves_unrelated_globals_and_historical_values(self):
+        result=self.run_repl('''(def counter 0)
+(defn base [] 41)
+(defn answer [] (Int.inc (base)))
+(set! counter 7)
+[10 20]
+(fn [] (base))
+(answer)
+(defn base [] 42)
+(answer)
+counter
+:inspect 1
+(@_2)
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertNotIn('native state reset',result.stdout)
+        self.assertIn('\n43\n7\n_1 : (Array Int)\n[10 20]\n41\n',result.stdout)
+
+    def test_global_replacement_refreshes_dependents_and_preserves_unrelated_state(self):
+        result=self.run_repl('''(def unrelated 0)
+(def base 10)
+(defn answer [] (Int.inc base))
+(set! unrelated 7)
+(answer)
+(def base 20)
+(answer)
+unrelated
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertNotIn('native state reset',result.stdout)
+        self.assertTrue(result.stdout.endswith('21\n7\n'),result.stdout)
+
+    def test_replacement_preserves_native_template_static_state(self):
+        result=self.run_repl('''(deftemplate stable-counter (Fn [] Int) "int $NAME(void)" "$DECL { static int calls; return ++calls; }")
+(defn base [] 41)
+(stable-counter)
+(base)
+(defn base [] 42)
+(base)
+(stable-counter)
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertNotIn('native state reset',result.stdout)
+        self.assertTrue(result.stdout.endswith('42\n2\n'),result.stdout)
+
+    def test_failed_mixed_publication_restores_active_native_versions(self):
+        result=self.run_repl('''(register missing-target (Fn [] Int) "metacarp_missing_invalidation_target")
+(defn base [] 41)
+(defn answer [] (base))
+[10 20]
+(answer)
+(do (defn base [] 42) (missing-target))
+(answer)
+:inspect 1
+:q
+''')
+        self.assertIn('jit:',result.stderr)
+        self.assertTrue(result.stdout.endswith('41\n_1 : (Array Int)\n[10 20]\n'),result.stdout)
+
+    def test_inspection_uses_current_binding_without_compiling_old_generations(self):
+        result=self.run_repl('''(defn answer [] 41)
+(answer)
+(defn answer [] 42)
+:llvm answer
+(answer)
+(IO.println "LATEST-IR")
+:llvm answer
+:q
+''')
+        self.assertEqual(result.stderr,'')
+        self.assertIn('not compiled yet',result.stdout)
+        latest=result.stdout.split('LATEST-IR\n')[-1]
+        self.assertIn('ret i32 42',latest)
+        self.assertNotIn('ret i32 41',latest)
+
+    def test_edit_preserves_unchanged_initializers_in_the_same_input(self):
+        result = self.run_repl('''(do (def counter 0) (defn answer [] 41))
+(set! counter 7)
+(answer)
+:edit 1
+(do (def counter 0) (defn answer [] 42))
+(answer)
+counter
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("42\n7\n"), result.stdout)
+
+    def test_native_revision_names_cannot_collide_with_source_names(self):
+        result = self.run_repl('''(defn resident3_target [] 99)
+(defn target [] 1)
+(resident3_target)
+(target)
+(defn target [] 2)
+(target)
+(resident3_target)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("2\n99\n"), result.stdout)
+
+    def test_repeating_a_value_declaration_initializes_that_binding_again(self):
+        result = self.run_repl('''(def counter 0)
+(set! counter 7)
+(def counter 0)
+counter
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("0\n"), result.stdout)
+
+    def test_revision_follows_concrete_interface_implementation_edges(self):
+        result = self.run_repl('''(definterface revised-score (Fn [(Ref a)] Int))
+(deftype RevisedRecord [value Int])
+(defn record-score [value] @(RevisedRecord.value value))
+(implements revised-score record-score)
+(defn read-score [value] (revised-score value))
+(RevisedRecord.init 41)
+(read-score _1)
+(defn record-score [value] (Int.inc @(RevisedRecord.value value)))
+(read-score _1)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("42\n"), result.stdout)
+
+    def test_revision_updates_all_polymorphic_instances(self):
+        result = self.run_repl('''(def calls 0)
+(defn marked [value] (do (set! calls (Int.inc calls)) value))
+(marked 10)
+(marked @"old")
+calls
+(defn marked [value] (do (set! calls (Int.+ calls 10)) value))
+(marked 20)
+(marked @"new")
+calls
+:inspect 2
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertIn("\n2\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("22\n_2 : String\nold\n"), result.stdout)
+
+    def test_revisions_can_switch_between_functions_and_function_values(self):
+        result = self.run_repl('''(defn selected [] 41)
+(defn call-selected [] (selected))
+(call-selected)
+(def selected (fn [] 42))
+(call-selected)
+(defn selected [] 43)
+(call-selected)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        values = re.findall(r"^\d+$", result.stdout, re.M)
+        self.assertEqual(values, ["41", "42", "43"], result.stdout)
+        self.assertNotIn("native state reset", result.stdout)
+
+    def test_signature_revisions_preserve_historical_function_types(self):
+        result = self.run_repl('''(defn answer [] 41)
+(defn call-answer [] (answer))
+(fn [] (answer))
+(call-answer)
+(defn answer [] @"new")
+(call-answer)
+(@_1)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("new\n41\n"), result.stdout)
+
+    def test_global_revisions_keep_storage_used_by_historical_closures(self):
+        result = self.run_repl('''(def xs [1 2])
+(fn [] (Array.length &xs))
+(def xs [10 20 30])
+(Array.length &xs)
+(@_1)
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertTrue(result.stdout.endswith("3\n2\n"), result.stdout)
+
+    def test_revision_initializes_affected_globals_once(self):
+        result = self.run_repl('''(def calls 0)
+(defn base [] 41)
+(def value (do (set! calls (Int.inc calls)) (base)))
+value
+calls
+(defn base [] 42)
+value
+calls
+calls
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        values = re.findall(r"^\d+$", result.stdout, re.M)
+        self.assertEqual(values, ["41", "1", "42", "2", "2"], result.stdout)
+
+    def test_view_queries_follow_redefined_provider_dependencies(self):
+        result = self.run_repl('''(deftype RevisedBadge [])
+(defn badge-label [] @"before")
+(defview revised-badge [value RevisedBadge] (do (ignore value) (=> (View.text) (View.content (badge-label)))))
+(RevisedBadge.init)
+:inspect 1
+:browse 1
+(defn badge-label [] @"after")
+:inspect 1
+:browse 1
+:q
+''')
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
+        self.assertEqual(re.findall(r"^(before|after)$", result.stdout, re.M),
+                         ["before", "before", "before", "after", "after"], result.stdout)
+
+    def test_owned_results_survive_additions_and_replacement(self):
         result = self.run_repl('''(Int.+ 40 2)
 (Int.+ _ 1)
 (String.copy "kept")
@@ -1127,7 +1737,8 @@ counter
         self.assertIn("42\n43\nkept\n_3 : String\nkept", result.stdout)
         self.assertIn("_1 : Int", result.stdout)
         self.assertIn("_3 : String", result.stdout)
-        self.assertIn("no live result _3", result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("native state reset", result.stdout)
         self.assertTrue(result.stdout.endswith("42\n"), result.stdout)
 
     def test_result_release_preserves_older_values(self):
@@ -1248,6 +1859,199 @@ counter
         result = subprocess.run([*COMMAND, "--core"], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("needs a directory", result.stderr)
+
+    def test_browse_navigation_keeps_parent_state_and_returns_to_editing(self):
+        with Terminal() as terminal:
+            terminal.resize(10, 80)
+            terminal.send(b"[10 20 30 40 50 60 70 80 90 100]\r")
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("[gtRawFor]  depth 1", timeout=15)
+            terminal.send(b"\t")
+            terminal.displayed("[array-items]  depth 1")
+            terminal.send(b"\x1b[B\x1b[B\r")
+            terminal.displayed("depth 2")
+            terminal.displayed("30")
+            terminal.send(b"\x1b[D")
+            terminal.displayed("[array-items]  depth 1")
+            terminal.displayed("> 2 | 30")
+            terminal.send(b" ")
+            terminal.displayed("offset 6")
+            terminal.resize(8, 60)
+            terminal.read_for(.25)
+            terminal.displayed("offset 6")
+            terminal.raw = b""
+            terminal.read_for(.35)
+            self.assertEqual(terminal.raw, b"", "an idle view must not repaint")
+            terminal.send(b"q")
+            terminal.next_prompt()
+            terminal.send(b"(+ 20 22)\r")
+            terminal.until(b"42\r\n")
+            terminal.until("λ> ".encode())
+
+    def test_browse_switches_declared_views_and_ctrl_c_closes(self):
+        with Terminal(color=False) as terminal:
+            terminal.resize(10, 80)
+            terminal.send(b'"hello"\r')
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("[gtRawFor]", timeout=15)
+            terminal.send(b"\t")
+            terminal.displayed("[string-value]")
+            terminal.send(b"\t")
+            terminal.displayed("[string-bytes]")
+            terminal.displayed("104")
+            terminal.send(b"\x03")
+            terminal.next_prompt()
+            terminal.send(b":drop 1\r")
+            terminal.next_prompt()
+
+    def test_interrupting_a_native_view_callback_returns_to_the_editor(self):
+        with Terminal() as terminal:
+            terminal.send(b"(deftype BlockingBrowser [])\r")
+            terminal.next_prompt()
+            terminal.send(b'(defview blocking-send [value BlockingBrowser] (do (ignore value) (=> (View.list) (View.items (fn [] 1)) (View.item-format (fn [i] (do (ignore i) @"open"))) (View.send (fn [i] (do (ignore i) (println* "native-view-started") (while true ()) -1))))))\r')
+            terminal.next_prompt()
+            terminal.send(b"(BlockingBrowser.init)\r")
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("depth 1", timeout=15)
+            for _ in range(4):
+                if "[blocking-send]" in terminal.screen.text(False):
+                    break
+                terminal.send(b"\t")
+                terminal.read_for(.05)
+            terminal.displayed("[blocking-send]")
+            terminal.send(b"\r")
+            terminal.until(b"native-view-started\r\n")
+            terminal.send(b"\x03")
+            terminal.until(b"Use :reinit")
+            terminal.until("λ> ".encode())
+            terminal.send(b":reinit\r")
+            terminal.next_prompt()
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_keystrokes_during_a_native_view_callback_are_retained(self):
+        with Terminal() as terminal:
+            terminal.send(b"(deftype DelayedBrowser [])\r")
+            terminal.next_prompt()
+            terminal.send(b'(defview delayed-send [value DelayedBrowser] (do (ignore value) (=> (View.list) (View.items (fn [] 1)) (View.item-format (fn [i] (do (ignore i) @"open"))) (View.send (fn [i] (do (ignore i) (println* "native-view-delayed") (System.sleep-micros 250000) (view-register 7)))))))\r')
+            terminal.next_prompt()
+            terminal.send(b"(DelayedBrowser.init)\r")
+            terminal.next_prompt()
+            terminal.send(b":browse 1\r")
+            terminal.displayed("depth 1", timeout=15)
+            for _ in range(4):
+                if "[delayed-send]" in terminal.screen.text(False):
+                    break
+                terminal.send(b"\t")
+                terminal.read_for(.05)
+            terminal.displayed("[delayed-send]")
+            terminal.send(b"\r")
+            terminal.until(b"native-view-delayed\r\n")
+            terminal.send(b"q(Int.+ 20 22)\r")
+            terminal.until(b"42\r\n")
+            terminal.until("λ> ".encode())
+
+    def test_browse_renders_native_bitmap_pixels(self):
+        with Terminal() as terminal:
+            terminal.resize(10, 80)
+            terminal.send(b"(deftype BrowseSwatch [])\r")
+            terminal.next_prompt()
+            terminal.send(b'(defview swatch [x BrowseSwatch] (do (ignore x) (=> (View.bitmap) (View.extent 1 1) (View.pixels [255b 0b 0b 255b]))))\r')
+            terminal.next_prompt()
+            terminal.send(b"(BrowseSwatch.init)\r")
+            terminal.next_prompt()
+            terminal.raw = b""
+            terminal.send(b":browse 1\r")
+            terminal.displayed("1 x 1 RGBA", timeout=15)
+            terminal.until_style(b"\x1b[38;2;255;0;0m")
+            terminal.send(b"q")
+            terminal.next_prompt()
+
+    def test_browse_accepts_native_selectors(self):
+        result = self.run_repl("[10 20 30]\n:browse 1 1\n:q\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Int : Raw", result.stdout)
+        self.assertIn("\n20\n", result.stdout)
+
+    def test_browse_pipe_is_bounded_plain_output(self):
+        result = self.run_repl("[10 20 30]\n:browse 1\n:q\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("gtRawFor", result.stdout)
+        self.assertRegex(result.stdout, r">\s*0\s*\|\s*Int\s*\|\s*10")
+        self.assertNotIn("\x1b", result.stdout)
+
+    def test_long_command_output_pages_and_quit_preserves_the_repl(self):
+        with Terminal() as terminal:
+            terminal.resize(8, 60)
+            terminal.send(b":help\r")
+            terminal.until(b"lines 1-")
+            terminal.displayed("q close")
+            idle = len(terminal.raw)
+            terminal.read_for(.25)
+            self.assertEqual(len(terminal.raw), idle, "idle paging must not repaint")
+            before = len(terminal.raw)
+            terminal.send(b" ")
+            terminal.read_for(.15)
+            self.assertNotIn(b"\x1b[J", terminal.raw[before:])
+            terminal.send(b"q")
+            terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_repeated_resize_keeps_editing_and_paging_usable(self):
+        with Terminal() as terminal:
+            for cycle in range(8):
+                terminal.send(b"x")
+                terminal.displayed("λ> x")
+                terminal.resize(8 + cycle % 3, 60 + cycle % 5)
+                terminal.read_for(.03)
+                terminal.send(b"\x03")
+                terminal.next_prompt()
+                terminal.send(b":help\r")
+                terminal.until(b"lines 1-")
+                terminal.resize(9 + cycle % 3, 62 + cycle % 5)
+                terminal.read_for(.03)
+                terminal.send(b"q")
+                terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 20 22)", b"42")
+
+    def test_pager_search_and_cancel_return_to_editing(self):
+        with Terminal() as terminal:
+            terminal.resize(8, 60)
+            terminal.send(b":help\r")
+            terminal.until(b"lines 1-")
+            terminal.send(b"/History\r")
+            terminal.displayed("History persists")
+            terminal.resize(12, 42)
+            terminal.displayed("History persists")
+            terminal.send(b"\x03")
+            terminal.until("λ> ".encode())
+            terminal.result(b"(Int.+ 6 7)", b"13")
+
+    def test_termination_during_paging_restores_terminal_mode(self):
+        with Terminal() as terminal:
+            terminal.resize(8, 60)
+            terminal.send(b":help\r")
+            terminal.until(b"lines 1-")
+            os.kill(terminal.child, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                child, status = os.waitpid(terminal.child, os.WNOHANG)
+                if child:
+                    terminal.child = None
+                    self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGTERM)
+                    break
+                time.sleep(.05)
+            self.assertIsNone(terminal.child, "REPL did not terminate during paging")
+            self.assertEqual(termios.tcgetattr(terminal.master), terminal.initial_terminal)
+
+    def test_pipe_output_never_enters_the_pager(self):
+        result = self.run_repl(":help\n:q\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+        self.assertNotIn("lines 1-", result.stdout)
+        self.assertNotIn("\x1b", result.stdout)
 
     def test_up_down_and_draft_restore(self):
         with Terminal() as terminal:
@@ -1407,6 +2211,16 @@ counter
             terminal.displayed(b"2)")
             terminal.resize(12, 24)
             terminal.result(b"\x1b[D\x1b[D\x1b[3~3\x05", b"43")
+
+    def test_continue_and_resize_signals_preserve_the_edited_buffer(self):
+        with Terminal() as terminal:
+            terminal.send(b"(Int.+ 40 2)")
+            terminal.displayed("λ> (Int.+ 40 2)")
+            for _ in range(6):
+                os.kill(terminal.child, signal.SIGCONT)
+                terminal.resize(12, 80)
+                terminal.read_for(.04)
+            terminal.result(b"", b"42")
 
     def test_termination_restores_terminal_mode(self):
         with Terminal() as terminal:

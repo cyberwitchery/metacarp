@@ -101,6 +101,17 @@ location is `--history <file>`, `$METACARP_HISTORY`, or
 `$HOME/.local/state/metacarp/history`. `--no-history` or an empty
 `METACARP_HISTORY` disables persistence. Loading history never evaluates it.
 
+## Output
+
+Long command and result output opens a pager in an interactive terminal.
+Space, Page Down, or Ctrl-F advance a page; `b`, Page Up, or Ctrl-B go back.
+Arrows or `j`/`k` move one row. Home/End or `g`/`G` select the first/last page.
+`/` starts a literal Unicode search; Enter accepts it, and `n`/`N` repeat it
+forward/backward. Resizing reflows the same source position. `q`, Escape,
+Ctrl-C, or Ctrl-D close the pager and return to the REPL.
+
+Pipes and simple terminals receive the original output without paging.
+
 ## Session and results
 
 Definitions persist. Compiler errors leave accepted source available. Mixed
@@ -108,11 +119,19 @@ declarations and expressions are prepared before native execution: successful
 submissions commit declarations and execute runtime roots once. Native
 preparation failure preserves the previous semantic and runtime state.
 
-New unrelated runtime functions and values preserve native globals and result
-handles. Replacement, compile-time declarations, removal, and reset invalidate
-native state and release retained values before retiring their code. The REPL
-reports native resets. Declarations can still fail when first specialized;
-acceptance does not compile every possible polymorphic instance.
+Function and value revisions preserve unrelated native globals and result
+handles. The compiler compares resolved bodies and ABI declarations, then follows
+the emitted LLVM and C dependency graphs to invalidate affected specializations.
+Changed bindings receive fresh symbols. Historical values and view handles keep
+their original code; future inspection queries use current provider versions.
+Published versions stay resident until reset.
+
+Editing an input preserves its unchanged value initializers. Submitting a new
+value declaration explicitly initializes that binding again. Type, interface,
+foreign, and compile-time definition changes retain a conservative reset boundary.
+Reset releases retained values before retiring their code. The REPL reports
+native resets. Declarations can still fail when first specialized; acceptance
+does not compile every possible polymorphic instance.
 
 The final non-Unit value is retained in one of 32 live slots, with a monotonic
 `_N` alias; `_` names the newest. Scalars are copied into expression scope.
@@ -163,9 +182,46 @@ current native generation. Custom callbacks remain native user code and must
 bound their own work and allocations. This API belongs to the warm base and
 survives reset.
 
-Declaration-producing macros are classified after expansion. A single macro
-form that emits both declarations and runtime expressions is rejected before
-commit; use separate top-level forms for those two parts.
+`:browse N [selectors]` opens a structured viewer over a retained result.
+Up/Down or j/k move through rows, Space/Page Down and b/Page Up change pages,
+and Home/End jump within counted collections. Enter or Right opens the selected
+item; Left, Backspace, or h returns to the parent with its prior selection and
+page. Tab cycles declared views. `[` and `]` scroll wide tables horizontally.
+q, Escape, Ctrl-C, and Ctrl-D close the viewer. Pipes and simple terminals
+receive a bounded plain snapshot.
+
+Text views scroll and request further UTF-8 byte windows at their boundaries.
+Trees retain the displayed child leases until their window changes or the
+handle closes. Bitmap views sample RGBA pixels to the viewport and byte budget;
+color terminals display blocks, and `NO_COLOR` selects a monochrome rendering.
+Partial alpha is composited over black. Native Raw views use recorded fields,
+active sum payloads, sequence elements, and closure captures.
+
+The viewer receives owned pages and opaque generation-checked handles through
+`ReplViewClient`. Native pointers and callbacks stay inside the engine. Closing
+a parent does not invalidate a selected child; dropping its source result or
+retiring the runtime invalidates both. Provider windows are bounded before
+rendering, and an idle viewer does not repaint or invoke providers.
+
+A macro can emit declarations and runtime expressions in one top-level
+sequence. The compiler prepares one expanded syntax tree, commits its declaration
+projection, then executes its runtime roots once. Type, ownership, or native
+publication errors leave the previous session intact. Rebuilding accepted
+source restores declarations without executing its runtime roots. History and
+export retain the original invocation.
+
+```clojure
+(defmacro define-and-call [name value]
+  `(do (defn %name [] %value) (%name)))
+
+(define-and-call answer 42)
+; 42, retained as _1
+(answer)
+; 42
+```
+
+F2 checks the same prepared syntax without committing or executing it. Loading
+an exported source sequence in the REPL explicitly executes its runtime parts.
 
 ## Queries and editable source
 
@@ -220,8 +276,8 @@ artifacts and materialization caches only after publication and lookup succeed.
 A failed publication removes both modules. Inspection neither recompiles nor
 reads scratch files.
 
-C support belongs to its JIT session and native generation. Replacement and
-reset retire C code, LLVM code, caches, and artifacts together. A discarded
+C support belongs to its JIT session and native generation. ABI boundary changes
+and reset retire C code, LLVM code, caches, and artifacts together. A discarded
 staged session cannot leave native definitions in another session. The next
 successful call compiles the active template definition. Included runtime
 implementations use explicit compiler annotations to import existing host or
@@ -253,8 +309,19 @@ effects and displayed results.
 ## Boundaries and validation
 
 The terminal knows buffer text, cursor positions, and structured query replies.
-It has no compiler or JIT state. `protocol.carp` defines the narrow interface;
-`service.carp` runs one serialized compiler worker; `language.carp` adapts
+It has no compiler or JIT state. `protocol.carp` defines the language interface;
+`worker-protocol.carp` carries owned commands, language replies, view pages,
+and source checkpoints across a process boundary. Codecs come from the same
+record and sum declarations. The native view prelude uses their plain type
+declarations, without the host's transport or callbacks.
+
+`remote.carp` supervises a fresh executable started with `posix_spawn`.
+The execution process owns the engine, compiler service thread, JIT, native
+values, and view callbacks. Private pipes carry framed messages; a separate
+PTY carries native stdin and terminal output; separately redirected stderr is
+preserved. A stable wake descriptor covers
+protocol replies, PTY output, and worker exit across process replacement.
+`service.carp` serializes compiler access inside that process; `language.carp` adapts
 the shared reader and compiler observations. `display.carp` renders supplied
 ranges and pairs. It does not recognize language syntax. `engine.carp` adapts
 Session and SessionJit; `values.carp` owns typed result channels;
@@ -263,7 +330,13 @@ Session and SessionJit; `values.carp` owns typed result channels;
 Reader facts arrive before semantic analysis. Cursor queries reuse the current
 analysis. Every reply carries document, source, and session revisions; editing
 replies also carry a request ID and cursor. Superseded replies are discarded.
-The host pauses and drains the worker before accessing its engine.
+The execution process pauses and drains the service before accessing its engine.
+The service thread inherits blocked terminal signals when it is created. While editing
+or paging, the terminal loop consumes those signals synchronously. It updates
+the layout on resize and restores terminal mode before delegating termination
+or suspension to the original signal disposition. Libedit's asynchronous signal
+handlers are disabled because their rearming depends on its builtin reader.
+The caller's signal mask is restored when input finishes.
 
 Semantic previews have a two-million-unit work budget and a 500 ms deadline.
 They restore compile-time state and never commit source or publish native code.
@@ -273,12 +346,29 @@ Buffers over 256 KiB report analysis unavailable. Incomplete and failed
 analysis retain reader facts and available scope facts; unknown types stay
 unknown. Quiet diagnostics appear after 450 ms.
 
-Compiler recovery cannot undo runtime I/O, native crashes, or nontermination.
-Ctrl-C cancels editing; interrupting arbitrary native execution is a separate
-problem. Type completion and docs use a separate compiler-owned type namespace,
-including pending declarations, parameters, and declaration generations. Automatic analysis has cooperative compiler
-limits; these do not isolate native execution or make blocking filesystem
-operations interruptible.
+Ctrl-C cancels editing. During execution or a native inspection callback, it
+terminates the worker's process group and returns to the editor. A crash or
+unexpected worker exit uses the same recovery path. Native values and view
+handles are discarded; accepted source and the journal stay in the parent.
+`:history`, `:defs`, and export remain available while execution is stopped.
+
+Use `:reinit` to discard native state and rebuild accepted declarations in a
+fresh worker. It also works while execution is healthy: the current worker
+releases its retained values and stops before its replacement starts. Source
+and history remain; live results and mutations are discarded. Reinitialization
+discards the runtime roots of mixed submissions and never replays past expression
+effects. Global initializers run again when the rebuilt native state is first
+used. Source checkpoints are acknowledged before native execution or cleanup
+callbacks begin, including after a mixed macro has committed declarations.
+Each worker has its own scratch directory. Cleanup removes compiler artifacts
+without following symlinks or removing unknown files. A parent lifeline stops
+the worker's execution group if the terminal process exits unexpectedly.
+
+Runtime I/O already performed cannot be undone. Type completion and docs use a
+separate compiler-owned type namespace, including pending declarations,
+parameters, and declaration generations. Automatic analysis retains its
+cooperative limits; cancellation of a blocked native preview can terminate the
+execution worker after its cancellation grace period.
 
 Run the input, reader-to-editor, display, service, process, and real PTY tests:
 
@@ -287,5 +377,6 @@ scripts/check-repl.sh
 ```
 
 Input and reader-to-editor tests also run in the compiler phase suite.
-Native display and service checks run with the macOS REPL check.
+Native display, browser, and service checks run with the macOS REPL check.
+The shared view runtime and engine handle checks also run in LLVM assurance.
 Session, JIT, C backend, and LLVM backend tests cover the underlying contracts.

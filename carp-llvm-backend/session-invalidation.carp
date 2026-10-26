@@ -1,0 +1,170 @@
+; Binding revisions retain old publications for historical values and callbacks.
+; Invalidation follows the emitted graphs, including native support and helpers.
+(deftype JitInvalidationNode
+  [symbol String
+   dependencies (Array String)
+   owners (Array String)])
+(deftype JitRevisionPlan
+  [versions (Array (Pair String String))
+   instances (Array Specialization)
+   revision Int
+   retired (Array Int)])
+
+(defmodule SessionJit
+  (defn- active-instance? [js instance]
+    (let-do [found false
+             active (JitSession.instances js)]
+      (for [i 0 (Array.length active)]
+        (when (String.= (Specialization.symbol instance)
+                        (Specialization.symbol (Array.unsafe-nth active i)))
+          (set! found true)))
+      found))
+
+  (defn- active-owners [js bindings]
+    (let-do [owners (the (Array String) [])]
+      (for [i 0 (Array.length bindings)]
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when (and @(LLVMArtifactBinding.resident binding)
+                     (active-instance? js (LLVMArtifactBinding.instance binding)))
+            (let [name (CoreRef.name
+                    (Specialization.reference (LLVMArtifactBinding.instance binding)))]
+              (unless (Array.contains? &owners name)
+                (Array.push-back! &owners @name))))))
+      owners))
+
+  (defn- invalidation-graph [js]
+    (let-do [nodes (the (Array JitInvalidationNode) [])
+             artifacts (JitSession.artifacts js)
+             support (JitSession.c-artifacts js)]
+      (for [i 0 (Array.length artifacts)]
+        (let [entities (JitArtifact.entities (Array.unsafe-nth artifacts i))]
+          (for [j 0 (Array.length entities)]
+            (let [entity (Array.unsafe-nth entities j)]
+              (Array.push-back! &nodes
+                                (JitInvalidationNode.init @(LLVMArtifactEntity.symbol entity)
+                                                          @(LLVMArtifactEntity.dependencies entity)
+                                                          (active-owners js
+                                                                         (LLVMArtifactEntity.bindings entity))))))))
+      (for [i 0 (Array.length support)]
+        (let [artifact (Array.unsafe-nth support i)]
+          (let [entities (CTranslationUnit.entities (JitCArtifact.emission artifact))]
+            (for [j 0 (Array.length entities)]
+              (let [entity (Array.unsafe-nth entities j)]
+                (Array.push-back! &nodes
+                                  (JitInvalidationNode.init @(CArtifactEntity.symbol entity)
+                                                            @(CArtifactEntity.dependencies entity)
+                                                            [])))))))
+      nodes))
+
+  (defn- intersects? [items selected]
+    (let-do [found false]
+      (for [i 0 (Array.length items)]
+        (when (Set.contains? selected (Array.unsafe-nth items i))
+          (set! found true)))
+      found))
+
+  (defn- add-invalidation! [selected name]
+    (if (Set.contains? selected name) false (do (Set.put! selected name) true)))
+
+  (defn- affected-bindings [js changed]
+    (let-do [nodes (invalidation-graph js)
+             names (the (Set String) (Set.create))
+             symbols (the (Set String) (Set.create))
+             again true]
+      (for [i 0 (Array.length changed)]
+        (Set.put! &names (Array.unsafe-nth changed i)))
+      (while-do again
+        (set! again false)
+        (for [i 0 (Array.length &nodes)]
+          (let [node (Array.unsafe-nth &nodes i)]
+            (when-do (or
+                (Set.contains? &symbols (JitInvalidationNode.symbol node))
+                (or
+                  (intersects? (JitInvalidationNode.dependencies node) &symbols)
+                  (intersects? (JitInvalidationNode.owners node) &names)))
+              (when (add-invalidation! &symbols
+                                       (JitInvalidationNode.symbol node))
+                (set! again true))
+              (let [owners (JitInvalidationNode.owners node)]
+                (for [j 0 (Array.length owners)]
+                  (when (add-invalidation! &names (Array.unsafe-nth owners j))
+                    (set! again true))))))))
+      (Pair.init names symbols)))
+
+  (doc revision-state "copies only the native binding policy and specialization
+cache. It contains no ownership of the LLJIT or published resources.")
+  (defn revision-state [js]
+    (JitRevisionPlan.init @(JitSession.versions js)
+                          @(JitSession.instances js)
+                          @(JitSession.revision js)
+                          @(JitSession.retired js)))
+
+  (defn- previously-published? [js name]
+    (let-do [found false
+             artifacts (JitSession.artifacts js)]
+      (for [i 0 (Array.length artifacts)]
+        (let [entities (JitArtifact.entities (Array.unsafe-nth artifacts i))]
+          (for [j 0 (Array.length entities)]
+            (let [bindings (LLVMArtifactEntity.bindings (Array.unsafe-nth entities
+                                                                          j))]
+              (for [b 0 (Array.length bindings)]
+                (let [binding (Array.unsafe-nth bindings b)]
+                  (when (and @(LLVMArtifactBinding.resident binding)
+                             (String.= name
+                                       (CoreRef.name
+                                         (Specialization.reference (LLVMArtifactBinding.instance binding)))))
+                    (set! found true))))))))
+      found))
+
+  (doc plan-revision "plans a binding revision without changing native state.
+Emitted LLVM and C dependency edges invalidate callers and related helpers.
+Unrelated instances are rebound to the current resolver identities; old native
+publications remain alive for retained historical values.")
+  (defn plan-revision [js globals changed]
+    (let-do [closure (affected-bindings js changed)
+             affected (Pair.a &closure)
+             symbols (Pair.b &closure)
+             retired @(JitSession.retired js)
+             versions (the (Array (Pair String String)) [])
+             instances (the (Array Specialization) [])
+             revision (Int.inc @(JitSession.revision js))
+             salt (fmt "resident%d_" revision)
+             previous (JitSession.versions js)
+             active (JitSession.instances js)]
+      (for [i 0 (Array.length previous)]
+        (let [entry (Array.unsafe-nth previous i)]
+          (unless (Set.contains? affected (Pair.a entry))
+            (Array.push-back! &versions @entry))))
+      (let [names (Set.to-array affected)]
+        (for [i 0 (Array.length &names)]
+          (when (previously-published? js (Array.unsafe-nth &names i))
+            (Array.push-back! &versions
+                              (Pair.init @(Array.unsafe-nth &names i) @&salt)))))
+      (for [i 0 (Array.length active)]
+        (let-do [instance (Array.unsafe-nth active i)
+                 name (CoreRef.name (Specialization.reference instance))]
+          (unless (Set.contains? affected name)
+            (for [j 0 (Array.length globals)]
+              (let [reference (Array.unsafe-nth globals j)]
+                (when (String.= name (CoreRef.name reference))
+                  (Array.push-back! &instances
+                                    (Specialization.init @reference
+                                                         @(Specialization.signature instance)
+                                                         @(Specialization.symbol instance)))))))))
+      (let [artifacts (JitSession.artifacts js)]
+        (for [i 0 (Array.length artifacts)]
+          (let [artifact (Array.unsafe-nth artifacts i)]
+            (when (and
+                (Set.contains? symbols (JitArtifact.roots artifact))
+                (not (Array.contains? &retired (JitArtifact.serial artifact))))
+              (Array.push-back! &retired @(JitArtifact.serial artifact))))))
+      (JitRevisionPlan.init versions instances revision retired)))
+
+  (doc use-revision! "installs a planned revision or restores a previous policy.
+Publication itself retains its existing resource-tracker transaction.")
+  (defn use-revision! [js revision]
+    (do
+      (JitSession.set-versions! js @(JitRevisionPlan.versions revision))
+      (JitSession.set-instances! js @(JitRevisionPlan.instances revision))
+      (JitSession.set-revision! js @(JitRevisionPlan.revision revision))
+      (JitSession.set-retired! js @(JitRevisionPlan.retired revision)))))

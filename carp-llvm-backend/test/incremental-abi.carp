@@ -1,0 +1,125 @@
+(load "../carp-session-jit.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(defn abi-core []
+  (match (IO.getenv "CARP_DIR")
+    (Maybe.Nothing) @"/missing-test-core"
+    (Maybe.Just root)
+      (if (String.ends-with? &root "/core") root (String.append &root "/core"))))
+
+(defn abi-result [jit session source]
+  (match (SessionJit.run-cell jit
+                              session
+                              &(SourceInput.init @"abi:cell" @source))
+    (Result.Error error) (do (IO.errorln (Diagnostic.message &error)) -1)
+    (Result.Success value) value))
+
+(defn abi-tests [initial]
+  (let-do [test @initial
+           core (abi-core)]
+    (match (Session.create &core)
+      (Result.Error error)
+        (set! test
+              (assert-equal &test
+                "a working session"
+                (Diagnostic.message &error)
+                "ABI fixtures load Core"))
+      (Result.Success session)
+        (let-do [jit (SessionJit.create &core "out")
+                 declarations (SourceInput.init @"abi:definitions"
+                                                @"(deftype AbiPayload [label String numbers (Array Int)])
+(defn abi-make [n] (AbiPayload.init (fmt \"row-%d\" n) [n n]))
+(defn abi-measure [value] (Int.+ (String.length (AbiPayload.label &value)) (Array.length (AbiPayload.numbers &value))))")
+                 accepted (Session.upsert-input &session &declarations)]
+          (match-ref &accepted
+            (Result.Error error) (IO.errorln (Diagnostic.message error))
+            (Result.Success _) ())
+          (set! test
+                (assert-true &test
+                  (Result.success? &accepted)
+                  "aggregate functions commit without choosing ABI from their first use"))
+          (set! test
+                (assert-equal &test
+                  7
+                  (abi-result &jit &session "(abi-measure (abi-make 3))")
+                  "an aggregate function first runs as a direct call"))
+          (set! test
+                (assert-equal &test
+                  7
+                  (abi-result &jit
+                              &session
+                              "(let [callback abi-make] (abi-measure (callback 4)))")
+                  "an already published aggregate function can escape as a callback"))
+          (set! test
+                (assert-equal &test
+                  7
+                  (abi-result &jit
+                              &session
+                              "(let [items [(abi-make 5) (abi-make 6)] copied @&items] (abi-measure @(Array.unsafe-nth &copied 1)))")
+                  "native templates can use aggregate copy and delete implementations"))
+          (set! test
+                (assert-equal &test
+                  7
+                  (abi-result &jit &session "(abi-measure (abi-make 8))")
+                  "later direct calls preserve the published pointer protocol"))
+          (set! test
+                (assert-equal &test
+                  (StaticArray.length &System.args)
+                  (abi-result &jit &session "(StaticArray.length &System.args)")
+                  "a C aggregate value getter publishes its native convention"))
+          (set! test
+                (assert-equal &test
+                  (String.length (StaticArray.unsafe-nth &System.args 0))
+                  (abi-result &jit
+                              &session
+                              "(String.length (StaticArray.unsafe-nth &System.args 0))")
+                  "a later cell reuses the C aggregate value getter"))
+          (let-do [warmed (abi-result &jit
+                                      &session
+                                      "(let [items [1 2] copied @&items] (Array.length &copied))")
+                   source (SourceInput.init @"abi:cached-copy"
+                                            @"((let [items [10 20]] (fn [n] (Int.+ n (Array.length &items)))) 0)")
+                   prepared (SessionJit.compile-cell &jit &session &source false)
+                   target @""
+                   instances (JitSession.instances &jit)]
+            (set! test
+                  (assert-equal &test
+                    2
+                    warmed
+                    "an earlier cell publishes the native array copier"))
+            (for [i 0 (Array.length instances)]
+              (let [instance (Array.unsafe-nth instances i)]
+                (when (String.=
+                    (CoreRef.name (Specialization.reference instance))
+                    "Array.copy")
+                  (when (String.=
+                      &(Type.render
+                        (Box.peek (Specialization.signature instance)))
+                      "(Fn [(Ref (Array Int))] (Array Int))")
+                    (set! target @(Specialization.symbol instance))))))
+            (let-do [correct (and (not (String.empty? &target))
+                                  (and (Result.success? &prepared)
+                                       (String.contains-string?
+                                         (JitArtifact.module-ir
+                                           (Array.unsafe-last (JitSession.artifacts &jit)))
+                                         &(fmt "call void @%s_carpabi(" &target))))]
+              (set! test
+                    (assert-true &test
+                      correct
+                      "later closure captures use the native copier's published ABI"))
+              (when correct
+                (match prepared
+                  (Result.Error _) ()
+                  (Result.Success address)
+                    (set! test
+                          (assert-equal &test
+                            2
+                            (LLVM.call-i32 address)
+                            "a closure keeps its copied collection after the source scope ends"))))))
+
+          (SessionJit.dispose &jit)))
+    test))
+
+(deftest test (abi-tests test))

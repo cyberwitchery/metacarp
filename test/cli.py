@@ -60,6 +60,13 @@ class CommandTests(unittest.TestCase):
                 self.assertIn(diagnostic, result.stderr)
                 self.assertNotIn("cannot read", result.stderr)
 
+    def test_private_worker_entry_requires_its_inherited_context(self):
+        result = subprocess.run(
+            [BINARY, "repl", "--repl-worker", CORE, "/tmp", "0"],
+            capture_output=True, text=True, timeout=10, start_new_session=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+
     def test_version_names_the_combined_command(self):
         result = self.invoke("--version")
         self.assertEqual(result.returncode, 0, result.stderr)

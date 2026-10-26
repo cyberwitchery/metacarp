@@ -53,9 +53,13 @@
    context-id Int
    last-executed Long
    generation Int
-   foreign-layout-cache ForeignLayoutCache])
+   foreign-layout-cache ForeignLayoutCache
+   versions (Array (Pair String String))
+   revision Int
+   retired (Array Int)])
 
 (load "native-support.carp")
+(load "session-invalidation.carp")
 
 (defmodule SessionJit
   (doc create "creates a warm JIT for one session: one thread-safe LLVM
@@ -108,7 +112,10 @@ headers native support compiles against; `scratch` holds its C and IR files.")
                        context-id
                        0l
                        0
-                       (ForeignLayouts.empty-cache))))
+                       (ForeignLayouts.empty-cache)
+                       []
+                       0
+                       [])))
 
   (doc reset-code! "removes every published module while retaining the LLJIT,
 thread-safe context and target state. C support, LLVM code, materialization
@@ -118,6 +125,9 @@ caches, and artifacts share this invalidation boundary.")
       (when-do (String.empty? &error)
         (JitSession.set-code! js (the (Array String) []))
         (JitSession.set-instances! js (the (Array Specialization) []))
+        (JitSession.set-versions! js [])
+        (JitSession.set-revision! js 0)
+        (JitSession.set-retired! js [])
         (JitSession.set-last-declarations! js 0)
         (JitSession.set-artifacts! js [])
         (JitSession.set-materialized! js [])
@@ -218,7 +228,7 @@ and target machine.")
                 (if (Int./= 0
                             (System.system
                               &(fmt
-                                "%s -S -emit-llvm -target %s -o %s %s -I %s %s"
+                                "%s -S -emit-llvm -fPIC -target %s -o %s %s -I %s %s"
                                 (support-clang)
                                 (JitSession.triple js)
                                 &ir-path
@@ -375,6 +385,7 @@ and target machine.")
       (Result.Error diagnostic) (Result.Error diagnostic)
       (Result.Success incremental)
         (let-do [backend @(IncrementalLowering.module &incremental)
+                 predefined (Array.copy (JitSession.code js))
                  instances (IncrementalLowering.instances &incremental)
                  started (System.nanotime)
                  serial @(JitSession.serial js)
@@ -386,6 +397,11 @@ and target machine.")
                  init-name (fmt "carp_llvm_init_globals_%d" serial)
                  mod (LLVM.module-create (String.cstr &cell-name) ctx)
                  builder (LLVM.builder-create ctx)]
+          ; Include native adapters so implicit capture copies and deletes keep the
+          ; ABI of templates materialized by earlier cells.
+          (let [native (JitSession.materialized js)]
+            (for [i 0 (Array.length native)]
+              (Array.push-back! &predefined @(Array.unsafe-nth native i))))
           (LLVM.set-target mod (String.cstr (JitSession.triple js)))
           (LLVM.set-module-data-layout mod td)
           (match (match (ForeignLayouts.query &backend
@@ -404,7 +420,7 @@ and target machine.")
                                                                     td
                                                                     &backend
                                                                     (ForeignLayoutCache.layouts &cache)
-                                                                    (JitSession.code js)
+                                                                    &predefined
                                                                     &roots-name
                                                                     &init-name)))
             (Result.Error message)
@@ -453,12 +469,15 @@ and target machine.")
   (hidden lower-cell)
   (defn lower-cell [js session input echo]
     (let-do [salt (fmt "jit%d_" @(JitSession.serial js))
-             _ignored-salt (BackendLower.use-lambda-symbol-salt! &salt)]
-      (Session.lower-cell-with-known-namespaced session
-                                                input
-                                                echo
-                                                (JitSession.instances js)
-                                                &salt)))
+             _salt (BackendLower.use-lambda-symbol-salt! &salt)
+             _versions (Specialize.use-binding-versions! (JitSession.versions js))
+             lowered (Session.lower-cell-with-known-namespaced session
+                                                               input
+                                                               echo
+                                                               (JitSession.instances js)
+                                                               &salt)]
+      (Specialize.clear-binding-versions!)
+      lowered))
 
   (doc run-cell "checks, lowers, JIT-compiles, and RUNS `input` against the
 session: `Session.lower-cell-plain`'s transactional BackendModule is emitted
@@ -544,7 +563,25 @@ address. A preparation failure never executes the cell.")
     (publish-lowered js
                      input
                      (lower-cell js session input echo)
-                     &(the (Maybe String) (Maybe.Nothing)))))
+                     &(the (Maybe String) (Maybe.Nothing))))
+
+  (doc compile-expanded-cell "publishes already expanded caller syntax
+without invoking its macros again. It has the same preparation and ownership
+boundaries as compile-cell.")
+  (defn compile-expanded-cell [js session sourced]
+    (let-do [salt (fmt "jit%d_" @(JitSession.serial js))
+             _salt (BackendLower.use-lambda-symbol-salt! &salt)
+             _versions (Specialize.use-binding-versions! (JitSession.versions js))
+             lowered (Session.lower-expanded-cell-with-known-namespaced session
+                                                                        sourced
+                                                                        false
+                                                                        (JitSession.instances js)
+                                                                        &salt)]
+      (Specialize.clear-binding-versions!)
+      (publish-lowered js
+                       (SourcedSurfaceModule.input sourced)
+                       lowered
+                       &(the (Maybe String) (Maybe.Nothing))))))
 
 (defmodule SessionJit
   (doc value-layout

@@ -4,8 +4,14 @@
 ; One compiled query per source type/provider in a native generation. The
 ; channel supplies request data and the current source address at invocation;
 ; neither source values nor their view callbacks escape the synchronous call.
-(deftype ReplViewInput [source Long
-                        request InspectRequest])
+(deftype ReplViewInput
+  [source Long
+   request InspectRequest
+   generation Long
+   operation Int
+   object Int
+   row Int
+   columns Int])
 (deftype ReplViewQuery
   [key String
    input (Ptr ReplViewInput)
@@ -19,43 +25,85 @@
       type
       &(Long.str address)))
 
-  (doc source "builds a typed query over stable request channels. Field
-addresses come from actual host accessors; no structure offsets are guessed.")
-  (defn source [channel type provider]
-    (let [input (Pointer.to-ref channel)
-          request (ReplViewInput.request input)]
-      (fmt
-        "(let [value (Pointer.to-ref (the (Ptr %s) (Pointer.from-long %s))) views (%s value)] (ReplView.present value &views &(View.request (copy %s) %s %s %s %s) %s))"
-        type
-        &(read-field "Long"
-                     (Pointer.to-long
-                       (Pointer.address (ReplViewInput.source input)))
-                     false)
-        provider
-        &(read-field "String"
-                     (Pointer.to-long
-                       (Pointer.address (InspectRequest.view request)))
-                     true)
-        &(read-field "Int"
-                     (Pointer.to-long
-                       (Pointer.address (InspectRequest.offset request)))
-                     false)
-        &(read-field "Int"
-                     (Pointer.to-long
-                       (Pointer.address (InspectRequest.count request)))
-                     false)
-        &(read-field "Int"
-                     (Pointer.to-long
-                       (Pointer.address (InspectRequest.depth request)))
-                     false)
-        &(read-field "Int"
-                     (Pointer.to-long
-                       (Pointer.address (InspectRequest.bytes request)))
-                     false)
-        &(read-field "Bool"
-                     (Pointer.to-long
-                       (Pointer.address (InspectRequest.views request)))
-                     false))))
+  (defn- window [request]
+    (fmt "(View.request (copy %s) %s %s %s %s)"
+         &(read-field "String"
+                      (Pointer.to-long
+                        (Pointer.address (InspectRequest.view request)))
+                      true)
+         &(read-field "Int"
+                      (Pointer.to-long
+                        (Pointer.address (InspectRequest.offset request)))
+                      false)
+         &(read-field "Int"
+                      (Pointer.to-long
+                        (Pointer.address (InspectRequest.count request)))
+                      false)
+         &(read-field "Int"
+                      (Pointer.to-long
+                        (Pointer.address (InspectRequest.depth request)))
+                      false)
+         &(read-field "Int"
+                      (Pointer.to-long
+                        (Pointer.address (InspectRequest.bytes request)))
+                      false)))
+
+  (doc source "builds text or browsing queries over the same typed channel.
+All field addresses come from host accessors, including transient borrow bounds.")
+  (defn source [channel type provider browsing]
+    (let-do [input (Pointer.to-ref channel)
+             request (ReplViewInput.request input)
+             address (read-field "Long"
+                                 (Pointer.to-long
+                                   (Pointer.address (ReplViewInput.source input)))
+                                 false)
+             bounds (window request)]
+      (if browsing
+        (let [generation (read-field "Long"
+                                     (Pointer.to-long
+                                       (Pointer.address (ReplViewInput.generation input)))
+                                     false)
+              operation (read-field "Int"
+                                    (Pointer.to-long
+                                      (Pointer.address (ReplViewInput.operation input)))
+                                    false)
+              object (read-field "Int"
+                                 (Pointer.to-long
+                                   (Pointer.address (ReplViewInput.object input)))
+                                 false)
+              row (read-field "Int"
+                              (Pointer.to-long
+                                (Pointer.address (ReplViewInput.row input)))
+                              false)
+              columns (read-field "Int"
+                                  (Pointer.to-long
+                                    (Pointer.address (ReplViewInput.columns input)))
+                                  false)]
+          (fmt
+            "(if (Int.= %s 0) (let [value (Pointer.to-ref (the (Ptr %s) (Pointer.from-long %s)))] (ReplView.open %s value &(%s value) &%s %s)) (ReplView.operate %s %s %s %s &%s %s))"
+            &operation
+            type
+            &address
+            &generation
+            provider
+            &bounds
+            &columns
+            &generation
+            &operation
+            &object
+            &row
+            &bounds
+            &columns))
+        (fmt
+          "(let [value (Pointer.to-ref (the (Ptr %s) (Pointer.from-long %s))) views (%s value)] (ReplView.present value &views &%s %s))"
+          type
+          &address
+          provider
+          &bounds
+          &(read-field "Bool"
+                       (Pointer.to-long
+                         (Pointer.address (InspectRequest.views request)))
+                       false)))))
 
   (doc discard-input
     "releases a channel after a failed compilation or retirement.")
@@ -72,4 +120,17 @@ the JIT generation that created them is invalidated.")
           (ReplValues.reset-slot! @(ReplPreparedResult.slot prepared))
           (ReplValues.discard-slot @(ReplPreparedResult.slot prepared))
           (discard-input @(ReplViewQuery.input query))))
-      (while-do (not (Array.empty? queries)) (ignore (Array.pop-back! queries))))))
+      (while-do (not (Array.empty? queries)) (ignore (Array.pop-back! queries)))))
+  (doc invoke! "decodes an owned reply before resetting its native result slot.")
+  (defn invoke! [jit query decode]
+    (let-do [prepared (ReplViewQuery.prepared query)
+             slot @(ReplPreparedResult.slot prepared)]
+      (ignore (LLVM.call-i32 @(ReplPreparedResult.address prepared)))
+      (let [value (NativeView.init
+              @(ReplValueSlot.address (Pointer.to-ref slot))
+              @(ReplPreparedResult.type-info prepared)
+              @(ReplPreparedResult.publication prepared)
+              false)]
+        (let-do [answer (decode jit &value)]
+          (ReplValues.reset-slot! slot)
+          answer)))))

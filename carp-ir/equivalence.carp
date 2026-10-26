@@ -1,0 +1,531 @@
+; Semantic equality ignores allocation identities and caller coordinates.
+; Lexical references compare through a bijection established by their binders.
+(defmodule CoreIR
+  (defn- equivalent-reference? [left right bindings]
+    (if (or @(CoreRef.global left) @(CoreRef.global right))
+      (and
+        (Bool.= @(CoreRef.global left) @(CoreRef.global right))
+        (String.= (CoreRef.name left) (CoreRef.name right)))
+      (match (Map.get-maybe bindings (CoreRef.id left))
+        (Maybe.Just target) (Int.= target @(CoreRef.id right))
+        (Maybe.Nothing) false)))
+
+  (defn- pair-binders! [left right bindings]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (let-do [a (Array.unsafe-nth left i)
+                   b (Array.unsafe-nth right i)]
+            (unless (String.= (CoreRef.name a) (CoreRef.name b))
+              (set! same false))
+            (Map.put! bindings (CoreRef.id a) (CoreRef.id b)))))
+      same))
+
+  (defn- equivalent-lifetime? [left right]
+    (match-ref left
+      (CoreLifetime.Inferred _)
+        (match-ref right (CoreLifetime.Inferred _) true _ false)
+      (CoreLifetime.Named name)
+        (match-ref right
+          (CoreLifetime.Named other) (String.= name other)
+          _ false)
+      (CoreLifetime.Static) (match-ref right (CoreLifetime.Static) true _ false)))
+
+  (defn- equivalent-types? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-type? (Box.peek (Array.unsafe-nth left i))
+                                    (Box.peek (Array.unsafe-nth right i)))))))
+      same))
+
+  (defn- equivalent-type? [left right]
+    (match-ref left
+      (CoreType.Integer) (match-ref right (CoreType.Integer) true _ false)
+      (CoreType.String) (match-ref right (CoreType.String) true _ false)
+      (CoreType.Boolean) (match-ref right (CoreType.Boolean) true _ false)
+      (CoreType.Unit) (match-ref right (CoreType.Unit) true _ false)
+      (CoreType.Variable name)
+        (match-ref right (CoreType.Variable other) (String.= name other) _ false)
+      (CoreType.Named name arguments)
+        (match-ref right
+          (CoreType.Named other parameters)
+            (and (String.= name other) (equivalent-types? arguments parameters))
+          _ false)
+      (CoreType.Reference type lifetime)
+        (match-ref right
+          (CoreType.Reference other scope)
+            (and
+              (equivalent-type? (Box.peek type) (Box.peek other))
+              (equivalent-lifetime? lifetime scope))
+          _ false)
+      (CoreType.Function arguments result)
+        (match-ref right
+          (CoreType.Function parameters returns)
+            (and (equivalent-types? arguments parameters)
+                 (equivalent-type? (Box.peek result) (Box.peek returns)))
+          _ false)))
+
+  (defn- equivalent-patterns? [left right bindings]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-pattern? (Box.peek (Array.unsafe-nth left i))
+                                       (Box.peek (Array.unsafe-nth right i))
+                                       bindings)))))
+      same))
+
+  (defn- equivalent-pattern? [left right bindings]
+    (match-ref left
+      (CorePattern.Ignore) (match-ref right (CorePattern.Ignore) true _ false)
+      (CorePattern.Bind reference)
+        (match-ref right
+          (CorePattern.Bind other)
+            (equivalent-reference? reference other bindings)
+          _ false)
+      (CorePattern.Constructor reference patterns)
+        (match-ref right
+          (CorePattern.Constructor other children)
+            (and
+              (equivalent-reference? reference other bindings)
+              (equivalent-patterns? patterns children bindings))
+          _ false)))
+
+  (defn- equivalent-expressions? [left right bindings]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-expression? (Box.peek (Array.unsafe-nth left i))
+                                          (Box.peek (Array.unsafe-nth right i))
+                                          bindings)))))
+      same))
+
+  (defn- equivalent-branches? [left right bindings]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (let [a (Array.unsafe-nth left i)
+                  b (Array.unsafe-nth right i)]
+              (set! same
+                    (and
+                      (pair-binders! (CoreMatchBranch.bindings a)
+                                     (CoreMatchBranch.bindings b)
+                                     bindings)
+                      (and
+                        (equivalent-pattern? (CoreMatchBranch.pattern a)
+                                             (CoreMatchBranch.pattern b)
+                                             bindings)
+                        (equivalent-expression? (Box.peek (CoreMatchBranch.body a))
+                                                (Box.peek (CoreMatchBranch.body b))
+                                                bindings))))))))
+      same))
+
+  (defn- equivalent-expression? [left right bindings]
+    (match-ref left
+      (CoreExpr.IntLit _ value)
+        (match-ref right (CoreExpr.IntLit _ other) (Int.= @value @other) _ false)
+      (CoreExpr.ByteLit _ value)
+        (match-ref right
+          (CoreExpr.ByteLit _ other) (Byte.= @value @other)
+          _ false)
+      (CoreExpr.LongLit _ value)
+        (match-ref right
+          (CoreExpr.LongLit _ other) (Long.= @value @other)
+          _ false)
+      (CoreExpr.FloatLit _ value)
+        (match-ref right
+          (CoreExpr.FloatLit _ other)
+            (and (Float.= @value @other)
+                 (or (Float./= @value 0f)
+                     (Bool.= (Float.< (Float./ 1f @value) 0f)
+                             (Float.< (Float./ 1f @other) 0f))))
+          _ false)
+      (CoreExpr.DoubleLit _ value)
+        (match-ref right
+          (CoreExpr.DoubleLit _ other)
+            (and (Double.= @value @other)
+                 (or (Double./= @value 0.0)
+                     (Bool.= (Double.< (Double./ 1.0 @value) 0.0)
+                             (Double.< (Double./ 1.0 @other) 0.0))))
+          _ false)
+      (CoreExpr.CharLit _ value)
+        (match-ref right
+          (CoreExpr.CharLit _ other) (Char.= @value @other)
+          _ false)
+      (CoreExpr.StringLit _ value)
+        (match-ref right
+          (CoreExpr.StringLit _ other) (String.= value other)
+          _ false)
+      (CoreExpr.PatternLit _ value)
+        (match-ref right
+          (CoreExpr.PatternLit _ other) (String.= value other)
+          _ false)
+      (CoreExpr.BoolLit _ value)
+        (match-ref right
+          (CoreExpr.BoolLit _ other) (Bool.= @value @other)
+          _ false)
+      (CoreExpr.UnitLit _) (match-ref right (CoreExpr.UnitLit _) true _ false)
+      (CoreExpr.Break _) (match-ref right (CoreExpr.Break _) true _ false)
+      (CoreExpr.ArrayLit _ values)
+        (match-ref right
+          (CoreExpr.ArrayLit _ others)
+            (equivalent-expressions? values others bindings)
+          _ false)
+      (CoreExpr.StaticArrayLit _ values)
+        (match-ref right
+          (CoreExpr.StaticArrayLit _ others)
+            (equivalent-expressions? values others bindings)
+          _ false)
+      (CoreExpr.Do _ values)
+        (match-ref right
+          (CoreExpr.Do _ others)
+            (equivalent-expressions? values others bindings)
+          _ false)
+      (CoreExpr.Reference _ reference)
+        (match-ref right
+          (CoreExpr.Reference _ other)
+            (equivalent-reference? reference other bindings)
+          _ false)
+      (CoreExpr.Call _ callee arguments)
+        (match-ref right
+          (CoreExpr.Call _ function parameters)
+            (and
+              (equivalent-expression? (Box.peek callee)
+                                      (Box.peek function)
+                                      bindings)
+              (equivalent-expressions? arguments parameters bindings))
+          _ false)
+      (CoreExpr.If _ condition yes no)
+        (match-ref right
+          (CoreExpr.If _ test then otherwise)
+            (and
+              (equivalent-expression? (Box.peek condition)
+                                      (Box.peek test)
+                                      bindings)
+              (and
+                (equivalent-expression? (Box.peek yes) (Box.peek then) bindings)
+                (equivalent-expression? (Box.peek no)
+                                        (Box.peek otherwise)
+                                        bindings)))
+          _ false)
+      (CoreExpr.Let _ reference value body)
+        (match-ref right
+          (CoreExpr.Let _ target initializer rest)
+            (do
+              (Map.put! bindings (CoreRef.id reference) (CoreRef.id target))
+              (and
+                (String.= (CoreRef.name reference) (CoreRef.name target))
+                (and
+                  (equivalent-expression? (Box.peek value)
+                                          (Box.peek initializer)
+                                          bindings)
+                  (equivalent-expression? (Box.peek body)
+                                          (Box.peek rest)
+                                          bindings))))
+          _ false)
+      (CoreExpr.Set _ reference value)
+        (match-ref right
+          (CoreExpr.Set _ target expression)
+            (and
+              (equivalent-reference? reference target bindings)
+              (equivalent-expression? (Box.peek value)
+                                      (Box.peek expression)
+                                      bindings))
+          _ false)
+      (CoreExpr.While _ condition body)
+        (match-ref right
+          (CoreExpr.While _ test rest)
+            (and
+              (equivalent-expression? (Box.peek condition)
+                                      (Box.peek test)
+                                      bindings)
+              (equivalent-expression? (Box.peek body) (Box.peek rest) bindings))
+          _ false)
+      (CoreExpr.Lambda _ parameters body)
+        (match-ref right
+          (CoreExpr.Lambda _ arguments expression)
+            (and
+              (pair-binders! parameters arguments bindings)
+              (equivalent-expression? (Box.peek body)
+                                      (Box.peek expression)
+                                      bindings))
+          _ false)
+      (CoreExpr.Match _ borrowed value branches)
+        (match-ref right
+          (CoreExpr.Match _ reference expression alternatives)
+            (and (Bool.= @borrowed @reference)
+                 (and
+                   (equivalent-expression? (Box.peek value)
+                                           (Box.peek expression)
+                                           bindings)
+                   (equivalent-branches? branches alternatives bindings)))
+          _ false)
+      (CoreExpr.Annotation _ value type)
+        (match-ref right
+          (CoreExpr.Annotation _ expression other)
+            (and
+              (equivalent-type? (Box.peek type) (Box.peek other))
+              (equivalent-expression? (Box.peek value)
+                                      (Box.peek expression)
+                                      bindings))
+          _ false)))
+
+  (doc equivalent-definition? "compares one named resolved definition across
+replays. Node IDs, source coordinates, and global allocation IDs do not affect equality. Lexical binding
+relationships, qualified global names, and names used by inspection do. Signed zero remains distinct, and NaNs conservatively compare unequal.")
+  (defn equivalent-definition? [before after name]
+    (let-do [found false
+             left-functions (CoreModule.functions before)
+             right-functions (CoreModule.functions after)
+             left-values (CoreModule.values before)
+             right-values (CoreModule.values after)]
+      (for [i 0 (Array.length left-functions)]
+        (let [a (Array.unsafe-nth left-functions i)]
+          (when (String.= name (CoreRef.name (CoreFunction.reference a)))
+            (for [j 0 (Array.length right-functions)]
+              (let [b (Array.unsafe-nth right-functions j)]
+                (when (String.= name (CoreRef.name (CoreFunction.reference b)))
+                  (let [bindings (the (Map Int Int) (Map.create))]
+                    (set! found
+                          (and
+                            (pair-binders! (CoreFunction.parameters a)
+                                           (CoreFunction.parameters b)
+                                           &bindings)
+                            (equivalent-expression? (Box.peek (CoreFunction.body a))
+                                                    (Box.peek (CoreFunction.body b))
+                                                    &bindings))))))))))
+      (for [i 0 (Array.length left-values)]
+        (let [a (Array.unsafe-nth left-values i)]
+          (when (String.= name (CoreRef.name (CoreValue.reference a)))
+            (for [j 0 (Array.length right-values)]
+              (let [b (Array.unsafe-nth right-values j)]
+                (when (String.= name (CoreRef.name (CoreValue.reference b)))
+                  (let [bindings (the (Map Int Int) (Map.create))]
+                    (set! found
+                          (equivalent-expression? (Box.peek (CoreValue.body a))
+                                                  (Box.peek (CoreValue.body b))
+                                                  &bindings)))))))))
+      found))
+
+  (defn- equivalent-payload? [left right]
+    (match-ref left
+      (CoreBuiltinPayload.External name)
+        (match-ref right
+          (CoreBuiltinPayload.External other) (= name other)
+          _ false)
+      (CoreBuiltinPayload.Template declaration body)
+        (match-ref right
+          (CoreBuiltinPayload.Template other implementation)
+            (and (String.= declaration other) (String.= body implementation))
+          _ false)))
+
+  (defn- equivalent-builtin? [left right]
+    (and
+      (String.=
+        (CoreRef.name (CoreBuiltin.reference left))
+        (CoreRef.name (CoreBuiltin.reference right)))
+      (equivalent-type? (Box.peek (CoreBuiltin.signature left))
+                        (Box.peek (CoreBuiltin.signature right)))))
+
+  (defn- equivalent-builtins? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-builtin? (Array.unsafe-nth left i)
+                                       (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-builtin-source? [left right]
+    (and
+      (String.=
+        (CoreRef.name (CoreBuiltinSource.reference left))
+        (CoreRef.name (CoreBuiltinSource.reference right)))
+      (and
+        (equivalent-type?
+          (Box.peek (CoreBuiltinSource.signature left))
+          (Box.peek (CoreBuiltinSource.signature right)))
+        (equivalent-payload? (CoreBuiltinSource.payload left)
+                             (CoreBuiltinSource.payload right)))))
+
+  (defn- equivalent-builtin-sources? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-builtin-source? (Array.unsafe-nth left i)
+                                              (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-member? [left right]
+    (and (String.= (Pair.a left) (Pair.a right))
+         (equivalent-type? (Pair.b left) (Pair.b right))))
+
+  (defn- equivalent-members? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-member? (Array.unsafe-nth left i)
+                                      (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-type-declaration? [left right]
+    (and
+      (String.= (CoreTypeDeclaration.name left) (CoreTypeDeclaration.name right))
+      (and
+        (=
+          (CoreTypeDeclaration.representation left)
+          (CoreTypeDeclaration.representation right))
+        (equivalent-members? (CoreTypeDeclaration.members left)
+                             (CoreTypeDeclaration.members right)))))
+
+  (defn- equivalent-type-declarations? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-type-declaration? (Array.unsafe-nth left i)
+                                                (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-constructor? [left right]
+    (and
+      (String.=
+        (CoreRef.name (CoreConstructorDeclaration.reference left))
+        (CoreRef.name (CoreConstructorDeclaration.reference right)))
+      (and
+        (Int.= @(CoreConstructorDeclaration.tag left)
+               @(CoreConstructorDeclaration.tag right))
+        (and
+          (equivalent-types?
+            (CoreConstructorDeclaration.arguments left)
+            (CoreConstructorDeclaration.arguments right))
+          (and
+            (=
+              (CoreConstructorDeclaration.field-names left)
+              (CoreConstructorDeclaration.field-names right))
+            (equivalent-type?
+              (Box.peek (CoreConstructorDeclaration.result left))
+              (Box.peek (CoreConstructorDeclaration.result right))))))))
+
+  (defn- equivalent-constructors? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-constructor? (Array.unsafe-nth left i)
+                                           (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-interface? [left right]
+    (and
+      (String.=
+        (CoreRef.name (CoreInterface.reference left))
+        (CoreRef.name (CoreInterface.reference right)))
+      (equivalent-type?
+        (Box.peek (CoreInterface.signature left))
+        (Box.peek (CoreInterface.signature right)))))
+
+  (defn- equivalent-interfaces? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-interface? (Array.unsafe-nth left i)
+                                         (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-implementation? [left right]
+    (and
+      (String.=
+        (CoreRef.name (CoreImplementation.interface left))
+        (CoreRef.name (CoreImplementation.interface right)))
+      (String.=
+        (CoreRef.name (CoreImplementation.implementation left))
+        (CoreRef.name (CoreImplementation.implementation right)))))
+
+  (defn- equivalent-implementations? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-implementation? (Array.unsafe-nth left i)
+                                              (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-global? [left right]
+    (String.= (CoreRef.name left) (CoreRef.name right)))
+
+  (defn- equivalent-globals? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-global? (Array.unsafe-nth left i)
+                                      (Array.unsafe-nth right i))))))
+      same))
+
+  (defn- equivalent-overload? [left right]
+    (and
+      (String.=
+        (CoreRef.name (CoreOverload.reference left))
+        (CoreRef.name (CoreOverload.reference right)))
+      (equivalent-globals? (CoreOverload.candidates left)
+                           (CoreOverload.candidates right))))
+
+  (defn- equivalent-overloads? [left right]
+    (let-do [same (Int.= (Array.length left) (Array.length right))]
+      (when same
+        (for [i 0 (Array.length left)]
+          (when same
+            (set! same
+                  (equivalent-overload? (Array.unsafe-nth left i)
+                                        (Array.unsafe-nth right i))))))
+      same))
+
+  (doc equivalent-native-context? "compares ABI-bearing declarations by their
+resolved structure. Ordinary function bodies and value initializers are compared
+separately, so their revisions can coexist without retiring unrelated storage.")
+  (defn equivalent-native-context? [before after]
+    (and
+      (equivalent-builtins? (CoreModule.builtins before)
+                            (CoreModule.builtins after))
+      (and
+        (equivalent-builtin-sources? (CoreModule.builtin-sources before)
+                                     (CoreModule.builtin-sources after))
+        (and
+          (equivalent-type-declarations? (CoreModule.type-declarations before)
+                                         (CoreModule.type-declarations after))
+          (and
+            (equivalent-constructors? (CoreModule.constructors before)
+                                      (CoreModule.constructors after))
+            (and
+              (= (CoreModule.recursive-types before)
+                 (CoreModule.recursive-types after))
+              (and
+                (equivalent-interfaces? (CoreModule.interfaces before)
+                                        (CoreModule.interfaces after))
+                (and
+                  (equivalent-implementations? (CoreModule.implementations before)
+                                               (CoreModule.implementations after))
+                  (and
+                    (equivalent-overloads? (CoreModule.overloads before)
+                                           (CoreModule.overloads after))
+                    (= (CoreModule.system-includes before)
+                       (CoreModule.system-includes after))))))))))))

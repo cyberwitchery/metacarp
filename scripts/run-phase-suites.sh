@@ -75,6 +75,7 @@ phase_tasks() {
   # small module tests and leave one long session test as a serial tail.
   emit_task . test/carp-compiler.carp normal
   emit_task . carp-session/test/carp-session.carp normal
+  emit_task . carp-session/test/prepared.carp normal
   emit_task . carp-session/test/core.carp normal
   emit_task . carp-session/test/memory.carp memory
   emit_task . carp-session/test/editing.carp normal

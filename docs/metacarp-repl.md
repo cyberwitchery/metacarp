@@ -54,16 +54,20 @@ semantic reply replaces it, including partial and unavailable results. The
 cache contains ranges and presentation categories, with no binding identities,
 types, or scopes. Completion, docs, and diagnostics cannot query it.
 
-Automatic analysis runs on one serialized compiler worker. The editor sends
-requests and polls structured replies through a narrow protocol. A wakeup pipe
-integrates with terminal input; only the service's own pipe is nonblocking.
+Automatic analysis runs on one serialized compiler service thread inside the
+execution process. The editor sends requests and polls owned replies through a
+narrow protocol. A stable wake descriptor integrates protocol replies, native
+PTY output, and process exit with terminal input. Private transport pipes are
+nonblocking; native stdio has its own terminal.
 The worker has one pending request and bounded reply slots. A newer source
 revision cancels work; stale source, session, cursor, and request IDs cannot
 alter the current buffer. Cursor-only queries reuse the cached analysis.
 
 ```text
 terminal.carp + terminal-language.carp + display.carp
-    | protocol.carp: requests, ranges, pairs, diagnostics, editing replies
+    | remote.carp: process supervision, owned source checkpoints
+    | worker-protocol.carp: framed commands, language replies, view pages
+execution process: engine.carp + LLVM JIT + native values and callbacks
 service.carp: serialized worker, cancellation barrier, wakeup pipe
     | language.carp: cached revision-specific compiler adapter
 Reader.read-syntax -> Surface editing tree -> expansion
@@ -95,8 +99,9 @@ inference, type solving, compile-time lowering, and every VM instruction.
 Size-growing VM builtins also charge for produced data. A 500 ms monotonic
 deadline uses those cooperative cancellation points. Automatic previews refuse
 compile-time file reads; explicit F2 permits them under the same work limits.
-These bounds do not interrupt blocking filesystem operations or arbitrary
-native execution. Buffers over 256 KiB report analysis unavailable.
+These cooperative bounds do not stop a blocked native call. Explicit
+cancellation can instead terminate the execution process after the compiler
+service's cancellation grace period. Buffers over 256 KiB report analysis unavailable.
 
 Reader facts are published first. Semantic results distinguish ready, partial,
 and unavailable states; diagnostics appear after 450 ms of quiet. Incomplete
@@ -123,18 +128,40 @@ Implemented:
 - Reader-backed continuation, located diagnostics, and prompt-free pipe mode.
 - Atomic source updates; failed replacements preserve the accepted definition.
 - Mixed submissions stage declarations and native publication before once-only
-  execution. A replacement uses a separate JIT while preparing its transaction.
-- Unrelated runtime additions retain published globals and result handles.
+  execution. ABI boundary changes use a separate JIT while preparing their
+  transaction; ordinary revisions restore their binding policy on failure.
+- Ordinary function and value revisions retain unrelated globals and results.
+- Invalidation follows resolved body changes and emitted LLVM/C dependencies,
+  including concrete interface implementations and ABI helpers.
 - Retained scalar, string, array, record, and closure results.
 - Recovery after returned compiler and native-publication diagnostics.
+- Source and journal recovery after native interruption, crashes, and unexpected
+  execution-process exit; explicit declaration rebuilding through `:reinit`.
 - Borrow checks on top-level roots as well as function bodies, including moves,
   escaping local references, and borrowed closure captures.
 
 Source acceptance and compilation of polymorphic instances remain separate.
-Compile-time declarations and replacements reset native state, with a notice.
+Type, interface, foreign, and compile-time definition changes reset native state,
+with a notice. Ordinary revisions keep old code for historical values. Editing
+an input preserves its unchanged initializers; a new value declaration explicitly
+initializes its binding again.
 Runtime I/O and mutations begin after preparation and cannot be rolled back.
-Native crashes, nontermination, and execution interrupts remain outside the
-compiler-error recovery contract. The current terminal integration targets macOS.
+The terminal supervises a fresh executable started through `posix_spawn`.
+Ctrl-C during native execution terminates its process group, including ordinary
+native children, and discards all native values and view handles. Accepted source
+and the journal remain available. `:reinit` rebuilds declarations explicitly,
+including while the current worker is healthy. It releases retained values and
+stops that worker before starting its replacement. Mixed runtime roots and past
+expressions are not replayed. Global initialization
+runs again when the rebuilt native state is used. Checkpoint acknowledgements
+precede native execution and cleanup callbacks, so a committed mixed macro keeps
+its declarations even if its runtime body never returns.
+
+Each worker has an independent scratch directory and a parent lifeline. Cleanup
+removes known compiler artifacts through a physical directory traversal, retaining
+unknown files. The current terminal integration targets macOS: libedit, terminal
+signal handling, spawn flags, kqueue wakeups, and native process/PTY primitives
+live behind the terminal and process interfaces.
 
 ## Milestone 2: terminal editing
 
@@ -266,8 +293,11 @@ in the host become external declarations. Previously published support is also
 imported; native template definitions remain owned by the session. Function
 imports preserve their type, calling convention, and ABI attributes.
 
-Replacement and reset retire C and LLVM code, materialization caches, and their
-artifacts together. Independent JIT sessions can publish the same native symbol
+ABI boundary changes and reset retire C and LLVM code, materialization caches,
+and their artifacts together. Ordinary revisions publish new binding symbols;
+current inspection selects active specializations while historical values keep
+their original publications. View queries are renewed when their emitted
+dependencies change. Independent JIT sessions can publish the same native symbol
 with different bodies and retire them independently. Source origins still come
 from the active compiler declaration's provenance; shadowed definitions cannot
 relabel emitted code. Inspection reads retained data without compiling,
@@ -282,7 +312,11 @@ Native templates expose their LLVM declarations, with implementation in the
 existing C backend. Focused excerpts may refer to types or metadata available
 in the full module.
 
-Paging and alternate output views remain separate interaction improvements.
+Long command and result output uses a bounded terminal pager with scrolling,
+literal search, and source anchors that survive reflow. It shares the editor's
+frame patching and libedit's input lifecycle, including signal restoration.
+Simple terminals and pipes retain plain output. Structured value navigation
+uses the same frame patching and input lifecycle through `:browse`.
 
 ## Milestone 5: editable history and export
 
@@ -365,9 +399,56 @@ current native generation. Custom callbacks remain native user code and must
 bound their own work and allocations. This API belongs to the warm base and
 survives reset.
 
-Declaration-producing macros are classified after expansion. A single macro
-form that emits both declarations and runtime expressions is rejected before
-commit; use separate top-level forms for those two parts.
+`:browse N [selectors]` opens a structured viewer over a retained result.
+Up/Down or j/k move through rows, Space/Page Down and b/Page Up change pages,
+and Home/End jump within counted collections. Enter or Right opens the selected
+item; Left, Backspace, or h returns to the parent with its prior selection and
+page. Tab cycles declared views. `[` and `]` scroll wide tables horizontally.
+q, Escape, Ctrl-C, and Ctrl-D close the viewer. Pipes and simple terminals
+receive a bounded plain snapshot.
+
+Text views scroll and request further UTF-8 byte windows at their boundaries.
+Trees retain the displayed child leases until their window changes or the
+handle closes. Bitmap views sample RGBA pixels to the viewport and byte budget;
+color terminals display blocks, and `NO_COLOR` selects a monochrome rendering.
+Partial alpha is composited over black. Native Raw views use recorded fields,
+active sum payloads, sequence elements, and closure captures.
+
+The viewer receives owned pages and opaque generation-checked handles through
+`ReplViewClient`. Native pointers and callbacks stay inside the engine. Closing
+a parent does not invalidate a selected child; dropping its source result or
+retiring the runtime invalidates both. Provider windows are bounded before
+rendering, and an idle viewer does not repaint or invoke providers.
+
+A macro can emit declarations and runtime expressions in one top-level
+sequence. The compiler prepares one expanded syntax tree, commits its declaration
+projection, then executes its runtime roots once. Type, ownership, or native
+publication errors leave the previous session intact. Rebuilding accepted
+source restores declarations without executing its runtime roots. History and
+export retain the original invocation.
+
+```clojure
+(defmacro define-and-call [name value]
+  `(do (defn %name [] %value) (%name)))
+
+(define-and-call answer 42)
+; 42, retained as _1
+(answer)
+; 42
+```
+
+F2 checks the same prepared syntax without committing or executing it. Loading
+an exported source sequence in the REPL explicitly executes its runtime parts.
+Module-scoped output keeps its namespace, imports, private access, and source
+coordinates. The terminal adapter materializes those runtime roots as transient
+functions; they never enter the committed source or definition list.
+
+Three alternating optimized PTY runs on the same Mac compared the structured
+viewer checkpoint with prepared submissions. Median startup was 791 ms versus
+790 ms, first integer evaluation 828 ms versus 824 ms, and warm evaluation
+245 ms versus 242 ms. A first invocation that defined and called a function
+through a mixed-output macro took 975 ms. These runs show no measurable change
+to ordinary evaluation latency at this sample size.
 
 ## Platform boundary
 
@@ -768,3 +849,101 @@ measured startup medians of 1,089.5 / 996.4 ms, first native evaluation of
 1,067.3 / 833.6 ms, and warm evaluation of 308.0 / 270.5 ms. These sequential
 samples were taken on the same busy machine and do not establish a speedup.
 The command integration adds dispatch and reuses the existing drivers.
+
+
+## Structured navigation measurements, 2026-10-24
+
+`:browse` uses owned pages and generation-checked handles for text, tables,
+trees, sampled RGBA images, and native Raw navigation. Closing a viewer
+releases its leases. The terminal retains parent pages and selections, and
+uses the existing frame diff. Compiler workers inherit blocked terminal signals.
+The terminal loop processes pending signals synchronously during input and
+paging, restoring terminal mode before termination or suspension. Libedit's
+asynchronous handlers depend on its builtin reader and are disabled here.
+
+Three optimized PTY runs on the same MacBookPro18,2, arm64 macOS 15.8.1,
+with LLVM 23.1.4 gave these medians. Each run measured three warm integer
+expressions. The baseline is the local pager checkpoint `4852837`.
+
+| Measurement | Pager checkpoint | Structured viewer |
+| --- | ---: | ---: |
+| Process ready | 725 ms | 812 ms |
+| First integer expression | 775 ms | 852 ms |
+| Warm integer expression | 227 ms | 253 ms |
+
+Opening the default Raw view of 100 integers took 450 ms; requesting its next
+20-row page took 1.14 ms. These are local end-to-end observations on a busy
+machine, with an 80-column, 24-row terminal, rather than throughput claims.
+The additional warm runtime has a measurable startup and expression cost.
+
+The engine view fixture passes 29 lifetime and navigation assertions and
+reports zero leaks under macOS `leaks -atExit`. Compiler regressions cover
+header ownership on cached template dependencies, references to specialized
+globals, aggregate calling conventions and cached native adapters across incremental
+publications, String
+field derivation without imported deleter declarations, and null storage for
+empty LLVM array literals.
+
+## Native binding revision measurements, 2026-10-25
+
+Ordinary revisions keep historical publications resident and version only the
+affected bindings. Resolved body comparison preserves lexical binding identity
+and names used by inspection. ABI comparison uses declaration deltas; inherited
+builtins and dispatch declarations stay in the warm compiler context. LLVM
+pointer-ABI bodies carry their original binding ownership for dependency
+traversal. Native version namespaces cannot collide with generated source names.
+
+Three alternating optimized PTY runs compared the mixed-submission checkpoint
+`766b177` with binding revisions on the same busy Mac. These are medians of
+local observations, with three warm integer evaluations per session.
+
+| Measurement | Mixed submissions | Binding revisions |
+| --- | ---: | ---: |
+| Process ready | 785 ms | 749 ms |
+| First integer expression | 814 ms | 768 ms |
+| Warm integer expression | 240 ms | 229 ms |
+| Add a function | 335 ms | 322 ms |
+| Replace a function | 363 ms | 357 ms |
+| Evaluate the replaced function | 759 ms | 482 ms |
+
+Ordinary commits snapshot user definitions and their IR. Copying the full warm
+session added about 60–70 ms to declaration commits in an earlier measurement.
+Historical values, closure storage, native template state, view leases, and
+current provider queries are covered by regression checks. Failed publication
+restores the previous specialization and binding policy.
+
+
+## Native interruption measurements, 2026-10-26
+
+The terminal supervises a separate execution process. Owned source checkpoints
+are acknowledged before native execution and cleanup callbacks. Interrupting
+that process discards native values and view handles, retains accepted source
+and the journal, and requires explicit `:reinit`. Past expression effects and
+the runtime roots of mixed submissions are not replayed.
+
+Three alternating optimized PTY pairs compared the binding-revision checkpoint
+`6fa0496` with process supervision on the same busy Mac. Each session included
+three warm integer evaluations. These are medians of local observations.
+
+| Measurement | Binding revisions | Process supervision |
+| --- | ---: | ---: |
+| Process ready | 774 ms | 804 ms |
+| First integer expression | 795 ms | 827 ms |
+| Warm integer expression | 236 ms | 243 ms |
+| Add a function | 333 ms | 342 ms |
+| Replace a function | 368 ms | 369 ms |
+| Evaluate the replaced function | 494 ms | 492 ms |
+
+For this small workload, allow roughly 1–2 seconds for startup or first native
+execution and 0.25–0.5 seconds for warm expressions, with additional headroom
+under load. Three pairs do not establish latency bounds.
+
+The final rebuilt host passes all 157 terminal and screen scenarios, 10 command
+tests, and 230 native assertions. Coverage includes native loops, blocking input,
+crashes, interrupted mixed macros and history edits, blocked view callbacks,
+child cleanup, parent death, public arguments, and stderr redirection. The
+compiler phase suite passes 626 assertions, and generation 2 and generation 3
+emit identical C. All 165 reference programs pass both the ordinary and sanitizer
+runs; the compiler leak check reports zero bytes. LLVM validation passes 238
+assertions and all 16 memory scenarios. Balance, lint, formatting, and whitespace
+checks pass.

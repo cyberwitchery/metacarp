@@ -1,0 +1,451 @@
+(load "view-protocol.carp")
+(load "pager.carp")
+
+(deftype ReplViewLocation
+  [page ReplViewPage
+   selected Int
+   horizontal Int
+   anchor Int])
+(deftype ReplBrowser
+  [client ReplViewClient
+   stack (Array ReplViewLocation)
+   message String])
+
+(doc ReplBrowser "owns navigation state and view leases behind a presentation
+client. It has no compiler or terminal input dependencies.")
+(defmodule ReplBrowser
+  (defn- current [browser]
+    (let [stack (ReplBrowser.stack browser)]
+      (Array.unsafe-nth stack (Int.dec (Array.length stack)))))
+
+  (defn- release [client page]
+    (ignore
+      (~(ReplViewClient.request client)
+        &(ReplViewRequest.init @(ReplViewPage.handle page)
+                               (ReplViewOperation.Release)))))
+
+  (doc create "takes ownership of the initial view's lease.")
+  (defn create [client page]
+    (ReplBrowser.init client [(ReplViewLocation.init page 0 0 0)] @""))
+
+  (doc close!
+    "releases children before their parents, including on cancellation.")
+  (defn close! [browser]
+    (let-do [stack (ReplBrowser.stack browser)]
+      (for [i (Array.length stack) 0 -1]
+        (release (ReplBrowser.client browser)
+                 (ReplViewLocation.page (Array.unsafe-nth stack (Int.dec i)))))
+      (ReplBrowser.set-stack! browser [])))
+
+  (doc page "returns the current owned snapshot.")
+  (defn page [browser] (ReplViewLocation.page (current browser)))
+
+  (defn- rows [height] (Int.max 1 (Int.- height 4)))
+  (defn- budget [width height]
+    (Int.max 256 (Int.min 65536 (Int.* (Int.max 4 width) (rows height)))))
+
+  (defn- request! [browser operation push]
+    (let-do [answer (~(ReplViewClient.request (ReplBrowser.client browser))
+               &(ReplViewRequest.init @(ReplViewPage.handle (page browser))
+                                      operation))]
+      (match answer
+        (Result.Error error) (ReplBrowser.set-message! browser error)
+        (Result.Success next)
+          (cond
+            push
+              (Array.push-back! (ReplBrowser.stack browser)
+                                (ReplViewLocation.init next 0 0 0))
+            (and
+              (String.= (ReplViewPage.kind &next) "text")
+              (and (Int.> @(ReplViewPage.offset &next) 0)
+                   (String.empty? (ReplViewPage.text &next))))
+              (ReplBrowser.set-message! browser @"end of text")
+            (and (Int.> @(ReplViewPage.offset &next) 0)
+                 (and
+                   (not (String.= (ReplViewPage.kind &next) "text"))
+                   (and
+                     (not (String.= (ReplViewPage.kind &next) "bitmap"))
+                     (Array.empty? (ReplViewPage.items &next)))))
+              (ReplBrowser.set-message! browser @"end of items")
+            (do
+              (ReplViewLocation.set-page! (current browser) next)
+              (ReplViewLocation.set-anchor! (current browser) 0))))))
+
+  (defn- fetch! [browser offset width height]
+    (request! browser
+              (ReplViewOperation.Page @(ReplViewPage.selector (page browser))
+                                      offset
+                                      (rows height)
+                                      width
+                                      (budget width height))
+              false))
+
+  (doc resize! "refreshes the visible provider window for the new viewport.")
+  (defn resize! [browser width height]
+    (let-do [snapshot (page browser)
+             offset @(ReplViewPage.offset snapshot)]
+      (when (String.= (ReplViewPage.kind snapshot) "text")
+        (let [prefix (String.from-chars
+                &(Array.prefix
+                  &(String.chars (ReplViewPage.text snapshot))
+                  @(ReplViewLocation.anchor (current browser))))]
+          (set! offset (Int.+ offset (String.length &prefix)))))
+      (fetch! browser offset width height)))
+
+  (defn- move! [browser delta width height]
+    (let-do [location (current browser)
+             snapshot (ReplViewLocation.page location)]
+      (if (String.= (ReplViewPage.kind snapshot) "text")
+        (let-do [layout (ReplPager.layout (ReplViewPage.text snapshot) width)
+                 anchor @(ReplViewLocation.anchor location)
+                 next (ReplPager.move &layout anchor delta (Int.- height 3))]
+          (if (and (Int.= anchor next) (Int./= delta 0))
+            (let [offset @(ReplViewPage.offset snapshot)
+                  bytes (String.length (ReplViewPage.text snapshot))]
+              (fetch! browser
+                      (Int.max 0
+                               (Int.+ offset
+                                      (if (Int.> delta 0)
+                                        bytes
+                                        (Int.- 0 (budget width height)))))
+                      width
+                      height))
+            (ReplViewLocation.set-anchor! location next)))
+        (let-do [total @(ReplViewPage.total snapshot)
+                 selected (Int.max 0
+                                   (Int.+ @(ReplViewLocation.selected location)
+                                          delta))
+                 offset @(ReplViewPage.offset snapshot)
+                 count (Array.length (ReplViewPage.items snapshot))]
+          (when (Int.>= total 0)
+            (set! selected (Int.min selected (Int.max 0 (Int.dec total)))))
+          (ReplViewLocation.set-selected! location selected)
+          (unless-do (and (Int.>= selected offset)
+                          (Int.< selected (Int.+ offset count)))
+            (fetch! browser
+                    (if (Int.< count (rows height))
+                      selected
+                      (Int.* (Int./ selected (rows height)) (rows height)))
+                    width
+                    height)
+            (let [items (ReplViewPage.items (page browser))]
+              (unless (Array.empty? items)
+                (ReplViewLocation.set-selected! (current browser)
+                                                (Int.max
+                                                  @(ReplViewItem.index (Array.unsafe-nth items
+                                                                                         0))
+                                                  (Int.min selected
+                                                           @(ReplViewItem.index (Array.unsafe-last items))))))))))))
+
+  (defn- switch! [browser width height]
+    (let-do [choices (ReplViewPage.choices (page browser))
+             next 0]
+      (for [i 0 (Array.length choices)]
+        (when (String.=
+            (ReplViewChoice.selector (Array.unsafe-nth choices i))
+            (ReplViewPage.selector (page browser)))
+          (set! next
+                (Int.positive-mod (Int.inc i) (Int.max 1 (Array.length choices))))))
+      (unless-do (Array.empty? choices)
+        (request! browser
+                  (ReplViewOperation.Page
+                    @(ReplViewChoice.selector (Array.unsafe-nth choices next))
+                    0
+                    (rows height)
+                    width
+                    (budget width height))
+                  false)
+        (ReplViewLocation.set-selected! (current browser) 0)
+        (ReplViewLocation.set-horizontal! (current browser) 0))))
+
+  (defn- parent! [browser]
+    (let [stack (ReplBrowser.stack browser)]
+      (when-do (Int.> (Array.length stack) 1)
+        (release (ReplBrowser.client browser) (page browser))
+        (ignore (Array.pop-back! stack)))))
+
+  (doc step!
+    "handles navigation and requests only windows or explicit selections.
+False closes the browser; the caller then releases all leases with close!.")
+  (defn step! [browser key width height]
+    (do
+      (ReplBrowser.set-message! browser @"")
+      (if (or (Int.= key -1)
+              (or (Int.= key 3)
+                  (or (Int.= key 4) (or (Int.= key 113) (Int.= key 27)))))
+        false
+        (do
+          (cond
+            (Int.= key 9) (switch! browser width height)
+            (or (Int.= key 127)
+                (or (Int.= key 8) (or (Int.= key 104) (Int.= key 307))))
+              (parent! browser)
+            (or (Int.= key 13)
+                (or (Int.= key 10) (or (Int.= key 108) (Int.= key 308))))
+              (unless (Array.empty? (ReplViewPage.items (page browser)))
+                (request! browser
+                          (ReplViewOperation.Select @(ReplViewPage.selector (page browser))
+                                                    @(ReplViewLocation.selected (current browser)))
+                          true))
+            (or (Int.= key 106) (Int.= key 302)) (move! browser 1 width height)
+            (or (Int.= key 107) (Int.= key 301)) (move! browser -1 width height)
+            (or (Int.= key 32) (or (Int.= key 6) (Int.= key 306)))
+              (move! browser (rows height) width height)
+            (or (Int.= key 98) (or (Int.= key 2) (Int.= key 305)))
+              (move! browser (Int.- 0 (rows height)) width height)
+            (or (Int.= key 103) (Int.= key 303))
+              (do
+                (fetch! browser 0 width height)
+                (ReplViewLocation.set-selected! (current browser) 0))
+            (or (Int.= key 71) (Int.= key 304))
+              (let [total @(ReplViewPage.total (page browser))]
+                (if (Int.>= total 0)
+                  (move! browser total width height)
+                  (ReplBrowser.set-message! browser
+                                            @"the provider has no total count")))
+            (or (Int.= key 91) (Int.= key 93))
+              (let [location (current browser)]
+                (ReplViewLocation.set-horizontal! location
+                                                  (Int.max 0
+                                                           (Int.+ @(ReplViewLocation.horizontal location)
+                                                                  (if (Int.= key
+                                                                             93)
+                                                                    8
+                                                                    -8)))))
+            ())
+          true))))
+
+  (defn- single-line [text]
+    (let-do [characters (String.chars text)
+             pieces (the (Array String) [])]
+      (for [i 0 (Array.length &characters)]
+        (let [c @(Array.unsafe-nth &characters i)]
+          (Array.push-back! &pieces
+                            (if (Char.= c \newline)
+                              @"↵"
+                              (String.from-chars &[c])))))
+      (String.concat &pieces)))
+
+  (defn- clipped [source skip width]
+    (let-do [layout (ReplPager.layout &(single-line source) 1048576)
+             cells (ReplDisplayRow.cells
+               (ReplPagerLine.row
+                 (Array.unsafe-nth (ReplPagerLayout.lines &layout) 0)))
+             pieces (the (Array String) [])
+             column 0
+             included false]
+      (for [i 0 (Array.length cells)]
+        (let-do [cell (Array.unsafe-nth cells i)
+                 size @(ReplDisplayCell.width cell)
+                 end (Int.+ column size)
+                 whole (and (Int.>= column skip) (Int.<= end (Int.+ skip width)))
+                 overlap (Int.max 0
+                                  (Int.- (Int.min end (Int.+ skip width))
+                                         (Int.max column skip)))]
+          (if (Int.= size 0)
+            (when included
+              (Array.push-back! &pieces @(ReplDisplayCell.glyph cell)))
+            (do
+              (set! included whole)
+              (cond
+                whole (Array.push-back! &pieces @(ReplDisplayCell.glyph cell))
+                (Int.> overlap 0)
+                  (Array.push-back! &pieces
+                                    (String.from-chars &(Array.replicate overlap
+                                                                         &\space)))
+                ())))
+          (set! column end)))
+      (String.concat &pieces)))
+
+  (defn- width [text]
+    @(ReplDisplayRow.width
+      (ReplPagerLine.row
+        (Array.unsafe-nth
+          (ReplPagerLayout.lines &(ReplPager.layout &(single-line text) 1048576))
+          0))))
+
+  (defn- table-line [cells widths]
+    (let-do [pieces (the (Array String) [])]
+      (for [i 0 (Array.length widths)]
+        (let-do [text (if (Int.< i (Array.length cells))
+                   @(Array.unsafe-nth cells i)
+                   @"")
+                 limit @(Array.unsafe-nth widths i)
+                 clipped (clipped &text 0 limit)
+                 padding (String.from-chars
+                   &(Array.replicate
+                     (Int.max 0 (Int.- limit (width &clipped)))
+                     &\space))]
+          (Array.push-back! &pieces (String.append &clipped &padding))))
+      (String.join " | " &pieces)))
+
+  (defn- row [text columns]
+    @(ReplPagerLine.row
+      (Array.unsafe-nth
+        (ReplPagerLayout.lines &(ReplPager.layout text (Int.max 4 columns)))
+        0)))
+
+  (doc frame "renders owned snapshots through the shared terminal row diff.")
+  (defn- image-rows [image columns limit colors]
+    (let-do [pixels (ReplViewImage.pixels image)
+             rows (the (Array ReplDisplayRow) [])]
+      (for [y 0 (Int.min limit @(ReplViewImage.sample-height image))]
+        (let-do [cells (the (Array ReplDisplayCell) [])
+                 pieces (the (Array String) [])]
+          (for [x
+                0
+                (Int.min (Int./ columns 2) @(ReplViewImage.sample-width image))]
+            (let-do [index (Int.* 4
+                                  (Int.+
+                                    (Int.* y @(ReplViewImage.sample-width image))
+                                    x))
+                     valid (Int.<= (Int.+ index 4) (Array.length pixels))
+                     alpha (if valid
+                       (Byte.to-int @(Array.unsafe-nth pixels (Int.+ index 3)))
+                       0)
+                     red (if valid
+                       (Int./
+                         (Int.* alpha
+                                (Byte.to-int @(Array.unsafe-nth pixels index)))
+                         255)
+                       0)
+                     green (if valid
+                       (Int./
+                         (Int.* alpha
+                                (Byte.to-int
+                                  @(Array.unsafe-nth pixels (Int.inc index))))
+                         255)
+                       0)
+                     blue (if valid
+                       (Int./
+                         (Int.* alpha
+                                (Byte.to-int
+                                  @(Array.unsafe-nth pixels (Int.+ index 2))))
+                         255)
+                       0)
+                     shade (Int./ (Int.+ red (Int.+ green blue)) 3)
+                     glyph (cond
+                       (Int.= alpha 0) @"  "
+                       colors @"██"
+                       (Int.> shade 192) @"##"
+                       (Int.> shade 96) @"++"
+                       (Int.> shade 32) @".."
+                       @"  ")
+                     style (if colors (ReplDisplay.rgb red green blue) -1)]
+              (Array.push-back! &pieces @&glyph)
+              (Array.push-back! &cells (ReplDisplayCell.init glyph 2 style))))
+          (Array.push-back! &rows
+                            (ReplDisplayRow.init (String.concat &pieces)
+                                                 (Int.* 2 (Array.length &cells))
+                                                 cells))))
+      rows))
+
+  (defn- table-rows [snapshot selected horizontal columns limit]
+    (let-do [headers (ReplViewPage.columns snapshot)
+             items (ReplViewPage.items snapshot)
+             widths (the (Array Int) [])
+             rows (the (Array ReplDisplayRow) [])]
+      (for [i 0 (Int.max 1 (Array.length headers))]
+        (let-do [size (if (Int.< i (Array.length headers))
+                   (width (Array.unsafe-nth headers i))
+                   0)]
+          (for [j 0 (Array.length items)]
+            (let [cells (ReplViewItem.cells (Array.unsafe-nth items j))]
+              (when (Int.< i (Array.length cells))
+                (set! size (Int.max size (width (Array.unsafe-nth cells i)))))))
+          (Array.push-back! &widths (Int.max 1 size))))
+      (Array.push-back! &rows
+                        (row
+                          &(String.append "  "
+                                          &(clipped &(table-line headers &widths)
+                                                    horizontal
+                                                    (Int.max 1 (Int.- columns 2))))
+                          columns))
+      (for [i 0 (Int.min limit (Array.length items))]
+        (let [item (Array.unsafe-nth items i)]
+          (Array.push-back! &rows
+                            (row
+                              &(String.append
+                                (if (Int.= @(ReplViewItem.index item) selected)
+                                  "> "
+                                  "  ")
+                                &(clipped
+                                  &(table-line (ReplViewItem.cells item) &widths)
+                                  horizontal
+                                  (Int.max 1 (Int.- columns 2))))
+                              columns))))
+      rows))
+
+  (doc frame "renders only the owned visible window. Provider strings are
+escaped as terminal text; resizing and navigation share the editor's row diff.")
+  (defn frame [browser columns height colors]
+    (let-do [location (current browser)
+             snapshot (page browser)
+             body (the (Array ReplDisplayRow) [])
+             limit (rows height)
+             content (cond
+               (String.= (ReplViewPage.kind snapshot) "text")
+                 (let [layout (ReplPager.layout (ReplViewPage.text snapshot)
+                                                columns)
+                       first (ReplPager.row-at &layout
+                                               @(ReplViewLocation.anchor location))]
+                   (Array.copy-map &(fn [line] @(ReplPagerLine.row line))
+                                   &(Array.slice (ReplPagerLayout.lines &layout)
+                                                 first
+                                                 (Int.min
+                                                   (Array.length (ReplPagerLayout.lines &layout))
+                                                   (Int.+ first (Int.inc limit))))))
+               (String.= (ReplViewPage.kind snapshot) "bitmap")
+                 (let-do [image (ReplViewPage.image snapshot)
+                          lines [(row
+                                   &(fmt "%d x %d RGBA"
+                                         @(ReplViewImage.width image)
+                                         @(ReplViewImage.height image))
+                                   columns)]
+                          pixels (image-rows image columns limit colors)]
+                   (for [i 0 (Array.length &pixels)]
+                     (Array.push-back! &lines @(Array.unsafe-nth &pixels i)))
+                   lines)
+               (table-rows snapshot
+                           @(ReplViewLocation.selected location)
+                           @(ReplViewLocation.horizontal location)
+                           columns
+                           limit))]
+      (Array.push-back! &body
+                        (row
+                          &(fmt "%s : %s  [%s]  depth %d"
+                                (ReplViewPage.type snapshot)
+                                (ReplViewPage.title snapshot)
+                                (ReplViewPage.selector snapshot)
+                                (Array.length (ReplBrowser.stack browser)))
+                          columns))
+      (for [i 0 (Int.min (Array.length &content) (Int.- height 3))]
+        (Array.push-back! &body @(Array.unsafe-nth &content i)))
+      (while-do (Int.< (Array.length &body) (Int.- height 2))
+        (Array.push-back! &body (ReplDisplayRow.init @"" 0 [])))
+      (Array.push-back! &body
+                        (row
+                          &(fmt
+                            "row %d / %s  offset %d  Tab view  Enter open  h parent"
+                            @(ReplViewLocation.selected location)
+                            &(if (Int.< @(ReplViewPage.total snapshot) 0)
+                              @"?"
+                              (str @(ReplViewPage.total snapshot)))
+                            @(ReplViewPage.offset snapshot))
+                          columns))
+      (Array.push-back! &body
+                        (row
+                          (if (String.empty? (ReplBrowser.message browser))
+                            "q close  arrows move  Space/b page  [/] scroll columns"
+                            (ReplBrowser.message browser))
+                          columns))
+      (let-do [texts (the (Array String) [])]
+        (for [i 0 (Array.length &body)]
+          (Array.push-back! &texts
+                            @(ReplDisplayRow.text (Array.unsafe-nth &body i))))
+        (ReplFrame.init (String.join "\r\n" &texts)
+                        body
+                        (Int.dec height)
+                        0
+                        (Int.dec height)
+                        0)))))

@@ -1,0 +1,183 @@
+(load "../carp-session.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(defn prepared-names [source]
+  (let [base (SourceInput.init @"base:prepared" @"")]
+    (match (Surface.parse-input-diagnosed &base)
+      (Result.Error error) @(Diagnostic.message &error)
+      (Result.Success parsed)
+        (match (Session.create-from-module &parsed &(ExpandConfig.init []))
+          (Result.Error error) @(Diagnostic.message &error)
+          (Result.Success session)
+            (let [input (SourceInput.init @"prepared:cell" @source)]
+              (match (Session.upsert-input &session &input)
+                (Result.Error error) @(Diagnostic.message &error)
+                (Result.Success definitions)
+                  (let-do [names (the (Array String) [])]
+                    (for [i 0 (Array.length &definitions)]
+                      (Array.push-back! &names
+                                        @(SessionDefInfo.name (Array.unsafe-nth &definitions
+                                                                                i))))
+                    (String.join " " &names))))))))
+
+(defn prepared-behavior []
+  (let-do [checks (the (Array Bool) [])
+           base (SourceInput.init @"base:projection" @"")]
+    (match (Surface.parse-input-diagnosed &base)
+      (Result.Error _) ()
+      (Result.Success parsed)
+        (match (Session.create-from-module &parsed &(ExpandConfig.init []))
+          (Result.Error _) ()
+          (Result.Success session)
+            (let [input (SourceInput.init @"projection:caller"
+                                          @"; retained source
+(do (defn prepared-answer [] 42)
+  (missing-runtime))")]
+              (match (Session.prepare-input &session &input)
+                (Result.Error error) (IO.errorln (Diagnostic.message &error))
+                (Result.Success prepared)
+                  (let-do [runtime (PreparedSessionInput.runtime &prepared)
+                           definitions (PreparedSessionInput.definitions &prepared)
+                           overlay (Array.unsafe-nth (CompilerSession.overlay &session)
+                                                     0)]
+                    (Array.push-back! &checks
+                                      (and (Int.= (Array.length definitions) 1)
+                                           (String.=
+                                             (SessionDefInfo.name (Array.unsafe-nth definitions
+                                                                                    0))
+                                             "prepared-answer")))
+                    (Array.push-back! &checks
+                                      (String.=
+                                        &(Surface.render-module (SourcedSurfaceModule.module runtime))
+                                        "(missing-runtime)"))
+                    (Array.push-back! &checks
+                                      (String.=
+                                        (SourceInput.source
+                                          (Array.unsafe-nth (SessionOverlay.inputs overlay)
+                                                            0))
+                                        (SourceInput.source &input)))
+                    (Array.push-back! &checks
+                                      (Array.empty?
+                                        (CoreModule.expressions (SessionOverlay.core overlay))))
+                    (Array.push-back! &checks
+                                      (Result.success?
+                                        &(Session.upsert-input &session
+                                                               &(SourceInput.init @"projection:later"
+                                                                                  @"(defn later-answer [] (prepared-answer))"))))
+                    (Array.push-back! &checks
+                                      (Array.empty?
+                                        (CoreModule.expressions
+                                          (SessionOverlay.core
+                                            (Array.unsafe-nth (CompilerSession.overlay &session)
+                                                              0)))))
+                    (let [bad (SourceInput.init @"projection:bad"
+                                                @"(defn invalid-answer [] no-such-binding) 9")]
+                      (Array.push-back! &checks
+                                        (and
+                                          (Result.error? &(Session.prepare-input &session
+                                                                                 &bad))
+                                          (Int.=
+                                            (Array.length &(Session.definitions &session))
+                                            2))))
+                    (Session.reset &session)
+                    (Array.push-back! &checks
+                                      (and
+                                        (Result.error?
+                                          &(Session.upsert-input &session
+                                                                 &(SourceInput.init @"projection:caller"
+                                                                                    @"(defn after-reset [] 42) (missing-after-reset)")))
+                                        (Array.empty? &(Session.definitions &session)))))))))
+    checks))
+
+(defn prepared-context-delta []
+  (let-do [checks (the (Array Bool) [])
+           base (SourceInput.init @"base:context-delta"
+                                  @"(register prepared-primitive (Fn [Int] Int) \"abs\")
+(definterface prepared-choice (Fn [a a] a))
+(defn prepared-left [a b] a)
+(implements prepared-choice prepared-left)")]
+    (match (Surface.parse-input-diagnosed &base)
+      (Result.Error _) ()
+      (Result.Success parsed)
+        (match (Session.create-from-module &parsed &(ExpandConfig.init []))
+          (Result.Error _) ()
+          (Result.Success session)
+            (do
+              (ignore
+                (Session.upsert-input &session
+                                      &(SourceInput.init @"context:first"
+                                                         @"(defn delegated [x] (prepared-primitive x))")))
+              (ignore
+                (Session.upsert-input &session
+                                      &(SourceInput.init @"context:second"
+                                                         @"(defn unrelated [] 42)")))
+              (let [core (SessionOverlay.core
+                      (Array.unsafe-nth (CompilerSession.overlay &session) 0))]
+                (Array.push-back! &checks
+                                  (and
+                                    (Array.empty? (CoreModule.builtins core))
+                                    (and
+                                      (Array.empty? (CoreModule.builtin-sources core))
+                                      (and
+                                        (Array.empty? (CoreModule.interfaces core))
+                                        (Array.empty? (CoreModule.implementations core)))))))
+              (Array.push-back! &checks
+                                (match (Session.infer-cell &session
+                                                           &(SourceInput.init @"context:cell"
+                                                                              @"(prepared-primitive (prepared-choice 1 2))"))
+                                  (Result.Error _) false
+                                  (Result.Success report)
+                                    (String.=
+                                      (SessionTypedEntity.type
+                                        (Array.unsafe-nth (CellReport.forms &report)
+                                                          0))
+                                      "Int")))
+              (ignore
+                (Session.upsert-input &session
+                                      &(SourceInput.init @"context:new-primitive"
+                                                         @"(register new-primitive (Fn [Int] Int) \"abs\")")))
+              (ignore
+                (Session.upsert-input &session
+                                      &(SourceInput.init @"context:shadow-primitive"
+                                                         @"(register prepared-primitive (Fn [Int] Int) \"labs\")")))
+              (let-do [sources (CoreModule.builtin-sources
+                         (SessionOverlay.core
+                           (Array.unsafe-nth (CompilerSession.overlay &session)
+                                             0)))
+                       shadowed false]
+                (for [i 0 (Array.length sources)]
+                  (let [entry (Array.unsafe-nth sources i)]
+                    (when (String.=
+                        (CoreRef.name (CoreBuiltinSource.reference entry))
+                        "prepared-primitive")
+                      (match-ref (CoreBuiltinSource.payload entry)
+                        (CoreBuiltinPayload.External name)
+                          (match-ref name
+                            (Maybe.Just native)
+                              (set! shadowed (String.= native "labs"))
+                            _ ())
+                        _ ()))))
+                (Array.push-back! &checks
+                                  (and shadowed (Int.= (Array.length sources) 2)))))))
+    checks))
+
+(deftest test
+  (assert-equal test
+    &[true true true]
+    &(prepared-context-delta)
+    "committed deltas omit inherited context and retain explicit native declarations")
+  (assert-equal test
+    "PreparedBox"
+    &(prepared-names "(deftype PreparedBox [value Int])")
+    "committing a type reports the type rather than its generated accessors")
+  (assert-equal test
+    "make-prepared PreparedGroup prepared-macro"
+    &(prepared-names
+      "(deftype PreparedGroup [value Int]) (defn make-prepared [] 42) (defmacro prepared-macro [] 17)")
+    "one input retains its functions, types, and macros")
+  (assert-equal test
+    &[true true true true true true true true]
+    &(prepared-behavior)
+    "prepared inputs preserve source, separate runtime roots, replay declarations, and recover atomically"))

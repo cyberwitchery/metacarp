@@ -176,10 +176,26 @@ run_llvm() {
     cd carp-llvm-backend
     "$compiler" -c "$core_dir" -x test/carp-llvm-backend.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/carp-session-jit.carp
+    CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/incremental-abi.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/artifacts.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/inspection-layout.carp
     CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x test/foreign-layout.carp
   )
+  if CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -x carp-repl/test/native/browse.carp; then
+    :
+  else
+    native_status=$?
+    # Rebuild with symbols for a diagnostic replay, preserving the failing gate.
+    if CARP_DIR="$core_dir" "$compiler" -c "$core_dir" -g -b -o out/repl-native-browse carp-repl/test/native/browse.carp; then
+      if command -v gdb >/dev/null 2>&1; then
+        CARP_DIR="$core_dir" gdb --batch -ex 'set pagination off' -ex run \
+          -ex 'thread apply all bt' --args out/repl-native-browse || true
+      fi
+    fi
+    exit "$native_status"
+  fi
+  "$compiler" -c "$core_dir" -x carp-repl/test/view-snapshot.carp
+  "$compiler" -c "$core_dir" -x carp-views/test/views.carp
   "$script_dir/check-llvm-memory.sh"
 }
 

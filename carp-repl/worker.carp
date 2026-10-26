@@ -1,0 +1,270 @@
+(load "console.carp")
+(load "language.carp")
+(load "process-native.carp")
+; Program arguments have process lifetime, including native atexit callbacks.
+(def *repl-worker-arguments* (the (Array String) []))
+
+(defmodule ReplWorker
+  (defn- die [] (System.exit 1))
+
+  (defn- send! [channel reply]
+    (ReplTransport.send! channel &(ReplWire.encode reply)))
+
+  (defn- flush! [channel]
+    (while-do (and (ReplTransport.pending? channel)
+                   (String.empty? (ReplChannel.error channel)))
+      (ReplTransport.flush! channel)
+      (when (ReplTransport.pending? channel)
+        (ignore (ReplTransport.wait &[] @(ReplChannel.writer channel) 100)))))
+
+  (defn- acknowledged! [channel checkpoint]
+    (do
+      (send! channel &(ReplWorkerReply.Checkpoint checkpoint))
+      (flush! channel)
+      (unless (String.empty? (ReplChannel.error channel)) (die))
+      (let-do [byte 0b
+               status -1l]
+        (while-do (and (Long.< status 0l)
+                       (or (Long.= status -1l)
+                           (Int.=
+                             (Pointer.to-value (ReplTransportNative.errno))
+                             ReplTransportNative.INTERRUPTED)))
+          (set! status
+                (ReplNative.read ReplProcessHost.acknowledgement-fd
+                                 (Pointer.address &byte)
+                                 1l))
+          (when (and (Long.< status 0l)
+                     (Int./=
+                       (Pointer.to-value (ReplTransportNative.errno))
+                       ReplTransportNative.INTERRUPTED))
+            (die)))
+        (unless (and (Long.= status 1l) (Byte.= byte 1b)) (die)))))
+
+  (sig watch-parent (Fn [(Ptr ())] (Ptr ())))
+  (defn- watch-parent [-context]
+    (let-do [byte 0b
+             status -1l]
+      (while-do (Long.< status 0l)
+        (set! status
+              (ReplNative.read ReplProcessHost.lifeline-fd
+                               (Pointer.address &byte)
+                               1l))
+        (when (and (Long.< status 0l)
+                   (Int./=
+                     (Pointer.to-value (ReplTransportNative.errno))
+                     ReplTransportNative.INTERRUPTED))
+          (set! status 0l)))
+      (unless (and (Long.= status 1l) (Byte.= byte 1b))
+        (ignore (ReplProcessNative.kill 0 ReplProcessNative.KILL)))
+      (Pointer.from-long 0l)))
+
+  (defn- handshake! [channel]
+    (let-do [schema (ReplWorkerProtocol.schema)
+             arguments (the (Array (Array String)) [])]
+      (ReplTransport.send! channel &(ReplWire.encode &schema))
+      (while-do (Array.empty? &arguments)
+        (ReplTransport.pump! channel)
+        (match (ReplTransport.poll! channel)
+          (Result.Error _) (die)
+          (Result.Success (Maybe.Nothing))
+            (ignore
+              (ReplTransport.wait &[@(ReplChannel.reader channel)]
+                                  (if (ReplTransport.pending? channel)
+                                    @(ReplChannel.writer channel)
+                                    -1)
+                                  100))
+          (Result.Success (Maybe.Just bytes))
+            (match (the (Result ReplWorkerStart String) (ReplWire.decode &bytes))
+              (Result.Error _) (die)
+              (Result.Success start)
+                (if (ReplWorkerProtocol.compatible? (ReplWorkerStart.schema &start))
+                  (Array.push-back! &arguments
+                                    @(ReplWorkerStart.arguments &start))
+                  (die)))))
+      @(Array.unsafe-nth &arguments 0)))
+
+  (defn- request! [engine service channel request console]
+    (match request
+      (ReplWorkerRequest.Language request)
+        (let-do [serial @(ReplLanguageRequest.request &request)]
+          (ReplService.submit! service request)
+          (send! channel &(ReplWorkerReply.LanguageAccepted serial))
+          true)
+      (ReplWorkerRequest.Resume)
+        (do
+          (ReplService.resume! service)
+          (send! channel &(ReplWorkerReply.Ready (ReplService.session service)))
+          true)
+      (ReplWorkerRequest.Pause)
+        (do
+          (ReplService.pause! service)
+          (send! channel
+                 &(ReplWorkerReply.Done @(ReplEngineState.editing engine)))
+          true)
+      (ReplWorkerRequest.CancelEdit)
+        (do
+          (ReplService.pause! service)
+          (ReplEngine.cancel-edit engine)
+          (ReplEngine.checkpoint! engine)
+          (send! channel &(ReplWorkerReply.Done 0))
+          true)
+      (ReplWorkerRequest.Restore checkpoint)
+        (match (ReplEngine.restore engine &checkpoint)
+          (Result.Error error)
+            (do
+              (ReplConsole.error console &error "")
+              (send! channel
+                     &(ReplWorkerReply.Failure @"could not rebuild declarations"))
+              false)
+          (Result.Success _)
+            (do
+              (ReplEngine.checkpoint! engine)
+              (send! channel &(ReplWorkerReply.Done 0))
+              true))
+      (ReplWorkerRequest.View request)
+        (do
+          (match (ReplEngine.view-request engine &request)
+            (Result.Error error)
+              (send! channel &(ReplWorkerReply.ViewError error))
+            (Result.Success page) (send! channel &(ReplWorkerReply.Page page)))
+          true)
+      (ReplWorkerRequest.Command source)
+        (do
+          (ReplService.pause! service)
+          (ReplEngine.checkpoint! engine)
+          (if (ReplCommands.command? &source)
+            (repl-engine-command engine &source console)
+            (ReplConsole.answer console
+                                engine
+                                (ReplEngine.submit engine &source)
+                                &source))
+          (ReplEngine.checkpoint! engine)
+          (IO.Raw.fflush! IO.Raw.stdout)
+          (IO.Raw.fflush! IO.Raw.stderr)
+          (send! channel
+                 &(ReplWorkerReply.Done @(ReplEngineState.editing engine)))
+          true)
+      (ReplWorkerRequest.Shutdown) false))
+
+  (defn- loop [engine service channel]
+    (let-do [pointer (Pointer.address channel)
+             console (ReplConsole.init
+               (fn [effect]
+                 (send! (Pointer.to-ref pointer)
+                        &(ReplWorkerReply.Effect effect))))
+             running true]
+      (while-do running
+        (ReplTransport.pump! channel)
+        (let-do [receiving true]
+          (while-do (and receiving running)
+            (match (ReplTransport.poll! channel)
+              (Result.Error _) (die)
+              (Result.Success (Maybe.Nothing)) (set! receiving false)
+              (Result.Success (Maybe.Just bytes))
+                (match (the (Result ReplWorkerRequest String)
+                            (ReplWire.decode &bytes))
+                  (Result.Error _) (die)
+                  (Result.Success request)
+                    (set! running
+                          (request! engine service channel request &console))))))
+        (let-do [publishing true]
+          (while-do publishing
+            (match (ReplService.poll! service)
+              (Maybe.Nothing) (set! publishing false)
+              (Maybe.Just update)
+                (send! channel &(ReplWorkerReply.Language update)))))
+        (ReplTransport.flush! channel)
+        (when running
+          (ignore
+            (ReplTransport.wait
+              &[@(ReplChannel.reader channel)
+                @(ReplLanguageWorker.wake-read (Pointer.to-ref service))]
+              (if (ReplTransport.pending? channel)
+                @(ReplChannel.writer channel)
+                -1)
+              100))))
+      (ReplService.close! service)
+      (ReplEngine.dispose engine)
+      (IO.Raw.fflush! IO.Raw.stdout)
+      (IO.Raw.fflush! IO.Raw.stderr)
+      (send! channel &(ReplWorkerReply.Done 0))
+      (flush! channel)))
+
+  (defn- run-execution [core scratch tty]
+    (let-do [channel (ReplTransport.create ReplProcessHost.request-fd
+                                           ReplProcessHost.reply-fd)
+             pointer (Pointer.address &channel)
+             thread (the (Ptr ReplNativeThread)
+                         (ReplNative.allocate
+                           (Pointer.width
+                             (the (Ptr ReplNativeThread) (Pointer.from-long 0l)))))]
+      (for [fd ReplProcessHost.request-fd (Int.inc ReplProcessHost.lifeline-fd)]
+        (ignore
+          (ReplNative.flags fd
+                            ReplTransportNative.SET-FD
+                            ReplTransportNative.CLOSE-ON-EXEC)))
+      (when (and tty
+                 (Int./=
+                   (ReplProcessNative.ioctl 0
+                                            ReplProcessNative.CLAIM-TTY
+                                            (Pointer.from-long 0l))
+                   0))
+        (die))
+      (ignore
+        (ReplProcessNative.set-buffer IO.Raw.stdin
+                                      (Pointer.from-long 0l)
+                                      ReplProcessNative.UNBUFFERED
+                                      0l))
+      (when (Int./=
+          (ReplNative.thread-create-worker thread
+                                           (Pointer.from-long 0l)
+                                           (Function.unsafe-ptr &watch-parent)
+                                           (Pointer.from-long 0l))
+          0)
+        (die))
+      (set! *repl-worker-arguments* (handshake! &channel))
+      (ignore
+        (ReplProcessNative.copy-bytes (Pointer.address &System.args)
+                                      (Pointer.address &*repl-worker-arguments*)
+                                      (Pointer.width
+                                        (Pointer.address &*repl-worker-arguments*))))
+      (match (ReplEngine.create core scratch)
+        (Result.Error error)
+          (do
+            (send! &channel
+                   &(ReplWorkerReply.Failure @(Diagnostic.message &error)))
+            (flush! &channel)
+            (die))
+        (Result.Success engine)
+          (let-do [context (ReplLanguage.create (Pointer.address &engine))]
+            (match (ReplService.create
+                (fn [request cancelled publish]
+                  (ReplLanguage.backend context request cancelled publish)))
+              (Result.Error error)
+                (do
+                  (send! &channel &(ReplWorkerReply.Failure error))
+                  (flush! &channel)
+                  (die))
+              (Result.Success service)
+                (do
+                  (ReplEngineState.set-checkpoint! &engine
+                                                   [(fn [checkpoint]
+                                                      (acknowledged! (Pointer.to-ref pointer)
+                                                                     checkpoint))])
+                  (send! &channel
+                         &(ReplWorkerReply.Ready (ReplService.session service)))
+                  (loop &engine service &channel)))
+            (ReplLanguage.dispose context)))
+      (ignore
+        (ReplNative.thread-join (Pointer.to-value thread) (Pointer.from-long 0l)))
+      (ReplNative.release thread)
+      0))
+  (defn run [core scratch tty]
+    (let-do [pid (ReplProcessNative.process-id)
+             valid (and
+               (Int.= (ReplProcessNative.session-id 0) pid)
+               (Int.= (ReplProcessNative.group-id) pid))]
+      (for [fd ReplProcessHost.request-fd (Int.inc ReplProcessHost.lifeline-fd)]
+        (when (Int.< (ReplNative.flags fd ReplProcessNative.GET-FD 0) 0)
+          (set! valid false)))
+      (if valid (run-execution core scratch tty) 2))))

@@ -16,6 +16,28 @@ carp-session itself stays free of libLLVM). `Session.create` loads and checks
 Core once; subsequent cells and definition rebuilds reuse the warm Core
 expansion, resolution, and inference snapshots.
 
+Committed overlays store declaration deltas. Builtins and dispatch declarations
+inherited for inference remain in the warm base or their owning earlier input;
+explicit native declarations and overrides remain in the new delta.
+
+`Session.prepare-input` supports hosts whose submissions can combine
+committed declarations and transient runtime roots, including a single macro
+that produces both. Call it on a candidate session. It returns a
+`PreparedSessionInput` with the original source, expanded runtime syntax,
+committed definition reports, and a declaration flag. The session stores the
+original input and its declaration projection policy; rebuilds re-expand that
+source and discard its runtime roots before resolution. Pure runtime inputs do
+not enter the committed replay list.
+
+`Session.infer-expanded-cell` and
+`Session.lower-expanded-cell-with-known-namespaced` check and lower that syntax
+without expanding it again. `SessionJit.compile-expanded-cell` publishes it
+without running it. A host can therefore validate native publication before
+installing the candidate session and invoking its roots. Syntax keeps its
+caller spans; result-capture scaffolding does not require printing or reparsing
+user forms. Native submission expansion retains runtime calls and assignments
+instead of applying the compiler's load-time command evaluation policy.
+
 The LLVM host adds a second persistent layer: one ORC LLJIT and thread-safe
 LLVM context per compiler session. Each cell contributes an incremental module
 containing only symbols not already published, so compiled globals and their

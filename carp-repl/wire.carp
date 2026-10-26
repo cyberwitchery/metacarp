@@ -1,0 +1,196 @@
+; Owned data only. The transport supplies framing; codecs never read a descriptor.
+(deftype ReplWireReader [bytes (Array Byte)
+                         cursor Int])
+
+(doc ReplWire "encodes explicit records into a local process protocol. Numeric
+fields are decimal lines; strings are byte-counted UTF-8 and need no escaping.")
+(defmodule ReplWire
+  (definterface write (Fn [(Ref (Array Byte)) (Ref a)] ()))
+  (definterface read (Fn [(Ref ReplWireReader)] (Result a String)))
+
+  (doc remaining "returns the unread payload size.")
+  (defn remaining [reader]
+    (Int.-
+      (Array.length (ReplWireReader.bytes reader))
+      @(ReplWireReader.cursor reader)))
+
+  (defn- append-bytes! [output bytes]
+    (for [i 0 (Array.length bytes)]
+      (Array.push-back! output @(Array.unsafe-nth bytes i))))
+
+  (sig write-long! (Fn [(Ref (Array Byte)) (Ref Long)] ()))
+  (defn- write-long! [output value]
+    (let-do [text (Long.str @value)]
+      (append-bytes! output &(String.to-bytes &text))
+      (Array.push-back! output 10b)))
+  (implements write write-long!)
+
+  (sig write-int! (Fn [(Ref (Array Byte)) (Ref Int)] ()))
+  (defn- write-int! [output value] (write-long! output &(Long.from-int @value)))
+  (implements write write-int!)
+
+  (sig write-byte! (Fn [(Ref (Array Byte)) (Ref Byte)] ()))
+  (defn- write-byte! [output value] (write-int! output &(Byte.to-int @value)))
+  (implements write write-byte!)
+
+  (sig write-bool! (Fn [(Ref (Array Byte)) (Ref Bool)] ()))
+  (defn- write-bool! [output value] (write-int! output &(if @value 1 0)))
+  (implements write write-bool!)
+
+  (sig write-string! (Fn [(Ref (Array Byte)) (Ref String)] ()))
+  (defn- write-string! [output value]
+    (let-do [bytes (String.to-bytes value)]
+      (write-int! output &(Array.length &bytes))
+      (append-bytes! output &bytes)))
+  (implements write write-string!)
+
+  (sig write-array! (Fn [(Ref (Array Byte)) (Ref (Array a))] ()))
+  (defn- write-array! [output values]
+    (let-do [count (Array.length values)]
+      (write-int! output &count)
+      (for [i 0 count] (write output (Array.unsafe-nth values i)))))
+  (implements write write-array!)
+
+  (sig write-maybe! (Fn [(Ref (Array Byte)) (Ref (Maybe a))] ()))
+  (defn- write-maybe! [output value]
+    (match-ref value
+      (Maybe.Nothing) (write-int! output &0)
+      (Maybe.Just item) (do (write-int! output &1) (write output item))))
+  (implements write write-maybe!)
+
+  (sig read-long (Fn [(Ref ReplWireReader)] (Result Long String)))
+  (defn- read-long [reader]
+    (let-do [start @(ReplWireReader.cursor reader)
+             negative false
+             value 0l
+             digits 0
+             done false
+             error @""]
+      (when-do (and (Int.> (remaining reader) 0)
+                    (Byte.=
+                      @(Array.unsafe-nth (ReplWireReader.bytes reader) start)
+                      45b))
+        (set! negative true)
+        (ReplWireReader.set-cursor! reader (Int.inc start)))
+      (let [limit (if negative Long.MIN (Long.neg Long.MAX))]
+        (while-do (and (not done) (String.empty? &error))
+          (if (Int.= (remaining reader) 0)
+            (set! error @"truncated numeric field")
+            (let-do [at @(ReplWireReader.cursor reader)
+                     byte (Byte.to-int
+                       @(Array.unsafe-nth (ReplWireReader.bytes reader) at))
+                     digit (Long.from-int (Int.- byte 48))]
+              (ReplWireReader.set-cursor! reader (Int.inc at))
+              (cond
+                (Int.= byte 10) (set! done true)
+                (or (Int.< byte 48) (Int.> byte 57))
+                  (set! error @"invalid numeric field")
+                (Long.< value (Long./ limit 10l))
+                  (set! error @"numeric field overflow")
+                (do
+                  (set! value (Long.* value 10l))
+                  (if (Long.< value (Long.+ limit digit))
+                    (set! error @"numeric field overflow")
+                    (do
+                      (set! value (Long.- value digit))
+                      (set! digits (Int.inc digits))))))))))
+      (cond
+        (not (String.empty? &error)) (Result.Error error)
+        (Int.= digits 0) (Result.Error @"empty numeric field")
+        (Result.Success (if negative value (Long.neg value))))))
+  (implements read read-long)
+
+  (sig read-int (Fn [(Ref ReplWireReader)] (Result Int String)))
+  (defn- read-int [reader]
+    (match (read-long reader)
+      (Result.Error error) (Result.Error error)
+      (Result.Success value)
+        (if (or (Long.< value (Long.from-int Int.MIN))
+                (Long.> value (Long.from-int Int.MAX)))
+          (Result.Error @"integer field overflow")
+          (Result.Success (Long.to-int value)))))
+  (implements read read-int)
+
+  (sig read-byte (Fn [(Ref ReplWireReader)] (Result Byte String)))
+  (defn- read-byte [reader]
+    (match (read-int reader)
+      (Result.Error error) (Result.Error error)
+      (Result.Success value)
+        (if (or (Int.< value 0) (Int.> value 255))
+          (Result.Error @"invalid byte field")
+          (Result.Success (Byte.from-int value)))))
+  (implements read read-byte)
+
+  (sig read-bool (Fn [(Ref ReplWireReader)] (Result Bool String)))
+  (defn- read-bool [reader]
+    (match (read-int reader)
+      (Result.Error error) (Result.Error error)
+      (Result.Success value)
+        (if (or (Int.= value 0) (Int.= value 1))
+          (Result.Success (Int.= value 1))
+          (Result.Error @"invalid boolean field"))))
+  (implements read read-bool)
+
+  (sig read-string (Fn [(Ref ReplWireReader)] (Result String String)))
+  (defn- read-string [reader]
+    (match (read-int reader)
+      (Result.Error error) (Result.Error error)
+      (Result.Success count)
+        (if (or (Int.< count 0) (Int.> count (remaining reader)))
+          (Result.Error @"truncated string field")
+          (let-do [start @(ReplWireReader.cursor reader)
+                   end (Int.+ start count)
+                   bytes (Array.slice (ReplWireReader.bytes reader) start end)]
+            (ReplWireReader.set-cursor! reader end)
+            (Result.Success (String.from-bytes &bytes))))))
+  (implements read read-string)
+
+  (sig read-array (Fn [(Ref ReplWireReader)] (Result (Array a) String)))
+  (defn- read-array [reader]
+    (match (read-int reader)
+      (Result.Error error)
+      (Result.Error error)
+      (Result.Success count)
+      ; Every codec emits at least a numeric header, including empty records.
+      (if (or (Int.< count 0) (Int.> count (remaining reader)))
+        (Result.Error @"invalid array length")
+        (let-do [values (the (Array a) [])
+                 error @""]
+          (for [i 0 count]
+            (when (String.empty? &error)
+              (match (the (Result a String) (read reader))
+                (Result.Error message) (set! error message)
+                (Result.Success value) (Array.push-back! &values value))))
+          (if (String.empty? &error)
+            (Result.Success values)
+            (Result.Error error))))))
+  (implements read read-array)
+
+  (sig read-maybe (Fn [(Ref ReplWireReader)] (Result (Maybe a) String)))
+  (defn- read-maybe [reader]
+    (match (read-int reader)
+      (Result.Error error) (Result.Error error)
+      (Result.Success tag)
+        (cond
+          (Int.= tag 0) (Result.Success (Maybe.Nothing))
+          (Int.= tag 1)
+            (match (the (Result a String) (read reader))
+              (Result.Error error) (Result.Error error)
+              (Result.Success value) (Result.Success (Maybe.Just value)))
+          (Result.Error @"invalid optional field tag"))))
+  (implements read read-maybe)
+
+  (doc encode "encodes one owned protocol value into a payload.")
+  (defn encode [value]
+    (let-do [bytes (the (Array Byte) [])] (write &bytes value) bytes))
+
+  (sig decode (Fn [(Ref (Array Byte))] (Result a String)))
+  (doc decode "decodes one complete payload and rejects trailing fields.")
+  (defn decode [bytes]
+    (let-do [reader (ReplWireReader.init @bytes 0)]
+      (match (the (Result a String) (read &reader))
+        (Result.Error error) (Result.Error error)
+        (Result.Success value)
+          (if (Int.= (remaining &reader) 0)
+            (Result.Success value)
+            (Result.Error @"trailing protocol data"))))))

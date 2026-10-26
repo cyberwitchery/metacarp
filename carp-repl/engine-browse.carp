@@ -1,0 +1,336 @@
+; Loaded by engine.carp. Compiler and native ownership stay behind the view client.
+(defmodule ReplEngine
+  (defn- browse-call! [engine index operation object row request columns decode]
+    (let-do [query (Array.unsafe-nth (ReplEngineState.browse-queries engine)
+                                     index)
+             channel (Pointer.to-ref @(ReplViewQuery.input query))]
+      (ReplViewInput.set-generation! channel
+                                     (Long.from-int @(ReplEngineState.generation engine)))
+      (ReplViewInput.set-operation! channel operation)
+      (ReplViewInput.set-object! channel object)
+      (ReplViewInput.set-row! channel row)
+      (ReplViewInput.set-request! channel @request)
+      (ReplViewInput.set-columns! channel columns)
+      (ReplViewQueries.invoke! (ReplEngineState.jit engine) query decode)))
+
+  (defn- browse-page! [engine index operation object row request columns]
+    (let [generation (Long.from-int @(ReplEngineState.generation engine))]
+      (browse-call! engine
+                    index
+                    operation
+                    object
+                    row
+                    request
+                    columns
+                    (fn [jit value] (ReplViewDecode.page jit value generation)))))
+
+  (defn- browse-release! [engine owner]
+    (let [index @(ReplBrowseOwner.query owner)]
+      (when (Int.>= index 0)
+        (browse-call! engine
+                      index
+                      3
+                      @(ReplBrowseOwner.object owner)
+                      0
+                      (ReplBrowseOwner.request owner)
+                      @(ReplBrowseOwner.columns owner)
+                      (fn [-jit -value] ())))))
+
+  (defn- clear-browse! [engine]
+    (let-do [owners (ReplEngineState.browse-owners engine)]
+      (for [i (Array.length owners) 0 -1]
+        (browse-release! engine (Array.unsafe-nth owners (Int.dec i))))
+      (ReplEngineState.set-browse-owners! engine [])
+      (when (Int.> (Array.length (ReplEngineState.browse-queries engine)) 0)
+        (browse-call! engine
+                      0
+                      4
+                      -1
+                      0
+                      &(ReplInspect.defaults)
+                      80
+                      (fn [-jit -value] ())))
+      (ReplViewQueries.clear! (ReplEngineState.browse-queries engine))))
+
+  (defn- close-result-views! [engine number]
+    (let-do [owners (ReplEngineState.browse-owners engine)
+             keep (the (Array ReplBrowseOwner) [])]
+      (for [i (Array.length owners) 0 -1]
+        (let [owner (Array.unsafe-nth owners (Int.dec i))]
+          (when (Int.>= @(ReplBrowseOwner.result owner) number)
+            (browse-release! engine owner))))
+      (for [i 0 (Array.length owners)]
+        (let [owner (Array.unsafe-nth owners i)]
+          (when (Int.< @(ReplBrowseOwner.result owner) number)
+            (Array.push-back! &keep @owner))))
+      (ReplEngineState.set-browse-owners! engine keep)))
+
+  (defn- keep-view! [engine page result query original request columns]
+    (let-do [serial @(ReplEngineState.next-browse engine)
+             handle (ReplViewHandle.init
+               (Long.from-int @(ReplEngineState.generation engine))
+               serial)
+             object (Long.to-int @(ReplViewHandle.id (ReplViewPage.handle page)))]
+      (ReplEngineState.set-next-browse! engine (Long.+ serial 1l))
+      (Array.push-back! (ReplEngineState.browse-owners engine)
+                        (ReplBrowseOwner.init @&handle
+                                              object
+                                              result
+                                              query
+                                              @original
+                                              @request
+                                              columns
+                                              @(ReplViewPage.choices page)))
+      (ReplViewPage.set-handle! page handle)))
+
+  (doc open-view "pins a retained result for bounded view navigation. The
+returned handle owns a registration, which must be released by the client.")
+  (defn- open-borrowed-view [engine view number request columns]
+    (let-do [query -1
+             answer (match (Session.view-provider (ReplEngineState.session engine)
+                                                  (Box.peek (NativeView.type view)))
+               (Maybe.Nothing)
+                 (ReplViewNative.page (ReplEngineState.jit engine)
+                                      view
+                                      &(ReplViewHandle.init
+                                        (Long.from-int @(ReplEngineState.generation engine))
+                                        -1l)
+                                      request)
+               (Maybe.Just provider)
+                 (match (view-query! engine
+                                     (ReplEngineState.browse-queries engine)
+                                     view
+                                     request
+                                     &provider
+                                     true
+                                     columns)
+                   (Result.Error error)
+                     (Result.Error @(Diagnostic.message &error))
+                   (Result.Success index)
+                     (do
+                       (set! query index)
+                       (browse-page! engine index 0 -1 0 request columns))))]
+      (match answer
+        (Result.Error error) (Result.Error error)
+        (Result.Success page)
+          (do
+            (ReplViewNative.choices &page)
+            (when (String.empty? (InspectRequest.view request))
+              (let-do [choices (ReplViewPage.choices &page)
+                       prefer-native false]
+                (for [i 0 (Array.length choices)]
+                  (let [choice (Array.unsafe-nth choices i)]
+                    (when (and
+                        (String.= (ReplViewChoice.selector choice)
+                                  (ReplViewPage.selector &page))
+                        (Int.>= @(ReplViewChoice.priority choice) 90))
+                      (set! prefer-native true))))
+                (when prefer-native
+                  (match (ReplViewNative.page (ReplEngineState.jit engine)
+                                              view
+                                              (ReplViewPage.handle &page)
+                                              request)
+                    (Result.Error _) ()
+                    (Result.Success native)
+                      (do
+                        (ReplViewPage.set-choices! &native @choices)
+                        (set! page native))))))
+            (keep-view! engine
+                        &page
+                        number
+                        query
+                        &(Maybe.Just @view)
+                        request
+                        columns)
+            (Result.Success page)))))
+
+  (defn open-view [engine number selectors columns rows]
+    (let-do [values (ReplEngineState.results engine)
+             answer (Result.Error (fmt "no live result _%d" number))
+             request (InspectRequest.init 0
+                                          (Int.max 1 (Int.min rows 1024))
+                                          6
+                                          65536
+                                          false
+                                          @""
+                                          false)]
+      (for [i 0 (Array.length values)]
+        (let [value (Array.unsafe-nth values i)]
+          (when (Int.= number @(ReplValue.number value))
+            (let [root (NativeView.init
+                    @(ReplValueSlot.address (Pointer.to-ref @(ReplValue.slot value)))
+                    @(ReplValue.type-info value)
+                    @(ReplValue.publication value)
+                    false)]
+              (set! answer
+                    (match (ReplInspect.navigate (ReplEngineState.jit engine)
+                                                 &root
+                                                 selectors)
+                      (Result.Error error) (Result.Error error)
+                      (Result.Success selected)
+                        (match (ReplInspect.dereference &selected)
+                          (Result.Error error) (Result.Error error)
+                          (Result.Success view)
+                            (open-borrowed-view engine
+                                                &view
+                                                number
+                                                &request
+                                                columns))))))))
+      answer))
+
+  (defn- view-owner [engine handle]
+    (let-do [owners (ReplEngineState.browse-owners engine)
+             found -1]
+      (when (Long.= @(ReplViewHandle.generation handle)
+                    (Long.from-int @(ReplEngineState.generation engine)))
+        (for [i 0 (Array.length owners)]
+          (when (Long.= @(ReplViewHandle.id handle)
+                        @(ReplViewHandle.id
+                          (ReplBrowseOwner.handle (Array.unsafe-nth owners i))))
+            (set! found i))))
+      found))
+
+  (doc view-request "validates a generation-scoped handle before any native
+access. Released and retired handles cannot alias newer object registrations.")
+  (defn view-request [engine input]
+    (let-do [index (view-owner engine (ReplViewRequest.handle input))]
+      (if (Int.< index 0)
+        (Result.Error
+          @"the view handle has been released or its runtime retired")
+        (let-do [owner @(Array.unsafe-nth (ReplEngineState.browse-owners engine)
+                                          index)
+                 request @(ReplBrowseOwner.request &owner)
+                 columns @(ReplBrowseOwner.columns &owner)
+                 operation 1
+                 row 0
+                 release false
+                 registered false]
+          (match-ref (ReplViewRequest.operation input)
+            (ReplViewOperation.Page selector offset count width bytes)
+              (do
+                (InspectRequest.set-view! &request @selector)
+                (InspectRequest.set-offset! &request
+                                            (Int.max 0
+                                                     (Int.min @offset
+                                                              (Int.- Int.MAX
+                                                                     1024))))
+                (InspectRequest.set-count! &request
+                                           (Int.max 1 (Int.min @count 1024)))
+                (InspectRequest.set-bytes! &request
+                                           (Int.max 0 (Int.min @bytes 65536)))
+                (set! columns (Int.max 4 (Int.min @width 1024))))
+            (ReplViewOperation.Select selector selected)
+              (do
+                (set! operation 2)
+                (set! row @selected)
+                (InspectRequest.set-view! &request @selector))
+            (ReplViewOperation.Release)
+              (do (set! operation 3) (set! release true)))
+          (let-do [answer (match-ref (ReplBrowseOwner.original &owner)
+                     (Maybe.Just original)
+                       (cond
+                         (and (not release)
+                              (or
+                                (Int.< @(ReplBrowseOwner.query &owner) 0)
+                                (String.= (InspectRequest.view &request)
+                                          "gtRawFor")))
+                           (if (Int.= operation 2)
+                             (match (ReplInspect.child (ReplEngineState.jit engine)
+                                                       original
+                                                       &(str row))
+                               (Result.Error error) (Result.Error error)
+                               (Result.Success child)
+                                 (do
+                                   (set! registered true)
+                                   (open-borrowed-view engine
+                                                       &child
+                                                       @(ReplBrowseOwner.result &owner)
+                                                       &(InspectRequest.init 0
+                                                                             @(InspectRequest.count &request)
+                                                                             6
+                                                                             @(InspectRequest.bytes &request)
+                                                                             false
+                                                                             @""
+                                                                             false)
+                                                       columns)))
+                             (ReplViewNative.page (ReplEngineState.jit engine)
+                                                  original
+                                                  (ReplBrowseOwner.handle &owner)
+                                                  &request))
+                         (Int.< @(ReplBrowseOwner.query &owner) 0)
+                           (Result.Success
+                             (ReplViewPage.init @(ReplBrowseOwner.handle &owner)
+                                                @""
+                                                []
+                                                @""
+                                                @""
+                                                @"empty"
+                                                0
+                                                0
+                                                @""
+                                                []
+                                                []
+                                                (ReplViewImage.init 0 0 0 0 [])))
+                         (browse-page! engine
+                                       @(ReplBrowseOwner.query &owner)
+                                       operation
+                                       @(ReplBrowseOwner.object &owner)
+                                       row
+                                       &request
+                                       columns))
+                     (Maybe.Nothing)
+                       (browse-page! engine
+                                     @(ReplBrowseOwner.query &owner)
+                                     operation
+                                     @(ReplBrowseOwner.object &owner)
+                                     row
+                                     &request
+                                     columns))]
+            (when release
+              (let-do [owners (ReplEngineState.browse-owners engine)
+                       keep (the (Array ReplBrowseOwner) [])]
+                (for [i 0 (Array.length owners)]
+                  (unless (Int.= i index)
+                    (Array.push-back! &keep @(Array.unsafe-nth owners i))))
+                (ReplEngineState.set-browse-owners! engine keep)))
+            (match answer
+              (Result.Error error) (Result.Error error)
+              (Result.Success page)
+                (do
+                  (cond
+                    (or release registered) ()
+                    (Int.= operation 2)
+                      (keep-view! engine
+                                  &page
+                                  @(ReplBrowseOwner.result &owner)
+                                  @(ReplBrowseOwner.query &owner)
+                                  &(the (Maybe NativeView) (Maybe.Nothing))
+                                  &(InspectRequest.init 0
+                                                        @(InspectRequest.count &request)
+                                                        6
+                                                        @(InspectRequest.bytes &request)
+                                                        false
+                                                        @""
+                                                        false)
+                                  columns)
+                    (do
+                      (ReplViewPage.set-choices! &page
+                                                 @(ReplBrowseOwner.choices &owner))
+                      (ReplViewPage.set-handle! &page
+                                                @(ReplBrowseOwner.handle &owner))
+                      (ReplBrowseOwner.set-request!
+                        (Array.unsafe-nth (ReplEngineState.browse-owners engine)
+                                          index)
+                        request)
+                      (ReplBrowseOwner.set-columns!
+                        (Array.unsafe-nth (ReplEngineState.browse-owners engine)
+                                          index)
+                        columns)))
+                  (Result.Success page))))))))
+
+  (doc view-client
+    "borrows the engine for the lifetime of a synchronous viewer.")
+  (defn view-client [engine]
+    (let [pointer (Pointer.address engine)]
+      (ReplViewClient.init
+        (fn [request] (view-request (Pointer.to-ref pointer) request))))))

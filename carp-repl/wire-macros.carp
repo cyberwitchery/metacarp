@@ -1,0 +1,154 @@
+(load "wire.carp")
+
+; The schema and its codecs are generated together, so adding a field cannot
+; silently omit it from the transport. Callback-bearing client types stay local.
+(defmodule ReplWireMacro
+  (defdynamic schemas '())
+
+  (defndynamic fields [members]
+    (if (= (length members) 0)
+      '()
+      (cons (list (car members) (cadr members))
+            (ReplWireMacro.fields (cddr members)))))
+
+  (defndynamic variables [types] (map (fn [_] (gensym-with 'wire-field)) types))
+
+  (defndynamic read-fields [fields names construct]
+    (if (= (length fields) 0)
+      `(Result.Success (%construct %@names))
+      (let [field (car fields)
+            name (gensym-with 'wire-field)
+            error (gensym-with 'wire-error)]
+        `(match (the (Result %field String) (ReplWire.read reader))
+          (Result.Error %error) (Result.Error %error)
+          (Result.Success %name)
+            %(ReplWireMacro.read-fields (cdr fields)
+                                        (cons-last name names)
+                                        construct)))))
+
+  (defndynamic write-record [name fields]
+    (cons 'do
+          (cons
+            `(ReplWire.write-int! output (ref %(length fields)))
+            (map
+              (fn [field]
+                `(ReplWire.write output
+                                 (%(Symbol.prefix name (car field)) value)))
+              fields))))
+
+  (defndynamic case-name [form] (if (symbol? form) form (car form)))
+
+  (defndynamic case-fields [form]
+    (if (symbol? form) '() (map (fn [x] x) (cadr form))))
+
+  (defndynamic write-cases [name cases index]
+    (if (= (length cases) 0)
+      '()
+      (let [case (car cases)
+            constructor (Symbol.prefix name (ReplWireMacro.case-name case))
+            variables (ReplWireMacro.variables (ReplWireMacro.case-fields case))
+            body (cons 'do
+                       (cons
+                         `(ReplWire.write-int! output (ref %index))
+                         (map
+                           (fn [value] `(ReplWire.write output %value))
+                           variables)))]
+        (append (list (cons constructor variables) body)
+                (ReplWireMacro.write-cases name (cdr cases) (+ index 1))))))
+
+  (defndynamic read-cases [name cases index]
+    (if (= (length cases) 0)
+      '((Result.Error (copy "unknown protocol variant")))
+      (let [case (car cases)
+            constructor (Symbol.prefix name (ReplWireMacro.case-name case))]
+        (append
+          (list `(Int.= tag %index)
+                (ReplWireMacro.read-fields (ReplWireMacro.case-fields case)
+                                           '()
+                                           constructor))
+          (ReplWireMacro.read-cases name (cdr cases) (+ index 1))))))
+
+  (defndynamic methods [name shape record]
+    (let [writer (Symbol.concat [name '-write!])
+          reader (Symbol.concat [name '-read])
+          fields (if record (ReplWireMacro.fields (car shape)) '())
+          encoder (if record
+            (ReplWireMacro.write-record name fields)
+            (cons 'match-ref
+                  (cons 'value (ReplWireMacro.write-cases name shape 0))))
+          decoder (if record
+            `(match (ReplWire.read-int reader)
+              (Result.Error error) (Result.Error error)
+              (Result.Success count)
+                (if (Int.= count %(length fields))
+                  %(ReplWireMacro.read-fields (map cadr fields)
+                                              '()
+                                              (Symbol.prefix name 'init))
+                  (Result.Error (copy "incorrect protocol record field count"))))
+            `(match (ReplWire.read-int reader)
+              (Result.Error error) (Result.Error error)
+              (Result.Success tag)
+                %(cons 'cond (ReplWireMacro.read-cases name shape 0))))]
+      `(defmodule ReplWire
+        (sig %writer (Fn [(Ref (Array Byte)) (Ref %name)] ()))
+        (defn- %writer [output value] %encoder)
+        (implements write %writer)
+        (sig %reader (Fn [(Ref ReplWireReader)] (Result %name String)))
+        (defn- %reader [reader] %decoder)
+        (implements read %reader))))
+
+  (defndynamic declare [name shape]
+    (let-do [definition (cons 'deftype (cons name shape))
+             record (and (= (length shape) 1) (array? (car shape)))]
+      (set! ReplWireMacro.schemas (cons-last definition ReplWireMacro.schemas))
+      `(do %definition %(ReplWireMacro.methods name shape record))))
+
+  (defndynamic existing-record [name]
+    (let-do [members (eval (Symbol.concat ['__members_ name]))
+             fields (map (fn [x] x) members)
+             flat (reduce (fn [result field] (append result field)) '() fields)]
+      (unless (array? members)
+        (macro-error "wire-record requires a record type"))
+      (set! ReplWireMacro.schemas
+            (cons-last (list 'record name members) ReplWireMacro.schemas))
+      (ReplWireMacro.methods name (list (collect-into flat array)) true))))
+
+(doc defwire "declares an owned protocol type and derives its codecs from the
+same fields or cases. Function and pointer fields have no wire implementation.")
+(defmacro defwire [name :rest shape] (ReplWireMacro.declare name shape))
+
+(doc wire-record "derives codecs from an existing record's declared members.")
+(defmacro wire-record [name] (ReplWireMacro.existing-record name))
+
+(doc wire-schema "captures the exact protocol declarations seen so far for a
+startup compatibility check between the two copies of the executable.")
+(defmacro wire-schema []
+  (collect-into
+    (map (fn [declaration] (list 'copy (str declaration))) ReplWireMacro.schemas)
+    array))
+
+(defmodule ReplWireMacro
+  (defdynamic groups '())
+  (defndynamic group [name declarations]
+    (let-do [source (String.concat
+               (map (fn [declaration] (String.concat [(str declaration) "
+"])) declarations))]
+      (set! ReplWireMacro.groups
+            (cons-last (list name source) ReplWireMacro.groups))
+      (cons 'do
+            (map
+              (fn [definition]
+                (if (and (list? definition) (= (car definition) 'deftype))
+                  (ReplWireMacro.declare (cadr definition) (cddr definition))
+                  (macro-error "a wire group contains deftype declarations")))
+              declarations))))
+  (defndynamic group-source [name]
+    (let [found (filter (fn [group] (= (car group) name)) ReplWireMacro.groups)]
+      (if (= (length found) 1)
+        (cadr (car found))
+        (macro-error "expected one declared wire group")))))
+
+(doc defwire-group "declares a group of owned types and retains the plain type
+declarations for native ABI clients. Codecs and native types share one schema.")
+(defmacro defwire-group [name :rest declarations]
+  (ReplWireMacro.group name declarations))

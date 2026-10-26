@@ -23,12 +23,14 @@ fi
 cd "$repo_root"
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/metacarp-repl-check.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT
-for suite in input syntax paint native/display native/wait native/service; do
+for suite in input syntax paint view-snapshot wire wire-derived native/display native/pager native/browser native/wait native/service native/browse native/checkpoint native/transport native/process native/scratch native/wake; do
   binary="$test_dir/${suite##*/}"
   "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" -b -o "$binary" "carp-repl/test/$suite.carp"
-  "$binary"
+  CARP_DIR="$core_dir" "$binary"
 done
 "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" --optimize -b -o out/metacarp-repl main-repl.carp
 "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" --optimize -b -o out/metacarp main-metacarp.carp
+"$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" -b -o "$test_dir/remote" carp-repl/test/native/remote.carp
+"$test_dir/remote" "$repo_root/out/metacarp" "$core_dir"
 python3 test/cli.py out/metacarp "$core_dir" -v
 python3 carp-repl/test/repl.py out/metacarp "$core_dir" --subcommand repl -v

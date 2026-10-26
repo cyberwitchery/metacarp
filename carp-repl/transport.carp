@@ -1,0 +1,210 @@
+(load "native.carp")
+(load "wire.carp")
+
+(defmodule ReplTransportNative
+  (register errno (Fn [] (Ptr Int)) "__error")
+  (register INTERRUPTED Int "EINTR")
+  (register SET-NO-SIGPIPE Int "F_SETNOSIGPIPE")
+  (register SET-FD Int "F_SETFD")
+  (register CLOSE-ON-EXEC Int "FD_CLOEXEC"))
+
+; Descriptors belong to the caller. Buffers belong to this endpoint. Pumping is
+; bounded and never blocks the editor, including under pipe backpressure.
+(deftype ReplChannel
+  [reader Int
+   writer Int
+   input (Array Byte)
+   output (Array Byte)
+   output-at Int
+   eof Bool
+   error String])
+
+(defmodule ReplTransport
+  (def max-frame 67108864)
+
+  (defn nonblocking! [fd]
+    (let [flags (ReplNative.flags fd ReplNative.GET-FLAGS 0)]
+      (and (Int.>= flags 0)
+           (Int.=
+             (ReplNative.flags fd
+                               ReplNative.SET-FLAGS
+                               (Int.bit-or flags ReplNative.NONBLOCK))
+             0))))
+
+  (defn private-writer! [fd]
+    (and
+      (Int.= (ReplNative.flags fd ReplTransportNative.SET-NO-SIGPIPE 1) 0)
+      (Int.=
+        (ReplNative.flags fd
+                          ReplTransportNative.SET-FD
+                          ReplTransportNative.CLOSE-ON-EXEC)
+        0)))
+
+  (defn create [reader writer]
+    (ReplChannel.init reader
+                      writer
+                      []
+                      []
+                      0
+                      false
+                      (if (and (nonblocking! reader)
+                               (and (nonblocking! writer)
+                                    (private-writer! writer)))
+                        @""
+                        @"could not configure worker channel")))
+
+  (defn- append! [target bytes start end]
+    (for [i start end] (Array.push-back! target @(Array.unsafe-nth bytes i))))
+
+  (defn send! [channel payload]
+    (let-do [count (Array.length payload)
+             output (ReplChannel.output channel)]
+      (cond
+        (or (Int.> count max-frame) (Int.= count 0))
+          (ReplChannel.set-error! channel @"invalid worker frame length")
+        (Int.>
+          (Int.- (Array.length output) @(ReplChannel.output-at channel))
+          max-frame)
+          (ReplChannel.set-error! channel
+                                  @"worker output queue exceeded its limit")
+        (do
+          (for [i 0 4]
+            (Array.push-back! output
+                              (Byte.from-int
+                                (Int.bit-and
+                                  (Int.bit-shift-right count
+                                                       (Int.* (Int.- 3 i) 8))
+                                  255))))
+          (append! output payload 0 count)))))
+
+  (defn- retry? []
+    (let [error (Pointer.to-value (ReplTransportNative.errno))]
+      (or (Int.= error ReplNative.AGAIN)
+          (Int.= error ReplTransportNative.INTERRUPTED))))
+
+  (defn flush! [channel]
+    (let-do [output (ReplChannel.output channel)
+             start @(ReplChannel.output-at channel)
+             remaining (Int.- (Array.length output) start)]
+      (when (and (Int.> remaining 0) (String.empty? (ReplChannel.error channel)))
+        (let-do [written (ReplNative.write @(ReplChannel.writer channel)
+                                           (Pointer.address (Array.unsafe-nth output
+                                                                              start))
+                                           (Long.from-int (Int.min remaining
+                                                                   65536)))]
+          (cond
+            (Long.> written 0l)
+              (let-do [end (Int.+ start (Long.to-int written))]
+                (if (Int.= end (Array.length output))
+                  (do
+                    (ReplChannel.set-output! channel [])
+                    (ReplChannel.set-output-at! channel 0))
+                  (ReplChannel.set-output-at! channel end)))
+            (not (retry?))
+              (ReplChannel.set-error! channel @"worker channel write failed")
+            ())))))
+
+  (defn pump! [channel]
+    (do
+      (flush! channel)
+      (when (and (not @(ReplChannel.eof channel))
+                 (String.empty? (ReplChannel.error channel)))
+        (let-do [buffer (Array.replicate 65536 &0b)
+                 count (ReplNative.read @(ReplChannel.reader channel)
+                                        (Pointer.address (Array.unsafe-nth &buffer
+                                                                           0))
+                                        65536l)]
+          (cond
+            (Long.> count 0l)
+              (if (Int.> (Array.length (ReplChannel.input channel)) max-frame)
+                (ReplChannel.set-error! channel
+                                        @"worker input queue exceeded its limit")
+                (append! (ReplChannel.input channel)
+                         &buffer
+                         0
+                         (Long.to-int count)))
+            (Long.= count 0l) (ReplChannel.set-eof! channel true)
+            (not (retry?))
+              (ReplChannel.set-error! channel @"worker channel read failed")
+            ())))))
+
+  (sig poll! (Fn [(Ref ReplChannel)] (Result (Maybe (Array Byte)) String)))
+  (defn poll! [channel]
+    (let-do [input (ReplChannel.input channel)
+             count (Array.length input)
+             length 0l]
+      (when (Int.>= count 4)
+        (for [i 0 4]
+          (set! length
+                (Long.+ (Long.* length 256l)
+                        (Long.from-int (Byte.to-int @(Array.unsafe-nth input i)))))))
+      (cond
+        (not (String.empty? (ReplChannel.error channel)))
+          (Result.Error @(ReplChannel.error channel))
+        (and (Int.>= count 4)
+             (or (Long.= length 0l) (Long.> length (Long.from-int max-frame))))
+          (Result.Error @"invalid worker frame length")
+        (and (Int.>= count 4) (Long.<= (Long.+ length 4l) (Long.from-int count)))
+          (let-do [end (Int.+ (Long.to-int length) 4)
+                   payload (Array.slice input 4 end)
+                   rest (Array.slice input end count)]
+            (ReplChannel.set-input! channel rest)
+            (Result.Success (Maybe.Just payload)))
+        @(ReplChannel.eof channel)
+          (Result.Error
+            (if (Int.= count 0)
+              @"worker channel closed"
+              @"truncated worker frame"))
+        (Result.Success (Maybe.Nothing)))))
+
+  (defn pending? [channel]
+    (Int.>
+      (Array.length (ReplChannel.output channel))
+      @(ReplChannel.output-at channel))))
+
+(defmodule ReplTransport
+  (defn wait [readers writer milliseconds]
+    (let-do [fds (the (Ptr ReplNativeFdSet)
+                      (ReplNative.allocate
+                        (Pointer.width
+                          (the (Ptr ReplNativeFdSet) (Pointer.from-long 0l)))))
+             writes (the (Ptr ReplNativeFdSet)
+                         (ReplNative.allocate
+                           (Pointer.width
+                             (the (Ptr ReplNativeFdSet) (Pointer.from-long 0l)))))
+             timeout (the (Ptr ReplNativeTimeout)
+                          (ReplNative.allocate
+                            (Pointer.width
+                              (the (Ptr ReplNativeTimeout)
+                                   (Pointer.from-long 0l)))))
+             highest -1
+             valid true]
+      (ReplNative.clear-fds fds)
+      (ReplNative.clear-fds writes)
+      (for [i 0 (Array.length readers)]
+        (let [fd @(Array.unsafe-nth readers i)]
+          (when (Int.>= fd 0)
+            (if (Int.>= fd ReplNative.FD-LIMIT)
+              (set! valid false)
+              (do (ReplNative.add-fd fd fds) (set! highest (Int.max highest fd)))))))
+      (when (Int.>= writer 0)
+        (if (Int.>= writer ReplNative.FD-LIMIT)
+          (set! valid false)
+          (do
+            (ReplNative.add-fd writer writes)
+            (set! highest (Int.max highest writer)))))
+      (ReplNativeTimeout.set-tv_sec! (Pointer.to-ref timeout)
+                                     (Long.from-int (Int./ milliseconds 1000)))
+      (ReplNativeTimeout.set-tv_usec! (Pointer.to-ref timeout)
+                                      (Int.* (Int.mod milliseconds 1000) 1000))
+      (let-do [status (if valid
+                 (ReplNative.select (Int.inc highest)
+                                    fds
+                                    writes
+                                    (Pointer.from-long 0l)
+                                    timeout)
+                 -1)]
+        (ReplNative.release fds)
+        (ReplNative.release writes)
+        (ReplNative.release timeout)
+        status))))

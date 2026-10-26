@@ -1,0 +1,110 @@
+(load "../../remote.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+(register remote-test-temp (Fn [(Ptr CChar)] (Ptr CChar)) "mkdtemp")
+(defn await [remote ready]
+  (let-do [found false
+           until (Long.+ (ReplNative.now) 10000000000l)]
+    (while-do (and (ReplRemoteHost.online? remote)
+                   (and (not found) (Long.< (ReplNative.now) until)))
+      (ReplRemoteHost.pump! remote)
+      (match (ReplRemoteHost.poll-reply! remote)
+        (Maybe.Just (ReplWorkerReply.Ready _)) (set! found ready)
+        (Maybe.Just (ReplWorkerReply.Done _)) (set! found (not ready))
+        _ ())
+      (unless found (ReplRemoteHost.wait remote 10)))
+    found))
+(defn language-queue-bounded? [remote]
+  (do
+    (ReplRemoteHost.send! remote &(ReplWorkerRequest.Resume))
+    (if (not (await remote true))
+      false
+      (let-do [pid @(ReplProcess.pid
+                 (Array.unsafe-nth (ReplRemote.process remote) 0))
+               source (String.append ";" &(String.repeat 200000 "x"))
+               stopped (Int.=
+                 (ReplProcessNative.kill (Int.neg pid) ReplProcessNative.STOP)
+                 0)
+               bounded false
+               fresh false]
+        (for [i 1 51]
+          (ReplRemoteHost.language-request! remote
+                                            (ReplLanguageRequest.init (ReplQuery.Analyze)
+                                                                      @"queue:test"
+                                                                      (Long.from-int i)
+                                                                      (ReplRemoteHost.session remote)
+                                                                      (Long.from-int i)
+                                                                      @&source
+                                                                      0)))
+        (set! bounded
+              (and stopped
+                   (and
+                     (Int.=
+                       (Array.length (ReplRemote.pending-language remote))
+                       1)
+                     (Int.<
+                       (Array.length
+                         (ReplChannel.output
+                           (Array.unsafe-nth (ReplRemote.channel remote) 0)))
+                       220000))))
+        (ignore
+          (ReplProcessNative.kill (Int.neg pid) ReplNative.SIGNAL-CONTINUE))
+        (let-do [until (Long.+ (ReplNative.now) 5000000000l)]
+          (while-do (and (not fresh)
+                         (and (ReplRemoteHost.online? remote)
+                              (Long.< (ReplNative.now) until)))
+            (match (ReplRemoteHost.poll-language! remote)
+              (Maybe.Just (ReplLanguageUpdate.Analysis analysis))
+                (when (Long.= @(ReplAnalysis.revision &analysis) 50l)
+                  (set! fresh true))
+              _ ())
+            (unless fresh (ReplRemoteHost.wait remote 10))))
+        (and bounded fresh)))))
+
+(defn remote-executes? []
+  (let-do [root @"/tmp/metacarp-remote-test-XXXXXX"
+           made (not (null? (remote-test-temp (String.cstr &root))))
+           arguments [@"repl"]
+           remote (ReplRemoteHost.create (StaticArray.unsafe-nth &System.args 1)
+                                         &arguments
+                                         (StaticArray.unsafe-nth &System.args 2)
+                                         &root
+                                         false)
+           started (and made (Result.success? &(ReplRemoteHost.start! &remote)))
+           ready (and started (await &remote true))]
+    (when ready
+      (ReplRemoteHost.send! &remote
+                            &(ReplWorkerRequest.Command @"(Int.+ 20 22)")))
+    (let-do [done (and ready (await &remote false))
+             found false
+             effects (ReplRemote.effects &remote)]
+      (for [i 0 (Array.length effects)]
+        (match-ref (Array.unsafe-nth effects i)
+          (ReplConsoleEffect.Output text)
+            (when (String.= text "42") (set! found true))
+          _ ()))
+      (let-do [bounded (and done (language-queue-bounded? &remote))]
+        (when-do (ReplRemoteHost.online? &remote)
+          (ReplRemoteHost.send! &remote &(ReplWorkerRequest.Shutdown))
+          (when (await &remote false) (ReplRemoteHost.finish! &remote)))
+        (ReplRemoteHost.dispose &remote)
+        (let [removed (Int.= (ReplScratchNative.rmdir (String.cstr &root)) 0)]
+          [(and done found) bounded removed])))))
+(defn main []
+  (let-do [test (Test.State.init 0 0)
+           results (remote-executes?)]
+    (set! test
+          (Test.assert-true &test
+                            @(Array.unsafe-nth &results 0)
+                            "owned replies and source checkpoints cross the execution boundary"))
+    (set! test
+          (Test.assert-true &test
+                            @(Array.unsafe-nth &results 1)
+                            "backpressure keeps only the newest pending language request"))
+    (set! test
+          (Test.assert-true &test
+                            @(Array.unsafe-nth &results 2)
+                            "worker shutdown releases its scratch directory"))
+    (Test.print-test-results &test)
+    @(Test.State.failed &test)))
