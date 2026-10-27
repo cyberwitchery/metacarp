@@ -223,6 +223,95 @@
             (SessionJit.dispose &js))))
     results))
 
+;; An ABI slot is allocated at one type; every store into it must be of that
+;; type. Synthesized calls (drops) share an expression id, so slots keyed by
+;; id alone were reused at a larger type and overran the frame.
+(defn abi-slot-type [line name]
+  (let [prefix (fmt "%s = alloca " name)]
+    (if (String.starts-with? line &prefix)
+      (let-do [rest (String.suffix line (String.length &prefix))
+               comma (String.index-of-string &rest ", align")]
+        (if (Int.< comma 0) rest (String.prefix &rest comma)))
+      @"")))
+
+(defn abi-slot-mismatches [ir]
+  (let-do [lines (Array.copy-map &String.trim &(String.lines ir))
+           names (the (Array String) [])
+           types (the (Array String) [])
+           checked 0
+           mismatched 0]
+    ;; slot names are local to a function, and its allocas precede its stores
+    (for [i 0 (Array.length &lines)]
+      (let [line (Array.unsafe-nth &lines i)
+            eq (String.index-of-string line " = alloca ")]
+        (cond
+          (String.starts-with? line "define ")
+            (do (set! names []) (set! types []))
+          (and (Int.> eq 0)
+               (or (String.starts-with? line "%abislot")
+                   (String.starts-with? line "%spill")))
+            (let-do [name (String.prefix line eq)]
+              (Array.push-back! &types (abi-slot-type line &name))
+              (Array.push-back! &names name))
+          (String.starts-with? line "store ")
+            (for [j 0 (Array.length &names)]
+              (when-do (or
+                  (String.ends-with? line
+                                     &(fmt ", ptr %s"
+                                           (Array.unsafe-nth &names j)))
+                  (String.contains-string? line
+                                           &(fmt ", ptr %s,"
+                                                 (Array.unsafe-nth &names j))))
+                (set! checked (Int.inc checked))
+                (unless-do (String.starts-with? line
+                                                &(fmt "store %s "
+                                                      (Array.unsafe-nth &types j)))
+                  (IO.errorln line)
+                  (set! mismatched (Int.inc mismatched)))))
+          ())))
+    (Pair.init checked mismatched)))
+
+;; results: [slot stores checked, mismatched stores, value of the cell]
+(defn abi-slot-scenario! []
+  (let-do [dir (core-dir)
+           _mk (ignore (System.system "mkdir -p out"))
+           js (SessionJit.create &dir "out")
+           results (the (Array Int) [])]
+    (match (Session.create &dir)
+      (Result.Error diagnostic) (IO.println &(diagnostic-line &diagnostic))
+      (Result.Success session)
+        (let [definitions (SourceInput.init @"definition:slots"
+                                            @"(deftype SlotSmall [a String])
+(deftype SlotBig [a String b String c String d String e String])
+(defn slot-pick [flag]
+  (if flag
+    (let [s (SlotSmall.init @\"a\")] (String.length (SlotSmall.a &s)))
+    (let [b (SlotBig.init @\"a\" @\"b\" @\"c\" @\"d\" @\"eee\")]
+      (String.length (SlotBig.e &b)))))")]
+          (match (SessionJit.upsert-input &js &session &definitions)
+            (Result.Error diagnostic)
+              (IO.println &(diagnostic-line &diagnostic))
+            (Result.Success _)
+              (let-do [value (run-int &js
+                                      &session
+                                      "cell:slots"
+                                      "(slot-pick false)")
+                       checked 0
+                       mismatched 0]
+                (for [i 0 (Array.length (JitSession.artifacts &js))]
+                  (let-do [counts (abi-slot-mismatches
+                             (JitArtifact.module-ir
+                               (Array.unsafe-nth (JitSession.artifacts &js) i)))]
+                    (set! checked (Int.+ checked @(Pair.a &counts)))
+                    (set! mismatched (Int.+ mismatched @(Pair.b &counts)))))
+                (Array.push-back! &results checked)
+                (Array.push-back! &results mismatched)
+                (Array.push-back! &results value)))))
+    (SessionJit.dispose &js)
+    results))
+
+(def *abi-slot-results* (the (Array Int) []))
+
 (deftest test
   (let-do [results (jit-scenario!)]
     (set! *jit-results* results)
@@ -332,4 +421,21 @@
     "an old compiled generation remains callable")
   (assert-true test
     (Float.approx @(Array.unsafe-nth &*dsp-results* 3) 0.4f)
-    "a failed replacement leaves the last valid DSP callable"))
+    "a failed replacement leaves the last valid DSP callable")
+  (let-do [results (abi-slot-scenario!)]
+    (set! *abi-slot-results* results)
+    (assert-equal test
+      3
+      (Array.length &*abi-slot-results*)
+      "the ABI slot scenario ran every step"))
+  (assert-true test
+    (Int.> @(Array.unsafe-nth &*abi-slot-results* 0) 0)
+    "drops of differently sized values pass through ABI slots")
+  (assert-equal test
+    0
+    @(Array.unsafe-nth &*abi-slot-results* 1)
+    "every ABI slot store matches the slot's allocated type")
+  (assert-equal test
+    3
+    @(Array.unsafe-nth &*abi-slot-results* 2)
+    "a function dropping differently sized values runs"))
