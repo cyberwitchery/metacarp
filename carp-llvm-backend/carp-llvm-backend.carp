@@ -128,12 +128,16 @@
 (def *llvm-foreign-layouts* (the (Array ForeignTypeLayout) []))
 
 ;; entry-block spill slots for wrapper-call arguments and returns, keyed by
-;; the call expression's id and position (-1 = the return slot).
+;; the call expression's id, position (-1 = the return slot) and the slot
+;; type's ABI key. Synthesized calls such as drops share id -1, so a slot
+;; keyed by id and position alone would be reused at a larger type.
 (def *llvm-argspill-pending-ids* (the (Array Int) []))
 (def *llvm-argspill-pending-pos* (the (Array Int) []))
+(def *llvm-argspill-pending-keys* (the (Array String) []))
 (def *llvm-argspill-pending-types* (the (Array MonoType) []))
 (def *llvm-argspill-ids* (the (Array Int) []))
 (def *llvm-argspill-pos* (the (Array Int) []))
+(def *llvm-argspill-keys* (the (Array String) []))
 (def *llvm-argspill-ptrs* (the (Array LLVMValue) []))
 
 ;; the module's closure functions, for construction sites and definitions.
@@ -173,10 +177,14 @@
 (def *llvm-di-lexical-scopes* (the (Array LLVMMetadata) []))
 
 ;; entry-block spill slots for by-value match scrutinees, keyed by the match
-;; expression's id: the pre-scan requests them, emit-slots! allocates them.
+;; expression's id and the spilled type's ABI key: the pre-scan requests them,
+;; emit-slots! allocates them. Synthesized expressions share id -1, so the id
+;; alone does not identify a slot.
 (def *llvm-matchspill-pending-ids* (the (Array Int) []))
+(def *llvm-matchspill-pending-keys* (the (Array String) []))
 (def *llvm-matchspill-pending-types* (the (Array MonoType) []))
 (def *llvm-matchspill-ids* (the (Array Int) []))
+(def *llvm-matchspill-keys* (the (Array String) []))
 (def *llvm-matchspill-ptrs* (the (Array LLVMValue) []))
 
 (hidden llvm-cstr)
@@ -408,14 +416,18 @@
     (set! *llvm-asm-scope-types* [])
     (set! *llvm-letbound-closures* [])
     (set! *llvm-matchspill-pending-ids* [])
+    (set! *llvm-matchspill-pending-keys* [])
     (set! *llvm-matchspill-pending-types* [])
     (set! *llvm-matchspill-ids* [])
+    (set! *llvm-matchspill-keys* [])
     (set! *llvm-matchspill-ptrs* [])
     (set! *llvm-argspill-pending-ids* [])
     (set! *llvm-argspill-pending-pos* [])
+    (set! *llvm-argspill-pending-keys* [])
     (set! *llvm-argspill-pending-types* [])
     (set! *llvm-argspill-ids* [])
     (set! *llvm-argspill-pos* [])
+    (set! *llvm-argspill-keys* [])
     (set! *llvm-argspill-ptrs* [])))
 
 (hidden llvm-pending-add!)
@@ -430,19 +442,26 @@
 
 (hidden llvm-matchspill-add!)
 (defn llvm-matchspill-add! [id type]
-  (let-do [known false]
+  (let-do [key (CAbi.type-key &type)
+           known false]
     (for [i 0 (Array.length &*llvm-matchspill-pending-ids*)]
-      (when (Int.= @(Array.unsafe-nth &*llvm-matchspill-pending-ids* i) id)
+      (when (and
+          (Int.= @(Array.unsafe-nth &*llvm-matchspill-pending-ids* i) id)
+          (String.= (Array.unsafe-nth &*llvm-matchspill-pending-keys* i) &key))
         (set! known true)))
     (unless-do known
       (Array.push-back! &*llvm-matchspill-pending-ids* id)
+      (Array.push-back! &*llvm-matchspill-pending-keys* key)
       (Array.push-back! &*llvm-matchspill-pending-types* type))))
 
 (hidden llvm-matchspill-index)
-(defn llvm-matchspill-index [id]
-  (let-do [found -1]
+(defn llvm-matchspill-index [id type]
+  (let-do [key (CAbi.type-key type)
+           found -1]
     (for [i 0 (Array.length &*llvm-matchspill-ids*)]
-      (when (Int.= @(Array.unsafe-nth &*llvm-matchspill-ids* i) id)
+      (when (and
+          (Int.= @(Array.unsafe-nth &*llvm-matchspill-ids* i) id)
+          (String.= (Array.unsafe-nth &*llvm-matchspill-keys* i) &key))
         (set! found i)))
     found))
 
@@ -452,24 +471,29 @@
 
 (hidden llvm-argspill-add!)
 (defn llvm-argspill-add! [id pos type]
-  (let-do [known false]
+  (let-do [key (CAbi.type-key &type)
+           known false]
     (for [i 0 (Array.length &*llvm-argspill-pending-ids*)]
       (when (and
           (Int.= @(Array.unsafe-nth &*llvm-argspill-pending-ids* i) id)
-          (Int.= @(Array.unsafe-nth &*llvm-argspill-pending-pos* i) pos))
+          (Int.= @(Array.unsafe-nth &*llvm-argspill-pending-pos* i) pos)
+          (String.= (Array.unsafe-nth &*llvm-argspill-pending-keys* i) &key))
         (set! known true)))
     (unless-do (or known (unit-type? &type))
       (Array.push-back! &*llvm-argspill-pending-ids* id)
       (Array.push-back! &*llvm-argspill-pending-pos* pos)
+      (Array.push-back! &*llvm-argspill-pending-keys* key)
       (Array.push-back! &*llvm-argspill-pending-types* type))))
 
 (hidden llvm-argspill-index)
-(defn llvm-argspill-index [id pos]
-  (let-do [found -1]
+(defn llvm-argspill-index [id pos type]
+  (let-do [key (CAbi.type-key type)
+           found -1]
     (for [i 0 (Array.length &*llvm-argspill-ids*)]
       (when (and
           (Int.= @(Array.unsafe-nth &*llvm-argspill-ids* i) id)
-          (Int.= @(Array.unsafe-nth &*llvm-argspill-pos* i) pos))
+          (Int.= @(Array.unsafe-nth &*llvm-argspill-pos* i) pos)
+          (String.= (Array.unsafe-nth &*llvm-argspill-keys* i) &key))
         (set! found i)))
     found))
 
@@ -1650,7 +1674,7 @@ aliasing); any other operand is spilled to this site's entry-block slot.")
 (hidden llvm-emit-ref-builtin)
 (hidden llvm-spill-ref)
 (defn llvm-spill-ref [ctx builder mod func id operand]
-  (let [sp (llvm-matchspill-index id)]
+  (let [sp (llvm-matchspill-index id &(Specialize.expression-type operand))]
     (if (Int.< sp 0)
       (do
         (llvm-emit-error! @"ref site without spill slot in llvm backend")
@@ -1814,7 +1838,10 @@ environment, store the captured values, and assemble a Lambda over
                                        (llvm-aggregate-monotype? capture-type)))
                             ;; the copier moves an aggregate: pointer protocol
                             ;; through the prescanned ref slot, out into the field
-                            (let-do [sp (llvm-argspill-index id i)]
+                            (let-do [sp (llvm-argspill-index id
+                                                             i
+                                                             &(Type.reference (MonoType.copy capture-type)
+                                                                              (MonoLifetime.Static)))]
                               (if (Int.< sp 0)
                                 (llvm-emit-error!
                                   @"capture copy without ref slot in llvm backend")
@@ -1974,7 +2001,9 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
                                          mod
                                          func
                                          (Box.peek (Array.unsafe-nth arguments i)))
-                   sp (llvm-argspill-index id i)]
+                   sp (llvm-argspill-index id
+                                           i
+                                           (Box.peek (Array.unsafe-nth fargs i)))]
             (unless (unit-type? (Box.peek (Array.unsafe-nth fargs i)))
               (if (Int.< sp 0)
                 (do
@@ -1986,7 +2015,9 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
                   (Array.push-back! &helper-args slot)
                   (Array.push-back! &helper-types
                                     (LLVM.pointer-type (LLVM.int8-type ctx) 0)))))))
-        (let-do [ret-slot (if ret-unit -1 (llvm-argspill-index id -1))]
+        (let-do [ret-slot (if ret-unit
+                   -1
+                   (llvm-argspill-index id -1 (Box.peek fret)))]
           (when-do (and (not ret-unit) (Int.< ret-slot 0))
             (llvm-emit-error! @"invoke call without return slot in llvm backend")
             (set! broken true))
@@ -2265,7 +2296,7 @@ the value loaded.")
                  ;; an aggregate constant crosses by out-pointer — a by-value struct
                  ;; return would not match clang's sret convention
                  (if (llvm-aggregate-monotype? (Box.peek value-type))
-                   (let [si (llvm-matchspill-index @id)]
+                   (let [si (llvm-matchspill-index @id (Box.peek value-type))]
                      (if (Int.< si 0)
                        (do
                          (llvm-emit-error!
@@ -2727,7 +2758,9 @@ through an out-pointer. Pointer-only signatures are ABI-safe on every target.")
             (unless (unit-type?
                 &(Specialize.expression-type
                   (Box.peek (Array.unsafe-nth arguments i))))
-              (let [sp (llvm-argspill-index id i)]
+              (let [sp (llvm-argspill-index id
+                                            i
+                                            (Box.peek (Array.unsafe-nth fargs i)))]
                 (if (Int.< sp 0)
                   (do
                     (llvm-emit-error!
@@ -2741,7 +2774,9 @@ through an out-pointer. Pointer-only signatures are ABI-safe on every target.")
                     (Array.push-back! &pointer-types
                                       (LLVM.pointer-type (LLVM.int8-type ctx) 0))))))))
         (let-do [ret-unit (unit-type? (Box.peek fret))
-                 ret-slot (if ret-unit -1 (llvm-argspill-index id -1))]
+                 ret-slot (if ret-unit
+                   -1
+                   (llvm-argspill-index id -1 (Box.peek fret)))]
           (when-do (and (not ret-unit) (Int.< ret-slot 0))
             (llvm-emit-error!
               (fmt "wrapper call %s without return slot in llvm backend" symbol))
@@ -3304,7 +3339,10 @@ the pointer to the static Array (the C backend's `static Array` block).")
           (llvm-dummy-value ctx)))
     (or
       (not (llvm-match-scrutinee-ok? (Box.peek scrutinee)))
-      (Int.< (llvm-matchspill-index id) 0))
+      (Int.<
+        (llvm-matchspill-index id
+                               &(Specialize.expression-type (Box.peek scrutinee)))
+        0))
     (do
       (llvm-emit-error! @"unsupported match scrutinee in llvm backend")
       (llvm-dummy-value ctx))
@@ -3314,7 +3352,8 @@ the pointer to the static Array (the C backend's `static Array` block).")
                                              func
                                              (Box.peek scrutinee))
              scrutinee-monotype (Specialize.expression-type (Box.peek scrutinee))
-             ptr (llvm-matchspill-ptr (llvm-matchspill-index id))]
+             ptr (llvm-matchspill-ptr
+               (llvm-matchspill-index id &scrutinee-monotype))]
       (ignore (LLVM.build-store builder scrutinee-value ptr))
       (llvm-emit-match-over ctx
                             builder
@@ -3466,6 +3505,8 @@ backend's abort() when nothing matched.")
       (do
         (Array.push-back! &*llvm-matchspill-ids*
                           @(Array.unsafe-nth &*llvm-matchspill-pending-ids* i))
+        (Array.push-back! &*llvm-matchspill-keys*
+                          @(Array.unsafe-nth &*llvm-matchspill-pending-keys* i))
         (Array.push-back! &*llvm-matchspill-ptrs*
                           (LLVM.build-alloca builder
                                              (llvm-lower-type ctx
@@ -3478,6 +3519,8 @@ backend's abort() when nothing matched.")
                           @(Array.unsafe-nth &*llvm-argspill-pending-ids* i))
         (Array.push-back! &*llvm-argspill-pos*
                           @(Array.unsafe-nth &*llvm-argspill-pending-pos* i))
+        (Array.push-back! &*llvm-argspill-keys*
+                          @(Array.unsafe-nth &*llvm-argspill-pending-keys* i))
         (Array.push-back! &*llvm-argspill-ptrs*
                           (LLVM.build-alloca builder
                                              (llvm-lower-type ctx
