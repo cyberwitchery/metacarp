@@ -29,6 +29,13 @@ addition takes over the id of a builtin that existing code or an overload
 refers to, it infers the whole module instead. The driver uses this for the
 module `close-generics` extends.
 
+`analysis.carp` owns normalized inference traces and their append-only session
+storage. `InferenceAnalysis.normalize` applies the producing run’s substitution
+and returns `NormalizedAnalysis`, which has no substitution. Only normalized
+analyses can be appended together; `append-inferred` normalizes each input
+before returning an ordinary inference result. Batch inference retains its
+solver snapshot until this explicit conversion.
+
 Ownership constraints and full Carp type syntax remain later gates.
 
 ```bash

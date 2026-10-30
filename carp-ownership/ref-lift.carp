@@ -1,0 +1,528 @@
+(load "../carp-specialize/carp-specialize.carp")
+
+(doc RefLift "lifts every `&rvalue` (a borrow whose operand is not an lvalue)
+into a fresh `let`-bound temporary that wraps the rest of its enclosing scope.
+A borrow that escapes into a later statement — as `deftest` does, threading a
+`State` accumulator through `(set! test &(assert-equal test ...))` — then keeps
+its referent alive for the whole scope, and the ownership phase schedules the
+temporary's delete like any other binding. Runs on the specialized module just
+before ownership so managed temporaries are freed correctly.")
+
+(defmodule RefLift
+  (private lvalue?)
+  (hidden lvalue?)
+  (defn lvalue? [expr]
+    (match-ref expr
+      (SpecializedExpr.Reference _ _ reference)
+        (not @(CoreRef.global reference))
+      (SpecializedExpr.GlobalValue _ _ _ _ _ _) true
+      (SpecializedExpr.Annotation _ _ inner _) (lvalue? (Box.peek inner))
+      _ false))
+
+  (private next-id!)
+  (hidden next-id!)
+  ;; lifted temporaries are locals: ids count DOWN from the module's local
+  ;; watermark (the counter is seeded by `module`), mirroring the resolver's
+  ;; negative local id space.
+  (defn next-id! [cell]
+    (let-do [v @(Array.unsafe-nth cell 0)] (Array.aset! cell 0 (Int.dec v)) v))
+
+  ;; index 1 of the counter is a per-definition expression-id allocator: the
+  ;; ownership validator indexes a `seen` array by expression id, so new nodes
+  ;; must take small ids just past the definition's existing maximum.
+  (private next-eid!)
+  (hidden next-eid!)
+  (defn next-eid! [cell]
+    (let-do [v @(Array.unsafe-nth cell 1)] (Array.aset! cell 1 (Int.inc v)) v))
+
+  (private max-eid)
+  (hidden max-eid)
+  (private max-eid-array)
+  (hidden max-eid-array)
+  (private max-eid-branches)
+  (hidden max-eid-branches)
+  (sig max-eid (Fn [(Ref SpecializedExpr)] Int))
+  (sig max-eid-array (Fn [(Ref (Array (Box SpecializedExpr)))] Int))
+  (sig max-eid-branches (Fn [(Ref (Array SpecializedMatchBranch))] Int))
+  (defn max-eid-array [xs]
+    (let-do [m -1]
+      (for [i 0 (Array.length xs)]
+        (set! m (Int.max m (max-eid (Box.peek (Array.unsafe-nth xs i))))))
+      m))
+  (defn max-eid-branches [branches]
+    (let-do [m -1]
+      (for [i 0 (Array.length branches)]
+        (set! m
+              (Int.max m
+                       (max-eid
+                         (Box.peek
+                           (SpecializedMatchBranch.body (Array.unsafe-nth branches
+                                                                          i)))))))
+      m))
+  (defn max-eid [expr]
+    (let [here (Specialize.expression-id expr)]
+      (match-ref expr
+        (SpecializedExpr.ArrayLit _ _ xs) (Int.max here (max-eid-array xs))
+        (SpecializedExpr.StaticArrayLit _ _ xs)
+          (Int.max here (max-eid-array xs))
+        (SpecializedExpr.Call _ _ callee args)
+          (Int.max here
+                   (Int.max (max-eid (Box.peek callee)) (max-eid-array args)))
+        (SpecializedExpr.GlobalCall _ _ _ _ _ args)
+          (Int.max here (max-eid-array args))
+        (SpecializedExpr.Do _ _ xs) (Int.max here (max-eid-array xs))
+        (SpecializedExpr.If _ _ c t e)
+          (Int.max here
+                   (Int.max (max-eid (Box.peek c))
+                            (Int.max (max-eid (Box.peek t))
+                                     (max-eid (Box.peek e)))))
+        (SpecializedExpr.Let _ _ _ value body)
+          (Int.max here
+                   (Int.max (max-eid (Box.peek value)) (max-eid (Box.peek body))))
+        (SpecializedExpr.Set _ _ _ value)
+          (Int.max here (max-eid (Box.peek value)))
+        (SpecializedExpr.While _ _ c body)
+          (Int.max here
+                   (Int.max (max-eid (Box.peek c)) (max-eid (Box.peek body))))
+        (SpecializedExpr.Lambda _ _ _ body)
+          (Int.max here (max-eid (Box.peek body)))
+        (SpecializedExpr.Match _ _ _ scrutinee branches)
+          (Int.max here
+                   (Int.max (max-eid (Box.peek scrutinee))
+                            (max-eid-branches branches)))
+        (SpecializedExpr.Annotation _ _ inner _)
+          (Int.max here (max-eid (Box.peek inner)))
+        _ here)))
+
+  (private ref-call?)
+  (hidden ref-call?)
+  (defn ref-call? [reference args]
+    (and (Int.= @(CoreRef.id reference) 5) (Int.= (Array.length args) 1)))
+
+  (private scope?)
+  (hidden scope?)
+  (defn scope? [expr]
+    (match-ref expr
+      (SpecializedExpr.Let _ _ _ _ _) true
+      (SpecializedExpr.If _ _ _ _ _) true
+      (SpecializedExpr.Do _ _ _) true
+      (SpecializedExpr.While _ _ _ _) true
+      (SpecializedExpr.Match _ _ _ _ _) true
+      (SpecializedExpr.Lambda _ _ _ _) true
+      _ false))
+
+  (private lift-node)
+  (hidden lift-node)
+  (private extract)
+  (hidden extract)
+  (private extract-array)
+  (hidden extract-array)
+  (private wrap)
+  (hidden wrap)
+  (private lift-do)
+  (hidden lift-do)
+  (private lift-branches)
+  (hidden lift-branches)
+  (private extract-set-value)
+  (hidden extract-set-value)
+  (sig lift-node (Fn [(Ref SpecializedExpr) (Ref (Array Int))] SpecializedExpr))
+  (sig extract
+       (Fn
+         [(Ref SpecializedExpr)
+          (Ref (Array (Pair CoreRef SpecializedExpr)))
+          (Ref (Array Int))]
+         SpecializedExpr))
+  (sig extract-array
+       (Fn
+         [(Ref (Array (Box SpecializedExpr)))
+          (Ref (Array (Pair CoreRef SpecializedExpr)))
+          (Ref (Array Int))]
+         (Array (Box SpecializedExpr))))
+  (sig wrap
+       (Fn
+         [(Ref (Array (Pair CoreRef SpecializedExpr)))
+          SpecializedExpr
+          (Ref (Array Int))]
+         SpecializedExpr))
+  (sig lift-do
+       (Fn
+         [(Ref (Array (Box SpecializedExpr))) Int (Ref (Array Int))]
+         SpecializedExpr))
+  (sig lift-branches
+       (Fn
+         [(Ref (Array SpecializedMatchBranch)) (Ref (Array Int))]
+         (Array SpecializedMatchBranch)))
+  (sig extract-set-value
+       (Fn
+         [(Ref CoreRef)
+          (Ref SpecializedExpr)
+          (Ref (Array (Pair CoreRef SpecializedExpr)))
+          (Ref (Array Int))]
+         SpecializedExpr))
+
+  (defn extract-array [args cell counter]
+    (let-do [result (the (Array (Box SpecializedExpr)) [])]
+      (for [i 0 (Array.length args)]
+        (Array.push-back! &result
+                          (Box.init
+                            (extract (Box.peek (Array.unsafe-nth args i))
+                                     cell
+                                     counter))))
+      result))
+
+  (defn extract [expr cell counter]
+    (match-ref expr
+      (SpecializedExpr.GlobalCall id type reference signature symbol args)
+      (if (and (ref-call? reference args)
+               (not (lvalue? (Box.peek (Array.unsafe-nth args 0)))))
+        ;; the operand's own borrowed temporaries join the SAME scope
+        ;; collection: the reference keeps every temporary of one statement
+        ;; alive to the statement's end (the `address` test relies on two
+        ;; inline array literals coexisting), so a nested lift scope here
+        ;; would free the inner literal too early.
+        (let-do [operand (extract (Box.peek (Array.unsafe-nth args 0))
+                                  cell
+                                  counter)
+                 operand-type (Specialize.expression-type &operand)
+                 fresh-id (next-id! counter)
+                 tmp (CoreRef.init fresh-id
+                                   (String.concat &[@"_reflift"
+                                                    (Int.str fresh-id)])
+                                   false)]
+          (Array.push-back! cell (Pair.init (CoreRef.copy &tmp) operand))
+          (SpecializedExpr.GlobalCall @id
+                                      (Box.init (MonoType.copy (Box.peek type)))
+                                      (CoreRef.copy reference)
+                                      (Box.init (MonoType.copy (Box.peek signature)))
+                                      (String.copy symbol)
+                                      [(Box.init
+                                         (SpecializedExpr.Reference (next-eid! counter)
+                                                                    (Box.init operand-type)
+                                                                    (CoreRef.copy &tmp)))]))
+        (SpecializedExpr.GlobalCall @id
+                                    (Box.init (MonoType.copy (Box.peek type)))
+                                    (CoreRef.copy reference)
+                                    (Box.init (MonoType.copy (Box.peek signature)))
+                                    (String.copy symbol)
+                                    (extract-array args cell counter)))
+      (SpecializedExpr.Call id type callee args)
+      (SpecializedExpr.Call @id
+                            (Box.init (MonoType.copy (Box.peek type)))
+                            (Box.init (extract (Box.peek callee) cell counter))
+                            (extract-array args cell counter))
+      ;; a `set!` statement in a scope-sequence: lift borrows out of its value so
+      ;; the temporary outlives the assignment target (the `deftest` accumulator).
+      (SpecializedExpr.Set id type reference value)
+      (SpecializedExpr.Set @id
+                           (Box.init (MonoType.copy (Box.peek type)))
+                           (CoreRef.copy reference)
+                           (Box.init
+                             (extract-set-value reference
+                                                (Box.peek value)
+                                                cell
+                                                counter)))
+      (SpecializedExpr.Annotation id type inner annotation)
+      (SpecializedExpr.Annotation @id
+                                  (Box.init (MonoType.copy (Box.peek type)))
+                                  (Box.init (extract (Box.peek inner)
+                                                     cell
+                                                     counter))
+                                  (Box.init (CoreType.copy (Box.peek annotation))))
+      ;; statement-shaped forms in argument position keep their own scopes;
+      ;; their borrows are lifted by recursing at statement level.
+      (SpecializedExpr.Do _ _ _)
+      (lift-node expr counter)
+      (SpecializedExpr.Let _ _ _ _ _)
+      (lift-node expr counter)
+      (SpecializedExpr.If _ _ _ _ _)
+      (lift-node expr counter)
+      (SpecializedExpr.Match _ _ _ _ _)
+      (lift-node expr counter)
+      (SpecializedExpr.While _ _ _ _)
+      (lift-node expr counter)
+      ;; array literals carry expression elements (e.g. `(Pair.init-from-refs
+      ;; &1 &2)`) whose borrows must be lifted like any other value position.
+      (SpecializedExpr.ArrayLit id type elements)
+      (SpecializedExpr.ArrayLit @id
+                                (Box.init (MonoType.copy (Box.peek type)))
+                                (extract-array elements cell counter))
+      ;; a static array literal borrows storage that has to live as long as
+      ;; the borrow and be freed with it, like `&[...]`: the reference gives it
+      ;; a stack temporary in the statement's scope. Lifting it into one here
+      ;; gives each evaluation (every call, every recursion depth, every loop
+      ;; iteration) its own storage, and ownership then deletes its elements
+      ;; at scope exit. A global's initializer keeps static storage (slot 3).
+      (SpecializedExpr.StaticArrayLit id type elements)
+      (let [extracted (extract-array elements cell counter)]
+        (match-ref (Box.peek type)
+          (MonoType.Reference storage-type _)
+            (if (Int.= 0 @(Array.unsafe-nth counter 3))
+              (SpecializedExpr.StaticArrayLit @id
+                                              (Box.init (MonoType.copy (Box.peek type)))
+                                              extracted)
+              (let-do [fresh-id (next-id! counter)
+                       tmp (CoreRef.init fresh-id
+                                         (String.concat &[@"_reflift"
+                                                          (Int.str fresh-id)])
+                                         false)]
+                (Array.push-back! cell
+                                  (Pair.init (CoreRef.copy &tmp)
+                                             (SpecializedExpr.StaticArrayLit @id
+                                                                             (Box.init (MonoType.copy (Box.peek storage-type)))
+                                                                             extracted)))
+                (SpecializedExpr.GlobalCall (next-eid! counter)
+                                            (Box.init (MonoType.copy (Box.peek type)))
+                                            (PrimitiveRegistry.ref-reference)
+                                            (Box.init
+                                              (MonoType.Function
+                                                [(Box.init (MonoType.copy (Box.peek storage-type)))]
+                                                (Box.init (MonoType.copy (Box.peek type)))))
+                                            (String.copy "ref")
+                                            [(Box.init
+                                               (SpecializedExpr.Reference (next-eid! counter)
+                                                                          (Box.init (MonoType.copy (Box.peek storage-type)))
+                                                                          tmp))])))
+          _
+            (SpecializedExpr.StaticArrayLit @id
+                                            (Box.init (MonoType.copy (Box.peek type)))
+                                            extracted)))
+      ;; a lambda in value position keeps its own body scope; borrows inside
+      ;; the body are lifted at the body's statement level.
+      (SpecializedExpr.Lambda id type parameters body)
+      (SpecializedExpr.Lambda @id
+                              (Box.init (MonoType.copy (Box.peek type)))
+                              (Array.copy parameters)
+                              (Box.init (lift-node (Box.peek body) counter)))
+      _
+      (SpecializedExpr.copy expr)))
+
+  ;; a set!'s temporaries normally join the statement's scope, so a reference
+  ;; target may keep borrowing from them (the `deftest` accumulator,
+  ;; `(set! t &(assert-true t ...))`). A temporary that takes the old value of a
+  ;; value target, as in `(set! a (f &[a]))`, stays inside the set!'s value
+  ;; instead: ownership decides there whether the value consumes the target,
+  ;; and the new value cannot borrow from a temporary holding the old one.
+  (defn extract-set-value [target value cell counter]
+    (let-do [own (the (Array (Pair CoreRef SpecializedExpr)) [])
+             value2 (extract value &own counter)
+             takes-old (and
+               (match (Specialize.expression-type value)
+                 (MonoType.Reference _ _) false
+                 _ true)
+               (Array.any?
+                 &(fn [binding] (Ownership.consumed? target (Pair.b binding)))
+                 &own))]
+      (if takes-old
+        (wrap &own value2 counter)
+        (do
+          (for [k 0 (Array.length &own)]
+            (Array.push-back! cell @(Array.unsafe-nth &own k)))
+          value2))))
+
+  (defn wrap [cell inner counter]
+    (let-do [result inner]
+      (for [k 0 (Array.length cell)]
+        (let [idx (Int.- (Int.dec (Array.length cell)) k)
+              binding (Array.unsafe-nth cell idx)
+              body-type (Specialize.expression-type &result)]
+          (set! result
+                (SpecializedExpr.Let (next-eid! counter)
+                                     (Box.init body-type)
+                                     (CoreRef.copy (Pair.a binding))
+                                     (Box.init (SpecializedExpr.copy (Pair.b binding)))
+                                     (Box.init result)))))
+      result))
+
+  (defn lift-do [stmts idx counter]
+    (if (Int.>= idx (Int.dec (Array.length stmts)))
+      (lift-node (Box.peek (Array.unsafe-nth stmts idx)) counter)
+      (let-do [si (Box.peek (Array.unsafe-nth stmts idx))
+               cell (the (Array (Pair CoreRef SpecializedExpr)) [])
+               si2 (if (scope? si)
+                 (lift-node si counter)
+                 (extract si &cell counter))
+               rest (lift-do stmts (Int.inc idx) counter)
+               combined (SpecializedExpr.Do (next-eid! counter)
+                                            (Box.init (Specialize.expression-type &rest))
+                                            [(Box.init si2) (Box.init rest)])]
+        (wrap &cell combined counter))))
+
+  (defn lift-branches [branches counter]
+    (let-do [result (the (Array SpecializedMatchBranch) [])]
+      (for [i 0 (Array.length branches)]
+        (let [b (Array.unsafe-nth branches i)]
+          (Array.push-back! &result
+                            (SpecializedMatchBranch.init @(SpecializedMatchBranch.pattern b)
+                                                         @(SpecializedMatchBranch.bindings b)
+                                                         (Box.init
+                                                           (lift-node
+                                                             (Box.peek (SpecializedMatchBranch.body b))
+                                                             counter))))))
+      result))
+
+  (defn lift-node [expr counter]
+    (match-ref expr
+      (SpecializedExpr.Do _ _ elements)
+        (if (Int.= 0 (Array.length elements))
+          (SpecializedExpr.copy expr)
+          (lift-do elements 0 counter))
+      (SpecializedExpr.Let id type reference value body)
+        (let-do [cell (the (Array (Pair CoreRef SpecializedExpr)) [])
+                 value2 (if (scope? (Box.peek value))
+                   (lift-node (Box.peek value) counter)
+                   (extract (Box.peek value) &cell counter))
+                 body2 (lift-node (Box.peek body) counter)]
+          (wrap &cell
+                (SpecializedExpr.Let @id
+                                     (Box.init (MonoType.copy (Box.peek type)))
+                                     (CoreRef.copy reference)
+                                     (Box.init value2)
+                                     (Box.init body2))
+                counter))
+      (SpecializedExpr.If id type condition then-branch else-branch)
+        (let-do [cell (the (Array (Pair CoreRef SpecializedExpr)) [])
+                 c2 (if (scope? (Box.peek condition))
+                   (lift-node (Box.peek condition) counter)
+                   (extract (Box.peek condition) &cell counter))]
+          (wrap &cell
+                (SpecializedExpr.If @id
+                                    (Box.init (MonoType.copy (Box.peek type)))
+                                    (Box.init c2)
+                                    (Box.init
+                                      (lift-node (Box.peek then-branch) counter))
+                                    (Box.init
+                                      (lift-node (Box.peek else-branch) counter)))
+                counter))
+      (SpecializedExpr.Set id type reference value)
+        (let-do [cell (the (Array (Pair CoreRef SpecializedExpr)) [])
+                 value2 (if (scope? (Box.peek value))
+                   (lift-node (Box.peek value) counter)
+                   (extract-set-value reference (Box.peek value) &cell counter))]
+          (wrap &cell
+                (SpecializedExpr.Set @id
+                                     (Box.init (MonoType.copy (Box.peek type)))
+                                     (CoreRef.copy reference)
+                                     (Box.init value2))
+                counter))
+      (SpecializedExpr.While id type condition body)
+        (SpecializedExpr.While @id
+                               (Box.init (MonoType.copy (Box.peek type)))
+                               (Box.init
+                                 (SpecializedExpr.copy (Box.peek condition)))
+                               (Box.init (lift-node (Box.peek body) counter)))
+      (SpecializedExpr.Match id type by-reference scrutinee branches)
+        (let-do [cell (the (Array (Pair CoreRef SpecializedExpr)) [])
+                 scrut2 (if (scope? (Box.peek scrutinee))
+                   (lift-node (Box.peek scrutinee) counter)
+                   (extract (Box.peek scrutinee) &cell counter))]
+          (wrap &cell
+                (SpecializedExpr.Match @id
+                                       (Box.init (MonoType.copy (Box.peek type)))
+                                       @by-reference
+                                       (Box.init scrut2)
+                                       (lift-branches branches counter))
+                counter))
+      (SpecializedExpr.Lambda id type parameters body)
+        (SpecializedExpr.Lambda @id
+                                (Box.init (MonoType.copy (Box.peek type)))
+                                (Array.copy parameters)
+                                (Box.init (lift-node (Box.peek body) counter)))
+      _
+        (let-do [cell (the (Array (Pair CoreRef SpecializedExpr)) [])
+                 atom (extract expr &cell counter)]
+          (wrap &cell atom counter))))
+
+  (private module-ceiling)
+  (hidden module-ceiling)
+  (doc module-ceiling "the largest expression id anywhere in the module.
+
+It walks the module in a function of its own rather than inside `module`,
+because two walks of the same array in one function are given the same name
+for that array''s data, and the second declaration of that name does not
+compile. That is a fault worth fixing where it lives; a caller can avoid
+tripping it by not asking one function to walk one array twice.")
+  (defn module-ceiling [bodies roots]
+    (let-do [ceiling 0]
+      (for [i 0 (Array.length bodies)]
+        (set! ceiling
+              (Int.max ceiling
+                       (max-eid
+                         (Box.peek
+                           (SpecializedBody.body (Array.unsafe-nth bodies i)))))))
+      (for [i 0 (Array.length roots)]
+        (set! ceiling
+              (Int.max ceiling (max-eid (Box.peek (Array.unsafe-nth roots i))))))
+      ceiling))
+
+  (private lift-body)
+  (hidden lift-body)
+  (doc lift-body "lifts one body's borrows, allocating ids for the temporaries
+it introduces.
+
+The ids start above this body's own maximum, which is enough for a validator
+that looks at one body at a time. It is not enough for a source map: that maps
+an id to where it was written, across the whole module, and an id invented
+here would otherwise name a line from some other definition. A build that
+wants a map says so, and then the ids start above every id in the module.")
+  (defn lift-body [b counter source-map]
+    (let-do [_ignored (Array.aset! counter
+                                   1
+                                   (if source-map
+                                     @(Array.unsafe-nth counter 2)
+                                     (Int.inc
+                                       (max-eid (Box.peek (SpecializedBody.body b))))))
+             ;; a global's initializer runs once and its value lives on, so its
+             ;; static array literals keep static storage
+             _static (Array.aset! counter 3 (if @(SpecializedBody.value b) 0 1))]
+      (SpecializedBody.init @(SpecializedBody.specialization b)
+                            (Array.copy (SpecializedBody.parameters b))
+                            (Box.init
+                              (lift-node (Box.peek (SpecializedBody.body b))
+                                         counter))
+                            @(SpecializedBody.value b))))
+
+  (doc module-with-source-map
+    "rewrites every function body and root of a specialized module so
+borrows of non-lvalues are lifted to scope-lived temporaries.")
+  (defn module-with-source-map [m source-map]
+    (let-do [counter (the (Array Int)
+                          [(Int.dec (Specialize.min-local-id m)) 0 0 1])
+             new-bodies (the (Array SpecializedBody) [])
+             new-roots (the (Array (Box SpecializedExpr)) [])
+             bodies (SpecializationModule.bodies m)
+             roots (SpecializationModule.roots m)]
+      ;; slot 2 is the module-wide ceiling: an id above everything written
+      ;; anywhere in the module, so a temporary cannot be mistaken for a form.
+      ;; slot 3 is 1 where static array literals get scope storage, 0 in a
+      ;; global's initializer.
+      (Array.aset! &counter 2 (Int.inc (module-ceiling bodies roots)))
+      (for [i 0 (Array.length bodies)]
+        (Array.push-back! &new-bodies
+                          (lift-body (Array.unsafe-nth bodies i)
+                                     &counter
+                                     source-map)))
+      ;; all roots share one dense expression-id space, so fresh ids must be
+      ;; allocated above the maximum across EVERY root, not per root.
+      (let-do [roots-max 0]
+        (for [i 0 (Array.length roots)]
+          (set! roots-max
+                (Int.max roots-max
+                         (max-eid (Box.peek (Array.unsafe-nth roots i))))))
+        (Array.aset! &counter 1 (Int.inc roots-max)))
+      (Array.aset! &counter 3 1)
+      (for [i 0 (Array.length roots)]
+        (Array.push-back! &new-roots
+                          (Box.init
+                            (lift-node (Box.peek (Array.unsafe-nth roots i))
+                                       &counter))))
+      (SpecializationModule.init @(SpecializationModule.instances m)
+                                 new-bodies
+                                 @(SpecializationModule.primitives m)
+                                 new-roots
+                                 @(SpecializationModule.constructors m)
+                                 @(SpecializationModule.system-includes m)
+                                 @(SpecializationModule.type-declarations m))))
+
+  (doc module
+    "lifts borrowed temporaries with owner-local generated identities.")
+  (defn module [m] (module-with-source-map m false)))

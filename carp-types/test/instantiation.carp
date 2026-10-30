@@ -1,0 +1,147 @@
+(load "../../carp-compiler.carp")
+(load "Test.carp")
+(Project.no-echo)
+(use-all Test)
+
+(defmodule Derive
+  (defn instantiate-test [type bindings] (core->mono type bindings)))
+(defmodule Specialize
+  (defn instantiate-test [type bindings]
+    (PatternTyping.field-type type bindings)))
+(defmodule CBackend
+  (defn instantiate-test [type bindings] (concretize-core-type bindings type)))
+
+(defn nested-source []
+  (CoreType.Function
+    [(Box.init
+       (CoreType.Named @"Pair"
+                       [(Box.init (CoreType.Variable @"a"))
+                        (Box.init (CoreType.Unit))]))
+     (Box.init
+       (CoreType.Reference (Box.init (CoreType.Variable @"a"))
+                           (CoreLifetime.Named @"borrow")))]
+    (Box.init (CoreType.Function [] (Box.init (CoreType.Boolean))))))
+(defn nested-expected []
+  (Type.function
+    [(Box.init
+       (Type.named "Pair" [(Box.init (Type.integer)) (Box.init (Type.unit))]))
+     (Box.init (Type.reference (Type.integer) (MonoLifetime.Static)))]
+    (Type.function [] (Type.boolean))))
+
+(defn reject-variable [visited name]
+  (do
+    (Array.push-back! visited (String.copy name))
+    (Result.Error (String.copy name))))
+
+(defn stops-at-first-error? []
+  (let-do [visited (the (Array String) [])
+           source (CoreType.Function
+             [(Box.init (CoreType.Integer))
+              (Box.init
+                (CoreType.Named @"Pair"
+                                [(Box.init (CoreType.String))
+                                 (Box.init (CoreType.Variable @"first"))]))
+              (Box.init (CoreType.Variable @"second"))]
+             (Box.init (CoreType.Variable @"return")))
+           result (CoreInstantiation.type-with &source &visited &reject-variable)]
+    (and
+      (match result
+        (Result.Error name) (String.= &name "first")
+        (Result.Success _) false)
+      (and (Int.= 1 (Array.length &visited))
+           (String.= (Array.unsafe-nth &visited 0) "first")))))
+
+(defn closed-types-need-no-lookup? []
+  (let-do [visited (the (Array String) [])
+           source (CoreType.Function
+             [(Box.init (CoreType.Integer))
+              (Box.init (CoreType.String))
+              (Box.init (CoreType.Boolean))
+              (Box.init (CoreType.Unit))
+              (Box.init (CoreType.Named @"Empty" []))]
+             (Box.init (CoreType.Unit)))
+           expected (Type.function
+             [(Box.init (Type.integer))
+              (Box.init (Type.string))
+              (Box.init (Type.boolean))
+              (Box.init (Type.unit))
+              (Box.init (Type.named "Empty" []))]
+             (Type.unit))
+           result (CoreInstantiation.type-with &source &visited &reject-variable)]
+    (and (Array.empty? &visited)
+         (match result
+           (Result.Success actual) (Type.same? &actual &expected)
+           (Result.Error _) false))))
+
+(deftest test
+  (let-do [variable (CoreType.Variable @"a")
+           pairs [(Pair.init @"a" (Type.integer)) (Pair.init @"a" (Type.string))]
+           templates [(TemplateTypeBinding.init @"a" (Box.init (Type.integer)))
+                      (TemplateTypeBinding.init @"a" (Box.init (Type.string)))]
+           first (Derive.instantiate-test &variable &pairs)
+           last (Specialize.instantiate-test &variable &pairs)
+           checked (CBackend.instantiate-test &variable &templates)]
+    (set! test
+          &(assert-true test
+            (Type.same? &first &(Type.integer))
+            "derivation selects the first duplicate binding"))
+    (set! test
+          &(assert-true test
+            (Type.same? &last &(Type.string))
+            "specialization selects the last duplicate binding"))
+    (assert-true test
+      (match checked
+        (Result.Success found) (Type.same? &found &(Type.string))
+        (Result.Error _) false)
+      "C layout selects the last duplicate binding"))
+  (let-do [variable (CoreType.Variable @"missing")
+           first (Derive.instantiate-test &variable
+                                          &(the (Array (Pair String MonoType))
+                                                []))
+           last (Specialize.instantiate-test &variable
+                                             &(the (Array (Pair String MonoType))
+                                                   []))
+           checked (CBackend.instantiate-test &variable
+                                              &(the (Array TemplateTypeBinding)
+                                                    []))]
+    (set! test
+          &(assert-true test
+            (Type.same? &first &(MonoType.Variable 0))
+            "derivation preserves its unresolved-variable fallback"))
+    (set! test
+          &(assert-true test
+            (Type.same? &last &(Type.unit))
+            "specialization preserves its missing-slot fallback"))
+    (assert-true test
+      (match checked
+        (Result.Success _) false
+        (Result.Error error)
+          (String.= (BackendError.message &error)
+                    "nominal layout variable has no concrete binding"))
+      "C layout reports its existing missing-variable diagnostic"))
+  (let-do [source (nested-source)
+           expected (nested-expected)
+           pairs [(Pair.init @"a" (Type.integer))]
+           templates [(TemplateTypeBinding.init @"a" (Box.init (Type.integer)))]
+           derived (Derive.instantiate-test &source &pairs)
+           slots (Specialize.instantiate-test &source &pairs)
+           layout (CBackend.instantiate-test &source &templates)]
+    (set! test
+          &(assert-true test
+            (Type.same? &derived &expected)
+            "derivation instantiates nested named, reference and function types"))
+    (set! test
+          &(assert-true test
+            (Type.same? &slots &expected)
+            "slot instantiation preserves names, order, empty arguments and static lifetimes"))
+    (assert-true test
+      (match layout
+        (Result.Success found) (Type.same? &found &expected)
+        (Result.Error _) false)
+      "C layout agrees on nested concrete field structure"))
+  (assert-true test
+    (stops-at-first-error?)
+    "shared instantiation stops before later arguments and return types after an error")
+  (assert-true test
+    (closed-types-need-no-lookup?)
+    "shared instantiation covers every closed scalar and empty nominal arguments without lookup"))

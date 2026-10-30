@@ -1,3 +1,4 @@
+(load "../carp-types/pattern-typing.carp")
 (load "../carp-specialize/carp-specialize.carp")
 
 (doc OwnershipSite "identifies one expression inside a concrete specialization
@@ -206,40 +207,22 @@ type with no declared delete stays `Unmanaged`.")
 
   (private resolved->mono)
   (hidden resolved->mono)
-  (private map-resolved->mono)
-  (hidden map-resolved->mono)
+
   (sig resolved->mono (Fn [(Ref CoreType)] MonoType))
-  (sig map-resolved->mono
-       (Fn [(Ref (Array (Box CoreType)))] (Array (Box MonoType))))
-  (defn map-resolved->mono [args]
-    (let-do [result (the (Array (Box MonoType)) [])
-             n (Array.length args)]
-      (for [i 0 n]
-        (set! result
-              (Array.push-back result
-                               (Box.init
-                                 (resolved->mono (Box.peek (Array.unsafe-nth args
-                                                                             i)))))))
-      result))
 
   (doc resolved->mono "converts a concrete resolved type to a MonoType so a
 generic-instance deleter's argument type can be keyed for ownership facts.")
-  (defn resolved->mono [core-type]
-    (match-ref core-type
-      (CoreType.Integer) (MonoType.Integer)
-      (CoreType.String) (MonoType.String)
-      (CoreType.Boolean) (MonoType.Boolean)
-      (CoreType.Unit) (MonoType.Unit)
-      (CoreType.Named n args)
-        (MonoType.Named (String.copy n) (map-resolved->mono args))
-      (CoreType.Reference inner _)
-        (MonoType.Reference
-          (Box.init (resolved->mono (Box.peek inner)))
-          (MonoLifetime.Static))
-      (CoreType.Function args ret)
-        (MonoType.Function (map-resolved->mono args)
-                           (Box.init (resolved->mono (Box.peek ret))))
-      (CoreType.Variable _) (MonoType.Variable 0)))
+  (private unresolved-variable)
+  (hidden unresolved-variable)
+  (defn unresolved-variable [_bindings _name]
+    (Result.Success (MonoType.Variable 0)))
+
+  (defn resolved->mono [type]
+    (Result.from-success
+      (CoreInstantiation.type-with type
+                                   &(the (Array (Pair String MonoType)) [])
+                                   &unresolved-variable)
+      (MonoType.Variable 0)))
 
   (private indirect-generic-target?)
   (hidden indirect-generic-target?)
@@ -2076,13 +2059,17 @@ choosing where to put one.")
               ;; (setter-displaced fields), which is why the types come from
               ;; the pattern, not from body references. `match-ref` bindings
               ;; only borrow — never delete.
-              (unless-do @by-reference
-                (let [scrutinee-type (Specialize.expression-type (Box.peek scrutinee))
-                      bound (Specialize.bound-slot-types (SpecializedMatchBranch.pattern branch)
-                                                         &scrutinee-type
-                                                         constructors)]
-                  (for [j 0 (Array.length &bound)]
-                    (let [slot (Array.unsafe-nth &bound j)
+              (unless @by-reference
+                (let-do [scrutinee-type (Specialize.expression-type (Box.peek scrutinee))
+                         slot-types (PatternTyping.analyze (SpecializedMatchBranch.pattern branch)
+                                                           &scrutinee-type
+                                                           constructors)
+                         bound (PatternSlotTypes.bound &slot-types)
+                         ignored (PatternSlotTypes.unbound &slot-types)]
+                  ; Bound payloads receive scope cleanup before ignored payload
+                  ; demands, retaining the existing ownership action order.
+                  (for [j 0 (Array.length bound)]
+                    (let [slot (Array.unsafe-nth bound j)
                           binder (Pair.a slot)
                           slot-type (Pair.b slot)]
                       (when (and (owned-type? slot-type facts)
@@ -2091,16 +2078,9 @@ choosing where to put one.")
                                           (make-delete-action context
                                                               (Specialize.expression-id body)
                                                               (CoreRef.copy binder)
-                                                              (MonoType.copy slot-type)))))))
-                ;; unbound (`_`) slots drop their payloads at the match: demand
-                ;; a deleter for each owned one so the backend can free them
-                ;; (Temporary resource: requirement-only, no scope delete).
-                (let [scrutinee-type (Specialize.expression-type (Box.peek scrutinee))
-                      slots (Specialize.unbound-slot-types (SpecializedMatchBranch.pattern branch)
-                                                           &scrutinee-type
-                                                           constructors)]
-                  (for [j 0 (Array.length &slots)]
-                    (let [slot (Array.unsafe-nth &slots j)]
+                                                              (MonoType.copy slot-type))))))
+                  (for [j 0 (Array.length ignored)]
+                    (let [slot (Array.unsafe-nth ignored j)]
                       (when (owned-type? slot facts)
                         (Array.push-back! acc
                                           (make-temporary-delete context

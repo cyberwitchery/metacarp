@@ -1,0 +1,288 @@
+(load "../carp-backend.carp")
+(Project.no-echo)
+(load "Test.carp")
+(use-all Test)
+
+(defn parameter [] (CoreRef.init 1 @"value" false))
+(defn owner [] (CoreRef.init 90 @"cleanup-fixture" true))
+(defn managed-type [other] (Type.named (if other "Other" "Widget") []))
+(defn signature [type] (Type.function [(Box.init @type)] (Type.unit)))
+
+(defn assignment-body [type]
+  (SpecializedExpr.Do 50
+                      (Box.init (Type.unit))
+                      [(Box.init
+                         (SpecializedExpr.Set 20
+                                              (Box.init (Type.unit))
+                                              (parameter)
+                                              (Box.init
+                                                (SpecializedExpr.GlobalCall 21
+                                                                            (Box.init @type)
+                                                                            (CoreRef.init 91
+                                                                                          @"make"
+                                                                                          true)
+                                                                            (Box.init (Type.function []
+                                                                                                     @type))
+                                                                            @"make_value"
+                                                                            []))))
+                       (Box.init
+                         (SpecializedExpr.UnitLit 51 (Box.init (Type.unit))))]))
+
+(defn actions-for [context type]
+  [(OwnershipAction.Delete (OwnershipSite.init context 50)
+                           (OwnershipResource.Binding (parameter))
+                           (Box.init @type))
+   (OwnershipAction.Delete (OwnershipSite.init context 20)
+                           (OwnershipResource.Binding (parameter))
+                           (Box.init @type))])
+
+(defn native-symbols []
+  [(Pair.init (CAbi.type-key &(managed-type false)) @"drop_widget")
+   (Pair.init (CAbi.type-key &(managed-type true)) @"drop_other")])
+
+(defn specialized-fixture [type]
+  (let [instance (Specialization.init (owner)
+                                      (Box.init (signature type))
+                                      @"cleanup_fixture")]
+    (SpecializationModule.init [@&instance]
+                               [(SpecializedBody.init instance
+                                                      [(parameter)]
+                                                      (Box.init (assignment-body type))
+                                                      false)]
+                               []
+                               [(Box.init
+                                  (SpecializedExpr.UnitLit 99
+                                                           (Box.init (Type.unit))))]
+                               []
+                               [@"fixture.h"]
+                               [])))
+
+(defn ownership-fixture [type actions]
+  (OwnershipPlan.init
+    [(OwnershipContext.Definition (owner)
+                                  (Box.init (signature type))
+                                  @"cleanup_fixture"
+                                  50)
+     (OwnershipContext.Roots 99)]
+    @actions
+    []))
+
+(defmodule BackendLower
+  (defn test-rewrite-module [type actions symbols]
+    (match (resolve-cleanup actions symbols)
+      (Result.Success cleanup)
+        (Result.Success
+          (rewrite-bodies (specialized-fixture type)
+                          &(ownership-fixture type actions)
+                          &cleanup
+                          symbols
+                          &(the (Maybe EchoPlan) (Maybe.Nothing))))
+      (Result.Error error) (Result.Error error)))
+
+  (defn test-rewrite-closure [type context actions symbols]
+    (match (resolve-cleanup actions symbols)
+      (Result.Success cleanup)
+        (let [closure (ClosureFunction.init @"closure_fixture"
+                                            (Box.init (signature type))
+                                            []
+                                            [(parameter)]
+                                            (Box.init (assignment-body type))
+                                            context)
+              result (rewrite-closures [closure] &cleanup symbols &[])]
+          (Result.Success
+            (SpecializedExpr.copy
+              (Box.peek (ClosureFunction.body (Array.unsafe-nth &result 0))))))
+      (Result.Error error) (Result.Error error)))
+
+  (defn test-rewrite-closures [closures actions symbols]
+    (match (resolve-cleanup actions symbols)
+      (Result.Success cleanup)
+        (Result.Success (rewrite-closures closures &cleanup symbols &[]))
+      (Result.Error error) (Result.Error error))))
+
+(private trace-array!)
+(hidden trace-array!)
+(sig trace-array!
+     (Fn [(Ref (Array (Box SpecializedExpr))) (Ref (Array String))] Unit))
+(private trace-expr!)
+(hidden trace-expr!)
+(sig trace-expr! (Fn [(Ref SpecializedExpr) (Ref (Array String))] Unit))
+
+(defn trace-array! [expressions output]
+  (for [i 0 (Array.length expressions)]
+    (trace-expr! (Box.peek (Array.unsafe-nth expressions i)) output)))
+
+(defn trace-expr! [expression output]
+  (match-ref expression
+    (SpecializedExpr.Do _ _ expressions) (trace-array! expressions output)
+    (SpecializedExpr.Let _ _ _ value body)
+      (do
+        (trace-expr! (Box.peek value) output)
+        (trace-expr! (Box.peek body) output))
+    (SpecializedExpr.Set _ _ _ value)
+      (do
+        (trace-expr! (Box.peek value) output)
+        (Array.push-back! output @"assign"))
+    (SpecializedExpr.GlobalCall _ _ _ _ symbol arguments)
+      (do (trace-array! arguments output) (Array.push-back! output @symbol))
+    (SpecializedExpr.Annotation _ _ inner _)
+      (trace-expr! (Box.peek inner) output)
+    _ ()))
+
+(defn expected-trace? [expression other]
+  (let-do [output (the (Array String) [])
+           expected (if other
+             "make_value|drop_other|assign|drop_other"
+             "make_value|drop_widget|assign|drop_widget")]
+    (trace-expr! expression &output)
+    (let-do [actual (String.join "|" &output)]
+      (unless (String.= &actual expected) (IO.errorln &actual))
+      (String.= &actual expected))))
+
+(defn ordinary-cleanup? []
+  (let [type (managed-type false)]
+    (match (BackendLower.test-rewrite-module &type
+                                             &(actions-for 0 &type)
+                                             &(native-symbols))
+      (Result.Success rewritten)
+        (expected-trace?
+          (Box.peek
+            (SpecializedBody.body
+              (Array.unsafe-nth (SpecializationModule.bodies &rewritten) 0)))
+          false)
+      (Result.Error _) false)))
+
+(defn closure-cleanup? [other]
+  (let-do [widget (managed-type false)
+           different (managed-type true)
+           actions (actions-for 0 &widget)]
+    (for [i 0 2]
+      (Array.push-back! &actions
+                        @(Array.unsafe-nth &(actions-for 1 &different) i)))
+    (match (BackendLower.test-rewrite-closure (if other &different &widget)
+                                              (if other 1 0)
+                                              &actions
+                                              &(native-symbols))
+      (Result.Success expression) (expected-trace? &expression other)
+      (Result.Error _) false)))
+
+(defn fallback-cleanup? []
+  (let [type (managed-type false)]
+    (match (BackendLower.test-rewrite-closure &type
+                                              -1
+                                              &(actions-for 7 &type)
+                                              &(native-symbols))
+      (Result.Success expression) (expected-trace? &expression false)
+      (Result.Error _) false)))
+
+(defn retains-closure-metadata? []
+  (let [type (managed-type false)
+        captures [(Pair.init (CoreRef.init 10 @"first" false)
+                             (Box.init (managed-type false)))
+                  (Pair.init (CoreRef.init 11 @"second" false)
+                             (Box.init (managed-type true)))]
+        closure (ClosureFunction.init @"closure_metadata"
+                                      (Box.init (signature &type))
+                                      @&captures
+                                      [(parameter)]
+                                      (Box.init (assignment-body &type))
+                                      0)]
+    (match (BackendLower.test-rewrite-closures [closure]
+                                               &(actions-for 0 &type)
+                                               &(native-symbols))
+      (Result.Success rewritten)
+        (let [result (Array.unsafe-nth &rewritten 0)
+              parameters (ClosureFunction.parameters result)]
+          (and
+            (String.= (ClosureFunction.symbol result) "closure_metadata")
+            (and
+              (String.=
+                &(CAbi.type-key (Box.peek (ClosureFunction.signature result)))
+                &(CAbi.type-key &(signature &type)))
+              (and
+                (Int.= @(ClosureFunction.context result) 0)
+                (and
+                  (String.=
+                    &(Array.str (ClosureFunction.captures result))
+                    &(Array.str &captures))
+                  (and (Int.= (Array.length parameters) 1)
+                       (and
+                         (CoreIR.same-ref? (Array.unsafe-nth parameters 0)
+                                           &(parameter))
+                         (expected-trace? (Box.peek (ClosureFunction.body result))
+                                          false))))))))
+      (Result.Error _) false)))
+
+(defn retains-tables-and-roots? []
+  (let [type (managed-type false)]
+    (match (BackendLower.test-rewrite-module &type
+                                             &(actions-for 0 &type)
+                                             &(native-symbols))
+      (Result.Success rewritten)
+        (and
+          (Int.= 1 (Array.length (SpecializationModule.instances &rewritten)))
+          (and
+            (Int.= 1 (Array.length (SpecializationModule.roots &rewritten)))
+            (String.= "fixture.h"
+                      (Array.unsafe-nth
+                        (SpecializationModule.system-includes &rewritten)
+                        0))))
+      (Result.Error _) false)))
+
+(defn missing-deleter? []
+  (let [type (managed-type false)]
+    (match (BackendLower.test-rewrite-module &type &(actions-for 0 &type) &[])
+      (Result.Success _) false
+      (Result.Error error)
+        (String.= (BackendError.message &error)
+                  "no concrete deleter for an owned local"))))
+
+(defn preserves-borrowed-input? []
+  (let [type (managed-type false)
+        source (specialized-fixture &type)
+        ownership (ownership-fixture &type &(actions-for 0 &type))
+        symbols (native-symbols)]
+    (match (BackendLower.module-with-ownership &source
+                                               &ownership
+                                               &symbols
+                                               &symbols)
+      (Result.Success backend)
+        (let-do [original (the (Array String) [])]
+          (trace-expr!
+            (Box.peek
+              (SpecializedBody.body
+                (Array.unsafe-nth (SpecializationModule.bodies &source) 0)))
+            &original)
+          (and
+            (String.= &(String.join "|" &original) "make_value|assign")
+            (match-ref (Array.unsafe-nth (BackendModule.declarations &backend) 0)
+              (BackendDeclaration.Function _ _ _ body)
+                (expected-trace? (Box.peek body) false)
+              _ false)))
+      (Result.Error _) false)))
+
+(deftest t
+  (assert-true t
+    (ordinary-cleanup?)
+    "ordinary cleanup deletes the displaced parameter before assignment and its replacement at exit")
+  (assert-true t
+    (closure-cleanup? false)
+    "closure cleanup selects its own context when sites and binders collide")
+  (assert-true t
+    (closure-cleanup? true)
+    "another generic closure context keeps its distinct concrete deleter")
+  (assert-true t
+    (fallback-cleanup?)
+    "legacy closure contexts retain the complete-delete-set fallback")
+  (assert-true t
+    (retains-tables-and-roots?)
+    "body rewriting retains specialization tables, includes and roots")
+  (assert-true t
+    (missing-deleter?)
+    "missing concrete deleters retain their backend diagnostic")
+  (assert-true t
+    (preserves-borrowed-input?)
+    "public lowering preserves its borrowed input while rewriting the owned intermediate")
+  (assert-true t
+    (retains-closure-metadata?)
+    "closure rewriting retains its symbol, signature, captures, parameters and context"))

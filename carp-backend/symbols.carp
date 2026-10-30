@@ -1,0 +1,109 @@
+(load "../carp-backend/carp-backend.carp")
+
+(doc BackendSymbols "owns native copier and deleter tables and the optional
+echo plan selected from one closed specialization module.")
+(deftype BackendSymbols
+  [deletes (Array (Pair String String))
+   copies (Array (Pair String String))
+   echo (Maybe EchoPlan)])
+
+(doc BackendSymbolSelection "selects native symbols after ownership and echo
+demands have closed. It borrows Core and specialization input and indexes full
+implementation identities once before walking instances.")
+(defmodule BackendSymbolSelection
+  (private reference-key)
+  (hidden reference-key)
+  ; Match every identity field used by CoreIR.same-ref?.
+  (defn reference-key [reference]
+    (fmt "%d:%d:%s"
+         @(CoreRef.id reference)
+         (if @(CoreRef.global reference) 1 0)
+         (CoreRef.name reference)))
+
+  (private roles-for)
+  (hidden roles-for)
+  ; Role bits: delete=1, copy=2, str=4. An implementation can have several.
+  (defn roles-for [core echo]
+    (let-do [roles (the (Map String Int) (Map.create))
+             impls (CoreModule.implementations core)
+             delete-ref (PrimitiveRegistry.delete-reference)
+             copy-ref (PrimitiveRegistry.reference 0 "copy")
+             str-ref (PrimitiveRegistry.str-reference)]
+      (for [i 0 (Array.length impls)]
+        (let [impl (Array.unsafe-nth impls i)
+              interface (CoreImplementation.interface impl)
+              role (cond
+                (CoreIR.same-ref? interface &delete-ref) 1
+                (CoreIR.same-ref? interface &copy-ref) 2
+                (and echo (CoreIR.same-ref? interface &str-ref)) 4
+                0)]
+          (when (Int.> role 0)
+            (let [key (reference-key (CoreImplementation.implementation impl))
+                  flags (Int.bit-or role
+                                    (Maybe.from (Map.get-maybe &roles &key) 0))]
+              (Map.put! &roles &key &flags)))))
+      roles))
+
+  (private append-strs!)
+  (hidden append-strs!)
+  (defn append-strs! [strs keys argument symbol]
+    (let [by-ref (match-ref argument (MonoType.Reference _ _) true _ false)
+          key (match-ref argument
+            (MonoType.Reference inner _) (CAbi.type-key (Box.peek inner))
+            _ (CAbi.type-key argument))]
+      (for [i 0 (Array.length keys)]
+        (when (String.= (Array.unsafe-nth keys i) &key)
+          (Array.push-back! strs
+                            (Pair.init (String.copy &key)
+                                       (EchoStr.init (String.copy symbol) by-ref)))))))
+
+  (doc for-module "selects copier, deleter and echo symbols in instance order.
+Deleters key unary argument types; copiers key return types. Echo keys enable
+echo selection, with borrowing taken from the selected str signature. Duplicate
+entries retain their order, and final lookups keep last-entry precedence.")
+  (defn for-module [core specialized echo-keys]
+    (let-do [deletes (the (Array (Pair String String)) [])
+             copies (the (Array (Pair String String)) [])
+             strs (the (Array (Pair String EchoStr)) [])
+             println (the (Maybe String) (Maybe.Nothing))
+             want-echo (Int.> (Array.length echo-keys) 0)
+             roles (roles-for core want-echo)
+             instances (SpecializationModule.instances specialized)]
+      (for [i 0 (Array.length instances)]
+        (let-do [instance (Array.unsafe-nth instances i)
+                 reference (Specialization.reference instance)
+                 symbol (Specialization.symbol instance)
+                 flags (Maybe.from
+                   (Map.get-maybe &roles &(reference-key reference))
+                   0)]
+          (when (and want-echo (String.= (CoreRef.name reference) "IO.println"))
+            (set! println (Maybe.Just (String.copy symbol))))
+          (match-ref (Box.peek (Specialization.signature instance))
+            (MonoType.Function args result)
+              (do
+                (when (and (Int.> (Int.bit-and flags 1) 0)
+                           (Int.= 1 (Array.length args)))
+                  (Array.push-back! &deletes
+                                    (Pair.init
+                                      (CAbi.type-key (Box.peek (Array.unsafe-nth args
+                                                                                 0)))
+                                      (String.copy symbol))))
+                (when (Int.> (Int.bit-and flags 2) 0)
+                  (Array.push-back! &copies
+                                    (Pair.init (CAbi.type-key (Box.peek result))
+                                               (String.copy symbol))))
+                (when (and (Int.> (Int.bit-and flags 4) 0)
+                           (Int.= 1 (Array.length args)))
+                  (append-strs! &strs
+                                echo-keys
+                                (Box.peek (Array.unsafe-nth args 0))
+                                symbol)))
+            _ ())))
+      (let [echo (match println
+              (Maybe.Just symbol)
+                (match (CAbi.symbol-for-type &deletes &(Type.string))
+                  (Maybe.Just delete)
+                    (Maybe.Just (EchoPlan.init strs symbol delete))
+                  (Maybe.Nothing) (the (Maybe EchoPlan) (Maybe.Nothing)))
+              (Maybe.Nothing) (the (Maybe EchoPlan) (Maybe.Nothing)))]
+        (BackendSymbols.init deletes copies echo)))))

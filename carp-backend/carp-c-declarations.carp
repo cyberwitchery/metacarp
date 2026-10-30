@@ -910,7 +910,9 @@ name are reported rather than emitted twice.")
     (Result.Error error) (Result.Error error)))
 
 (doc constructor-definition "renders one reachable nominal constructor.")
-(defn constructor-definition [constructors declaration]
+(private constructor-definition-with-map)
+(hidden constructor-definition-with-map)
+(defn constructor-definition-with-map [constructors declaration line-map]
   (match-ref declaration
     (BackendDeclaration.Constructor _ signature constructor)
       (match (prototype-head declaration)
@@ -923,7 +925,7 @@ name are reported rather than emitted twice.")
                            ;; a function starts somewhere of its own; without
                            ;; this its head belongs to the last line of the
                            ;; function before it
-                           _ignored-reset (LineMap.mark-reset! &buffer)
+                           _ignored-reset (LineMap.mark-reset! line-map &buffer)
                            _ignored-head (StringBuf.append-str &buffer &head)]
                     (StringBuf.append-str &buffer " {
   ")
@@ -971,6 +973,11 @@ name are reported rather than emitted twice.")
       (Result.Error
         (BackendError.init @"declaration is not a nominal constructor"))))
 
+(defn constructor-definition [constructors declaration]
+  (constructor-definition-with-map constructors
+                                   declaration
+                                   &(BackendLineMap.empty)))
+
 (defn constructor-definitions [module]
   (let-do [result (the (Result Unit BackendError) (Result.Success ()))
            buffer (StringBuf.create)
@@ -983,8 +990,9 @@ name are reported rather than emitted twice.")
           (let [declaration (Array.unsafe-nth declarations i)]
             (match-ref declaration
               (BackendDeclaration.Constructor _ _ _)
-                (match (constructor-definition (BackendModule.constructors module)
-                                               declaration)
+                (match (constructor-definition-with-map (BackendModule.constructors module)
+                                                        declaration
+                                                        (BackendModule.line-map module))
                   (Result.Success rendered)
                     (do (when rendered-any (StringBuf.append-str &buffer "
 
@@ -1052,25 +1060,10 @@ signature and every emitted expression are in the unmanaged scalar subset.")
         (Result.Error error) (Result.Error error))
     _ (Result.Error (BackendError.init @"closure has a non-function signature"))))
 
-(defn closure-delete-symbol [delete-symbols value-type]
-  (let-do [result (the (Maybe String) (Maybe.Nothing))
-           key (CAbi.type-key value-type)
-           n (Array.length delete-symbols)]
-    (for [i 0 n]
-      (let [entry (Array.unsafe-nth delete-symbols i)]
-        (when (String.= (Pair.a entry) &key)
-          (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
-    result))
-
-(defn closure-copy-symbol [copy-symbols value-type]
-  (let-do [result (the (Maybe String) (Maybe.Nothing))
-           key (CAbi.type-key value-type)
-           n (Array.length copy-symbols)]
-    (for [i 0 n]
-      (let [entry (Array.unsafe-nth copy-symbols i)]
-        (when (String.= (Pair.a entry) &key)
-          (set! result (Maybe.Just (sanitize (Pair.b entry)))))))
-    result))
+(defn managed-symbol [symbols value-type]
+  (match (CAbi.symbol-for-type symbols value-type)
+    (Maybe.Just symbol) (Maybe.Just (sanitize &symbol))
+    (Maybe.Nothing) (the (Maybe String) (Maybe.Nothing))))
 
 (doc closure-env-copy-definition "renders the callback stored in `Lambda.copy`:
 it allocates a fresh environment and deep-copies managed captures. A recursive
@@ -1113,7 +1106,7 @@ self edge is rebuilt as a non-owning view of the fresh environment.")
             (StringBuf.append-str &buffer
                                   ", .env = _copy, .delete = NULL, .copy = NULL };
   } else ")
-            (match (closure-copy-symbol copy-symbols capture-type)
+            (match (managed-symbol copy-symbols capture-type)
               (Maybe.Just symbol)
                 (do
                   (StringBuf.append-str &buffer "if (_env->")
@@ -1141,9 +1134,9 @@ self edge is rebuilt as a non-owning view of the fresh environment.")
                                                                                                                                            ";
   }
 "))))
-          (match (closure-delete-symbol delete-symbols capture-type)
+          (match (managed-symbol delete-symbols capture-type)
             (Maybe.Just _)
-              (match (closure-copy-symbol copy-symbols capture-type)
+              (match (managed-symbol copy-symbols capture-type)
                 (Maybe.Just symbol)
                   (do
                     (StringBuf.append-str &buffer "  _copy->")
@@ -1192,7 +1185,7 @@ this callback and then frees the environment cell itself.")
 ")
     (for [i 0 (Array.length captures)]
       (let [capture (Array.unsafe-nth captures i)]
-        (match (closure-delete-symbol delete-symbols (Box.peek (Pair.b capture)))
+        (match (managed-symbol delete-symbols (Box.peek (Pair.b capture)))
           (Maybe.Just symbol)
             (do
               (StringBuf.append-str &buffer "  ")
@@ -1205,7 +1198,7 @@ this callback and then frees the environment cell itself.")
     (StringBuf.append-char &buffer \})
     (StringBuf.into-string buffer)))
 
-(defn closure-function-definition [constructors closure-fn]
+(defn closure-function-definition [module closure-fn]
   (let-do [signature (Box.peek (ClosureFunction.signature closure-fn))
            captures (ClosureFunction.captures closure-fn)
            env-type (String.concat
@@ -1249,7 +1242,7 @@ this callback and then frees the environment cell itself.")
                 (Maybe.Nothing)
                   (let [destination (ResultDestination.Return
                           (Box.init (MonoType.copy (Box.peek return-type))))]
-                    (match (append-result! constructors
+                    (match (append-result! module
                                            &buffer
                                            (Box.peek (ClosureFunction.body closure-fn))
                                            &destination
@@ -1331,8 +1324,7 @@ with a leading environment pointer and captured-value unpacking.")
                                   &(closure-env-copy-definition closure-fn
                                                                 (BackendModule.delete-symbols module)
                                                                 (BackendModule.copy-symbols module)))
-            (match (closure-function-definition (BackendModule.constructors module)
-                                                closure-fn)
+            (match (closure-function-definition module closure-fn)
               (Result.Success rendered)
                 (do
                   (StringBuf.append-char &buffer \newline)
@@ -1344,11 +1336,12 @@ with a leading environment pointer and captured-value unpacking.")
       (Result.Success _) (Result.Success (StringBuf.into-string buffer))
       (Result.Error error) (Result.Error error))))
 
-(defn function-definition [constructors declaration]
+(defn function-definition [module declaration]
   (match-ref declaration
     (BackendDeclaration.Function fn-symbol signature parameters body)
       (let-do [_ignored-context (set! *render-context* [(String.copy fn-symbol)])]
-        (if (renderable-signature? constructors (Box.peek signature))
+        (if (renderable-signature? (BackendModule.constructors module)
+                                   (Box.peek signature))
           (match-ref (Box.peek signature)
             (MonoType.Function _ return-type)
               (match (do
@@ -1359,13 +1352,14 @@ with a leading environment pointer and captured-value unpacking.")
                            ;; a function starts somewhere of its own; without
                            ;; this its head belongs to the last line of the
                            ;; function before it
-                           _ignored-reset (LineMap.mark-reset! &buffer)
+                           _ignored-reset (LineMap.mark-reset! (BackendModule.line-map module)
+                                                               &buffer)
                            _ignored-head (StringBuf.append-str &buffer &head)
                            _ignored-open (StringBuf.append-str &buffer " {
 ")
                            destination (ResultDestination.Return
                              (Box.init (MonoType.copy (Box.peek return-type))))
-                           body-result (append-result! constructors
+                           body-result (append-result! module
                                                        &buffer
                                                        (Box.peek body)
                                                        &destination
@@ -1399,8 +1393,7 @@ supported by the unmanaged scalar subset.")
           (let [declaration (Array.unsafe-nth declarations i)]
             (match-ref declaration
               (BackendDeclaration.Function _ _ _ _)
-                (match (function-definition (BackendModule.constructors module)
-                                            declaration)
+                (match (function-definition module declaration)
                   (Result.Success rendered)
                     (do (when rendered-any (StringBuf.append-str &buffer "
 
@@ -1433,7 +1426,7 @@ supported by the unmanaged scalar subset.")
 
 (doc global-definition "renders one ownership-free scalar global with a
 compile-time C initializer.")
-(defn global-definition [constructors declaration]
+(defn global-definition [module declaration]
   (match-ref declaration
     (BackendDeclaration.Global symbol signature body)
       (match-ref (Box.peek signature)
@@ -1441,11 +1434,12 @@ compile-time C initializer.")
         (MonoType.Unit)
         (Result.Success (String.copy ""))
         _
-        (if (unmanaged-type? constructors (Box.peek signature))
+        (if (unmanaged-type? (BackendModule.constructors module)
+                             (Box.peek signature))
           (match (render-type (Box.peek signature))
             (Result.Success rendered-type)
               (if (constant-global-initializer? (Box.peek body))
-                (match (render-value-expression constructors (Box.peek body))
+                (match (render-value-expression module (Box.peek body))
                   (Result.Success initializer)
                     (Result.Success
                       (String.concat
@@ -1485,8 +1479,7 @@ global definition.")
           (let [declaration (Array.unsafe-nth declarations i)]
             (match-ref declaration
               (BackendDeclaration.Global _ _ _)
-                (match (global-definition (BackendModule.constructors module)
-                                          declaration)
+                (match (global-definition module declaration)
                   (Result.Success rendered)
                     (do (when rendered-any (StringBuf.append-str &buffer "
 
@@ -1638,7 +1631,8 @@ cycles retain declaration order.")
         _ ()))
     (let-do [buffer (StringBuf.create)
              ;; global initialization is the compiler's own code too
-             _ignored-reset (LineMap.mark-reset! &buffer)
+             _ignored-reset (LineMap.mark-reset! (BackendModule.line-map module)
+                                                 &buffer)
              _ignored-plain (clear-plain-locals!)
              ;; the reference signature: argc/argv feed `System.args` before
              ;; any other global initializes. The tentative definition merges
@@ -1671,7 +1665,7 @@ cycles retain declaration order.")
                         (StringBuf.append-str &buffer "  {
 ")
                         (set! result
-                              (append-result! (BackendModule.constructors module)
+                              (append-result! module
                                               &buffer
                                               (Box.peek body)
                                               &destination

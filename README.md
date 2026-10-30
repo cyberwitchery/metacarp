@@ -305,6 +305,14 @@ delete plan covers let scopes, unconsumed parameters, discarded intermediates,
 wildcard pattern drops — with deep deleters and copiers for nested containers.
 Escaping closures heap-allocate their environments.
 
+[`carp-frontend`](carp-frontend/README.md) owns expansion through inference.
+Batch compilation, ownership tooling, and library compilation use the same
+preparation path. Derivation lives in `carp-derive`; borrowed-temporary lifting
+lives beside ownership. Read-only capture analysis is shared by ownership
+closure and backend lifting, so planning does not run backend transformations.
+See [compiler architecture](docs/compiler-architecture.md) for the phase and
+ownership boundaries.
+
 The reusable entry point is `CarpCompiler.compile-source`, or
 `CarpCompiler.compile-sources` when the caller already holds an in-memory source
 registry. Embedders can use `CarpCompiler.compile-inferred-library-roots` to
