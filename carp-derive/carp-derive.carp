@@ -1,0 +1,2297 @@
+(load "../carp-ownership/carp-ownership.carp")
+(load "../carp-types/core-instantiation.carp")
+
+(doc DeriveContext
+  "one derivation invocation's identity policy and the derived string functions it generated. Separate invocations share no mutable derivation state.")
+(deftype DeriveContext
+  [preserve-expression-ids Bool
+   fallback-str-ids (Array Int)])
+
+(doc Derive "generates memberwise `delete` and `copy` implementations for
+concrete and generic deftypes that own memory through their fields, mirroring
+the reference compiler's derivation. Each derived function is a real IR match
+over the type's constructors (deleting every managed field, or reconstructing
+while deep-copying managed fields and blitting the rest) inserted before
+inference, so it flows through the normal pipeline. Generic instances are
+discovered from inference and closed over their nested managed instances.")
+
+(defmodule Derive
+  (private finish-indexing)
+  (hidden finish-indexing)
+  (doc finish-indexing "keeps the historical owner-local indexing for normal
+compilation. A provenanced session derivation preserves resolved IDs here and
+assigns fresh identities to generated nodes once, after all derivation passes.")
+  (defn finish-indexing [context core]
+    (if @(DeriveContext.preserve-expression-ids context)
+      core
+      (CoreIR.index-call-sites core)))
+
+  (private contains-key?)
+  (hidden contains-key?)
+  (defn contains-key? [keys key]
+    (let-do [found false
+             i 0
+             n (Array.length keys)]
+      (while (and (Int.< i n) (not found))
+        (if (String.= (Array.unsafe-nth keys i) key)
+          (set! found true)
+          (set! i (Int.inc i))))
+      found))
+
+  (private subst-lookup)
+  (hidden subst-lookup)
+  (defn subst-lookup [subst var]
+    (let-do [result (MonoType.Variable 0)
+             found false
+             i 0
+             n (Array.length subst)]
+      (while (and (Int.< i n) (not found))
+        (let [entry (Array.unsafe-nth subst i)]
+          (if (String.= (Pair.a entry) var)
+            (do (set! result (MonoType.copy (Pair.b entry))) (set! found true))
+            (set! i (Int.inc i)))))
+      (Result.Success result)))
+
+  (private core->mono)
+  (hidden core->mono)
+
+  (sig core->mono
+       (Fn [(Ref CoreType) (Ref (Array (Pair String MonoType)))] MonoType))
+
+  (doc core->mono "instantiates a resolved field type to a concrete MonoType
+under a substitution mapping type-variable names to concrete types.")
+  (defn core->mono [core-type subst]
+    (Result.from-success
+      (CoreInstantiation.type-with core-type subst &subst-lookup)
+      (MonoType.Variable 0)))
+
+  (private build-subst)
+  (hidden build-subst)
+  (doc build-subst "recovers the type-variable substitution for a concrete
+instance by aligning a constructor's result-type arguments (type variables)
+with the instance's concrete type arguments.")
+  (defn build-subst [result-type instance]
+    (let-do [subst (the (Array (Pair String MonoType)) [])]
+      (match-ref result-type
+        (CoreType.Named _ rargs)
+          (match-ref instance
+            (MonoType.Named _ margs)
+              (for [i 0 (Int.min (Array.length rargs) (Array.length margs))]
+                (match-ref (Box.peek (Array.unsafe-nth rargs i))
+                  (CoreType.Variable v)
+                    (set! subst
+                          (Array.push-back subst
+                                           (Pair.init (String.copy v)
+                                                      (MonoType.copy (Box.peek (Array.unsafe-nth margs
+                                                                                                 i))))))
+                  _ ()))
+            _ ())
+        _ ())
+      subst))
+
+  (private managed-mono?)
+  (hidden managed-mono?)
+  (private managed-instance?)
+  (hidden managed-instance?)
+  (sig managed-mono?
+       (Fn
+         [(Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          (Ref (Array String))]
+         Bool))
+  (sig managed-instance?
+       (Fn
+         [(Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          (Ref (Array String))]
+         Bool))
+
+  (doc managed-mono? "reports whether a concrete type owns memory: strings and
+keys with a deleter are managed; a generic nominal instance is managed when any
+of its instantiated fields is (checked per instance).")
+  (defn managed-mono? [mono constructors base-managed]
+    (match-ref mono
+      (MonoType.String) true
+      (MonoType.Function _ _) true
+      (MonoType.Named name args)
+        (cond
+          (contains-key? base-managed &(CAbi.type-key mono))
+          true
+          ;; a deleter declared once for every instance of a type — core's
+          ;; `(sig delete (Fn [(Box a)] ()))` — is keyed generically. Without
+          ;; this, `(Box Int)` owns a heap cell no field of it accounts for
+          ;; and nothing ever frees it. Only an application can carry one, and
+          ;; the key allocates, so plain names skip the question.
+          (and (Int.> (Array.length args) 0)
+               (contains-key? base-managed &(CAbi.generic-key mono)))
+          true
+          ;; builtin containers own heap storage at every instantiation but
+          ;; have no constructor declarations to classify through.
+          (or (String.= name "Array") (String.= name "StaticArray"))
+          true
+          (Int.> (Array.length args) 0)
+          (managed-instance? mono constructors base-managed)
+          false)
+      _ false))
+
+  (defn managed-instance? [mono constructors base-managed]
+    (match-ref mono
+      (MonoType.Named name _)
+        (let-do [found false
+                 n (Array.length constructors)]
+          (for [i 0 n]
+            (let [c (Array.unsafe-nth constructors i)]
+              (match-ref (Box.peek (CoreConstructorDeclaration.result c))
+                (CoreType.Named rname _)
+                  (when (String.= rname name)
+                    (let-do [subst (build-subst
+                               (Box.peek (CoreConstructorDeclaration.result c))
+                               mono)
+                             fields (CoreConstructorDeclaration.arguments c)]
+                      (for [fi 0 (Array.length fields)]
+                        (when (managed-mono?
+                            &(core->mono (Box.peek (Array.unsafe-nth fields fi))
+                                         &subst)
+                            constructors
+                            base-managed)
+                          (set! found true)))))
+                _ ())))
+          found)
+      _ false))
+
+  (doc core-type-key "the concrete ABI type key of a resolved field or result
+type, or Nothing for generic (type-variable) or non-nominal types, which this
+first derivation pass does not handle.")
+  (private core-type-key)
+  (hidden core-type-key)
+  (defn core-type-key [core-type]
+    (match-ref core-type
+      (CoreType.String) (Maybe.Just (CAbi.type-key &(MonoType.String)))
+      (CoreType.Named name arguments)
+        (if (Int.= 0 (Array.length arguments))
+          (Maybe.Just (CAbi.type-key &(MonoType.Named (String.copy name) [])))
+          (Maybe.Nothing))
+      _ (Maybe.Nothing)))
+
+  (private core-base-type-key)
+  (hidden core-base-type-key)
+  (defn core-base-type-key [core-type]
+    (match-ref core-type
+      (CoreType.Named name _)
+        (Maybe.Just (CAbi.type-key &(MonoType.Named (String.copy name) [])))
+      _ (Maybe.Nothing)))
+
+  (private field-managed?)
+  (hidden field-managed?)
+  ;; a generic application can hold memory even though it has no bare type
+  ;; key: heap containers (Array/StaticArray/Box) always do, and a user
+  ;; generic (Maybe/Pair/...) does when instantiated over a managed argument.
+  ;; Without this, a type whose memory is held ONLY through containers (e.g.
+  ;; InferEnvironment's `(Array SchemeBinding)`) derived a SHALLOW copier
+  ;; whose copies alias the container buffers (found via a self-hosting
+  ;; divergence). `Ptr` stays a raw, unmanaged pointer.
+  (defn field-managed? [field-type managed]
+    (match-ref field-type
+      ; Strings own storage even when a session delta omits Core's deleters.
+      (CoreType.String)
+      true
+      ;; a function value may carry a heap-allocated closure environment, so a
+      ;; field holding one makes its type managed. `managed-mono?` applies the
+      ;; same rule on the per-instance path generic types take.
+      (CoreType.Function _ _)
+      true
+      (CoreType.Named name arguments)
+      (cond
+        (Int.= 0 (Array.length arguments))
+        (match (core-type-key field-type)
+          (Maybe.Just key) (contains-key? managed &key)
+          (Maybe.Nothing) false)
+        (String.= name "Ptr")
+        false
+        (or (String.= name "Array") (String.= name "StaticArray"))
+        true
+        ;; a generic whose own fields hold memory whatever it is applied to
+        ;; (`Map`'s bucket array) is managed at every application, not only
+        ;; over managed arguments: deciding by the arguments alone derived a
+        ;; shallow copier for `(Map Int Int)` members, and copies aliased the
+        ;; buckets.
+        (match (core-base-type-key field-type)
+          (Maybe.Just key) (contains-key? managed &key)
+          (Maybe.Nothing) false)
+        true
+        (let-do [any false]
+          (for [i 0 (Array.length arguments)]
+            (when (field-managed?
+                (Box.peek (Array.unsafe-nth arguments i))
+                managed)
+              (set! any true)))
+          any))
+      _
+      (match (core-type-key field-type)
+        (Maybe.Just key) (contains-key? managed &key)
+        (Maybe.Nothing) false)))
+
+  (private constructor-has-managed-field?)
+  (hidden constructor-has-managed-field?)
+  (defn constructor-has-managed-field? [constructor managed]
+    (let-do [found false
+             fields (CoreConstructorDeclaration.arguments constructor)
+             n (Array.length fields)]
+      (for [i 0 n]
+        (when (field-managed? (Box.peek (Array.unsafe-nth fields i)) managed)
+          (set! found true)))
+      found))
+
+  (doc managed-keys "the fixed point of type keys that own memory: the keys with
+an explicit deleter, plus every deftype that (transitively) has a managed
+field. A generic deftype is keyed by its base name, and is in the set only when
+a field owns memory with its type variables taken as unmanaged.")
+  (private managed-keys)
+  (hidden managed-keys)
+  (defn managed-keys [core owned]
+    (let-do [managed (Array.copy owned)
+             constructors (CoreModule.constructors core)
+             n (Array.length constructors)
+             changed true]
+      (while-do changed
+        (set! changed false)
+        (for [i 0 n]
+          (let [c (Array.unsafe-nth constructors i)]
+            (match (core-base-type-key
+                (Box.peek (CoreConstructorDeclaration.result c)))
+              (Maybe.Just rkey)
+                (unless-do (contains-key? &managed &rkey)
+                  (when-do (constructor-has-managed-field? c &managed)
+                    (set! managed (Array.push-back managed rkey))
+                    (set! changed true)))
+              (Maybe.Nothing) ()))))
+      managed))
+
+  (doc derive-target-keys "the concrete deftype keys that need a derived
+deleter: those that are managed through their fields but have no explicit
+deleter of their own.")
+  (defn derive-target-keys [core]
+    (let-do [facts (OwnershipClassify.facts-from-module core)
+             owned (OwnershipTypeFacts.owned &facts)
+             managed (managed-keys core owned)
+             result (the (Array String) [])
+             constructors (CoreModule.constructors core)
+             n (Array.length constructors)]
+      (for [i 0 n]
+        (let [c (Array.unsafe-nth constructors i)]
+          (match (core-type-key (Box.peek (CoreConstructorDeclaration.result c)))
+            (Maybe.Just rkey)
+              (unless-do (or (contains-key? owned &rkey)
+                             (contains-key? &result &rkey))
+                (when (contains-key? &managed &rkey)
+                  (set! result (Array.push-back result rkey))))
+            (Maybe.Nothing) ())))
+      result))
+
+  (private record-declaration?)
+  (hidden record-declaration?)
+  ;; a record declares its members; a sum type carries its data in its
+  ;; constructors and declares none.
+  (defn record-declaration? [declarations name]
+    (let-do [found false
+             n (Array.length declarations)]
+      (for [i 0 n]
+        (let [declaration (Array.unsafe-nth declarations i)]
+          (when (and
+              (String.= (CoreTypeDeclaration.name declaration) name)
+              (Int.> (Array.length (CoreTypeDeclaration.members declaration)) 0))
+            (set! found true))))
+      found))
+
+  ;; every sum type: reference Carp derives `copy` for every deftype. Generic
+  ;; sums need one polymorphic body that can specialize to both managed and
+  ;; unmanaged fields; unmanaged sums such as `Color.Id` still need one when
+  ;; they flow through `copy`. Records are covered by resolve's scalar-copy, so
+  ;; only sum types are collected here.
+  ;;
+  ;; A nonzero tag means "has more than one constructor", which misses a sum
+  ;; with a SINGLE one. Such a type gets no copier from here, and if it is
+  ;; unmanaged it gets none from `derive-target-keys` either, so a `<T>.copy`
+  ;; call site links against a body nothing emits.
+  ;;
+  ;; Only concrete single-constructor sums are added. Managed ones already
+  ;; arrive through `derive-target-keys`, and a GENERIC one cannot be judged
+  ;; from its declaration at all — `(deftype (Pair a b) (Init [a b]))` holds
+  ;; memory or not depending on the instance, and it has its own path through
+  ;; the managed instances.
+  (defn sum-keys [core managed]
+    (let-do [constructors (CoreModule.constructors core)
+             declarations (CoreModule.type-declarations core)
+             result (the (Array String) [])
+             n (Array.length constructors)]
+      (for [i 0 n]
+        (let [c (Array.unsafe-nth constructors i)]
+          (match-ref (Box.peek (CoreConstructorDeclaration.result c))
+            (CoreType.Named name arguments)
+              (match (core-base-type-key
+                  (Box.peek (CoreConstructorDeclaration.result c)))
+                (Maybe.Just rkey)
+                  (unless (contains-key? &result &rkey)
+                    (when (or
+                        (Int.> @(CoreConstructorDeclaration.tag c) 0)
+                        (and (Int.= 0 (Array.length arguments))
+                             (and
+                               (not (record-declaration? declarations name))
+                               (not (contains-key? managed &rkey)))))
+                      (set! result (Array.push-back result rkey))))
+                (Maybe.Nothing) ())
+            _ ())))
+      result)))
+
+(defmodule Derive
+  (private next-id!)
+  (hidden next-id!)
+  (defn next-id! [cell]
+    (let-do [value @(Array.unsafe-nth cell 0)]
+      (Array.aset! cell 0 (Int.inc value))
+      value))
+
+  (private deftype-name)
+  (hidden deftype-name)
+  (defn deftype-name [constructors key]
+    (let-do [result (String.copy "")
+             n (Array.length constructors)]
+      (for [i 0 n]
+        (match-ref (Box.peek
+            (CoreConstructorDeclaration.result (Array.unsafe-nth constructors i)))
+          (CoreType.Named name arguments)
+            (when (String.=
+                &(CAbi.type-key &(MonoType.Named (String.copy name) []))
+                key)
+              (set! result (String.copy name)))
+          _ ()))
+      result))
+
+  (private constructor-of?)
+  (hidden constructor-of?)
+  (defn constructor-of? [constructor key]
+    (match (core-base-type-key
+        (Box.peek (CoreConstructorDeclaration.result constructor)))
+      (Maybe.Just candidate) (String.= &candidate key)
+      (Maybe.Nothing) false))
+
+  (private delete-branch)
+  (hidden delete-branch)
+  (defn delete-branch [constructor managed delete-ref cell]
+    (let-do [fields (CoreConstructorDeclaration.arguments constructor)
+             nf (Array.length fields)
+             patterns (the (Array (Box CorePattern)) [])
+             bindings (the (Array CoreRef) [])
+             body-exprs (the (Array (Box CoreExpr)) [])]
+      (for [fi 0 nf]
+        ;; unmanaged fields have nothing to delete: an `Ignore` slot instead
+        ;; of an unused binding keeps the emitted C warning-free.
+        (if (field-managed? (Box.peek (Array.unsafe-nth fields fi)) managed)
+          (let-do [fref (CoreRef.init (next-id! cell)
+                                      (String.concat &[@"field" (Int.str fi)])
+                                      false)]
+            (set! patterns
+                  (Array.push-back patterns
+                                   (Box.init (CorePattern.Bind (CoreRef.copy &fref)))))
+            (set! bindings (Array.push-back bindings (CoreRef.copy &fref)))
+            (set! body-exprs
+                  (Array.push-back body-exprs
+                                   (Box.init
+                                     (CoreExpr.Call -1
+                                                    (Box.init
+                                                      (CoreExpr.Reference -1
+                                                                          (CoreRef.copy delete-ref)))
+                                                    [(Box.init
+                                                       (CoreExpr.Reference -1
+                                                                           (CoreRef.copy &fref)))])))))
+          (set! patterns
+                (Array.push-back patterns (Box.init (CorePattern.Ignore))))))
+      (CoreMatchBranch.init
+        (CorePattern.Constructor
+          (CoreRef.copy (CoreConstructorDeclaration.reference constructor))
+          patterns)
+        bindings
+        (Box.init
+          (if (Int.= 0 (Array.length &body-exprs))
+            (CoreExpr.UnitLit -1)
+            (CoreExpr.Do -1 body-exprs))))))
+
+  (doc deletes "returns `core` extended with a derived `delete` implementation
+for every concrete deftype that owns memory through its fields. Each is a real
+IR function (a match over the type's constructors deleting each managed field),
+so inference, specialization, ownership and the backend handle it normally.")
+  (defn deletes [context core]
+    (let-do [targets (derive-target-keys core)
+             facts (OwnershipClassify.facts-from-module core)
+             managed (managed-keys core (OwnershipTypeFacts.owned &facts))
+             constructors (CoreModule.constructors core)
+             new-functions (Array.copy (CoreModule.functions core))
+             new-impls (Array.copy (CoreModule.implementations core))
+             new-signatures (Array.copy (CoreModule.signatures core))
+             delete-ref (PrimitiveRegistry.delete-reference)
+             cell (the (Array Int)
+                       [(Int.inc (CoreIR.max-declared-global-id core))])]
+      (for [t 0 (Array.length &targets)]
+        (let-do [tkey (Array.unsafe-nth &targets t)
+                 type-name (deftype-name constructors tkey)
+                 fn-ref (CoreRef.init (next-id! &cell)
+                                      (String.concat &[(String.copy &type-name)
+                                                       @".delete"])
+                                      true)
+                 param-ref (CoreRef.init (next-id! &cell) @"x" false)
+                 branches (the (Array CoreMatchBranch) [])
+                 cn (Array.length constructors)]
+          (for [ci 0 cn]
+            (let [c (Array.unsafe-nth constructors ci)]
+              (when (constructor-of? c tkey)
+                (set! branches
+                      (Array.push-back branches
+                                       (delete-branch c
+                                                      &managed
+                                                      &delete-ref
+                                                      &cell))))))
+          (set! new-functions
+                (Array.push-back new-functions
+                                 (CoreFunction.init (CoreRef.copy &fn-ref)
+                                                    [(CoreRef.copy &param-ref)]
+                                                    (Box.init
+                                                      (CoreExpr.Match -1
+                                                                      false
+                                                                      (Box.init
+                                                                        (CoreExpr.Reference -1
+                                                                                            (CoreRef.copy &param-ref)))
+                                                                      branches)))))
+          (set! new-impls
+                (Array.push-back new-impls
+                                 (CoreImplementation.init (CoreRef.copy &delete-ref)
+                                                          (CoreRef.copy &fn-ref))))
+          (set! new-signatures
+                (Array.push-back new-signatures
+                                 (CoreSignature.init (CoreRef.copy &fn-ref)
+                                                     (Box.init
+                                                       (CoreType.Function
+                                                         [(Box.init
+                                                            (CoreType.Named (String.copy &type-name)
+                                                                            []))]
+                                                         (Box.init (CoreType.Unit)))))))))
+      (finish-indexing context
+                       (CoreModule.init new-functions
+                                        @(CoreModule.values core)
+                                        @(CoreModule.builtins core)
+                                        @(CoreModule.builtin-sources core)
+                                        new-signatures
+                                        @(CoreModule.type-declarations core)
+                                        @(CoreModule.constructors core)
+                                        @(CoreModule.recursive-types core)
+                                        @(CoreModule.interfaces core)
+                                        new-impls
+                                        @(CoreModule.overloads core)
+                                        @(CoreModule.system-includes core)
+                                        @(CoreModule.expressions core))))))
+
+(defmodule Derive
+  (private mono->core)
+  (hidden mono->core)
+  (private map-mono->core)
+  (hidden map-mono->core)
+  (sig mono->core (Fn [(Ref MonoType)] CoreType))
+  (sig map-mono->core (Fn [(Ref (Array (Box MonoType)))] (Array (Box CoreType))))
+  (defn map-mono->core [args]
+    (let-do [result (the (Array (Box CoreType)) [])
+             n (Array.length args)]
+      (for [i 0 n]
+        (set! result
+              (Array.push-back result
+                               (Box.init
+                                 (mono->core (Box.peek (Array.unsafe-nth args i)))))))
+      result))
+
+  (doc mono->core "converts a concrete MonoType back to a resolved CoreType, for
+building the argument type of a per-instance deleter's signature.")
+  (defn mono->core [mono]
+    (match-ref mono
+      (MonoType.Integer) (CoreType.Integer)
+      (MonoType.String) (CoreType.String)
+      (MonoType.Boolean) (CoreType.Boolean)
+      (MonoType.Unit) (CoreType.Unit)
+      (MonoType.Named n args)
+        (CoreType.Named (String.copy n) (map-mono->core args))
+      (MonoType.Reference inner _)
+        (CoreType.Reference (Box.init (mono->core (Box.peek inner)))
+                            (CoreLifetime.Static))
+      (MonoType.Function args ret)
+        (CoreType.Function (map-mono->core args)
+                           (Box.init (mono->core (Box.peek ret))))
+      (MonoType.Variable _) (CoreType.Variable (String.copy "a"))))
+
+  (private generic-instance?)
+  (hidden generic-instance?)
+  (defn generic-instance? [mono]
+    (match-ref mono
+      (MonoType.Named _ args) (Int.> (Array.length args) 0)
+      _ false))
+
+  (private instance-listed?)
+  (hidden instance-listed?)
+  (defn instance-listed? [instances mono]
+    (let-do [found false
+             key (CAbi.type-key mono)
+             n (Array.length instances)]
+      (for [i 0 n]
+        (when (String.= &(CAbi.type-key (Array.unsafe-nth instances i)) &key)
+          (set! found true)))
+      found))
+
+  (private constructors-declared?)
+  (hidden constructors-declared?)
+  (defn constructors-declared? [constructors name]
+    (let-do [found false
+             n (Array.length constructors)]
+      (for [i 0 n]
+        (match-ref (Box.peek
+            (CoreConstructorDeclaration.result (Array.unsafe-nth constructors i)))
+          (CoreType.Named rname _)
+            (when (String.= rname name) (set! found true))
+          _ ()))
+      found))
+
+  (private declared-type-names)
+  (hidden declared-type-names)
+  (doc declared-type-names "the type names `constructors` declare, for the
+membership test `constructors-declared?` answers by scanning.")
+  (defn declared-type-names [constructors]
+    (let-do [names (the (Set String) (Set.create))]
+      (for [i 0 (Array.length constructors)]
+        (match-ref (Box.peek
+            (CoreConstructorDeclaration.result (Array.unsafe-nth constructors i)))
+          (CoreType.Named name _) (Set.put! &names name)
+          _ ()))
+      names))
+
+  (private extract-instances!)
+  (hidden extract-instances!)
+  (sig extract-instances!
+       (Fn
+         [(Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          (Ref (Set String))
+          (Ref (Array String))
+          (Ref (Set String))
+          (Ref (Array MonoType))]
+         ()))
+  (defn extract-instances! [type constructors declared base-managed keys acc]
+    (match-ref type
+      (MonoType.Named name args)
+        (do
+          ;; builtin containers (Array/StaticArray/Box) are managed but have
+          ;; template copy/delete — deriving over their (absent) constructor
+          ;; declarations would collide with the template symbols.
+          ;; `keys` holds every instance already classified, managed or
+          ;; not: whether one is managed depends only on the type
+          (when (and (Int.> (Array.length args) 0) (Set.contains? declared name))
+            (let [key (CAbi.type-key type)]
+              (unless-do (Set.contains? keys &key)
+                (Set.put! keys &key)
+                (when (managed-mono? type constructors base-managed)
+                  (Array.push-back! acc (MonoType.copy type))))))
+          (for [i 0 (Array.length args)]
+            (extract-instances! (Box.peek (Array.unsafe-nth args i))
+                                constructors
+                                declared
+                                base-managed
+                                keys
+                                acc)))
+      (MonoType.Reference inner _)
+        (extract-instances! (Box.peek inner)
+                            constructors
+                            declared
+                            base-managed
+                            keys
+                            acc)
+      (MonoType.Function args ret)
+        (do
+          (for [i 0 (Array.length args)]
+            (extract-instances! (Box.peek (Array.unsafe-nth args i))
+                                constructors
+                                declared
+                                base-managed
+                                keys
+                                acc))
+          (extract-instances! (Box.peek ret)
+                              constructors
+                              declared
+                              base-managed
+                              keys
+                              acc))
+      _ ()))
+
+  (doc discover "the concrete managed generic instances a program uses, read
+from the inferred module's node types (which include the concrete instances at
+call sites and roots). Reading from inference, not specialization, lets this run
+before the derived copy/delete implementations those instances need exist.")
+  (defn discover [inferred constructors base-managed]
+    (let-do [instances (the (Array MonoType) [])
+             keys (the (Set String) (Set.create))
+             declared (declared-type-names constructors)
+             node-types (InferredModule.node-types inferred)
+             solver (Type.solver-from-substitution (InferredModule.substitution inferred))]
+      (for [i 0 (Array.length node-types)]
+        (extract-instances!
+          &(Type.solver-apply &solver
+                              (Box.peek
+                                (InferredNodeType.type (Array.unsafe-nth node-types
+                                                                         i))))
+          constructors
+          &declared
+          base-managed
+          &keys
+          &instances))
+      instances))
+
+  (private extract-any-instances!)
+  (hidden extract-any-instances!)
+  (sig extract-any-instances!
+       (Fn
+         [(Ref MonoType)
+          (Ref (Set String))
+          (Ref (Set String))
+          (Ref (Array MonoType))]
+         ()))
+  (defn extract-any-instances! [type declared keys acc]
+    (match-ref type
+      (MonoType.Named name args)
+        (do
+          (when (and (Int.> (Array.length args) 0) (Set.contains? declared name))
+            (let [key (CAbi.type-key type)]
+              (unless-do (Set.contains? keys &key)
+                (Set.put! keys &key)
+                (Array.push-back! acc (MonoType.copy type)))))
+          (for [i 0 (Array.length args)]
+            (extract-any-instances! (Box.peek (Array.unsafe-nth args i))
+                                    declared
+                                    keys
+                                    acc)))
+      (MonoType.Reference inner _)
+        (extract-any-instances! (Box.peek inner) declared keys acc)
+      (MonoType.Function args ret)
+        (do
+          (for [i 0 (Array.length args)]
+            (extract-any-instances! (Box.peek (Array.unsafe-nth args i))
+                                    declared
+                                    keys
+                                    acc))
+          (extract-any-instances! (Box.peek ret) declared keys acc))
+      _ ()))
+
+  (doc discover-any "every concrete generic deftype instance the program uses,
+managed or not — `str` derivation must cover unmanaged instances too.")
+  (private discover-any)
+  (hidden discover-any)
+  (defn discover-any [inferred constructors]
+    (let-do [instances (the (Array MonoType) [])
+             keys (the (Set String) (Set.create))
+             declared (declared-type-names constructors)
+             node-types (InferredModule.node-types inferred)
+             solver (Type.solver-from-substitution (InferredModule.substitution inferred))]
+      (for [i 0 (Array.length node-types)]
+        (extract-any-instances!
+          &(Type.solver-apply &solver
+                              (Box.peek
+                                (InferredNodeType.type (Array.unsafe-nth node-types
+                                                                         i))))
+          &declared
+          &keys
+          &instances))
+      instances))
+
+  (private constructor-base-is?)
+  (hidden constructor-base-is?)
+  (defn constructor-base-is? [constructor base-name]
+    (match-ref (Box.peek (CoreConstructorDeclaration.result constructor))
+      (CoreType.Named rname _) (String.= rname base-name)
+      _ false))
+
+  (private queue-instances!)
+  (hidden queue-instances!)
+  (sig queue-instances!
+       (Fn
+         [(Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          (Ref (Array String))
+          (Ref (Array MonoType))]
+         ()))
+  (doc queue-instances! "queues every concrete instance a field's type holds,
+not only the field's own. A field typed `(Array (Bucket String Int))` needs
+the BUCKET's deleter as much as the array's: `Array` declares no
+constructors, so the worklist skips it and, with nothing derived for the
+element, its deleter falls back to freeing the array's buffer and leaking
+everything the elements own.")
+  (defn queue-instances! [type constructors base-managed acc]
+    (match-ref type
+      (MonoType.Named _ arguments)
+        (do
+          ;; only what owns memory: a deleter demanded for an instance that
+          ;; owns nothing — `(Pair Bool Double)` — has none to dispatch to
+          (when (and
+              (managed-mono? type constructors base-managed)
+              (and (generic-instance? type) (not (instance-listed? acc type))))
+            (Array.push-back! acc (MonoType.copy type)))
+          (for [i 0 (Array.length arguments)]
+            (queue-instances!
+              (Box.peek (Array.unsafe-nth arguments i))
+              constructors
+              base-managed
+              acc)))
+      (MonoType.Reference inner _)
+        (queue-instances! (Box.peek inner) constructors base-managed acc)
+      _ ()))
+
+  (private generic-branch)
+  (hidden generic-branch)
+  (defn generic-branch [constructor
+                        inst
+                        constructors
+                        base-managed
+                        delete-ref
+                        cell
+                        new-insts]
+    (let-do [subst (build-subst
+               (Box.peek (CoreConstructorDeclaration.result constructor))
+               inst)
+             fields (CoreConstructorDeclaration.arguments constructor)
+             nf (Array.length fields)
+             patterns (the (Array (Box CorePattern)) [])
+             bindings (the (Array CoreRef) [])
+             body-exprs (the (Array (Box CoreExpr)) [])]
+      (for [fi 0 nf]
+        (let [field-mono (core->mono (Box.peek (Array.unsafe-nth fields fi))
+                                     &subst)]
+          ;; unmanaged fields have nothing to delete: an `Ignore` slot instead
+          ;; of an unused binding keeps the emitted C warning-free.
+          (if (managed-mono? &field-mono constructors base-managed)
+            (let-do [fref (CoreRef.init (next-id! cell)
+                                        (String.concat &[@"field" (Int.str fi)])
+                                        false)]
+              (set! patterns
+                    (Array.push-back patterns
+                                     (Box.init (CorePattern.Bind (CoreRef.copy &fref)))))
+              (set! bindings (Array.push-back bindings (CoreRef.copy &fref)))
+              (set! body-exprs
+                    (Array.push-back body-exprs
+                                     (Box.init
+                                       (CoreExpr.Call -1
+                                                      (Box.init
+                                                        (CoreExpr.Reference -1
+                                                                            (CoreRef.copy delete-ref)))
+                                                      [(Box.init
+                                                         (CoreExpr.Reference -1
+                                                                             (CoreRef.copy &fref)))]))))
+              (queue-instances! &field-mono constructors base-managed new-insts))
+            (set! patterns
+                  (Array.push-back patterns (Box.init (CorePattern.Ignore)))))))
+      (CoreMatchBranch.init
+        (CorePattern.Constructor
+          (CoreRef.copy (CoreConstructorDeclaration.reference constructor))
+          patterns)
+        bindings
+        (Box.init
+          (if (Int.= 0 (Array.length &body-exprs))
+            (CoreExpr.UnitLit -1)
+            (CoreExpr.Do -1 body-exprs))))))
+
+  (private instance-deleter!)
+  (hidden instance-deleter!)
+  (doc instance-deleter! "generates the concrete deleter for one managed generic
+instance (appending function, implementation and signature) and returns the
+generic instances its managed fields introduce, for the worklist.")
+  (defn instance-deleter! [inst
+                           constructors
+                           base-managed
+                           delete-ref
+                           cell
+                           functions
+                           impls
+                           sigs]
+    (match-ref inst
+      (MonoType.Named base-name _)
+        (let-do [fn-ref (CoreRef.init (next-id! cell)
+                                      (String.concat &[(String.copy base-name)
+                                                       @".delete"])
+                                      true)
+                 param-ref (CoreRef.init (next-id! cell) @"x" false)
+                 branches (the (Array CoreMatchBranch) [])
+                 new-insts (the (Array MonoType) [])
+                 cn (Array.length constructors)]
+          (for [ci 0 cn]
+            (let [c (Array.unsafe-nth constructors ci)]
+              (when (constructor-base-is? c base-name)
+                (set! branches
+                      (Array.push-back branches
+                                       (generic-branch c
+                                                       inst
+                                                       constructors
+                                                       base-managed
+                                                       delete-ref
+                                                       cell
+                                                       &new-insts))))))
+          (Array.push-back! functions
+                            (CoreFunction.init (CoreRef.copy &fn-ref)
+                                               [(CoreRef.copy &param-ref)]
+                                               (Box.init
+                                                 (CoreExpr.Match -1
+                                                                 false
+                                                                 (Box.init
+                                                                   (CoreExpr.Reference -1
+                                                                                       (CoreRef.copy &param-ref)))
+                                                                 branches))))
+          (Array.push-back! impls
+                            (CoreImplementation.init (CoreRef.copy delete-ref)
+                                                     (CoreRef.copy &fn-ref)))
+          (Array.push-back! sigs
+                            (CoreSignature.init (CoreRef.copy &fn-ref)
+                                                (Box.init
+                                                  (CoreType.Function [(Box.init (mono->core inst))]
+                                                                     (Box.init (CoreType.Unit))))))
+          new-insts)
+      _ (the (Array MonoType) [])))
+
+  (private generic-copy-branch)
+  (hidden generic-copy-branch)
+  (doc generic-copy-branch "one match-ref branch of a per-instance generic
+`copy`: binds every field by reference and reconstructs through the constructor,
+deep-copying managed fields (`copy`) and blitting the rest (`deref`), enqueueing
+any managed generic-instance field for the worklist.")
+  (defn generic-copy-branch [constructor
+                             inst
+                             constructors
+                             base-managed
+                             copy-ref
+                             deref-ref
+                             cell
+                             new-insts]
+    (let-do [subst (build-subst
+               (Box.peek (CoreConstructorDeclaration.result constructor))
+               inst)
+             fields (CoreConstructorDeclaration.arguments constructor)
+             nf (Array.length fields)
+             patterns (the (Array (Box CorePattern)) [])
+             bindings (the (Array CoreRef) [])
+             args (the (Array (Box CoreExpr)) [])]
+      (for [fi 0 nf]
+        (let-do [fref (CoreRef.init (next-id! cell)
+                                    (String.concat &[@"field" (Int.str fi)])
+                                    false)
+                 field-mono (core->mono (Box.peek (Array.unsafe-nth fields fi))
+                                        &subst)
+                 managed (managed-mono? &field-mono constructors base-managed)]
+          (set! patterns
+                (Array.push-back patterns
+                                 (Box.init (CorePattern.Bind (CoreRef.copy &fref)))))
+          (set! bindings (Array.push-back bindings (CoreRef.copy &fref)))
+          (set! args
+                (Array.push-back args
+                                 (Box.init
+                                   (CoreExpr.Call -1
+                                                  (Box.init
+                                                    (CoreExpr.Reference -1
+                                                                        (if managed
+                                                                          (CoreRef.copy copy-ref)
+                                                                          (CoreRef.copy deref-ref))))
+                                                  [(Box.init
+                                                     (CoreExpr.Reference -1
+                                                                         (CoreRef.copy &fref)))]))))
+          (when (and managed
+                     (and (generic-instance? &field-mono)
+                          (not (instance-listed? new-insts &field-mono))))
+            (Array.push-back! new-insts (MonoType.copy &field-mono)))))
+      (CoreMatchBranch.init
+        (CorePattern.Constructor
+          (CoreRef.copy (CoreConstructorDeclaration.reference constructor))
+          patterns)
+        bindings
+        (Box.init
+          (CoreExpr.Call -1
+                         (Box.init
+                           (CoreExpr.Reference -1
+                                               (CoreRef.copy
+                                                 (CoreConstructorDeclaration.reference constructor))))
+                         args)))))
+
+  (private builtin-ref-by-name)
+  (hidden builtin-ref-by-name)
+  (defn builtin-ref-by-name [builtins name]
+    (let-do [result (the (Maybe CoreRef) (Maybe.Nothing))
+             n (Array.length builtins)]
+      (for [i 0 n]
+        (let [reference (CoreBuiltin.reference (Array.unsafe-nth builtins i))]
+          (when (String.= (CoreRef.name reference) name)
+            (set! result (Maybe.Just (CoreRef.copy reference))))))
+      result))
+
+  (private builtins-except)
+  (hidden builtins-except)
+  (defn builtins-except [builtins names]
+    (let-do [result (the (Array CoreBuiltin) [])
+             n (Array.length builtins)]
+      (for [i 0 n]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (unless (contains-key? names
+                                 (CoreRef.name (CoreBuiltin.reference builtin)))
+            (Array.push-back! &result (CoreBuiltin.copy builtin)))))
+      result))
+
+  (private function-named?)
+  (hidden function-named?)
+  (defn function-named? [functions name]
+    (let-do [found false
+             n (Array.length functions)]
+      (for [i 0 n]
+        (when (String.=
+            (CoreRef.name
+              (CoreFunction.reference (Array.unsafe-nth functions i)))
+            name)
+          (set! found true)))
+      found))
+
+  (private implementation-exists?)
+  (hidden implementation-exists?)
+  (defn implementation-exists? [implementations interface implementation]
+    (let-do [found false
+             n (Array.length implementations)]
+      (for [i 0 n]
+        (let [candidate (Array.unsafe-nth implementations i)]
+          (when (and
+              (CoreIR.same-ref? (CoreImplementation.interface candidate)
+                                interface)
+              (CoreIR.same-ref?
+                (CoreImplementation.implementation candidate)
+                implementation))
+            (set! found true))))
+      found))
+
+  (private instance-copier!)
+  (hidden instance-copier!)
+  (doc instance-copier! "generates the concrete `copy` for one managed generic
+instance (by-reference match over its constructors, appending function and
+implementation, plus a signature pinning it to the instance) and returns the
+generic instances its managed fields introduce.")
+  (defn instance-copier! [inst
+                          constructors
+                          base-managed
+                          copy-ref
+                          deref-ref
+                          cell
+                          functions
+                          impls
+                          sigs
+                          builtins
+                          removed]
+    (match-ref inst
+      (MonoType.Named base-name _)
+        (let-do [fn-name (String.concat &[(String.copy base-name) @".copy"])
+                 builtin (if (contains-key? removed &fn-name)
+                   (the (Maybe CoreRef) (Maybe.Nothing))
+                   (builtin-ref-by-name builtins &fn-name))
+                 fn-ref (match-ref &builtin
+                   (Maybe.Just reference) (CoreRef.copy reference)
+                   (Maybe.Nothing)
+                     (CoreRef.init (next-id! cell) (String.copy &fn-name) true))
+                 param-ref (CoreRef.init (next-id! cell) @"ref" false)
+                 branches (the (Array CoreMatchBranch) [])
+                 new-insts (the (Array MonoType) [])
+                 cn (Array.length constructors)]
+          (for [ci 0 cn]
+            (let [c (Array.unsafe-nth constructors ci)]
+              (when (constructor-base-is? c base-name)
+                (set! branches
+                      (Array.push-back branches
+                                       (generic-copy-branch c
+                                                            inst
+                                                            constructors
+                                                            base-managed
+                                                            copy-ref
+                                                            deref-ref
+                                                            cell
+                                                            &new-insts))))))
+          (Array.push-back! functions
+                            (CoreFunction.init (CoreRef.copy &fn-ref)
+                                               [(CoreRef.copy &param-ref)]
+                                               (Box.init
+                                                 (CoreExpr.Match -1
+                                                                 true
+                                                                 (Box.init
+                                                                   (CoreExpr.Annotation -1
+                                                                                        (Box.init
+                                                                                          (CoreExpr.Reference -1
+                                                                                                              (CoreRef.copy &param-ref)))
+                                                                                        (Box.init
+                                                                                          (CoreType.Reference (Box.init (mono->core inst))
+                                                                                                              (CoreLifetime.Inferred 0)))))
+                                                                 branches))))
+          (match-ref &builtin
+            (Maybe.Just _) (Array.push-back! removed (String.copy &fn-name))
+            (Maybe.Nothing) ())
+          (unless (implementation-exists? impls copy-ref &fn-ref)
+            (Array.push-back! impls
+                              (CoreImplementation.init (CoreRef.copy copy-ref)
+                                                       (CoreRef.copy &fn-ref))))
+          ;; Unlike the generic source-level fallback, this function is a
+          ;; single concrete instance. Pinning its scheme keeps inference and
+          ;; specialization on the same reference; without it a call can be
+          ;; assigned the concrete `Maybe.copy` symbol while the generated body
+          ;; remains polymorphic and is never emitted.
+          (Array.push-back! sigs
+                            (CoreSignature.init (CoreRef.copy &fn-ref)
+                                                (Box.init
+                                                  (CoreType.Function
+                                                    [(Box.init
+                                                       (CoreType.Reference (Box.init (mono->core inst))
+                                                                           (CoreLifetime.Inferred 0)))]
+                                                    (Box.init (mono->core inst))))))
+          new-insts)
+      _ (the (Array MonoType) [])))
+
+  (private value-str-convention?)
+  (hidden value-str-convention?)
+  ;; whether `str` for this concrete type takes its argument by value
+  ;; (primitives and register-backed numerics) rather than by reference.
+  (defn value-str-convention? [mono]
+    (match-ref mono
+      (MonoType.Integer) true
+      (MonoType.Boolean) true
+      (MonoType.Named name args)
+        (and (Int.= 0 (Array.length args))
+             (contains-key?
+               &[@"Int"
+                 @"Long"
+                 @"Bool"
+                 @"Float"
+                 @"Double"
+                 @"Byte"
+                 @"Char"
+                 @"Int8"
+                 @"Int16"
+                 @"Int32"
+                 @"Int64"
+                 @"Uint8"
+                 @"Uint16"
+                 @"Uint32"
+                 @"Uint64"]
+               name))
+      _ false))
+
+  (private constructor-local-name)
+  (hidden constructor-local-name)
+  (defn constructor-local-name [name]
+    (let [segments (String.split-by name &[\.])]
+      @(Array.unsafe-nth &segments (Int.dec (Array.length &segments)))))
+
+  (private instance-str-branch)
+  (hidden instance-str-branch)
+  (doc instance-str-branch "one match-ref branch of a per-instance `str`:
+`(CtorName field-strs..)`, each field rendered through `str` (dereferenced
+first when the field type's `str` takes its argument by value). Nested generic
+fields are enqueued for the worklist.")
+  (defn instance-str-branch [constructor
+                             inst
+                             cell
+                             -str-ref
+                             deref-ref
+                             copy-ref
+                             ref-ref
+                             concat-ref
+                             new-insts]
+    (let-do [subst (build-subst
+               (Box.peek (CoreConstructorDeclaration.result constructor))
+               inst)
+             fields (CoreConstructorDeclaration.arguments constructor)
+             nf (Array.length fields)
+             patterns (the (Array (Box CorePattern)) [])
+             bindings (the (Array CoreRef) [])
+             parts (the (Array (Box CoreExpr)) [])
+             ;; a record's constructor is `Type.init`, displayed as the type
+             ;; name; a sum's constructor keeps its own (local) name.
+             ctor-name (CoreRef.name
+               (CoreConstructorDeclaration.reference constructor))
+             local-name (if (String.ends-with? ctor-name ".init")
+               (match-ref (Box.peek
+                   (CoreConstructorDeclaration.result constructor))
+                 (CoreType.Named name _) (String.copy name)
+                 _ (constructor-local-name ctor-name))
+               (constructor-local-name ctor-name))]
+      (Array.push-back! &parts
+                        (Box.init
+                          (CoreExpr.Call -1
+                                         (Box.init
+                                           (CoreExpr.Reference -1
+                                                               (CoreRef.copy copy-ref)))
+                                         [(Box.init
+                                            (CoreExpr.StringLit -1
+                                                                (String.concat &[@"("
+                                                                                 (String.copy &local-name)])))])))
+      (for [fi 0 nf]
+        (let-do [fref (CoreRef.init (next-id! cell)
+                                    (String.concat &[@"field" (Int.str fi)])
+                                    false)
+                 field-mono (core->mono (Box.peek (Array.unsafe-nth fields fi))
+                                        &subst)]
+          (Array.push-back! &patterns
+                            (Box.init (CorePattern.Bind (CoreRef.copy &fref))))
+          (Array.push-back! &bindings (CoreRef.copy &fref))
+          (Array.push-back! &parts
+                            (Box.init
+                              (CoreExpr.Call -1
+                                             (Box.init
+                                               (CoreExpr.Reference -1
+                                                                   (CoreRef.copy copy-ref)))
+                                             [(Box.init (CoreExpr.StringLit -1
+                                                                            @" "))])))
+          (Array.push-back! &parts
+                            (Box.init
+                              (CoreExpr.Call -1
+                                             (Box.init
+                                               (CoreExpr.Reference -1
+                                                                   ;; the reference renders members through `prn`
+                                                                   ;; (StructUtils.memberPrn), so String fields
+                                                                   ;; show as @"..." literals.
+                                                                   (PrimitiveRegistry.reference 2
+                                                                                                "prn")))
+                                             [(Box.init
+                                                (if (value-str-convention? &field-mono)
+                                                  (CoreExpr.Call -1
+                                                                 (Box.init
+                                                                   (CoreExpr.Reference -1
+                                                                                       (CoreRef.copy deref-ref)))
+                                                                 [(Box.init
+                                                                    (CoreExpr.Reference -1
+                                                                                        (CoreRef.copy &fref)))])
+                                                  (CoreExpr.Reference -1
+                                                                      (CoreRef.copy &fref))))])))
+          (when (and (generic-instance? &field-mono)
+                     (not (instance-listed? new-insts &field-mono)))
+            (Array.push-back! new-insts (MonoType.copy &field-mono)))))
+      (Array.push-back! &parts
+                        (Box.init
+                          (CoreExpr.Call -1
+                                         (Box.init
+                                           (CoreExpr.Reference -1
+                                                               (CoreRef.copy copy-ref)))
+                                         [(Box.init (CoreExpr.StringLit -1 @")"))])))
+      (CoreMatchBranch.init
+        (CorePattern.Constructor
+          (CoreRef.copy (CoreConstructorDeclaration.reference constructor))
+          patterns)
+        bindings
+        (Box.init
+          (CoreExpr.Call -1
+                         (Box.init
+                           (CoreExpr.Reference -1 (CoreRef.copy concat-ref)))
+                         [(Box.init
+                            (CoreExpr.Call -1
+                                           (Box.init
+                                             (CoreExpr.Reference -1
+                                                                 (CoreRef.copy ref-ref)))
+                                           [(Box.init (CoreExpr.ArrayLit -1
+                                                                         parts))]))])))))
+
+  (private instance-strfn!)
+  (hidden instance-strfn!)
+  (doc instance-strfn! "generates the concrete `str` for one generic deftype
+instance and registers it, pinned to the instance, as the `str` and the `prn`
+implementation the user has not written (`derive-str?`, `derive-prn?`).
+Returns nested generic instances for the worklist.")
+  (defn instance-strfn! [context
+                         inst
+                         constructors
+                         cell
+                         functions
+                         impls
+                         concat-ref
+                         derive-str?
+                         derive-prn?]
+    (let-do [str-ref (PrimitiveRegistry.reference 1 "str")
+             deref-ref (PrimitiveRegistry.reference 6 "deref")
+             copy-ref (PrimitiveRegistry.reference 0 "copy")
+             ref-ref (PrimitiveRegistry.reference 5 "ref")
+             new-insts (the (Array MonoType) [])]
+      (match-ref inst
+        (MonoType.Named base-name _)
+          (let-do [fn-ref (CoreRef.init (next-id! cell)
+                                        (String.concat
+                                          &[(String.copy base-name)
+                                            (if derive-str? @".str" @".prn")])
+                                        true)
+                   ;; a per-instance str is derived, not user-written: record
+                   ;; it so later instances of the same base are still derived.
+                   _ignored-provenance (Array.push-back! (DeriveContext.fallback-str-ids context)
+                                                         @(CoreRef.id &fn-ref))
+                   param-ref (CoreRef.init (next-id! cell) @"self" false)
+                   branches (the (Array CoreMatchBranch) [])
+                   cn (Array.length constructors)]
+            (for [ci 0 cn]
+              (let [c (Array.unsafe-nth constructors ci)]
+                (when (constructor-base-is? c base-name)
+                  (set! branches
+                        (Array.push-back branches
+                                         (instance-str-branch c
+                                                              inst
+                                                              cell
+                                                              &str-ref
+                                                              &deref-ref
+                                                              &copy-ref
+                                                              &ref-ref
+                                                              concat-ref
+                                                              &new-insts))))))
+            (Array.push-back! functions
+                              (CoreFunction.init (CoreRef.copy &fn-ref)
+                                                 [(CoreRef.copy &param-ref)]
+                                                 (Box.init
+                                                   (CoreExpr.Match -1
+                                                                   true
+                                                                   (Box.init
+                                                                     (CoreExpr.Annotation -1
+                                                                                          (Box.init
+                                                                                            (CoreExpr.Reference -1
+                                                                                                                (CoreRef.copy &param-ref)))
+                                                                                          (Box.init
+                                                                                            (CoreType.Reference (Box.init (mono->core inst))
+                                                                                                                (CoreLifetime.Inferred 0)))))
+                                                                   branches))))
+            (when derive-str?
+              (Array.push-back! impls
+                                (CoreImplementation.init (CoreRef.copy &str-ref)
+                                                         (CoreRef.copy &fn-ref))))
+            ;; the reference derives both a `str` and a `prn` binder per deftype
+            ;; (Deftype.binderForStrOrPrn), with identical bodies for non-strings,
+            ;; and a user-written one replaces only its own.
+            (when derive-prn?
+              (Array.push-back! impls
+                                (CoreImplementation.init (PrimitiveRegistry.reference 2
+                                                                                      "prn")
+                                                         (CoreRef.copy &fn-ref)))))
+        _ ())
+      new-insts))
+
+  (private fallback-str-id?)
+  (hidden fallback-str-id?)
+  (defn fallback-str-id? [context id]
+    (let-do [found false]
+      (for [i 0 (Array.length (DeriveContext.fallback-str-ids context))]
+        (when (Int.=
+            @(Array.unsafe-nth (DeriveContext.fallback-str-ids context) i)
+            id)
+          (set! found true)))
+      found))
+
+  (private user-member-defined?)
+  (hidden user-member-defined?)
+  ;; a `<T>.str` or `<T>.prn` that is NOT one of the recorded derived ones is
+  ;; user-written (or accessor-adopted): instance derivation must not
+  ;; override it.
+  (defn user-member-defined? [context functions base-name member]
+    (let-do [found false
+             target (String.concat &[(String.copy base-name) @"." @member])]
+      (for [i 0 (Array.length functions)]
+        (let [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
+          (when (and
+              (String.= (CoreRef.name reference) &target)
+              (not (fallback-str-id? context @(CoreRef.id reference))))
+            (set! found true))))
+      found))
+
+  (private derive-instance-strs)
+  (hidden derive-instance-strs)
+  (doc derive-instance-strs "extends `core` with a per-instance `str` for every
+concrete generic deftype instance the program uses (the reference derives str
+per concretization, rendering constructor name plus field values). Types with a
+user-written `<T>.str` keep it.")
+  (defn derive-instance-strs [context core inferred]
+    (let-do [functions (Array.copy (CoreModule.functions core))
+             impls (Array.copy (CoreModule.implementations core))
+             constructors (CoreModule.constructors core)
+             concat-found (the (Maybe CoreRef) (Maybe.Nothing))]
+      (for [i 0 (Array.length &functions)]
+        (let [reference (CoreFunction.reference (Array.unsafe-nth &functions i))]
+          (when (String.= (CoreRef.name reference) "String.concat")
+            (set! concat-found (Maybe.Just (CoreRef.copy reference))))))
+      (match concat-found
+        (Maybe.Nothing) @core
+        (Maybe.Just concat-ref)
+          (let-do [pending (discover-any inferred constructors)
+                   done (the (Array String) [])
+                   cell (the (Array Int)
+                             [(Int.inc (CoreIR.max-declared-global-id core))])
+                   cursor 0]
+            (while-do (Int.< cursor (Array.length &pending))
+              (let-do [inst (Array.unsafe-nth &pending cursor)
+                       key (CAbi.type-key inst)
+                       skip (or (contains-key? &done &key)
+                                (or
+                                  (not
+                                    (match-ref inst
+                                      (MonoType.Named base-name _)
+                                        (constructors-declared? constructors
+                                                                base-name)
+                                      _ false))
+                                  (match-ref inst
+                                    (MonoType.Named base-name _)
+                                      (and
+                                        (user-member-defined? context
+                                                              &functions
+                                                              base-name
+                                                              "str")
+                                        (user-member-defined? context
+                                                              &functions
+                                                              base-name
+                                                              "prn"))
+                                    _ true)))]
+                (unless-do skip
+                  (set! done (Array.push-back done key))
+                  (let [base (match-ref inst
+                          (MonoType.Named base-name _) @base-name
+                          _ @"")
+                        new-insts (instance-strfn! context
+                                                   inst
+                                                   constructors
+                                                   &cell
+                                                   &functions
+                                                   &impls
+                                                   &concat-ref
+                                                   (not
+                                                     (user-member-defined? context
+                                                                           &functions
+                                                                           &base
+                                                                           "str"))
+                                                   (not
+                                                     (user-member-defined? context
+                                                                           &functions
+                                                                           &base
+                                                                           "prn")))]
+                    (for [i 0 (Array.length &new-insts)]
+                      (set! pending
+                            (Array.push-back pending
+                                             @(Array.unsafe-nth &new-insts i))))))
+                (set! cursor (Int.inc cursor))))
+            (finish-indexing context
+                             (CoreModule.init functions
+                                              @(CoreModule.values core)
+                                              @(CoreModule.builtins core)
+                                              @(CoreModule.builtin-sources core)
+                                              @(CoreModule.signatures core)
+                                              @(CoreModule.type-declarations core)
+                                              @(CoreModule.constructors core)
+                                              @(CoreModule.recursive-types core)
+                                              @(CoreModule.interfaces core)
+                                              impls
+                                              @(CoreModule.overloads core)
+                                              @(CoreModule.system-includes core)
+                                              @(CoreModule.expressions core)))))))
+
+  (private worklist-generate)
+  (hidden worklist-generate)
+  (private polymorphic-core-type?)
+  (hidden polymorphic-core-type?)
+  (private generic-delete-declared?)
+  (hidden generic-delete-declared?)
+  (doc generic-delete-declared? "whether a `<base>.delete` written once for
+every instance of the type is already in scope — core's
+`(sig delete (Fn [(Box a)] ()))`. Such a body specializes correctly for every
+instance and must stay the sole implementation: a concrete deleter derived
+beside it wins dispatch and deletes only the fields the DECLARATION shows,
+which for `(deftype (Box a) [data (Ptr a)])` is nothing at all. The signature,
+not the name, is what tells it apart from the per-instance deleters this
+worklist itself appends.
+
+Only for a type whose members are all indirections. Everywhere else the
+derived per-instance deleter is the right one — it frees the fields the
+instance actually holds — and suppressing it in favour of a generic body
+leaves an instance like `(Bucket Bool String)` with nothing to dispatch to.")
+  (defn generic-delete-declared? [sigs constructors base-name]
+    (let-do [found false
+             name (String.concat &[(String.copy base-name) @".delete"])
+             indirect (CoreIR.indirection-nominal? constructors base-name)
+             n (Array.length sigs)]
+      (for [i 0 n]
+        (let [candidate (Array.unsafe-nth sigs i)]
+          (when (and indirect
+                     (and
+                       (String.=
+                         (CoreRef.name (CoreSignature.reference candidate))
+                         &name)
+                       (polymorphic-core-type?
+                         (Box.peek (CoreSignature.signature candidate)))))
+            (set! found true))))
+      found))
+
+  (defn worklist-generate [context core worklist base-managed]
+    (let-do [functions (Array.copy (CoreModule.functions core))
+             impls (Array.copy (CoreModule.implementations core))
+             sigs (Array.copy (CoreModule.signatures core))
+             constructors (CoreModule.constructors core)
+             builtins (CoreModule.builtins core)
+             delete-ref (PrimitiveRegistry.delete-reference)
+             copy-ref (PrimitiveRegistry.reference 0 "copy")
+             deref-ref (PrimitiveRegistry.reference 6 "deref")
+             cell (the (Array Int)
+                       [(Int.inc (CoreIR.max-declared-global-id core))])
+             pending (Array.copy worklist)
+             done (the (Array String) [])
+             removed (the (Array String) [])
+             cursor 0]
+      (while-do (Int.< cursor (Array.length &pending))
+        (let-do [inst (Array.unsafe-nth &pending cursor)
+                 key (CAbi.type-key inst)]
+          (unless-do (or (contains-key? &done &key)
+                         (not
+                           (match-ref inst
+                             (MonoType.Named base-name _)
+                               (constructors-declared? constructors base-name)
+                             _ false)))
+            (set! done (Array.push-back done key))
+            (let-do [base-name (match-ref inst
+                       (MonoType.Named name _) (String.copy name)
+                       _ (String.copy ""))
+                     new-insts (if (generic-delete-declared? &sigs
+                                                             constructors
+                                                             &base-name)
+                       (the (Array MonoType) [])
+                       (instance-deleter! inst
+                                          constructors
+                                          &base-managed
+                                          &delete-ref
+                                          &cell
+                                          &functions
+                                          &impls
+                                          &sigs))
+                     copy-name (match-ref inst
+                       (MonoType.Named base-name _)
+                         (String.concat &[(String.copy base-name) @".copy"])
+                       _ (String.copy ""))]
+              ;; A generic derived/accessor copier specializes correctly for
+              ;; every instance and must remain the sole implementation. Only
+              ;; synthesize a concrete fallback when no such body exists.
+              (unless (function-named? &functions &copy-name)
+                (ignore
+                  (instance-copier! inst
+                                    constructors
+                                    &base-managed
+                                    &copy-ref
+                                    &deref-ref
+                                    &cell
+                                    &functions
+                                    &impls
+                                    &sigs
+                                    builtins
+                                    &removed)))
+              (for [i 0 (Array.length &new-insts)]
+                (set! pending
+                      (Array.push-back pending @(Array.unsafe-nth &new-insts i))))))
+          (set! cursor (Int.inc cursor))))
+      (finish-indexing context
+                       (CoreModule.init functions
+                                        @(CoreModule.values core)
+                                        (builtins-except builtins &removed)
+                                        @(CoreModule.builtin-sources core)
+                                        sigs
+                                        @(CoreModule.type-declarations core)
+                                        @(CoreModule.constructors core)
+                                        @(CoreModule.recursive-types core)
+                                        @(CoreModule.interfaces core)
+                                        impls
+                                        @(CoreModule.overloads core)
+                                        @(CoreModule.system-includes core)
+                                        @(CoreModule.expressions core)))))
+
+  (doc close-generics "extends `core` with a per-instance `copy` and `delete`
+for every concrete managed generic instance the program uses (discovered from
+inference, then closed over nested instances). Discovery reads inferred node
+types rather than specialized ones so it runs before the derived implementations
+those instances need exist. Best-effort: if inference fails here, returns core
+unchanged and lets the driver report the error.
+
+The inference it ran comes back with the module: everything here only adds
+definitions (the module's own are reindexed to the ids they already have), so
+`Infer.module-from-base` can infer the result from it without starting over.")
+  (defn close-generics [context core]
+    (match (Infer.module-resumable core)
+      (Result.Success base)
+        (let [inf (InferenceBase.inferred &base)
+              facts (OwnershipClassify.facts-from-module core)
+              base-managed (managed-keys core (OwnershipTypeFacts.owned &facts))]
+          (Pair.init
+            (derive-instance-strs context
+                                  &(worklist-generate context
+                                                      core
+                                                      &(discover inf
+                                                                 (CoreModule.constructors core)
+                                                                 &base-managed)
+                                                      base-managed)
+                                  inf)
+            (Maybe.Just base)))
+      (Result.Error _)
+        (Pair.init @core (the (Maybe InferenceBase) (Maybe.Nothing))))))
+
+(defmodule Derive
+  (private copy-branch)
+  (hidden copy-branch)
+  (defn polymorphic-core-type? [type]
+    (match-ref type
+      (CoreType.Variable _) true
+      (CoreType.Named _ arguments)
+        (let-do [found false]
+          (for [i 0 (Array.length arguments)]
+            (when (polymorphic-core-type?
+                (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)
+      (CoreType.Reference inner _) (polymorphic-core-type? (Box.peek inner))
+      (CoreType.Function arguments result)
+        (let-do [found (polymorphic-core-type? (Box.peek result))]
+          (for [i 0 (Array.length arguments)]
+            (when (polymorphic-core-type?
+                (Box.peek (Array.unsafe-nth arguments i)))
+              (set! found true)))
+          found)
+      _ false))
+  (doc copy-branch "one match-ref branch of a derived `copy`: binds every field
+by reference and reconstructs the value through the constructor, deep-copying
+managed fields (via `copy`) and blitting the rest (via `deref`).")
+  (defn copy-branch [constructor managed copy-ref deref-ref cell]
+    (let-do [fields (CoreConstructorDeclaration.arguments constructor)
+             nf (Array.length fields)
+             patterns (the (Array (Box CorePattern)) [])
+             bindings (the (Array CoreRef) [])
+             args (the (Array (Box CoreExpr)) [])]
+      (for [fi 0 nf]
+        (let-do [fref (CoreRef.init (next-id! cell)
+                                    (String.concat &[@"field" (Int.str fi)])
+                                    false)]
+          (set! patterns
+                (Array.push-back patterns
+                                 (Box.init (CorePattern.Bind (CoreRef.copy &fref)))))
+          (set! bindings (Array.push-back bindings (CoreRef.copy &fref)))
+          (set! args
+                (Array.push-back args
+                                 (Box.init
+                                   (CoreExpr.Call -1
+                                                  (Box.init
+                                                    (CoreExpr.Reference -1
+                                                                        (if (or
+                                                                            (field-managed? (Box.peek (Array.unsafe-nth fields
+                                                                                                                        fi))
+                                                                                            managed)
+                                                                            (polymorphic-core-type? (Box.peek (Array.unsafe-nth fields
+                                                                                                                                fi))))
+                                                                          (CoreRef.copy copy-ref)
+                                                                          (CoreRef.copy deref-ref))))
+                                                  [(Box.init
+                                                     (CoreExpr.Reference -1
+                                                                         (CoreRef.copy &fref)))]))))))
+      (CoreMatchBranch.init
+        (CorePattern.Constructor
+          (CoreRef.copy (CoreConstructorDeclaration.reference constructor))
+          patterns)
+        bindings
+        (Box.init
+          (CoreExpr.Call -1
+                         (Box.init
+                           (CoreExpr.Reference -1
+                                               (CoreRef.copy
+                                                 (CoreConstructorDeclaration.reference constructor))))
+                         args)))))
+
+  (private named-type-name)
+  (hidden named-type-name)
+  (defn named-type-name [ct]
+    (match-ref ct (CoreType.Named name _) (String.copy name) _ (String.copy "")))
+
+  (private builtin-by-name)
+  (hidden builtin-by-name)
+  (defn builtin-by-name [builtins name]
+    (let-do [result (the (Maybe CoreBuiltin) (Maybe.Nothing))]
+      (for [i 0 (Array.length builtins)]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (when (String.= (CoreRef.name (CoreBuiltin.reference builtin)) name)
+            (set! result (Maybe.Just @builtin)))))
+      result))
+
+  ;; builds `(defn getter [self] (match-ref self (Ctor f0 f1 ..) fN))`: a by-ref
+  ;; match that binds every field and returns a reference to field `fi`.
+  (private make-getter)
+  (hidden make-getter)
+  ;; builds a record accessor by kind: 0 getter `(match-ref self (Ctor f..) fN)`;
+  ;; 1 setter `(match self (Ctor f..) (Ctor f0 .. value .. fk))`; 2 updater with
+  ;; `(f fN)` at the target; 3 copy `(match-ref self (Ctor f..) (Ctor ~f0 ~f1 ..))`.
+  ;; getter/copy read by reference; setter/updater consume and reconstruct.
+  (private make-field-fn)
+  (hidden make-field-fn)
+  (defn make-field-fn [fref decl-ref result-type nf fi kind cell]
+    (let-do [self-ref (CoreRef.init (next-id! cell) @"self" false)
+             extra-ref (CoreRef.init (next-id! cell) @"arg" false)
+             deref-ref (PrimitiveRegistry.reference 6 "deref")
+             copy-ref (PrimitiveRegistry.reference 0 "copy")
+             by-ref (or (Int.= kind 0) (Int.= kind 3))
+             patterns (the (Array (Box CorePattern)) [])
+             bindings (the (Array CoreRef) [])
+             args (the (Array (Box CoreExpr)) [])
+             target (CoreRef.init 0 @"" false)]
+      (for [k 0 nf]
+        (let-do [bref (CoreRef.init (next-id! cell)
+                                    (String.concat &[@"f" (Int.str k)])
+                                    false)]
+          ;; the getter (kind 0) reads one field: binding the others only
+          ;; emits unused locals, so they stay `Ignore` slots.
+          (if (and (Int.= kind 0) (not (Int.= k fi)))
+            (Array.push-back! &patterns (Box.init (CorePattern.Ignore)))
+            (do
+              (Array.push-back! &patterns
+                                (Box.init (CorePattern.Bind (CoreRef.copy &bref))))
+              (Array.push-back! &bindings (CoreRef.copy &bref))))
+          (when (Int.= k fi) (set! target (CoreRef.copy &bref)))
+          (Array.push-back! &args
+                            (Box.init
+                              (cond
+                                (and (Int.= kind 1) (Int.= k fi))
+                                (CoreExpr.Reference -1 (CoreRef.copy &extra-ref))
+                                (and (Int.= kind 2) (Int.= k fi))
+                                (CoreExpr.Call -1
+                                               (Box.init
+                                                 (CoreExpr.Call -1
+                                                                (Box.init
+                                                                  (CoreExpr.Reference -1
+                                                                                      (CoreRef.copy &deref-ref)))
+                                                                [(Box.init
+                                                                   (CoreExpr.Reference -1
+                                                                                       (CoreRef.copy &extra-ref)))]))
+                                               [(Box.init
+                                                  (CoreExpr.Reference -1
+                                                                      (CoreRef.copy &bref)))])
+                                ;; the copy body deep-copies EVERY field
+                                ;; through the `copy` interface (like
+                                ;; `init-from-refs`): dispatch picks the
+                                ;; derived deep copier for managed fields and
+                                ;; the blit for unmanaged ones, per
+                                ;; instantiation. A `deref` blit here aliased
+                                ;; managed fields of generic instantiations
+                                ;; (found via a self-hosting double free).
+                                (Int.= kind 3)
+                                (CoreExpr.Call -1
+                                               (Box.init
+                                                 (CoreExpr.Reference -1
+                                                                     (CoreRef.copy &copy-ref)))
+                                               [(Box.init
+                                                  (CoreExpr.Reference -1
+                                                                      (CoreRef.copy &bref)))])
+                                (CoreExpr.Reference -1 (CoreRef.copy &bref)))))))
+      (let [params (if (or (Int.= kind 1) (Int.= kind 2))
+              [(CoreRef.copy &self-ref) (CoreRef.copy &extra-ref)]
+              [(CoreRef.copy &self-ref)])
+            ann-type (if by-ref
+              (CoreType.Reference (Box.init (CoreType.copy result-type))
+                                  (CoreLifetime.Inferred 0))
+              (CoreType.copy result-type))
+            body (if (Int.= kind 0)
+              (CoreExpr.Reference -1 target)
+              (CoreExpr.Call -1
+                             (Box.init
+                               (CoreExpr.Reference -1 (CoreRef.copy decl-ref)))
+                             args))]
+        (CoreFunction.init (CoreRef.copy fref)
+                           params
+                           (Box.init
+                             (CoreExpr.Match -1
+                                             by-ref
+                                             (Box.init
+                                               (CoreExpr.Annotation -1
+                                                                    (Box.init
+                                                                      (CoreExpr.Reference -1
+                                                                                          (CoreRef.copy &self-ref)))
+                                                                    (Box.init ann-type)))
+                                             [(CoreMatchBranch.init
+                                                (CorePattern.Constructor (CoreRef.copy decl-ref)
+                                                                         patterns)
+                                                bindings
+                                                (Box.init body))]))))))
+
+  ;; the in-place mutating setter `set-<field>!`: `(field-set! self 0 fi value)`
+  ;; writes member `fi` of the record (single constructor, tag 0) behind the
+  ;; `(Ref record)` in place. Distinct from make-field-fn because its body is the
+  ;; field-set! intrinsic, not a reconstructing match.
+  (private make-mutator-fn)
+  (hidden make-mutator-fn)
+  (defn make-mutator-fn [fref result-type fi cell]
+    (let-do [self-ref (CoreRef.init (next-id! cell) @"self" false)
+             value-ref (CoreRef.init (next-id! cell) @"value" false)
+             field-set-ref (PrimitiveRegistry.reference 49 "field-set!")
+             self-ann (CoreType.Reference (Box.init (CoreType.copy result-type))
+                                          (CoreLifetime.Inferred 0))]
+      (CoreFunction.init (CoreRef.copy fref)
+                         [(CoreRef.copy &self-ref) (CoreRef.copy &value-ref)]
+                         (Box.init
+                           (CoreExpr.Call -1
+                                          (Box.init
+                                            (CoreExpr.Reference -1
+                                                                (CoreRef.copy &field-set-ref)))
+                                          [(Box.init
+                                             (CoreExpr.Annotation -1
+                                                                  (Box.init
+                                                                    (CoreExpr.Reference -1
+                                                                                        (CoreRef.copy &self-ref)))
+                                                                  (Box.init self-ann)))
+                                           (Box.init (CoreExpr.IntLit -1 0))
+                                           (Box.init (CoreExpr.IntLit -1 fi))
+                                           (Box.init
+                                             (CoreExpr.Reference -1
+                                                                 (CoreRef.copy &value-ref)))])))))
+
+  (private gen-into)
+  (hidden gen-into)
+  (defn gen-into [builtins name decl-ref result-type nf fi kind cell fns removed]
+    (match (builtin-ref-by-name builtins name)
+      (Maybe.Just fref)
+        (do
+          (Array.push-back! fns
+                            (make-field-fn &fref
+                                           decl-ref
+                                           result-type
+                                           nf
+                                           fi
+                                           kind
+                                           cell))
+          (Array.push-back! removed @name))
+      (Maybe.Nothing) ()))
+
+  (doc accessors "returns `core` with real bodies for record field accessors.
+Resolution registers a getter as a body-less builtin; here each record
+constructor's fields generate a `(match-ref self (Ctor f..) fN)` body, and the
+matching builtin is dropped so the function is emitted and links.")
+  (defn accessors [context core]
+    (let-do [constructors (CoreModule.constructors core)
+             builtins (CoreModule.builtins core)
+             new-functions (Array.copy (CoreModule.functions core))
+             new-impls (Array.copy (CoreModule.implementations core))
+             new-signatures (Array.copy (CoreModule.signatures core))
+             removed (the (Array String) [])
+             cell (the (Array Int)
+                       [(Int.inc (CoreIR.max-declared-global-id core))])
+             cn (Array.length constructors)]
+      (for [ci 0 cn]
+        (let [c (Array.unsafe-nth constructors ci)
+              fnames (CoreConstructorDeclaration.field-names c)]
+          (when (Int.> (Array.length fnames) 0)
+            (let-do [decl-ref (CoreConstructorDeclaration.reference c)
+                     result-type (Box.peek (CoreConstructorDeclaration.result c))
+                     type-name (named-type-name result-type)
+                     nf (Array.length fnames)]
+              (for [fi 0 nf]
+                (let-do [field (Array.unsafe-nth fnames fi)
+                         base (String.concat &[(String.copy &type-name) @"."])]
+                  (gen-into builtins
+                            &(String.concat &[(String.copy &base) @field])
+                            decl-ref
+                            result-type
+                            nf
+                            fi
+                            0
+                            &cell
+                            &new-functions
+                            &removed)
+                  (gen-into builtins
+                            &(String.concat &[(String.copy &base) @"set-" @field])
+                            decl-ref
+                            result-type
+                            nf
+                            fi
+                            1
+                            &cell
+                            &new-functions
+                            &removed)
+                  (gen-into builtins
+                            &(String.concat &[(String.copy &base)
+                                              @"update-"
+                                              @field])
+                            decl-ref
+                            result-type
+                            nf
+                            fi
+                            2
+                            &cell
+                            &new-functions
+                            &removed)
+                  (let [mut-name (String.concat
+                          &[(String.copy &base) @"set-" @field @"!"])]
+                    (match (builtin-by-name builtins &mut-name)
+                      (Maybe.Just builtin)
+                        (do
+                          (Array.push-back! &new-functions
+                                            (make-mutator-fn (CoreBuiltin.reference &builtin)
+                                                             result-type
+                                                             fi
+                                                             &cell))
+                          ;; the body writes through `field-set!`, which
+                          ;; takes any value, so only the declared signature
+                          ;; ties the value to the field: keep it, as the
+                          ;; reference's setter is typed by its field
+                          (Array.push-back! &new-signatures
+                                            (CoreSignature.init @(CoreBuiltin.reference &builtin)
+                                                                @(CoreBuiltin.signature &builtin)))
+                          (Array.push-back! &removed @&mut-name))
+                      (Maybe.Nothing) ()))))
+              ;; copy is dispatched through the `copy` interface, so besides the
+              ;; body it needs an implementation registration.
+              (let [copy-name (String.concat &[(String.copy &type-name) @".copy"])]
+                (match (builtin-ref-by-name builtins &copy-name)
+                  (Maybe.Just cref)
+                    (do
+                      (Array.push-back! &new-functions
+                                        (make-field-fn &cref
+                                                       decl-ref
+                                                       result-type
+                                                       nf
+                                                       0
+                                                       3
+                                                       &cell))
+                      (Array.push-back! &new-impls
+                                        (CoreImplementation.init (PrimitiveRegistry.reference 0
+                                                                                              "copy")
+                                                                 (CoreRef.copy &cref)))
+                      (Array.push-back! &removed @&copy-name))
+                  (Maybe.Nothing) ()))))))
+      (finish-indexing context
+                       (CoreModule.init new-functions
+                                        @(CoreModule.values core)
+                                        (builtins-except builtins &removed)
+                                        @(CoreModule.builtin-sources core)
+                                        new-signatures
+                                        @(CoreModule.type-declarations core)
+                                        @(CoreModule.constructors core)
+                                        @(CoreModule.recursive-types core)
+                                        @(CoreModule.interfaces core)
+                                        new-impls
+                                        @(CoreModule.overloads core)
+                                        @(CoreModule.system-includes core)
+                                        @(CoreModule.expressions core)))))
+
+  ;; `Pair.init-from-refs` is registered as a body-less builtin (id 31) but is a
+  ;; real Core function `(init (copy a) (copy b))`. Give it that body so it emits
+  ;; and links; specialization monomorphizes it per concrete `Pair`.
+  (private make-init-from-refs)
+  (hidden make-init-from-refs)
+  (defn make-init-from-refs [fref cell]
+    (let-do [a-ref (CoreRef.init (next-id! cell) @"a" false)
+             b-ref (CoreRef.init (next-id! cell) @"b" false)
+             init-ref (PrimitiveRegistry.reference 38 "Pair.init")
+             copy-ref (PrimitiveRegistry.reference 0 "copy")]
+      (CoreFunction.init (CoreRef.copy fref)
+                         [(CoreRef.copy &a-ref) (CoreRef.copy &b-ref)]
+                         (Box.init
+                           (CoreExpr.Call -1
+                                          (Box.init
+                                            (CoreExpr.Reference -1
+                                                                (CoreRef.copy &init-ref)))
+                                          [(Box.init
+                                             (CoreExpr.Call -1
+                                                            (Box.init
+                                                              (CoreExpr.Reference -1
+                                                                                  (CoreRef.copy &copy-ref)))
+                                                            [(Box.init
+                                                               (CoreExpr.Reference -1
+                                                                                   (CoreRef.copy &a-ref)))]))
+                                           (Box.init
+                                             (CoreExpr.Call -1
+                                                            (Box.init
+                                                              (CoreExpr.Reference -1
+                                                                                  (CoreRef.copy &copy-ref)))
+                                                            [(Box.init
+                                                               (CoreExpr.Reference -1
+                                                                                   (CoreRef.copy &b-ref)))]))])))))
+
+  (doc pair-refs "supplies the body for the `Pair.init-from-refs` builtin so it
+links; a no-op when the builtin is absent.")
+  (defn pair-refs [context core]
+    (let-do [builtins (CoreModule.builtins core)
+             new-functions (Array.copy (CoreModule.functions core))
+             removed (the (Array String) [])
+             cell (the (Array Int)
+                       [(Int.inc (CoreIR.max-declared-global-id core))])]
+      (match (builtin-ref-by-name builtins "Pair.init-from-refs")
+        (Maybe.Just fref)
+          (do
+            (Array.push-back! &new-functions (make-init-from-refs &fref &cell))
+            (Array.push-back! &removed @"Pair.init-from-refs"))
+        (Maybe.Nothing) ())
+      (finish-indexing context
+                       (CoreModule.init new-functions
+                                        @(CoreModule.values core)
+                                        (builtins-except builtins &removed)
+                                        @(CoreModule.builtin-sources core)
+                                        @(CoreModule.signatures core)
+                                        @(CoreModule.type-declarations core)
+                                        @(CoreModule.constructors core)
+                                        @(CoreModule.recursive-types core)
+                                        @(CoreModule.interfaces core)
+                                        @(CoreModule.implementations core)
+                                        @(CoreModule.overloads core)
+                                        @(CoreModule.system-includes core)
+                                        @(CoreModule.expressions core)))))
+
+  ;; whether a deftype declaration is generic (its result type carries type
+  ;; arguments). A generic type's fallback `str` must stay field-less so it
+  ;; unifies at every instance; per-instance strs render the fields.
+  (private generic-constructor?)
+  (hidden generic-constructor?)
+  (defn generic-constructor? [c]
+    (match-ref (Box.peek (CoreConstructorDeclaration.result c))
+      (CoreType.Named _ args) (Int.> (Array.length args) 0)
+      _ false))
+
+  (private concat-reference)
+  (hidden concat-reference)
+  (defn concat-reference [core]
+    (let-do [found (the (Maybe CoreRef) (Maybe.Nothing))
+             functions (CoreModule.functions core)]
+      (for [i 0 (Array.length functions)]
+        (let [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
+          (when (String.= (CoreRef.name reference) "String.concat")
+            (set! found (Maybe.Just (CoreRef.copy reference))))))
+      found))
+
+  ;; one match branch for a constructor whose body is the constructor's name as
+  ;; a literal string (a simple faithful `str`; field values are not recursed).
+  (private str-branch)
+  (hidden str-branch)
+  (defn str-branch [c -cell]
+    (let-do [fields (CoreConstructorDeclaration.arguments c)
+             nf (Array.length fields)
+             patterns (the (Array (Box CorePattern)) [])
+             ctor-ref (CoreConstructorDeclaration.reference c)
+             ctor-name @(CoreRef.name ctor-ref)
+             ;; the reference compiler wraps the name in parentheses, e.g. `(A)`
+             ;; or `(Just)`. A record's constructor is `Type.init`, whose display
+             ;; is the type name; a sum's constructor keeps its own name. Field
+             ;; values are not recursed yet.
+             display (if (String.ends-with? &ctor-name ".init")
+               (named-type-name (Box.peek (CoreConstructorDeclaration.result c)))
+               (String.copy &ctor-name))
+             formatted (String.concat &[@"(" display @")"])]
+      ;; ignore every field: the body needs no field values, so the match leaves
+      ;; the type variables free and `str` stays generic (matches per instance).
+      (for [k 0 nf] (Array.push-back! &patterns (Box.init (CorePattern.Ignore))))
+      (CoreMatchBranch.init
+        (CorePattern.Constructor (CoreRef.copy ctor-ref) patterns)
+        []
+        (Box.init
+          (CoreExpr.Call -1
+                         (Box.init
+                           (CoreExpr.Reference -1
+                                               (PrimitiveRegistry.reference 0
+                                                                            "copy")))
+                         [(Box.init (CoreExpr.StringLit -1 formatted))])))))
+
+  (doc strs "generates a `str` for every deftype (record and sum) and registers
+it as a `str` implementation, the way the reference compiler derives it. Output
+is the matched constructor's name; a body-less builtin would not link and the
+Test framework calls `str` on every asserted value. Types that already define
+their own `<T>.str` (e.g. via a user `derive`) are left alone.")
+  (defn strs [context core]
+    (let-do [_ignored-reset (DeriveContext.set-fallback-str-ids! context [])
+             constructors (CoreModule.constructors core)
+             new-functions (Array.copy (CoreModule.functions core))
+             new-impls (Array.copy (CoreModule.implementations core))
+             str-ref (PrimitiveRegistry.reference 1 "str")
+             deref-ref (PrimitiveRegistry.reference 6 "deref")
+             copy-ref (PrimitiveRegistry.reference 0 "copy")
+             ref-ref (PrimitiveRegistry.reference 5 "ref")
+             concat-found (concat-reference core)
+             builtins (CoreModule.builtins core)
+             removed (the (Array String) [])
+             ;; nested generic field instances surfaced here are discarded:
+             ;; close-generics discovers them independently from inference.
+             scratch-insts (the (Array MonoType) [])
+             seen (the (Array String) [])
+             cell (the (Array Int)
+                       [(Int.inc (CoreIR.max-declared-global-id core))])
+             cn (Array.length constructors)]
+      (for [ci 0 cn]
+        (let-do [c (Array.unsafe-nth constructors ci)
+                 result-type (Box.peek (CoreConstructorDeclaration.result c))
+                 type-name (named-type-name result-type)
+                 ;; a user-written `<T>.str` or `<T>.prn` replaces only its
+                 ;; own member: the other is still derived, as in the reference
+                 derive-str? (not
+                   (function-named? (CoreModule.functions core)
+                                    &(String.concat &[(String.copy &type-name)
+                                                      @".str"])))
+                 derive-prn? (not
+                   (function-named? (CoreModule.functions core)
+                                    &(String.concat &[(String.copy &type-name)
+                                                      @".prn"])))]
+          (unless-do (or (contains-key? &seen &type-name)
+                         (not (or derive-str? derive-prn?)))
+            (set! seen (Array.push-back seen (String.copy &type-name)))
+            (let-do [branches (the (Array CoreMatchBranch) [])
+                     fn-name (String.concat
+                       &[(String.copy &type-name)
+                         (if derive-str? @".str" @".prn")])
+                     ;; a qualified call site (`(T.str &x)`) makes resolution
+                     ;; register a body-less builtin for the name; bind the
+                     ;; derived definition to THAT reference and drop the
+                     ;; builtin, exactly as `accessors` does — otherwise the
+                     ;; call site points at a declaration with no body and the
+                     ;; program fails to link.
+                     ;; Only for concrete types: a generic type's fallback
+                     ;; keeps a fresh id recorded in the derivation context,
+                     ;; which is how per-instance derivation tells a derived
+                     ;; str from a user-written one.
+                     fn-ref (match (if (generic-constructor? c)
+                         (Maybe.Nothing)
+                         (builtin-ref-by-name builtins &fn-name))
+                       (Maybe.Just existing)
+                         (do
+                           (Array.push-back! &removed (String.copy &fn-name))
+                           existing)
+                       (Maybe.Nothing)
+                         (CoreRef.init (next-id! &cell)
+                                       (String.copy &fn-name)
+                                       true))
+                     ;; a generic type's fallback is overridable by
+                     ;; per-instance derivation: record its identity.
+                     _ignored-provenance (when (generic-constructor? c)
+                       (Array.push-back! (DeriveContext.fallback-str-ids context)
+                                         @(CoreRef.id &fn-ref)))
+                     param-ref (CoreRef.init (next-id! &cell) @"self" false)]
+              (for [cj 0 cn]
+                (let [c2 (Array.unsafe-nth constructors cj)]
+                  (when (String.=
+                      &(named-type-name
+                        (Box.peek (CoreConstructorDeclaration.result c2)))
+                      &type-name)
+                    ;; a concrete deftype's fields have no type variables, so
+                    ;; its `str` can render field values right here (matching
+                    ;; the reference, which derives str per concretization).
+                    ;; A generic type keeps the field-less fallback so it
+                    ;; unifies at every instance; per-instance strs, derived
+                    ;; later, render those fields and win dispatch.
+                    (set! branches
+                          (Array.push-back branches
+                                           (match-ref &concat-found
+                                             (Maybe.Just concat-ref)
+                                               (if (generic-constructor? c2)
+                                                 (str-branch c2 &cell)
+                                                 (instance-str-branch c2
+                                                                      &(MonoType.Named (String.copy &type-name)
+                                                                                       [])
+                                                                      &cell
+                                                                      &str-ref
+                                                                      &deref-ref
+                                                                      &copy-ref
+                                                                      &ref-ref
+                                                                      concat-ref
+                                                                      &scratch-insts))
+                                             (Maybe.Nothing)
+                                               (str-branch c2 &cell)))))))
+              (set! new-functions
+                    (Array.push-back new-functions
+                                     (CoreFunction.init (CoreRef.copy &fn-ref)
+                                                        [(CoreRef.copy &param-ref)]
+                                                        (Box.init
+                                                          (CoreExpr.Match -1
+                                                                          true
+                                                                          (Box.init
+                                                                            (CoreExpr.Annotation -1
+                                                                                                 (Box.init
+                                                                                                   (CoreExpr.Reference -1
+                                                                                                                       (CoreRef.copy &param-ref)))
+                                                                                                 (Box.init
+                                                                                                   (CoreType.Reference (Box.init (CoreType.copy result-type))
+                                                                                                                       (CoreLifetime.Inferred 0)))))
+                                                                          branches)))))
+              (when derive-str?
+                (set! new-impls
+                      (Array.push-back new-impls
+                                       (CoreImplementation.init (CoreRef.copy &str-ref)
+                                                                (CoreRef.copy &fn-ref)))))
+              (when derive-prn?
+                (set! new-impls
+                      (Array.push-back new-impls
+                                       (CoreImplementation.init (PrimitiveRegistry.reference 2
+                                                                                             "prn")
+                                                                (CoreRef.copy &fn-ref)))))))))
+      (finish-indexing context
+                       (CoreModule.init new-functions
+                                        @(CoreModule.values core)
+                                        (builtins-except builtins &removed)
+                                        @(CoreModule.builtin-sources core)
+                                        @(CoreModule.signatures core)
+                                        @(CoreModule.type-declarations core)
+                                        @(CoreModule.constructors core)
+                                        @(CoreModule.recursive-types core)
+                                        @(CoreModule.interfaces core)
+                                        new-impls
+                                        @(CoreModule.overloads core)
+                                        @(CoreModule.system-includes core)
+                                        @(CoreModule.expressions core))))))
+
+(defmodule Derive
+  (doc copies "returns `core` extended with a derived `copy` for every managed
+deftype and every sum type: a `(match-ref ref (Ctor f..) (Ctor (copy f)..))`
+that deep-copies managed or polymorphic fields and blits the rest, so generic
+sums retain a real specializable body instead of a body-less Core declaration.")
+  (private replace-function-named)
+  (hidden replace-function-named)
+  ;; Overwrite the one matching function in place. Rebuilding the array
+  ;; instead deep-copies every OTHER function to replace one of them, and
+  ;; `copies` calls this once per managed type.
+  (defn replace-function-named [functions name parameter body]
+    (let-do [n (Array.length &functions)
+             at -1]
+      (for [i 0 n]
+        (when (and (Int.< at 0)
+                   (String.=
+                     (CoreRef.name
+                       (CoreFunction.reference (Array.unsafe-nth &functions i)))
+                     name))
+          (set! at i)))
+      (when-do (Int.>= at 0)
+        (let [replacement (CoreFunction.init
+                (CoreRef.copy
+                  (CoreFunction.reference (Array.unsafe-nth &functions at)))
+                [(CoreRef.copy parameter)]
+                (Box.init (CoreExpr.copy body)))]
+          (Array.aset! &functions at replacement)))
+      functions))
+
+  (private deftype-core-type)
+  (hidden deftype-core-type)
+  (defn deftype-core-type [constructors key]
+    (let-do [result (CoreType.Unit)
+             found false
+             n (Array.length constructors)]
+      (for [i 0 n]
+        (let [candidate (Box.peek
+                (CoreConstructorDeclaration.result (Array.unsafe-nth constructors
+                                                                     i)))]
+          (match (core-base-type-key candidate)
+            (Maybe.Just candidate-key)
+              (when-do (and (not found) (String.= &candidate-key key))
+                (set! result (CoreType.copy candidate))
+                (set! found true))
+            (Maybe.Nothing) ())))
+      result))
+
+  (defn copies [context core]
+    (let-do [targets (derive-target-keys core)
+             facts (OwnershipClassify.facts-from-module core)
+             managed (managed-keys core (OwnershipTypeFacts.owned &facts))
+             extra (sum-keys core &managed)
+             constructors (CoreModule.constructors core)
+             builtins (CoreModule.builtins core)
+             new-functions (Array.copy (CoreModule.functions core))
+             new-impls (Array.copy (CoreModule.implementations core))
+             new-signatures (Array.copy (CoreModule.signatures core))
+             removed (the (Array String) [])
+             copy-ref (PrimitiveRegistry.reference 0 "copy")
+             deref-ref (PrimitiveRegistry.reference 6 "deref")
+             cell (the (Array Int)
+                       [(Int.inc (CoreIR.max-declared-global-id core))])]
+      (for [e 0 (Array.length &extra)]
+        (let [key (Array.unsafe-nth &extra e)]
+          (unless (contains-key? &targets key)
+            (set! targets (Array.push-back targets @key)))))
+      (for [t 0 (Array.length &targets)]
+        (let-do [tkey (Array.unsafe-nth &targets t)
+                 type-name (deftype-name constructors tkey)
+                 result-type (deftype-core-type constructors tkey)
+                 fn-name (String.concat &[(String.copy &type-name) @".copy"])
+                 ;; `accessors` already supplies a `<T>.copy` when resolution
+                 ;; declared one (a qualified `(T.copy &x)` call site); deriving
+                 ;; a second one collides on the same C symbol.
+                 already (function-named? (CoreModule.functions core) &fn-name)
+                 builtin (builtin-ref-by-name builtins &fn-name)
+                 fn-ref (match-ref &builtin
+                   (Maybe.Just reference) (CoreRef.copy reference)
+                   (Maybe.Nothing)
+                     (CoreRef.init (next-id! &cell) (String.copy &fn-name) true))
+                 param-ref (CoreRef.init (next-id! &cell) @"ref" false)
+                 branches (the (Array CoreMatchBranch) [])
+                 cn (Array.length constructors)]
+          (for [ci 0 cn]
+            (let [c (Array.unsafe-nth constructors ci)]
+              (when (constructor-of? c tkey)
+                (set! branches
+                      (Array.push-back branches
+                                       (copy-branch c
+                                                    &managed
+                                                    &copy-ref
+                                                    &deref-ref
+                                                    &cell))))))
+          (if already
+            ;; `accessors` already materialized the declared `<T>.copy` with a
+            ;; shallow blit body. A type that owns memory through a field must
+            ;; deep-copy it, so the deep body REPLACES the shallow one — under
+            ;; the same reference, keeping the existing implementation entry
+            ;; and any call sites valid.
+            (when (contains-key? &managed tkey)
+              (set! new-functions
+                    (replace-function-named new-functions
+                                            &fn-name
+                                            &param-ref
+                                            &(CoreExpr.Match -1
+                                                             true
+                                                             (Box.init
+                                                               (CoreExpr.Reference -1
+                                                                                   (CoreRef.copy &param-ref)))
+                                                             branches))))
+            (do
+              (set! new-functions
+                    (Array.push-back new-functions
+                                     (CoreFunction.init (CoreRef.copy &fn-ref)
+                                                        [(CoreRef.copy &param-ref)]
+                                                        (Box.init
+                                                          (CoreExpr.Match -1
+                                                                          true
+                                                                          (Box.init
+                                                                            (CoreExpr.Reference -1
+                                                                                                (CoreRef.copy &param-ref)))
+                                                                          branches)))))
+              ;; Core's deftype expansion may already have declared a body-less
+              ;; `<T>.copy` builtin and registered it with the interface. Adopt
+              ;; that exact reference, remove the builtin declaration, and
+              ;; attach the derived body so existing call sites materialize it.
+              (match-ref &builtin
+                (Maybe.Just _)
+                  (Array.push-back! &removed (String.copy &fn-name))
+                (Maybe.Nothing) ())
+              (unless (implementation-exists? &new-impls &copy-ref &fn-ref)
+                (set! new-impls
+                      (Array.push-back new-impls
+                                       (CoreImplementation.init (CoreRef.copy &copy-ref)
+                                                                (CoreRef.copy &fn-ref)))))
+              ;; Removing a body-less Core builtin also removes the declaration
+              ;; that constrained its nominal type. Retain that constraint as
+              ;; an explicit signature; otherwise inference generalizes every
+              ;; derived sum copier to `&a -> a` and unrelated constructors can
+              ;; steal each other's calls during interface dispatch.
+              (set! new-signatures
+                    (Array.push-back new-signatures
+                                     (CoreSignature.init (CoreRef.copy &fn-ref)
+                                                         (Box.init
+                                                           (CoreType.Function
+                                                             [(Box.init
+                                                                (CoreType.Reference (Box.init (CoreType.copy &result-type))
+                                                                                    (CoreLifetime.Inferred 0)))]
+                                                             (Box.init (CoreType.copy &result-type)))))))))))
+      (finish-indexing context
+                       (CoreModule.init new-functions
+                                        @(CoreModule.values core)
+                                        (builtins-except builtins &removed)
+                                        @(CoreModule.builtin-sources core)
+                                        new-signatures
+                                        @(CoreModule.type-declarations core)
+                                        @(CoreModule.constructors core)
+                                        @(CoreModule.recursive-types core)
+                                        @(CoreModule.interfaces core)
+                                        new-impls
+                                        @(CoreModule.overloads core)
+                                        @(CoreModule.system-includes core)
+                                        @(CoreModule.expressions core))))))

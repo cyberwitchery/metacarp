@@ -17,27 +17,43 @@ An interface call is resolved to a matching registered implementation before
 an instance is emitted. Builtins are leaf instances; functions continue to
 contribute body dependencies.
 
-Module-level caches carry data derived from one inferred module. `prime-trace!`
-primes them at every public entry and `clear-caches!` drops them afterwards:
-the normalized node types, an indexed `Type.solver-from-substitution` view of
-the module substitution (which applies that substitution wherever a concrete
-type is needed), and the node types and call sites grouped by owner. A public
-entry that does not prime them applies one module's substitution to another's
-types. `module-with-known` adds two that also depend on the core module and
-are only on while it runs: interface dispatch results, keyed by the interface
-id and an exact spelling of the call type (`Type.render` drops lifetimes and
-renames variables, so it cannot serve as the key), and the implementations
-grouped by interface.
+`Specialize.prepare` builds an invocation-owned `SpecializeContext` for one
+unchanged Core/inference input. It owns the scheme index, owner and call buckets, interface implementation buckets, and a
+snapshot of native naming policy. The driver reuses this context for named
+roots, specialization/ownership closure rounds, and echo demands.
 
-Call and expression ids repeat across owners, so nothing here may be memoized
-by id alone; `*trace-positions*` is rebuilt per owner for that reason.
+`SpecializationDemands` retains deduplicated copier and deleter requests across
+ownership-closure rounds. `Specialize.module-with-demands` borrows these streams
+and seeds its work queue in deleter, copier, then named-seed order. The driver
+adds requirements and decides convergence; specialization owns request storage
+and does not call ownership. Existing specialization entry points keep their
+arguments and results.
 
-The module also exports the pattern-slot utilities the ownership and backend
-phases share: `bound-slot-types` and `unbound-slot-types` type a match
-pattern's `Bind` and `Ignore` slots from the constructor declarations and the
-scrutinee's concrete type, and `bind-unbound-slots` rewrites chosen `Ignore`
-slots to fresh bindings in the same depth-first order — how a by-value match's
-dropped payloads get owners the delete plan can free.
+Each materialization call owns a separate `SpecializeWork`: instance buckets,
+owner-local expression positions, an indexed copy of its module substitution,
+normalized node types, and exact-type
+interface dispatch results. It releases that work before ownership planning.
+Named and echo queries allocate no trace memo. Materialization allocates empty
+optional slots on its first expression query and boxes only normalized types
+it actually visits. No boxed Unit placeholders are allocated.
+
+Call and expression ids repeat across owners. Expression positions are rebuilt
+per owner; indexed hits still check the complete reference identity. Dispatch
+keys retain lifetimes and variable identities, which `Type.render` omits.
+The legacy naming setters change defaults for future contexts; prepared
+contexts retain their own snapshots. Other compiler services still require
+serialized invocations.
+
+The pattern-slot entry points remain as compatibility facades over
+`PatternTyping` in `carp-types/pattern-typing.carp`. That library owns typing
+of bound and ignored payloads and the corresponding masked pattern rewrite.
+Ownership obtains both slot sets in one traversal; backend lowering requests
+only ignored slots.
+
+`captures.carp` provides read-only `CaptureAnalysis`: free bindings of one
+lambda or all closures in a concrete module. Ownership closure and backend
+lambda lifting use the same lexical binding rules. Analysis does not rewrite
+bodies or allocate native symbols.
 
 ```bash
 carp -x test/carp-specialize.carp

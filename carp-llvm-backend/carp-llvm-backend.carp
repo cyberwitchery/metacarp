@@ -31,6 +31,7 @@
 ;; emission under the reference compiler, at top level it is reliable.
 
 (load "../carp-backend/carp-backend.carp")
+(load "../carp-types/core-instantiation.carp")
 (load "git@github.com:carpentry-org/llvm@0.1.0")
 (load "artifacts.carp")
 (LLVM.setup)
@@ -183,29 +184,16 @@
 (defn llvm-cstr [s] (String.cstr s))
 
 (hidden llvm-debug-enabled?)
-(defn llvm-debug-enabled? []
-  (Int.> (Array.length (BackendLineMap.lines &*llvm-line-map*)) 0))
+(defn llvm-debug-enabled? [] (BackendLineMap.enabled? &*llvm-line-map*))
 
 (hidden llvm-debug-line)
-(defn llvm-debug-line [id]
-  (if (and (Int.>= id 0)
-           (Int.< id (Array.length (BackendLineMap.lines &*llvm-line-map*))))
-    @(Array.unsafe-nth (BackendLineMap.lines &*llvm-line-map*) id)
-    -1))
+(defn llvm-debug-line [id] (BackendLineMap.line-of &*llvm-line-map* id))
 
 (hidden llvm-debug-column)
-(defn llvm-debug-column [id]
-  (if (and (Int.>= id 0)
-           (Int.< id (Array.length (BackendLineMap.columns &*llvm-line-map*))))
-    @(Array.unsafe-nth (BackendLineMap.columns &*llvm-line-map*) id)
-    0))
+(defn llvm-debug-column [id] (BackendLineMap.column-of &*llvm-line-map* id))
 
 (hidden llvm-debug-file-name)
-(defn llvm-debug-file-name [id]
-  (if (and (Int.>= id 0)
-           (Int.< id (Array.length (BackendLineMap.files &*llvm-line-map*))))
-    (String.copy (Array.unsafe-nth (BackendLineMap.files &*llvm-line-map*) id))
-    @""))
+(defn llvm-debug-file-name [id] (BackendLineMap.file-of &*llvm-line-map* id))
 
 (hidden llvm-debug-file-index)
 (defn llvm-debug-file-index [name]
@@ -823,16 +811,6 @@ copy }` — every function value shares it.")
         (set! found i)))
     found))
 
-(hidden llvm-managed-symbol)
-(defn llvm-managed-symbol [pairs type]
-  (let-do [result (the (Maybe String) (Maybe.Nothing))
-           key (CAbi.type-key type)]
-    (for [i 0 (Array.length pairs)]
-      (let [entry (Array.unsafe-nth pairs i)]
-        (when (String.= (Pair.a entry) &key)
-          (set! result (Maybe.Just (String.copy (Pair.b entry)))))))
-    result))
-
 (doc llvm-named-fn "get-named-function with the name String kept alive
 across the call — `(llvm-cstr &(fmt ...))` hands LLVM a pointer into a
 temporary that can be freed first.")
@@ -904,7 +882,7 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
           (let [t (Specialize.expression-type
                   (llvm-capture-value (Box.peek (Array.unsafe-nth arguments i))))]
             (when (and (llvm-aggregate-monotype? &t)
-                       (match (llvm-managed-symbol &*llvm-copy-symbols* &t)
+                       (match (CAbi.symbol-for-type &*llvm-copy-symbols* &t)
                          (Maybe.Just _) true
                          (Maybe.Nothing) false))
               (llvm-argspill-add! @id i (Type.reference t (MonoLifetime.Static)))))))
@@ -1015,61 +993,31 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
 (doc llvm-monotype-of-coretype-with "a constructor field's concrete type:
 the declared CoreType with the instance's variable bindings substituted.")
 (hidden llvm-monotype-of-coretype-with)
-(defn llvm-monotype-of-coretype-with [names types type]
-  (match-ref type
-    (CoreType.Integer) (Type.integer)
-    (CoreType.Boolean) (Type.boolean)
-    (CoreType.String) (Type.string)
-    (CoreType.Unit) (Type.unit)
-    (CoreType.Variable vname)
-      (let-do [result (the (Maybe MonoType) (Maybe.Nothing))]
-        (for [i 0 (Array.length names)]
-          (when (String.= (Array.unsafe-nth names i) vname)
-            (set! result (Maybe.Just (MonoType.copy (Array.unsafe-nth types i))))))
-        (match result
-          (Maybe.Just concrete) concrete
-          (Maybe.Nothing)
-            (do
-              (llvm-emit-error!
-                (fmt "unbound type variable %s in llvm backend" vname))
-              (Type.integer))))
-    (CoreType.Named name arguments)
-      (let-do [lowered (the (Array (Box MonoType)) [])]
-        (for [i 0 (Array.length arguments)]
-          (Array.push-back! &lowered
-                            (Box.init
-                              (llvm-monotype-of-coretype-with names
-                                                              types
-                                                              (Box.peek (Array.unsafe-nth arguments
-                                                                                          i))))))
-        (Type.named name lowered))
-    (CoreType.Reference inner _)
-      (Type.reference
-        (llvm-monotype-of-coretype-with names types (Box.peek inner))
-        (MonoLifetime.Static))
-    (CoreType.Function arguments result)
-      (let-do [lowered (the (Array (Box MonoType)) [])]
-        (for [i 0 (Array.length arguments)]
-          (Array.push-back! &lowered
-                            (Box.init
-                              (llvm-monotype-of-coretype-with names
-                                                              types
-                                                              (Box.peek (Array.unsafe-nth arguments
-                                                                                          i))))))
-        (Type.function lowered
-                       (llvm-monotype-of-coretype-with names
-                                                       types
-                                                       (Box.peek result))))
-    _
-      (do
-        (llvm-emit-error! @"unsupported constructor field type in llvm backend")
-        (Type.integer))))
+(hidden llvm-lookup-field-variable)
+(defn llvm-lookup-field-variable [bindings vname]
+  (let-do [result (the (Maybe MonoType) (Maybe.Nothing))]
+    (for [i 0 (Array.length bindings)]
+      (when (String.= (Pair.a (Array.unsafe-nth bindings i)) vname)
+        (set! result
+              (Maybe.Just (MonoType.copy (Pair.b (Array.unsafe-nth bindings i)))))))
+    (match result
+      (Maybe.Just concrete) (Result.Success concrete)
+      (Maybe.Nothing)
+        (do
+          (llvm-emit-error!
+            (fmt "unbound type variable %s in llvm backend" vname))
+          (Result.Success (Type.integer))))))
 
-(doc llvm-instance-bindings! "fills `names`/`types` with the variable bindings
+(defn llvm-monotype-of-coretype-with [bindings type]
+  (Result.from-success
+    (CoreInstantiation.type-with type bindings &llvm-lookup-field-variable)
+    (Type.integer)))
+
+(doc llvm-instance-bindings! "fills `bindings` with the variable bindings
 that specialize a constructor's declared result to the concrete `instance`.
 False when the shapes do not line up.")
 (hidden llvm-instance-bindings!)
-(defn llvm-instance-bindings! [decl instance names types]
+(defn llvm-instance-bindings! [decl instance bindings]
   (match-ref (Box.peek (CoreConstructorDeclaration.result decl))
     (CoreType.Named _ vars)
       (match-ref instance
@@ -1080,11 +1028,10 @@ False when the shapes do not line up.")
               (for [i 0 (Array.length vars)]
                 (match-ref (Box.peek (Array.unsafe-nth vars i))
                   (CoreType.Variable vname)
-                    (do
-                      (Array.push-back! names (String.copy vname))
-                      (Array.push-back! types
-                                        (MonoType.copy (Box.peek (Array.unsafe-nth concrete
-                                                                                   i)))))
+                    (Array.push-back! bindings
+                                      (Pair.init (String.copy vname)
+                                                 (MonoType.copy (Box.peek (Array.unsafe-nth concrete
+                                                                                            i)))))
                   _ (set! ok false)))
               ok))
         _ false)
@@ -1217,15 +1164,13 @@ through a pointer-only wrapper.")
       (let [decl (Array.unsafe-nth &*llvm-backend-constructors* i)]
         (when (and (llvm-sum-variant-of? decl &name)
                    (Int.= @(CoreConstructorDeclaration.tag decl) tag))
-          (let-do [names (the (Array String) [])
-                   types (the (Array MonoType) [])]
+          (let-do [bindings (the (Array (Pair String MonoType)) [])]
             (set! found true)
-            (if (llvm-instance-bindings! decl instance &names &types)
+            (if (llvm-instance-bindings! decl instance &bindings)
               (let [arguments (CoreConstructorDeclaration.arguments decl)]
                 (for [j 0 (Array.length arguments)]
                   ;; a unit member has no storage, like the C backend's elision
-                  (let [mt (llvm-monotype-of-coretype-with &names
-                                                           &types
+                  (let [mt (llvm-monotype-of-coretype-with &bindings
                                                            (Box.peek (Array.unsafe-nth arguments
                                                                                        j)))]
                     (unless (unit-type? &mt)
@@ -1379,15 +1324,12 @@ type and the unqualified name, like the C backend's constructor-for-pattern.")
 under the given instance.")
 (hidden llvm-ctor-field-monotype)
 (defn llvm-ctor-field-monotype [index instance field]
-  (let-do [names (the (Array String) [])
-           types (the (Array MonoType) [])]
+  (let-do [bindings (the (Array (Pair String MonoType)) [])]
     (if (llvm-instance-bindings!
         (Array.unsafe-nth &*llvm-backend-constructors* index)
         instance
-        &names
-        &types)
-      (llvm-monotype-of-coretype-with &names
-                                      &types
+        &bindings)
+      (llvm-monotype-of-coretype-with &bindings
                                       (Box.peek
                                         (Array.unsafe-nth
                                           (CoreConstructorDeclaration.arguments
@@ -1806,8 +1748,8 @@ environment, store the captured values, and assemble a Lambda over
                   (when (Int.< i (Array.length &captures))
                     (let [capture-type (Box.peek (Pair.b (Array.unsafe-nth &captures
                                                                            i)))]
-                      (match (llvm-managed-symbol &*llvm-copy-symbols*
-                                                  capture-type)
+                      (match (CAbi.symbol-for-type &*llvm-copy-symbols*
+                                                   capture-type)
                         (Maybe.Just copier)
                           (if (or (llvm-cimpl? &copier)
                                   (and (llvm-cnative? &copier)
@@ -2127,7 +2069,7 @@ an aggregate (the entry then takes the place itself); otherwise directly, with
 the value loaded.")
 (hidden llvm-delete-in-place!)
 (defn llvm-delete-in-place! [ctx builder mod type place]
-  (match (llvm-managed-symbol &*llvm-delete-symbols* type)
+  (match (CAbi.symbol-for-type &*llvm-delete-symbols* type)
     (Maybe.Just deleter)
       (if (or (llvm-cimpl? &deleter)
               (and (llvm-cnative? &deleter) (llvm-aggregate-monotype? type)))
@@ -3885,7 +3827,7 @@ copied through their copiers.")
 (hidden llvm-define-closure-env-fns!)
 (hidden llvm-copy-field!)
 (defn llvm-copy-field! [ctx builder mod type source destination]
-  (match (llvm-managed-symbol &*llvm-copy-symbols* type)
+  (match (CAbi.symbol-for-type &*llvm-copy-symbols* type)
     (Maybe.Just copier)
       (if (or (llvm-cimpl? &copier)
               (and (llvm-cnative? &copier) (llvm-aggregate-monotype? type)))

@@ -1,3 +1,5 @@
+(load "../carp-graph/positions.carp")
+(load "../carp-types/pattern-typing.carp")
 (load "../carp-ir/carp-ir.carp")
 (load "../carp-infer/carp-infer.carp")
 (load "../carp-types/carp-types.carp")
@@ -101,91 +103,54 @@ and the complete concrete instance cache after satisfying that cell's roots.")
 (deftype SpecializationRequest [call CallSite
                                 origin String])
 
-;; id→position index over the current scheme environment; primed by every
-;; public entry (see prime-schemes!) so scheme lookups are O(1) instead of a
-;; full environment scan per call site.
-(def *scheme-id-index* (the (Array Int) []))
+(doc SpecializationDemands "owns deduplicated copier and deleter requests across
+closure rounds. Each stream retains its first ABI-key representative and order.")
+(deftype SpecializationDemands
+  [delete-keys (Set String)
+   copy-keys (Set String)
+   deletes (Array SpecializationRequest)
+   copies (Array SpecializationRequest)])
 
-;; reference-id→instance-positions buckets over the worklist's instance
-;; array; primed by the worklist and consulted by contains-instance? and
-;; instance-for so instance lookups scan one reference's bucket, not every
-;; instance. Empty buckets (an unprimed standalone call) fall back to the
-;; linear scan.
-(def *instance-buckets* (the (Array (Array Int)) []))
-
-;; Persistent native sessions compile transactional cells into one symbol
-;; table. Their Core identities intentionally repeat, so the host supplies a
-;; per-cell namespace. Batch compilation leaves this empty.
+; Legacy naming defaults are snapshotted at invocation creation. They are
+; policy inputs; none of the specialization caches lives in process globals.
 (def *specialization-symbol-salt* (String.copy ""))
 (def *specialization-symbol-references* (the (Array CoreRef) []))
 (def *specialization-binding-versions* (the (Array (Pair String String)) []))
 
-;; per-trace-position memo of node types with the module substitution applied,
-;; filled lazily on first touch (normalization is instance-independent, so a
-;; node touched by many instances pays the full-substitution apply once; nodes
-;; never materialized pay nothing). Reset per public entry (see prime-trace!).
-;; Unfilled slots hold a Unit placeholder; *normalized-filled* is the truth.
-(def *normalized-node-types* (the (Array (Box MonoType)) []))
-(def *normalized-filled* (the (Array Bool) []))
-;; an indexed, read-only view of the module substitution, built once per
-;; public entry. Applying a substitution looks a variable up per occurrence,
-;; and the module substitution is module-sized, so the plain association-list
-;; scan is linear in the whole module every time. `Type.solver-*` answers in
-;; constant time from the same bindings.
-;;
-;; This view must belong to the `inferred` that specialization is running
-;; over. It rides the same invariant the normalized-node-type memo above it
-;; already rides: every public entry calls `prime-trace!` before anything
-;; downstream can reach it, and `clear-caches!` drops it afterwards. A stale
-;; view would apply one module's substitution to another module's types.
-(def *module-solver* (Type.solver))
-(def *module-solver-ready* false)
+(doc SpecializeContext
+  "the indexes and native naming policy for one fixed Core/inference input. Reuse it only with that input, including repeated ownership-closure rounds.")
+(deftype SpecializeContext
+  [scheme-id-index (Array Int)
+   owner-buckets PositionBuckets
+   call-buckets PositionBuckets
+   implementation-buckets PositionBuckets
+   symbol-salt String
+   symbol-references (Array CoreRef)
+   binding-versions (Array (Pair String String))])
 
-;; node-type positions grouped by owner, as a flat array plus per-owner
-;; start offsets (`*owner-bucket-items*` indexed by `*owner-bucket-start*`),
-;; with `*owner-slot-of-key*` mapping an owner's trace key to its slot. Built
-;; in one pass per entry, because `prime-trace-owner!` otherwise scans every
-;; node type in the module twice on every owner switch, and materialization
-;; switches owners once per instance.
-(def *owner-slot-of-key* (the (Map Int Int) (Map.create)))
-(def *owner-bucket-start* (the (Array Int) []))
-(def *owner-bucket-items* (the (Array Int) []))
-
-(doc PositionBuckets "positions grouped by an integer key: `items` holds them
-slot by slot, `starts` where each slot begins, and `slot-of` maps a key to its
-slot.")
-(deftype PositionBuckets
-  [slot-of (Map Int Int)
-   starts (Array Int)
-   items (Array Int)])
-
-;; call-site positions grouped by owner the same way, so the calls one
-;; definition makes are found without scanning every call in the module per
-;; specialized instance. Only valid between `prime-trace!` and
-;; `clear-caches!`; a lookup outside that window scans.
-(def *call-buckets* (PositionBuckets.init (Map.create) [] []))
-(def *call-buckets-ready* false)
-
-;; expr-id → trace position for the owner named by *trace-owner-key*;
-;; expression ids repeat across owners, so the index is per-owner and is
-;; rebuilt when the owner changes (once per materialized instance).
-(def *trace-positions* (the (Array Int) []))
-(def *trace-owner-key* -1000000002)
-
-;; interface dispatch results by interface id and exact call type. The
-;; worklist resolves a dispatch when it queues a call and materialization
-;; resolves the same one again, and one `delete` or `copy` at one type is
-;; called from many definitions. Only on inside `module-with-known`, whose
-;; core and inferred module the answers belong to.
-(def *implementations*
-  (the
-    (Map String (Result (Pair CoreRef (Box MonoType)) SpecializeError))
-    (Map.create)))
-(def *implementations-ready* false)
-;; implementation positions grouped by interface id, built with the memo above
-(def *implementation-buckets* (PositionBuckets.init (Map.create) [] []))
+; Reusable indexes and temporary work are passed separately as references.
+; A work record never escapes an entry function; all returned IR is owned.
+(deftype SpecializeWork
+  [module-solver TypeSolver
+   instance-buckets (Array (Array Int))
+   normalized-node-types (Array (Maybe (Box MonoType)))
+   trace-positions (Array Int)
+   trace-owner-key Int
+   implementations (Map String
+                        (Result (Pair CoreRef (Box MonoType)) SpecializeError))])
 
 (defmodule Specialize
+  (private work-for)
+  (hidden work-for)
+  (defn work-for [inferred]
+    (SpecializeWork.init
+      (Type.solver-from-substitution (InferredModule.substitution inferred))
+      []
+      []
+      []
+      -1000000002
+      (Map.create)))
+
   (doc expression-id "returns the stable, owner-scoped ID retained on a
 specialized expression.")
   (defn expression-id [expression]
@@ -248,222 +213,21 @@ expression.")
       (SpecializedExpr.Match _ type _ _ _) (MonoType.copy (Box.peek type))
       (SpecializedExpr.Annotation _ type _ _) (MonoType.copy (Box.peek type))))
 
-  (private slot-subst-lookup)
-  (hidden slot-subst-lookup)
-  (defn slot-subst-lookup [subst name]
-    (let-do [result (MonoType.Unit)
-             n (Array.length subst)]
-      (for [i 0 n]
-        (when (String.= (Pair.a (Array.unsafe-nth subst i)) name)
-          (set! result (MonoType.copy (Pair.b (Array.unsafe-nth subst i))))))
-      result))
+  (doc unbound-slot-types
+    "compatibility facade for PatternTyping.unbound-slot-types.")
+  (defn unbound-slot-types [pattern type constructors]
+    (PatternTyping.unbound-slot-types pattern type constructors))
 
-  (private concretize-slot-type)
-  (hidden concretize-slot-type)
-  (sig concretize-slot-type
-       (Fn [(Ref CoreType) (Ref (Array (Pair String MonoType)))] MonoType))
-  (defn concretize-slot-type [core-type subst]
-    (match-ref core-type
-      (CoreType.Integer) (MonoType.Integer)
-      (CoreType.String) (MonoType.String)
-      (CoreType.Boolean) (MonoType.Boolean)
-      (CoreType.Unit) (MonoType.Unit)
-      (CoreType.Variable name) (slot-subst-lookup subst name)
-      (CoreType.Named name arguments)
-        (let-do [margs (the (Array (Box MonoType)) [])]
-          (for [i 0 (Array.length arguments)]
-            (Array.push-back! &margs
-                              (Box.init
-                                (concretize-slot-type
-                                  (Box.peek (Array.unsafe-nth arguments i))
-                                  subst))))
-          (MonoType.Named (String.copy name) margs))
-      (CoreType.Reference inner _)
-        (MonoType.Reference
-          (Box.init (concretize-slot-type (Box.peek inner) subst))
-          (MonoLifetime.Static))
-      (CoreType.Function arguments return-type)
-        (let-do [margs (the (Array (Box MonoType)) [])]
-          (for [i 0 (Array.length arguments)]
-            (Array.push-back! &margs
-                              (Box.init
-                                (concretize-slot-type
-                                  (Box.peek (Array.unsafe-nth arguments i))
-                                  subst))))
-          (MonoType.Function margs
-                             (Box.init
-                               (concretize-slot-type (Box.peek return-type)
-                                                     subst))))))
+  (doc bound-slot-types
+    "compatibility facade for PatternTyping.bound-slot-types.")
+  (defn bound-slot-types [pattern type constructors]
+    (PatternTyping.bound-slot-types pattern type constructors))
 
-  (private collect-unbound-slots!)
-  (hidden collect-unbound-slots!)
-  (sig collect-unbound-slots!
-       (Fn
-         [(Ref CorePattern)
-          (Ref MonoType)
-          (Ref (Array CoreConstructorDeclaration))
-          (Ref (Array MonoType))]
-         ()))
-  (defn collect-unbound-slots! [pattern scrutinee-type constructors acc]
-    (match-ref pattern
-      (CorePattern.Ignore) (Array.push-back! acc (MonoType.copy scrutinee-type))
-      (CorePattern.Bind _) ()
-      (CorePattern.Constructor reference children)
-        (let-do [found false
-                 n (Array.length constructors)]
-          (for [i 0 n]
-            (let [declaration (Array.unsafe-nth constructors i)]
-              (when-do (and (not found)
-                            (CoreIR.same-ref?
-                              (CoreConstructorDeclaration.reference declaration)
-                              reference))
-                (set! found true)
-                (let-do [subst (the (Array (Pair String MonoType)) [])]
-                  (match-ref (Box.peek
-                      (CoreConstructorDeclaration.result declaration))
-                    (CoreType.Named _ result-arguments)
-                      (match-ref scrutinee-type
-                        (MonoType.Named _ mono-arguments)
-                          (let [pairs (Int.min (Array.length result-arguments)
-                                               (Array.length mono-arguments))]
-                            (for [j 0 pairs]
-                              (match-ref (Box.peek (Array.unsafe-nth result-arguments
-                                                                     j))
-                                (CoreType.Variable variable)
-                                  (Array.push-back! &subst
-                                                    (Pair.init (String.copy variable)
-                                                               (MonoType.copy
-                                                                 (Box.peek (Array.unsafe-nth mono-arguments
-                                                                                             j)))))
-                                _ ())))
-                        _ ())
-                    _ ())
-                  (let [fields (CoreConstructorDeclaration.arguments declaration)
-                        pairs (Int.min (Array.length fields)
-                                       (Array.length children))]
-                    (for [j 0 pairs]
-                      (let [field-mono (concretize-slot-type (Box.peek (Array.unsafe-nth fields
-                                                                                         j))
-                                                             &subst)]
-                        (collect-unbound-slots! (Box.peek (Array.unsafe-nth children
-                                                                            j))
-                                                &field-mono
-                                                constructors
-                                                acc))))))))
-          ())))
+  (doc bind-unbound-slots
+    "compatibility facade for PatternTyping.bind-unbound-slots.")
 
-  (doc unbound-slot-types "the mono types of every `Ignore` slot in a match
-pattern, in depth-first pre-order — the payloads a by-value match would drop
-without binding. A root-level `Ignore` reports the whole scrutinee type.
-Callers pair this with `bind-unbound-slots`, which visits the same slots in
-the same order.")
-  (defn unbound-slot-types [pattern scrutinee-type constructors]
-    (let-do [acc (the (Array MonoType) [])]
-      (collect-unbound-slots! pattern scrutinee-type constructors &acc)
-      acc))
-
-  (private collect-bound-slots!)
-  (hidden collect-bound-slots!)
-  (sig collect-bound-slots!
-       (Fn
-         [(Ref CorePattern)
-          (Ref MonoType)
-          (Ref (Array CoreConstructorDeclaration))
-          (Ref (Array (Pair CoreRef MonoType)))]
-         ()))
-  (defn collect-bound-slots! [pattern scrutinee-type constructors acc]
-    (match-ref pattern
-      (CorePattern.Ignore) ()
-      (CorePattern.Bind reference)
-        (Array.push-back! acc
-                          (Pair.init (CoreRef.copy reference)
-                                     (MonoType.copy scrutinee-type)))
-      (CorePattern.Constructor reference children)
-        (let-do [found false
-                 n (Array.length constructors)]
-          (for [i 0 n]
-            (let [declaration (Array.unsafe-nth constructors i)]
-              (when-do (and (not found)
-                            (CoreIR.same-ref?
-                              (CoreConstructorDeclaration.reference declaration)
-                              reference))
-                (set! found true)
-                (let-do [subst (the (Array (Pair String MonoType)) [])]
-                  (match-ref (Box.peek
-                      (CoreConstructorDeclaration.result declaration))
-                    (CoreType.Named _ result-arguments)
-                      (match-ref scrutinee-type
-                        (MonoType.Named _ mono-arguments)
-                          (let [pairs (Int.min (Array.length result-arguments)
-                                               (Array.length mono-arguments))]
-                            (for [j 0 pairs]
-                              (match-ref (Box.peek (Array.unsafe-nth result-arguments
-                                                                     j))
-                                (CoreType.Variable variable)
-                                  (Array.push-back! &subst
-                                                    (Pair.init (String.copy variable)
-                                                               (MonoType.copy
-                                                                 (Box.peek (Array.unsafe-nth mono-arguments
-                                                                                             j)))))
-                                _ ())))
-                        _ ())
-                    _ ())
-                  (let [fields (CoreConstructorDeclaration.arguments declaration)
-                        pairs (Int.min (Array.length fields)
-                                       (Array.length children))]
-                    (for [j 0 pairs]
-                      (let [field-mono (concretize-slot-type (Box.peek (Array.unsafe-nth fields
-                                                                                         j))
-                                                             &subst)]
-                        (collect-bound-slots! (Box.peek (Array.unsafe-nth children
-                                                                          j))
-                                              &field-mono
-                                              constructors
-                                              acc))))))))
-          ())))
-
-  (doc bound-slot-types "the `(binder, mono type)` pair of every `Bind` slot
-in a match pattern, in depth-first pre-order, typed from the constructor
-declarations and the scrutinee's concrete type. Unlike searching the branch
-body for references, this types bindings that are never used — the ones a
-by-value match must still delete.")
-  (defn bound-slot-types [pattern scrutinee-type constructors]
-    (let-do [acc (the (Array (Pair CoreRef MonoType)) [])]
-      (collect-bound-slots! pattern scrutinee-type constructors &acc)
-      acc))
-
-  (doc bind-unbound-slots "rewrites `pattern`, replacing each `Ignore` slot
-(in the same depth-first pre-order as `unbound-slot-types`) whose `mask`
-entry is true with a `Bind` of the same-index reference in `refs`; masked-out
-slots stay `Ignore` (nothing to delete — binding them would only emit unused
-locals). `cursor` is a one-element counter array the recursion advances.")
-  (sig bind-unbound-slots
-       (Fn
-         [(Ref CorePattern)
-          (Ref (Array CoreRef))
-          (Ref (Array Bool))
-          (Ref (Array Int))]
-         CorePattern))
   (defn bind-unbound-slots [pattern refs mask cursor]
-    (match-ref pattern
-      (CorePattern.Ignore)
-        (let-do [index @(Array.unsafe-nth cursor 0)]
-          (Array.aset! cursor 0 (Int.inc index))
-          (if @(Array.unsafe-nth mask index)
-            (CorePattern.Bind (CoreRef.copy (Array.unsafe-nth refs index)))
-            (CorePattern.Ignore)))
-      (CorePattern.Bind reference) (CorePattern.Bind (CoreRef.copy reference))
-      (CorePattern.Constructor reference children)
-        (let-do [rewritten (the (Array (Box CorePattern)) [])]
-          (for [i 0 (Array.length children)]
-            (Array.push-back! &rewritten
-                              (Box.init
-                                (bind-unbound-slots (Box.peek (Array.unsafe-nth children
-                                                                                i))
-                                                    refs
-                                                    mask
-                                                    cursor))))
-          (CorePattern.Constructor (CoreRef.copy reference) rewritten))))
+    (PatternTyping.bind-unbound-slots pattern refs mask cursor))
 
   (private has-definition?)
   (hidden has-definition?)
@@ -561,28 +325,38 @@ reference falls back to the scan.")
 
   (private buckets-reset!)
   (hidden buckets-reset!)
-  (defn buckets-reset! [max-id]
-    (set! *instance-buckets*
-          (Array.replicate (Int.inc (Int.max 0 max-id)) &(the (Array Int) []))))
+  (defn buckets-reset! [state max-id]
+    (SpecializeWork.set-instance-buckets! state
+                                          (Array.replicate (Int.inc (Int.max 0
+                                                                             max-id))
+                                                           &(the (Array Int) []))))
 
   (private buckets-note!)
   (hidden buckets-note!)
-  (defn buckets-note! [reference position]
+  (defn buckets-note! [state reference position]
     (let-do [id @(CoreRef.id reference)]
       (when-do (Int.>= id 0)
-        (while-do (Int.<= (Array.length &*instance-buckets*) id)
-          (Array.push-back! &*instance-buckets* (the (Array Int) [])))
-        (Array.push-back! (Array.unsafe-nth &*instance-buckets* id) position))))
+        (while-do (Int.<=
+            (Array.length (SpecializeWork.instance-buckets state))
+            id)
+          (Array.push-back! (SpecializeWork.instance-buckets state)
+                            (the (Array Int) [])))
+        (Array.push-back!
+          (Array.unsafe-nth (SpecializeWork.instance-buckets state) id)
+          position))))
 
   (private bucket-instance-at)
   (hidden bucket-instance-at)
   ;; position of the instance matching (reference, signature) inside the
   ;; reference's bucket, or -1. Only valid when the buckets are primed.
-  (defn bucket-instance-at [instances reference signature]
+  (defn bucket-instance-at [state instances reference signature]
     (let-do [result -1
              id @(CoreRef.id reference)]
-      (when (and (Int.>= id 0) (Int.< id (Array.length &*instance-buckets*)))
-        (let-do [bucket (Array.unsafe-nth &*instance-buckets* id)
+      (when (and (Int.>= id 0)
+                 (Int.< id
+                        (Array.length (SpecializeWork.instance-buckets state))))
+        (let-do [bucket (Array.unsafe-nth (SpecializeWork.instance-buckets state)
+                                          id)
                  n (Array.length bucket)]
           (for [i 0 n]
             (when (Int.= result -1)
@@ -594,20 +368,8 @@ reference falls back to the scan.")
                   (set! result at)))))))
       result))
 
-  (defn contains-instance? [instances reference signature]
-    (if (Int.> (Array.length &*instance-buckets*) 0)
-      (Int.>= (bucket-instance-at instances reference signature) 0)
-      (let-do [found false
-               n (Array.length instances)]
-        (for [i 0 n]
-          (let [instance (Array.unsafe-nth instances i)]
-            (when (and
-                (CoreIR.same-ref? (Specialization.reference instance) reference)
-                (Type.same-representation?
-                  (Box.peek (Specialization.signature instance))
-                  signature))
-              (set! found true))))
-        found)))
+  (defn contains-instance? [state instances reference signature]
+    (Int.>= (bucket-instance-at state instances reference signature) 0))
 
   (private symbol-for)
   (hidden symbol-for)
@@ -627,11 +389,11 @@ names.")
 
   (private namespaced-reference?)
   (hidden namespaced-reference?)
-  (defn namespaced-reference? [reference]
+  (defn namespaced-reference? [context reference]
     (let-do [found false]
-      (for [i 0 (Array.length &*specialization-symbol-references*)]
+      (for [i 0 (Array.length (SpecializeContext.symbol-references context))]
         (when (CoreIR.same-ref?
-            (Array.unsafe-nth &*specialization-symbol-references* i)
+            (Array.unsafe-nth (SpecializeContext.symbol-references context) i)
             reference)
           (set! found true)))
       found))
@@ -647,21 +409,23 @@ the ordinary AOT symbol policy.")
     (set! *specialization-binding-versions*
           (the (Array (Pair String String)) [])))
 
-  (defn- binding-version [reference]
+  (defn- binding-version [context reference]
     (let-do [version @""]
-      (for [i 0 (Array.length &*specialization-binding-versions*)]
-        (let [entry (Array.unsafe-nth &*specialization-binding-versions* i)]
+      (for [i 0 (Array.length (SpecializeContext.binding-versions context))]
+        (let [entry (Array.unsafe-nth
+                (SpecializeContext.binding-versions context)
+                i)]
           (when (String.= (CoreRef.name reference) (Pair.a entry))
             (set! version @(Pair.b entry)))))
       version))
 
   (private mangled-symbol)
   (hidden mangled-symbol)
-  (defn mangled-symbol [reference signature]
+  (defn mangled-symbol [context reference signature]
     (let [base (CAbi.mangle (CoreRef.name reference) signature)
-          salt (if (namespaced-reference? reference)
-            @&*specialization-symbol-salt*
-            (binding-version reference))]
+          salt (if (namespaced-reference? context reference)
+            @(SpecializeContext.symbol-salt context)
+            (binding-version context reference))]
       (if (String.empty? &salt)
         base
         (fmt "carp_session_%s_%s" &(CAbi.component &salt) &base))))
@@ -695,7 +459,7 @@ the ordinary AOT symbol policy.")
                     _ false)))))
       external))
 
-  (defn symbol-for [core reference signature]
+  (defn symbol-for [context core reference signature]
     (match (builtin-source-for core reference)
       (Maybe.Just source)
         (match-ref (SpecializedBuiltinSource.payload &source)
@@ -703,8 +467,9 @@ the ordinary AOT symbol policy.")
             (match-ref external-name
               (Maybe.Just name) (String.copy name)
               (Maybe.Nothing) (CAbi.runtime-symbol (CoreRef.name reference)))
-          (CoreBuiltinPayload.Template _ _) (mangled-symbol reference signature))
-      (Maybe.Nothing) (mangled-symbol reference signature)))
+          (CoreBuiltinPayload.Template _ _)
+            (mangled-symbol context reference signature))
+      (Maybe.Nothing) (mangled-symbol context reference signature)))
 
   (private scheme-position-linear)
   (hidden scheme-position-linear)
@@ -718,14 +483,14 @@ the ordinary AOT symbol policy.")
           (set! result i)))
       result))
 
-  (private prime-schemes!)
-  (hidden prime-schemes!)
-  (doc prime-schemes! "builds the id→position index over a scheme environment;
+  (private scheme-index)
+  (hidden scheme-index)
+  (doc scheme-index "builds the id→position index over a scheme environment;
 called at every public entry before `scheme-for` runs. Ids can repeat across
 categories, so the index keeps the LAST position per id (matching the linear
 scan) and `scheme-for` verifies the hit, falling back to the scan on
 mismatch.")
-  (defn prime-schemes! [environment]
+  (defn scheme-index [environment]
     (let-do [max-id 0
              n (Array.length environment)]
       (for [i 0 n]
@@ -737,60 +502,16 @@ mismatch.")
           (let [id @(CoreRef.id
                   (SchemeBinding.reference (Array.unsafe-nth environment i)))]
             (when (Int.>= id 0) (Array.aset! &index id i))))
-        (set! *scheme-id-index* index))))
+        index)))
 
-  (private prime-trace!)
-  (hidden prime-trace!)
-  (doc prime-trace! "resets the lazy normalized-node-type memo to match the
-trace's length; slots fill on first touch in `expression-type-for`.")
-  (private build-owner-buckets!)
-  (hidden build-owner-buckets!)
+  (private owner-buckets)
+  (hidden owner-buckets)
   (private owner-trace-key)
   (hidden owner-trace-key)
-  (private bucket-positions)
-  (hidden bucket-positions)
-  (doc bucket-positions "groups the positions of `keys` by key in one linear
-pass: count per slot, prefix-sum into starts, then place. Positions keep their
-order within a slot.")
-  (defn bucket-positions [keys]
-    (let-do [n (Array.length keys)
-             slot-of (the (Map Int Int) (Map.create))
-             slots (Array.allocate n)
-             counts (the (Array Int) [])]
-      (for [i 0 n]
-        (let [key (Array.unsafe-nth keys i)]
-          (match (Map.get-maybe &slot-of key)
-            (Maybe.Just slot)
-              (do
-                (Array.aset-uninitialized! &slots i slot)
-                (Array.aset! &counts
-                             slot
-                             (Int.inc @(Array.unsafe-nth &counts slot))))
-            (Maybe.Nothing)
-              (let-do [slot (Array.length &counts)]
-                (ignore (Map.put! &slot-of key &slot))
-                (Array.push-back! &counts 1)
-                (Array.aset-uninitialized! &slots i slot)))))
-      (let-do [slot-count (Array.length &counts)
-               starts (Array.replicate (Int.inc slot-count) &0)
-               running 0]
-        (for [k 0 slot-count]
-          (do
-            (Array.aset! &starts k running)
-            (set! running (Int.+ running @(Array.unsafe-nth &counts k)))))
-        (Array.aset! &starts slot-count running)
-        (let-do [items (Array.replicate running &0)
-                 cursor @&starts]
-          (for [i 0 n]
-            (let-do [slot @(Array.unsafe-nth &slots i)
-                     at @(Array.unsafe-nth &cursor slot)]
-              (Array.aset! &items at i)
-              (Array.aset! &cursor slot (Int.inc at))))
-          (PositionBuckets.init slot-of starts items)))))
 
-  (doc build-owner-buckets! "groups node-type positions by owner trace key in
+  (doc owner-buckets "groups node-type positions by owner trace key in
 one linear pass: count per slot, prefix-sum into starts, then place.")
-  (defn build-owner-buckets! [inferred]
+  (defn owner-buckets [inferred]
     (let-do [node-types (InferredModule.node-types inferred)
              keys (the (Array Int) [])]
       (for [i 0 (Array.length node-types)]
@@ -798,71 +519,32 @@ one linear pass: count per slot, prefix-sum into starts, then place.")
                           (owner-trace-key
                             (InferredNodeType.owner (Array.unsafe-nth node-types
                                                                       i)))))
-      (let-do [buckets (bucket-positions &keys)]
-        (set! *owner-slot-of-key* @(PositionBuckets.slot-of &buckets))
-        (set! *owner-bucket-start* @(PositionBuckets.starts &buckets))
-        (set! *owner-bucket-items* @(PositionBuckets.items &buckets)))))
+      (PositionBuckets.from-keys &keys)))
 
-  (private build-call-buckets!)
-  (hidden build-call-buckets!)
-  (defn build-call-buckets! [inferred]
+  (private call-buckets)
+  (hidden call-buckets)
+  (defn call-buckets [inferred]
     (let-do [calls (InferredModule.calls inferred)
              keys (the (Array Int) [])]
       (for [i 0 (Array.length calls)]
         (Array.push-back! &keys
                           (owner-trace-key
                             (CallSite.owner (Array.unsafe-nth calls i)))))
-      (set! *call-buckets* (bucket-positions &keys))
-      (set! *call-buckets-ready* true)))
-
-  (defn prime-trace! [inferred]
-    (let-do [n (Array.length (InferredModule.node-types inferred))
-             placeholder (Box.init (MonoType.Unit))]
-      (set! *normalized-node-types* (Array.replicate n &placeholder))
-      (set! *normalized-filled* (Array.replicate n &false))
-      (set! *module-solver*
-            (Type.solver-from-substitution (InferredModule.substitution inferred)))
-      (set! *module-solver-ready* true)
-      (build-owner-buckets! inferred)
-      (build-call-buckets! inferred)
-      (set! *trace-owner-key* -1000000002)))
-
-  (private clear-caches!)
-  (hidden clear-caches!)
-  (doc clear-caches! "releases specialization-only indexes and normalized
-types before ownership and backend lowering begin. The materialized module owns
-its concrete node types, so none of these memoized values are needed afterward.")
-  (defn clear-caches! []
-    (do
-      (set! *scheme-id-index* [])
-      (set! *instance-buckets* [])
-      (set! *normalized-node-types* [])
-      (set! *normalized-filled* [])
-      (set! *module-solver* (Type.solver))
-      (set! *module-solver-ready* false)
-      (set! *owner-slot-of-key* (the (Map Int Int) (Map.create)))
-      (set! *owner-bucket-start* [])
-      (set! *owner-bucket-items* [])
-      (set! *call-buckets* (PositionBuckets.init (Map.create) [] []))
-      (set! *call-buckets-ready* false)
-      (set! *trace-positions* [])
-      (set! *trace-owner-key* -1000000002)
-      (set! *implementations*
-            (the
-              (Map String (Result (Pair CoreRef (Box MonoType)) SpecializeError))
-              (Map.create)))
-      (set! *implementations-ready* false)
-      (set! *implementation-buckets* (PositionBuckets.init (Map.create) [] []))))
+      (PositionBuckets.from-keys &keys)))
 
   (private scheme-position)
   (hidden scheme-position)
   (doc scheme-position "where `reference`'s scheme sits in `environment`, or
 -1. A caller that only reads the scheme reads it there instead of copying it.")
-  (defn scheme-position [environment reference]
+  (defn scheme-position [context environment reference]
     (let [id @(CoreRef.id reference)]
-      (if (or (Int.< id 0) (Int.>= id (Array.length &*scheme-id-index*)))
+      (if (or (Int.< id 0)
+              (Int.>= id
+                      (Array.length (SpecializeContext.scheme-id-index context))))
         -1
-        (let [at @(Array.unsafe-nth &*scheme-id-index* id)]
+        (let [at @(Array.unsafe-nth
+                (SpecializeContext.scheme-id-index context)
+                id)]
           (cond
             (or (Int.< at 0) (Int.>= at (Array.length environment))) -1
             (CoreIR.same-ref?
@@ -873,8 +555,8 @@ its concrete node types, so none of these memoized values are needed afterward."
 
   (private scheme-for)
   (hidden scheme-for)
-  (defn scheme-for [environment reference]
-    (let [at (scheme-position environment reference)]
+  (defn scheme-for [context environment reference]
+    (let [at (scheme-position context environment reference)]
       (if (Int.< at 0)
         (Maybe.Nothing)
         (Maybe.Just @(SchemeBinding.scheme (Array.unsafe-nth environment at))))))
@@ -975,33 +657,9 @@ which `Type.render` leaves out.")
           (Array.push-back! parts @"]")
           (exact-type-key! (Box.peek result) parts))))
 
-  (private implementations-of)
-  (hidden implementations-of)
-  (doc implementations-of "the positions in `implementations` that may
-implement `interface`, in order: its bucket while the memo is on, every
-position otherwise.")
-  (defn implementations-of [implementations interface]
-    (let-do [result (the (Array Int) [])]
-      (if *implementations-ready*
-        (match (Map.get-maybe
-            (PositionBuckets.slot-of &*implementation-buckets*)
-            (CoreRef.id interface))
-          (Maybe.Just slot)
-            (let [starts (PositionBuckets.starts &*implementation-buckets*)]
-              (for [b
-                    @(Array.unsafe-nth starts slot)
-                    @(Array.unsafe-nth starts (Int.inc slot))]
-                (Array.push-back! &result
-                                  @(Array.unsafe-nth
-                                    (PositionBuckets.items &*implementation-buckets*)
-                                    b))))
-          (Maybe.Nothing) ())
-        (for [i 0 (Array.length implementations)] (Array.push-back! &result i)))
-      result))
-
   (private implementation-search)
   (hidden implementation-search)
-  (defn implementation-search [core inferred call]
+  (defn implementation-search [context core inferred call]
     (let-do [interface (CallSite.reference call)
              signature (Box.peek (CallSite.type call))
              result (the (Maybe CallSite) (Maybe.Nothing))
@@ -1010,14 +668,16 @@ position otherwise.")
              found false
              found-specificity 1000000
              found-structure -1
-             positions (implementations-of implementations interface)
-             n (Array.length &positions)]
-      (for [p 0 n]
+             buckets (SpecializeContext.implementation-buckets context)
+             range (PositionBuckets.range buckets (CoreRef.id interface))
+             items (PositionBuckets.items buckets)]
+      (for [p @(Pair.a &range) @(Pair.b &range)]
         (let [candidate (Array.unsafe-nth implementations
-                                          @(Array.unsafe-nth &positions p))]
+                                          @(Array.unsafe-nth items p))]
           (when (CoreIR.same-ref? (CoreImplementation.interface candidate)
                                   interface)
-            (let [at (scheme-position environment
+            (let [at (scheme-position context
+                                      environment
                                       (CoreImplementation.implementation candidate))]
               (when (Int.>= at 0)
                 (let [scheme (SchemeBinding.scheme (Array.unsafe-nth environment
@@ -1092,44 +752,48 @@ position otherwise.")
   (doc implementation-for "the implementation of `call`'s interface that its
 type dispatches to: the most constrained of the implementations whose type
 fits. Answers are memoized while `module-with-known` runs.")
-  (defn implementation-for [core inferred call]
-    (if *implementations-ready*
-      (let-do [parts (the (Array String) [])
-               _ignored (exact-type-key! (Box.peek (CallSite.type call)) &parts)
-               key (fmt "%d %s"
-                        @(CoreRef.id (CallSite.reference call))
-                        &(String.concat &parts))
-               answer (match (Map.get-maybe &*implementations* &key)
-                 (Maybe.Just known) known
-                 (Maybe.Nothing)
-                   (let-do [found (match (implementation-search core
-                                                                inferred
-                                                                call)
-                              (Result.Success site)
-                                (Result.Success
-                                  (Pair.init @(CallSite.reference &site)
-                                             @(CallSite.type &site)))
-                              (Result.Error error) (Result.Error error))]
-                     (Map.put! &*implementations* &key &found)
-                     found))]
-        (match answer
-          (Result.Success pair)
-            (Result.Success
-              (CallSite.init @(CallSite.id call)
-                             @(Pair.a &pair)
-                             @(Pair.b &pair)
-                             (copy-call-owner call)))
-          (Result.Error error) (Result.Error error)))
-      (implementation-search core inferred call)))
+  (defn implementation-for [context state core inferred call]
+    (let-do [parts (the (Array String) [])
+             _ignored (exact-type-key! (Box.peek (CallSite.type call)) &parts)
+             key (fmt "%d %s"
+                      @(CoreRef.id (CallSite.reference call))
+                      &(String.concat &parts))
+             answer (match (Map.get-maybe (SpecializeWork.implementations state)
+                                          &key)
+               (Maybe.Just known) known
+               (Maybe.Nothing)
+                 (let-do [found (match (implementation-search context
+                                                              core
+                                                              inferred
+                                                              call)
+                            (Result.Success site)
+                              (Result.Success
+                                (Pair.init @(CallSite.reference &site)
+                                           @(CallSite.type &site)))
+                            (Result.Error error) (Result.Error error))]
+                   (Map.put! (SpecializeWork.implementations state) &key &found)
+                   found))]
+      (match answer
+        (Result.Success pair)
+          (Result.Success
+            (CallSite.init @(CallSite.id call)
+                           @(Pair.a &pair)
+                           @(Pair.b &pair)
+                           (copy-call-owner call)))
+        (Result.Error error) (Result.Error error))))
 
   (sig collect-global-values-from-expressions!
        (Fn
-         [(Ref (Array (Box CoreExpr)))
+         [(Ref SpecializeContext)
+          (Ref SpecializeWork)
+          (Ref (Array (Box CoreExpr)))
           (Ref InferredModule)
           (Ref (Maybe CoreRef))
           (Ref (Array CallSite))]
          (Result Unit SpecializeError)))
-  (defn collect-global-values-from-expressions! [expressions
+  (defn collect-global-values-from-expressions! [context
+                                                 state
+                                                 expressions
                                                  inferred
                                                  owner
                                                  sites]
@@ -1139,60 +803,82 @@ fits. Answers are memoized while `module-with-known` runs.")
         (match-ref &result
           (Result.Success _)
             (set! result
-                  (collect-global-values!
-                    (Box.peek (Array.unsafe-nth expressions i))
-                    inferred
-                    owner
-                    sites))
+                  (collect-global-values! context
+                                          state
+                                          (Box.peek (Array.unsafe-nth expressions
+                                                                      i))
+                                          inferred
+                                          owner
+                                          sites))
           (Result.Error _) ()))
       result))
 
   (sig collect-global-values-from-branches!
        (Fn
-         [(Ref (Array CoreMatchBranch))
+         [(Ref SpecializeContext)
+          (Ref SpecializeWork)
+          (Ref (Array CoreMatchBranch))
           (Ref InferredModule)
           (Ref (Maybe CoreRef))
           (Ref (Array CallSite))]
          (Result Unit SpecializeError)))
-  (defn collect-global-values-from-branches! [branches inferred owner sites]
+  (defn collect-global-values-from-branches! [context
+                                              state
+                                              branches
+                                              inferred
+                                              owner
+                                              sites]
     (let-do [result (the (Result Unit SpecializeError) (Result.Success ()))
              n (Array.length branches)]
       (for [i 0 n]
         (match-ref &result
           (Result.Success _)
             (set! result
-                  (collect-global-values!
-                    (Box.peek
-                      (CoreMatchBranch.body (Array.unsafe-nth branches i)))
-                    inferred
-                    owner
-                    sites))
+                  (collect-global-values! context
+                                          state
+                                          (Box.peek
+                                            (CoreMatchBranch.body (Array.unsafe-nth branches
+                                                                                    i)))
+                                          inferred
+                                          owner
+                                          sites))
           (Result.Error _) ()))
       result))
 
   (sig collect-global-values!
        (Fn
-         [(Ref CoreExpr)
+         [(Ref SpecializeContext)
+          (Ref SpecializeWork)
+          (Ref CoreExpr)
           (Ref InferredModule)
           (Ref (Maybe CoreRef))
           (Ref (Array CallSite))]
          (Result Unit SpecializeError)))
-  (defn collect-global-values! [expression inferred owner sites]
+  (defn collect-global-values! [context state expression inferred owner sites]
     (match-ref expression
       (CoreExpr.ArrayLit _ expressions)
-        (collect-global-values-from-expressions! expressions
+        (collect-global-values-from-expressions! context
+                                                 state
+                                                 expressions
                                                  inferred
                                                  owner
                                                  sites)
       (CoreExpr.StaticArrayLit _ expressions)
-        (collect-global-values-from-expressions! expressions
+        (collect-global-values-from-expressions! context
+                                                 state
+                                                 expressions
                                                  inferred
                                                  owner
                                                  sites)
       (CoreExpr.Reference expression-id reference)
         (if @(CoreRef.global reference)
           (let [empty (Type.empty-substitution)]
-            (match (expression-type-for inferred owner @expression-id &empty)
+            (match (expression-type-for context
+                                        state
+                                        inferred
+                                        owner
+                                        @expression-id
+                                        &empty)
               (Result.Success type)
                 (do
                   (Array.push-back! sites
@@ -1212,71 +898,137 @@ fits. Answers are memoized while `module-with-known` runs.")
                 (CoreExpr.Reference _ reference)
                   (if @(CoreRef.global reference)
                     (Result.Success ())
-                    (collect-global-values! (Box.peek callee)
+                    (collect-global-values! context
+                                            state
+                                            (Box.peek callee)
                                             inferred
                                             owner
                                             sites))
                 _
-                  (collect-global-values! (Box.peek callee) inferred owner sites))]
+                  (collect-global-values! context
+                                          state
+                                          (Box.peek callee)
+                                          inferred
+                                          owner
+                                          sites))]
           (match callee-result
             (Result.Success _)
-              (collect-global-values-from-expressions! arguments
+              (collect-global-values-from-expressions! context
+                                                       state
+                                                       arguments
                                                        inferred
                                                        owner
                                                        sites)
             (Result.Error error) (Result.Error error)))
       (CoreExpr.Do _ expressions)
-        (collect-global-values-from-expressions! expressions
+        (collect-global-values-from-expressions! context
+                                                 state
+                                                 expressions
                                                  inferred
                                                  owner
                                                  sites)
       (CoreExpr.If _ condition then-branch else-branch)
-        (match (collect-global-values! (Box.peek condition) inferred owner sites)
+        (match (collect-global-values! context
+                                       state
+                                       (Box.peek condition)
+                                       inferred
+                                       owner
+                                       sites)
           (Result.Success _)
-            (match (collect-global-values! (Box.peek then-branch)
+            (match (collect-global-values! context
+                                           state
+                                           (Box.peek then-branch)
                                            inferred
                                            owner
                                            sites)
               (Result.Success _)
-                (collect-global-values! (Box.peek else-branch)
+                (collect-global-values! context
+                                        state
+                                        (Box.peek else-branch)
                                         inferred
                                         owner
                                         sites)
               (Result.Error error) (Result.Error error))
           (Result.Error error) (Result.Error error))
       (CoreExpr.Let _ _ value body)
-        (match (collect-global-values! (Box.peek value) inferred owner sites)
+        (match (collect-global-values! context
+                                       state
+                                       (Box.peek value)
+                                       inferred
+                                       owner
+                                       sites)
           (Result.Success _)
-            (collect-global-values! (Box.peek body) inferred owner sites)
+            (collect-global-values! context
+                                    state
+                                    (Box.peek body)
+                                    inferred
+                                    owner
+                                    sites)
           (Result.Error error) (Result.Error error))
       (CoreExpr.Set _ _ value)
-        (collect-global-values! (Box.peek value) inferred owner sites)
+        (collect-global-values! context
+                                state
+                                (Box.peek value)
+                                inferred
+                                owner
+                                sites)
       (CoreExpr.While _ condition body)
-        (match (collect-global-values! (Box.peek condition) inferred owner sites)
+        (match (collect-global-values! context
+                                       state
+                                       (Box.peek condition)
+                                       inferred
+                                       owner
+                                       sites)
           (Result.Success _)
-            (collect-global-values! (Box.peek body) inferred owner sites)
+            (collect-global-values! context
+                                    state
+                                    (Box.peek body)
+                                    inferred
+                                    owner
+                                    sites)
           (Result.Error error) (Result.Error error))
       (CoreExpr.Lambda _ _ body)
-        (collect-global-values! (Box.peek body) inferred owner sites)
+        (collect-global-values! context
+                                state
+                                (Box.peek body)
+                                inferred
+                                owner
+                                sites)
       (CoreExpr.Match _ _ scrutinee branches)
-        (match (collect-global-values! (Box.peek scrutinee) inferred owner sites)
+        (match (collect-global-values! context
+                                       state
+                                       (Box.peek scrutinee)
+                                       inferred
+                                       owner
+                                       sites)
           (Result.Success _)
-            (collect-global-values-from-branches! branches inferred owner sites)
+            (collect-global-values-from-branches! context
+                                                  state
+                                                  branches
+                                                  inferred
+                                                  owner
+                                                  sites)
           (Result.Error error) (Result.Error error))
       (CoreExpr.Annotation _ inner _)
-        (collect-global-values! (Box.peek inner) inferred owner sites)
+        (collect-global-values! context
+                                state
+                                (Box.peek inner)
+                                inferred
+                                owner
+                                sites)
       _ (Result.Success ())))
 
-  (defn global-values-in [expression inferred owner]
+  (defn global-values-in [context state expression inferred owner]
     (let-do [sites (the (Array CallSite) [])]
-      (match (collect-global-values! expression inferred owner &sites)
+      (match (collect-global-values! context
+                                     state
+                                     expression
+                                     inferred
+                                     owner
+                                     &sites)
         (Result.Success _) (Result.Success sites)
         (Result.Error error) (Result.Error error))))
 
-  (private calls-for-function)
-  (hidden calls-for-function)
-  (private calls-for-value)
-  (hidden calls-for-value)
   (private call-owned-by?)
   (hidden call-owned-by?)
   (private root-call?)
@@ -1293,35 +1045,16 @@ fits. Answers are memoized while `module-with-known` runs.")
   (hidden calls-owned-by)
   (doc calls-owned-by "the calls `reference`'s definition makes, in trace
 order: its owner bucket when one is primed, else a scan of every call.")
-  (defn calls-owned-by [inferred reference]
+  (defn calls-owned-by [context inferred reference]
     (let-do [result (the (Array CallSite) [])
-             calls (InferredModule.calls inferred)]
-      (if *call-buckets-ready*
-        (match (Map.get-maybe
-            (PositionBuckets.slot-of &*call-buckets*)
-            (CoreRef.id reference))
-          (Maybe.Just slot)
-            (let [starts (PositionBuckets.starts &*call-buckets*)]
-              (for [b
-                    @(Array.unsafe-nth starts slot)
-                    @(Array.unsafe-nth starts (Int.inc slot))]
-                (let [call (Array.unsafe-nth calls
-                                             @(Array.unsafe-nth (PositionBuckets.items &*call-buckets*)
-                                                                b))]
-                  (when (call-owned-by? call reference)
-                    (Array.push-back! &result @call)))))
-          (Maybe.Nothing) ())
-        (for [i 0 (Array.length calls)]
-          (let [call (Array.unsafe-nth calls i)]
-            (when (call-owned-by? call reference)
-              (Array.push-back! &result @call)))))
+             calls (InferredModule.calls inferred)
+             buckets (SpecializeContext.call-buckets context)
+             range (PositionBuckets.range buckets (CoreRef.id reference))
+             items (PositionBuckets.items buckets)]
+      (for [b @(Pair.a &range) @(Pair.b &range)]
+        (let [call (Array.unsafe-nth calls @(Array.unsafe-nth items b))]
+          (when (call-owned-by? call reference) (Array.push-back! &result @call))))
       result))
-
-  (defn calls-for-function [-core inferred reference]
-    (calls-owned-by inferred reference))
-
-  (defn calls-for-value [-core inferred reference]
-    (calls-owned-by inferred reference))
 
   (private root-calls)
   (hidden root-calls)
@@ -1345,17 +1078,15 @@ order: its owner bucket when one is primed, else a scan of every call.")
   (hidden apply-module-substitution)
   (doc apply-module-substitution "applies the module substitution, through the
 indexed view when one has been built for this module.")
-  (defn apply-module-substitution [inferred type]
-    (if *module-solver-ready*
-      (Type.solver-apply &*module-solver* type)
-      (Type.apply (InferredModule.substitution inferred) type)))
+  (defn apply-module-substitution [state type]
+    (Type.solver-apply (SpecializeWork.module-solver state) type))
 
-  (defn normalize-call [inferred call]
+  (defn normalize-call [state inferred call]
     (CallSite.init @(CallSite.id call)
                    (CoreRef.copy (CallSite.reference call))
-                   (Box.init
-                     (apply-module-substitution inferred
-                                                (Box.peek (CallSite.type call))))
+                   (Box.init (apply-module-substitution state
+
+                                                        (Box.peek (CallSite.type call))))
                    (copy-call-owner call)))
 
   (private entry-type-error)
@@ -1392,7 +1123,7 @@ reference words it, when `main` takes arguments or answers something other
 than an `Int` or `()`.")
   (private entry-request)
   (hidden entry-request)
-  (defn entry-request [core inferred]
+  (defn entry-request [context core inferred]
     (let-do [result (the
                (Result (Array SpecializationRequest) SpecializeError)
                (Result.Success []))
@@ -1401,7 +1132,9 @@ than an `Int` or `()`.")
       (for [i 0 n]
         (let [reference (CoreFunction.reference (Array.unsafe-nth functions i))]
           (when (String.= (CoreRef.name reference) "main")
-            (match (scheme-for (InferredModule.environment inferred) reference)
+            (match (scheme-for context
+                               (InferredModule.environment inferred)
+                               reference)
               (Maybe.Just scheme)
                 (let [type (Type.apply (InferredModule.substitution inferred)
                                        (Box.peek (TypeScheme.body &scheme)))]
@@ -1422,11 +1155,11 @@ than an `Int` or `()`.")
 
   (private root-requests)
   (hidden root-requests)
-  (defn root-requests [core inferred]
+  (defn root-requests [context state core inferred]
     (let-do [result (the (Array SpecializationRequest) [])
              calls (root-calls core inferred)
              n (Array.length &calls)
-             entry (entry-request core inferred)]
+             entry (entry-request context core inferred)]
       (for [i 0 n]
         (Array.push-back! &result
                           (SpecializationRequest.init @(Array.unsafe-nth &calls
@@ -1444,7 +1177,8 @@ than an `Int` or `()`.")
         (for [i 0 value-count]
           (let [value (Array.unsafe-nth values i)
                 value-reference (CoreValue.reference value)]
-            (match (scheme-for (InferredModule.environment inferred)
+            (match (scheme-for context
+                               (InferredModule.environment inferred)
                                value-reference)
               (Maybe.Just scheme)
                 (Array.push-back! &result
@@ -1461,7 +1195,9 @@ than an `Int` or `()`.")
         _
           (let-do [sites (the (Array CallSite) [])
                    owner (the (Maybe CoreRef) (Maybe.Nothing))]
-            (match (collect-global-values-from-expressions! (CoreModule.expressions core)
+            (match (collect-global-values-from-expressions! context
+                                                            state
+                                                            (CoreModule.expressions core)
                                                             inferred
                                                             &owner
                                                             &sites)
@@ -1567,7 +1303,7 @@ moved, so passing it by value out of a borrowed container is safe. `blit` is a
 Core interface, looked up the same way the reference looks it up.")
   (private blit-implemented?)
   (hidden blit-implemented?)
-  (defn blit-implemented? [core inferred element]
+  (defn blit-implemented? [context state core inferred element]
     (let-do [interfaces (CoreModule.interfaces core)
              found (the (Maybe CoreRef) (Maybe.Nothing))]
       (for [i 0 (Array.length interfaces)]
@@ -1583,7 +1319,7 @@ Core interface, looked up the same way the reference looks it up.")
                                       (Type.function [(Box.init (MonoType.copy element))]
                                                      (MonoType.copy element)))
                                     (Maybe.Nothing))]
-            (match (implementation-for core inferred &site)
+            (match (implementation-for context state core inferred &site)
               (Result.Success _) true
               (Result.Error _) false)))))
 
@@ -1625,10 +1361,16 @@ only for blittable elements, since a by-value call on a managed element would
 move it out of the borrowed container.")
   (private element-render-callsite)
   (hidden element-render-callsite)
-  (defn element-render-callsite [core inferred interface lifetime element]
+  (defn element-render-callsite [context
+                                 state
+                                 core
+                                 inferred
+                                 interface
+                                 lifetime
+                                 element]
     (let [str-interface (PrimitiveRegistry.reference 1 "str")
           candidates (if (or
-              (blit-implemented? core inferred element)
+              (blit-implemented? context state core inferred element)
               (blittable-element? element))
             [(str-callsite interface lifetime element false)
              (str-callsite interface lifetime element true)
@@ -1639,7 +1381,9 @@ move it out of the borrowed container.")
       (let-do [chosen (the (Maybe CallSite) (Maybe.Nothing))]
         (for [i 0 (Array.length &candidates)]
           (when (match-ref &chosen (Maybe.Nothing) true _ false)
-            (match (implementation-for core
+            (match (implementation-for context
+                                       state
+                                       core
                                        inferred
                                        (Array.unsafe-nth &candidates i))
               (Result.Success _)
@@ -1651,7 +1395,7 @@ move it out of the borrowed container.")
           (Maybe.Just site) site
           (Maybe.Nothing) (str-callsite interface lifetime element true)))))
 
-  (defn str-template-dependency [core inferred interface signature]
+  (defn str-template-dependency [context state core inferred interface signature]
     (match-ref signature
       (MonoType.Function arguments _)
         (if (Int.= 1 (Array.length arguments))
@@ -1663,7 +1407,9 @@ move it out of the borrowed container.")
                     (let [element (MonoType.copy
                             (Box.peek (Array.unsafe-nth type-arguments 0)))]
                       (Result.Success
-                        (element-render-callsite core
+                        (element-render-callsite context
+                                                 state
+                                                 core
                                                  inferred
                                                  interface
                                                  lifetime
@@ -1688,7 +1434,12 @@ move it out of the borrowed container.")
   ;; `Array.delete` takes its array BY VALUE, so the element type sits directly
   ;; in the container argument. Elements without a `delete` implementation are
   ;; unmanaged and need no dependency at all.
-  (defn array-delete-template-dependencies [core inferred interface signature]
+  (defn array-delete-template-dependencies [context
+                                            state
+                                            core
+                                            inferred
+                                            interface
+                                            signature]
     (match-ref signature
       (MonoType.Function arguments _)
         (if (Int.= 1 (Array.length arguments))
@@ -1703,7 +1454,7 @@ move it out of the borrowed container.")
                                             (Type.function [(Box.init (MonoType.copy &element))]
                                                            (MonoType.Unit)))
                                           (Maybe.Nothing))]
-                  (match (implementation-for core inferred &site)
+                  (match (implementation-for context state core inferred &site)
                     (Result.Success _) (Result.Success [site])
                     (Result.Error _) (Result.Success (the (Array CallSite) []))))
                 (Result.Error
@@ -1721,7 +1472,12 @@ move it out of the borrowed container.")
           (SpecializeError.init
             @"array delete template must have a function signature"))))
 
-  (defn array-set-template-dependencies [core inferred interface signature]
+  (defn array-set-template-dependencies [context
+                                         state
+                                         core
+                                         inferred
+                                         interface
+                                         signature]
     (match-ref signature
       (MonoType.Function arguments _)
         (if (Int.= 3 (Array.length arguments))
@@ -1732,7 +1488,7 @@ move it out of the borrowed container.")
                                       (Type.function [(Box.init (MonoType.copy &element))]
                                                      (MonoType.Unit)))
                                     (Maybe.Nothing))]
-            (match (implementation-for core inferred &site)
+            (match (implementation-for context state core inferred &site)
               ;; Keep the dispatch result: re-enqueueing the interface site
               ;; makes the worklist resolve the same implementation again for
               ;; every Array.set!/filter dependency before instance dedup can
@@ -1749,7 +1505,12 @@ move it out of the borrowed container.")
           (SpecializeError.init
             @"array set template must have a function signature"))))
 
-  (defn array-filter-template-dependencies [core inferred interface signature]
+  (defn array-filter-template-dependencies [context
+                                            state
+                                            core
+                                            inferred
+                                            interface
+                                            signature]
     (match-ref signature
       (MonoType.Function arguments _)
         (if (Int.= 2 (Array.length arguments))
@@ -1764,7 +1525,7 @@ move it out of the borrowed container.")
                                             (Type.function [(Box.init (MonoType.copy &element))]
                                                            (MonoType.Unit)))
                                           (Maybe.Nothing))]
-                  (match (implementation-for core inferred &site)
+                  (match (implementation-for context state core inferred &site)
                     (Result.Success implementation)
                       (Result.Success [implementation])
                     (Result.Error _) (Result.Success (the (Array CallSite) []))))
@@ -1818,7 +1579,12 @@ move it out of the borrowed container.")
           (SpecializeError.init
             @"pair copy template must have a function signature"))))
 
-  (defn primitive-dependencies-for [core inferred reference signature]
+  (defn primitive-dependencies-for [context
+                                    state
+                                    core
+                                    inferred
+                                    reference
+                                    signature]
     (match (PrimitiveRegistry.lowering-for reference)
       (Maybe.Just lowering)
         (match-ref &lowering
@@ -1830,29 +1596,39 @@ move it out of the borrowed container.")
                   (Result.Success dependency) (Result.Success [dependency])
                   (Result.Error error) (Result.Error error))
               (PrimitiveTemplate.ArrayStr str-interface)
-                (match (str-template-dependency core
+                (match (str-template-dependency context
+                                                state
+                                                core
                                                 inferred
                                                 str-interface
                                                 signature)
                   (Result.Success dependency) (Result.Success [dependency])
                   (Result.Error error) (Result.Error error))
               (PrimitiveTemplate.ArrayDelete delete-interface)
-                (array-delete-template-dependencies core
+                (array-delete-template-dependencies context
+                                                    state
+                                                    core
                                                     inferred
                                                     delete-interface
                                                     signature)
               (PrimitiveTemplate.ArraySet delete-interface)
-                (array-set-template-dependencies core
+                (array-set-template-dependencies context
+                                                 state
+                                                 core
                                                  inferred
                                                  delete-interface
                                                  signature)
               (PrimitiveTemplate.ArrayPopBack delete-interface)
-                (array-delete-template-dependencies core
+                (array-delete-template-dependencies context
+                                                    state
+                                                    core
                                                     inferred
                                                     delete-interface
                                                     signature)
               (PrimitiveTemplate.ArrayFilter delete-interface)
-                (array-filter-template-dependencies core
+                (array-filter-template-dependencies context
+                                                    state
+                                                    core
                                                     inferred
                                                     delete-interface
                                                     signature)
@@ -1878,10 +1654,15 @@ unexplained.")
           (TypeError.message &(Type.mismatch declared signature)))
       _ (SpecializeError.init (TypeError.message error))))
 
-  (defn dependencies-for [core inferred reference signature]
+  (defn dependencies-for [context state core inferred reference signature]
     (if (has-builtin? (CoreModule.builtins core) reference)
-      (primitive-dependencies-for core inferred reference signature)
-      (match (scheme-for (InferredModule.environment inferred) reference)
+      (primitive-dependencies-for context
+                                  state
+                                  core
+                                  inferred
+                                  reference
+                                  signature)
+      (match (scheme-for context (InferredModule.environment inferred) reference)
         (Maybe.Just scheme)
           (let [empty (Type.empty-substitution)]
             (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
@@ -1891,23 +1672,24 @@ unexplained.")
                 (let-do [result (the
                            (Result (Array CallSite) SpecializeError)
                            (Result.Success []))
-                         raw-calls (if (has-value? (CoreModule.values core)
-                                                   reference)
-                           (calls-for-value core inferred reference)
-                           (calls-for-function core inferred reference))
+                         raw-calls (calls-owned-by context inferred reference)
                          owner (the (Maybe CoreRef)
                                     (Maybe.Just (CoreRef.copy reference)))
                          global-values (match (value-for (CoreModule.values core)
                                                          reference)
                            (Maybe.Just value)
-                             (global-values-in (Box.peek (CoreValue.body &value))
+                             (global-values-in context
+                                               state
+                                               (Box.peek (CoreValue.body &value))
                                                inferred
                                                &owner)
                            (Maybe.Nothing)
                              (match (function-for (CoreModule.functions core)
                                                   reference)
                                (Maybe.Just function)
-                                 (global-values-in (Box.peek (CoreFunction.body &function))
+                                 (global-values-in context
+                                                   state
+                                                   (Box.peek (CoreFunction.body &function))
                                                    inferred
                                                    &owner)
                                (Maybe.Nothing) (Result.Success [])))]
@@ -1922,7 +1704,8 @@ unexplained.")
                     (for [i 0 n]
                       (match-ref &result
                         (Result.Success calls)
-                          (let [normalized (normalize-call inferred
+                          (let [normalized (normalize-call state
+                                                           inferred
                                                            (Array.unsafe-nth &raw-calls
                                                                              i))
                                 signature (Type.apply &instance-substitution
@@ -1945,23 +1728,11 @@ unexplained.")
 
   (private instance-for)
   (hidden instance-for)
-  (defn instance-for [instances reference signature]
-    (if (Int.> (Array.length &*instance-buckets*) 0)
-      (let [at (bucket-instance-at instances reference signature)]
-        (if (Int.>= at 0)
-          (Maybe.Just @(Array.unsafe-nth instances at))
-          (the (Maybe Specialization) (Maybe.Nothing))))
-      (let-do [result (the (Maybe Specialization) (Maybe.Nothing))
-               n (Array.length instances)]
-        (for [i 0 n]
-          (let [instance (Array.unsafe-nth instances i)]
-            (when (and
-                (CoreIR.same-ref? (Specialization.reference instance) reference)
-                (Type.same-representation?
-                  (Box.peek (Specialization.signature instance))
-                  signature))
-              (set! result (Maybe.Just @instance)))))
-        result)))
+  (defn instance-for [state instances reference signature]
+    (let [at (bucket-instance-at state instances reference signature)]
+      (if (Int.>= at 0)
+        (Maybe.Just @(Array.unsafe-nth instances at))
+        (the (Maybe Specialization) (Maybe.Nothing)))))
 
   (private overload-for)
   (hidden overload-for)
@@ -1980,14 +1751,14 @@ unexplained.")
 chooses: the one whose type fits. Inference settles every choice its types
 decide, so what arrives here is an instance of a definition generalized over
 an open choice, whose concrete types decide it now.")
-  (defn candidate-for [inferred call overload]
+  (defn candidate-for [context inferred call overload]
     (let-do [signature (Box.peek (CallSite.type call))
              environment (InferredModule.environment inferred)
              fitting (the (Array CallSite) [])
              candidates (CoreOverload.candidates overload)]
       (for [i 0 (Array.length candidates)]
         (let [candidate (Array.unsafe-nth candidates i)]
-          (match (scheme-for environment candidate)
+          (match (scheme-for context environment candidate)
             (Maybe.Just scheme)
               (let [empty (Type.empty-substitution)]
                 (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
@@ -2017,12 +1788,12 @@ an open choice, whose concrete types decide it now.")
 
   (private concrete-call)
   (hidden concrete-call)
-  (defn concrete-call [core inferred call]
+  (defn concrete-call [context state core inferred call]
     (let [reference (CallSite.reference call)]
       (if (interface? (CoreModule.interfaces core) reference)
-        (implementation-for core inferred call)
+        (implementation-for context state core inferred call)
         (match (overload-for core reference)
-          (Maybe.Just overload) (candidate-for inferred call &overload)
+          (Maybe.Just overload) (candidate-for context inferred call &overload)
           (Maybe.Nothing) (Result.Success @call)))))
 
   (private materialize-calls)
@@ -2032,7 +1803,7 @@ an open choice, whose concrete types decide it now.")
   (doc materialize-calls "binds each of an instance's `dependencies`, as the
 worklist recorded them when it created the instance, to the instance it
 resolves to.")
-  (defn materialize-calls [core inferred instances dependencies]
+  (defn materialize-calls [context state core inferred instances dependencies]
     (let-do [result (the
                (Result (Array SpecializedCall) SpecializeError)
                (Result.Success []))
@@ -2040,12 +1811,15 @@ resolves to.")
       (for [i 0 n]
         (match-ref &result
           (Result.Success calls)
-            (match (concrete-call core
+            (match (concrete-call context
+                                  state
+                                  core
                                   inferred
                                   (Array.unsafe-nth dependencies i))
               (Result.Success concrete)
               (when (concrete-signature? (Box.peek (CallSite.type &concrete)))
-                (match (instance-for instances
+                (match (instance-for state
+                                     instances
                                      (CallSite.reference &concrete)
                                      (Box.peek (CallSite.type &concrete)))
                   (Maybe.Just target)
@@ -2078,14 +1852,16 @@ resolves to.")
           (Result.Error _) ()))
       result))
 
-  (defn materialize-root-calls [core inferred instances]
+  (defn materialize-root-calls [context state core inferred instances]
     (let-do [result (the
                (Result (Array SpecializedCall) SpecializeError)
                (Result.Success []))
              raw-calls (root-calls core inferred)
              owner (the (Maybe CoreRef) (Maybe.Nothing))
              global-values (let-do [sites (the (Array CallSite) [])]
-               (match (collect-global-values-from-expressions! (CoreModule.expressions core)
+               (match (collect-global-values-from-expressions! context
+                                                               state
+                                                               (CoreModule.expressions core)
                                                                inferred
                                                                &owner
                                                                &sites)
@@ -2101,12 +1877,14 @@ resolves to.")
       (for [i 0 n]
         (match-ref &result
           (Result.Success calls)
-            (let [normalized (normalize-call inferred
+            (let [normalized (normalize-call state
+                                             inferred
                                              (Array.unsafe-nth &raw-calls i))]
-              (match (concrete-call core inferred &normalized)
+              (match (concrete-call context state core inferred &normalized)
                 (Result.Success concrete)
                   (when (concrete-signature? (Box.peek (CallSite.type &concrete)))
-                    (match (instance-for instances
+                    (match (instance-for state
+                                         instances
                                          (CallSite.reference &concrete)
                                          (Box.peek (CallSite.type &concrete)))
                       (Maybe.Just target)
@@ -2321,7 +2099,8 @@ hardcoded ranges.")
 
   (private expression-type-for-linear)
   (hidden expression-type-for-linear)
-  (defn expression-type-for-linear [inferred
+  (defn expression-type-for-linear [state
+                                    inferred
                                     owner
                                     expression-id
                                     instance-substitution]
@@ -2332,10 +2111,12 @@ hardcoded ranges.")
         (let [node-type (Array.unsafe-nth node-types i)]
           (when (Int.= @(InferredNodeType.id node-type) expression-id)
             (when (same-owner? (InferredNodeType.owner node-type) owner)
-              (let [normalized (apply-module-substitution inferred
-                                                          (Box.peek (InferredNodeType.type node-type)))]
-                (set! result
-                      (Maybe.Just (Type.apply instance-substitution &normalized))))))))
+              (let [normalized (apply-module-substitution state
+
+                                                          (Box.peek (InferredNodeType.type node-type)))] (set! result
+                                                                                                               (Maybe.Just
+                                                                                                                 (Type.apply instance-substitution
+                                                                                                                             &normalized))))))))
       (match result
         (Maybe.Just found) (Result.Success found)
         (Maybe.Nothing) (expression-type-missing owner expression-id))))
@@ -2352,17 +2133,14 @@ hardcoded ranges.")
   (doc prime-trace-owner! "rebuilds the expr-id→trace-position index for one
 owner; runs when materialization switches owners (once per instance), so the
 per-expression trace scan becomes an array lookup.")
-  (defn prime-trace-owner! [inferred owner]
+  (defn prime-trace-owner! [context state inferred owner]
     (let-do [node-types (InferredModule.node-types inferred)
              key (owner-trace-key owner)
-             from 0
-             to 0]
-      (match (Map.get-maybe &*owner-slot-of-key* &key)
-        (Maybe.Just slot)
-          (do
-            (set! from @(Array.unsafe-nth &*owner-bucket-start* slot))
-            (set! to @(Array.unsafe-nth &*owner-bucket-start* (Int.inc slot))))
-        (Maybe.Nothing) ())
+             buckets (SpecializeContext.owner-buckets context)
+             range (PositionBuckets.range buckets &key)
+             from @(Pair.a &range)
+             to @(Pair.b &range)
+             items (PositionBuckets.items buckets)]
       ;; the bucket is keyed by the owner's reference id, which `same-owner?`
       ;; also compares its name and globalness for, so the strict test still
       ;; runs — over the handful of entries this owner has, rather than over
@@ -2370,61 +2148,81 @@ per-expression trace scan becomes an array lookup.")
       (let-do [max-id 0]
         (for [b from to]
           (let [node-type (Array.unsafe-nth node-types
-                                            @(Array.unsafe-nth &*owner-bucket-items*
-                                                               b))]
+                                            @(Array.unsafe-nth items b))]
             (when (same-owner? (InferredNodeType.owner node-type) owner)
               (when (Int.> @(InferredNodeType.id node-type) max-id)
                 (set! max-id @(InferredNodeType.id node-type))))))
         (let-do [positions (Array.replicate (Int.inc max-id) &-1)]
           (for [b from to]
-            (let-do [i @(Array.unsafe-nth &*owner-bucket-items* b)
+            (let-do [i @(Array.unsafe-nth items b)
                      node-type (Array.unsafe-nth node-types i)]
               (when (same-owner? (InferredNodeType.owner node-type) owner)
                 (let [id @(InferredNodeType.id node-type)]
                   (when (Int.>= id 0) (Array.aset! &positions id i))))))
-          (set! *trace-positions* positions)
-          (set! *trace-owner-key* (owner-trace-key owner))))))
+          (SpecializeWork.set-trace-positions! state positions)
+          (SpecializeWork.set-trace-owner-key! state (owner-trace-key owner))))))
 
-  (defn expression-type-for [inferred owner expression-id instance-substitution]
-    (if (Int.= 0 (Array.length &*normalized-node-types*))
-      (expression-type-for-linear inferred
-                                  owner
-                                  expression-id
-                                  instance-substitution)
-      (do
-        (unless (Int.= (owner-trace-key owner) *trace-owner-key*)
-          (prime-trace-owner! inferred owner))
-        (if (or (Int.< expression-id 0)
-                (Int.>= expression-id (Array.length &*trace-positions*)))
-          (expression-type-missing owner expression-id)
-          (let [at @(Array.unsafe-nth &*trace-positions* expression-id)]
-            (if (or (Int.< at 0)
-                    (Int.>= at (Array.length &*normalized-node-types*)))
-              (expression-type-missing owner expression-id)
-              (let [node-type (Array.unsafe-nth (InferredModule.node-types inferred)
-                                                at)]
-                (if (and
-                    (Int.= @(InferredNodeType.id node-type) expression-id)
-                    (same-owner? (InferredNodeType.owner node-type) owner))
-                  (do
-                    (unless-do @(Array.unsafe-nth &*normalized-filled* at)
-                      (Array.aset! &*normalized-node-types*
-                                   at
-                                   (Box.init
-                                     (apply-module-substitution inferred
-                                                                (Box.peek (InferredNodeType.type node-type)))))
-                      (Array.aset! &*normalized-filled* at true))
-                    (Result.Success
-                      (Type.apply instance-substitution
-                                  (Box.peek
-                                    (Array.unsafe-nth &*normalized-node-types*
-                                                      at)))))
-                  (expression-type-for-linear inferred
-                                              owner
-                                              expression-id
-                                              instance-substitution)))))))))
+  (defn expression-type-for [context
+                             state
+                             inferred
+                             owner
+                             expression-id
+                             instance-substitution]
+    (do
+      (when (Int.= 0 (Array.length (SpecializeWork.normalized-node-types state)))
+        (SpecializeWork.set-normalized-node-types! state
+                                                   (Array.replicate
+                                                     (Array.length (InferredModule.node-types inferred))
+                                                     &(the (Maybe (Box MonoType))
+                                                           (Maybe.Nothing)))))
+      (unless (Int.= (owner-trace-key owner)
+                     @(SpecializeWork.trace-owner-key state))
+        (prime-trace-owner! context state inferred owner))
+      (if (or (Int.< expression-id 0)
+              (Int.>= expression-id
+                      (Array.length (SpecializeWork.trace-positions state))))
+        (expression-type-missing owner expression-id)
+        (let [at @(Array.unsafe-nth (SpecializeWork.trace-positions state)
+                                    expression-id)]
+          (if (or (Int.< at 0)
+                  (Int.>= at
+                          (Array.length
+                            (SpecializeWork.normalized-node-types state))))
+            (expression-type-missing owner expression-id)
+            (let [node-type (Array.unsafe-nth (InferredModule.node-types inferred)
+                                              at)]
+              (if (and
+                  (Int.= @(InferredNodeType.id node-type) expression-id)
+                  (same-owner? (InferredNodeType.owner node-type) owner))
+                (do
+                  (when (match-ref (Array.unsafe-nth
+                        (SpecializeWork.normalized-node-types state)
+                        at)
+                      (Maybe.Nothing) true
+                      (Maybe.Just _) false)
+                    (Array.aset!
+                      (SpecializeWork.normalized-node-types state)
+                      at
+                      (Maybe.Just (Box.init (apply-module-substitution state
 
-  (defn rewrite-expressions [expressions
+                                                                       (Box.peek (InferredNodeType.type node-type)))))))
+                  (match-ref (Array.unsafe-nth
+                      (SpecializeWork.normalized-node-types state)
+                      at)
+                    (Maybe.Just normalized)
+                      (Result.Success
+                        (Type.apply instance-substitution (Box.peek normalized)))
+                    (Maybe.Nothing)
+                      (expression-type-missing owner expression-id)))
+                (expression-type-for-linear state
+                                            inferred
+                                            owner
+                                            expression-id
+                                            instance-substitution))))))))
+
+  (defn rewrite-expressions [context
+                             state
+                             expressions
                              calls
                              inferred
                              owner
@@ -2436,19 +2234,26 @@ per-expression trace scan becomes an array lookup.")
       (for [i 0 n]
         (match-ref &result
           (Result.Success rewritten)
-            (match (rewrite-expression
-                (Box.peek (Array.unsafe-nth expressions i))
-                calls
-                inferred
-                owner
-                instance-substitution)
+            (match (rewrite-expression context
+                                       state
+                                       (Box.peek (Array.unsafe-nth expressions i))
+                                       calls
+                                       inferred
+                                       owner
+                                       instance-substitution)
               (Result.Success expression)
                 (Array.push-back! rewritten (Box.init expression))
               (Result.Error error) (set! result (Result.Error error)))
           (Result.Error _) ()))
       result))
 
-  (defn rewrite-branches [branches calls inferred owner instance-substitution]
+  (defn rewrite-branches [context
+                          state
+                          branches
+                          calls
+                          inferred
+                          owner
+                          instance-substitution]
     (let-do [result (the
                (Result (Array SpecializedMatchBranch) SpecializeError)
                (Result.Success []))
@@ -2457,7 +2262,9 @@ per-expression trace scan becomes an array lookup.")
         (match-ref &result
           (Result.Success rewritten)
             (let [branch (Array.unsafe-nth branches i)]
-              (match (rewrite-expression (Box.peek (CoreMatchBranch.body branch))
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek (CoreMatchBranch.body branch))
                                          calls
                                          inferred
                                          owner
@@ -2471,13 +2278,17 @@ per-expression trace scan becomes an array lookup.")
           (Result.Error _) ()))
       result))
 
-  (defn rewrite-expression [expression
+  (defn rewrite-expression [context
+                            state
+                            expression
                             calls
                             inferred
                             owner
                             instance-substitution]
     (let [expression-id (CoreIR.expression-id expression)]
-      (match (expression-type-for inferred
+      (match (expression-type-for context
+                                  state
+                                  inferred
                                   owner
                                   expression-id
                                   instance-substitution)
@@ -2532,7 +2343,9 @@ per-expression trace scan becomes an array lookup.")
               (Result.Success
                 (SpecializedExpr.UnitLit expression-id (Box.init node-type)))
             (CoreExpr.ArrayLit _ expressions)
-              (match (rewrite-expressions expressions
+              (match (rewrite-expressions context
+                                          state
+                                          expressions
                                           calls
                                           inferred
                                           owner
@@ -2544,7 +2357,9 @@ per-expression trace scan becomes an array lookup.")
                                               rewritten))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.StaticArrayLit _ expressions)
-              (match (rewrite-expressions expressions
+              (match (rewrite-expressions context
+                                          state
+                                          expressions
                                           calls
                                           inferred
                                           owner
@@ -2576,13 +2391,17 @@ per-expression trace scan becomes an array lookup.")
                                              (Box.init node-type)
                                              (CoreRef.copy reference))))
             (CoreExpr.Call call-id callee arguments)
-              (match (rewrite-expression (Box.peek callee)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek callee)
                                          calls
                                          inferred
                                          owner
                                          instance-substitution)
                 (Result.Success rewritten-callee)
-                  (match (rewrite-expressions arguments
+                  (match (rewrite-expressions context
+                                              state
+                                              arguments
                                               calls
                                               inferred
                                               owner
@@ -2617,7 +2436,9 @@ per-expression trace scan becomes an array lookup.")
                                                               @(SpecializedCall.symbol &target)
                                                               rewritten-arguments)))
                               (Result.Error _)
-                              (let [callee-type-name (match (expression-type-for inferred
+                              (let [callee-type-name (match (expression-type-for context
+                                                                                 state
+                                                                                 inferred
                                                                                  owner
                                                                                  (CoreIR.expression-id (Box.peek callee))
                                                                                  instance-substitution)
@@ -2664,7 +2485,9 @@ per-expression trace scan becomes an array lookup.")
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.Do _ expressions)
-              (match (rewrite-expressions expressions
+              (match (rewrite-expressions context
+                                          state
+                                          expressions
                                           calls
                                           inferred
                                           owner
@@ -2676,19 +2499,25 @@ per-expression trace scan becomes an array lookup.")
                                         rewritten))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.If _ condition then-branch else-branch)
-              (match (rewrite-expression (Box.peek condition)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek condition)
                                          calls
                                          inferred
                                          owner
                                          instance-substitution)
                 (Result.Success rewritten-condition)
-                  (match (rewrite-expression (Box.peek then-branch)
+                  (match (rewrite-expression context
+                                             state
+                                             (Box.peek then-branch)
                                              calls
                                              inferred
                                              owner
                                              instance-substitution)
                     (Result.Success rewritten-then)
-                      (match (rewrite-expression (Box.peek else-branch)
+                      (match (rewrite-expression context
+                                                 state
+                                                 (Box.peek else-branch)
                                                  calls
                                                  inferred
                                                  owner
@@ -2704,13 +2533,17 @@ per-expression trace scan becomes an array lookup.")
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.Let _ reference value body)
-              (match (rewrite-expression (Box.peek value)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek value)
                                          calls
                                          inferred
                                          owner
                                          instance-substitution)
                 (Result.Success rewritten-value)
-                  (match (rewrite-expression (Box.peek body)
+                  (match (rewrite-expression context
+                                             state
+                                             (Box.peek body)
                                              calls
                                              inferred
                                              owner
@@ -2725,7 +2558,9 @@ per-expression trace scan becomes an array lookup.")
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.Set _ reference value)
-              (match (rewrite-expression (Box.peek value)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek value)
                                          calls
                                          inferred
                                          owner
@@ -2738,13 +2573,17 @@ per-expression trace scan becomes an array lookup.")
                                          (Box.init rewritten)))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.While _ condition body)
-              (match (rewrite-expression (Box.peek condition)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek condition)
                                          calls
                                          inferred
                                          owner
                                          instance-substitution)
                 (Result.Success rewritten-condition)
-                  (match (rewrite-expression (Box.peek body)
+                  (match (rewrite-expression context
+                                             state
+                                             (Box.peek body)
                                              calls
                                              inferred
                                              owner
@@ -2761,7 +2600,9 @@ per-expression trace scan becomes an array lookup.")
               (Result.Success
                 (SpecializedExpr.Break expression-id (Box.init node-type)))
             (CoreExpr.Lambda _ parameters body)
-              (match (rewrite-expression (Box.peek body)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek body)
                                          calls
                                          inferred
                                          owner
@@ -2774,13 +2615,17 @@ per-expression trace scan becomes an array lookup.")
                                             (Box.init rewritten)))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.Match _ by-reference scrutinee branches)
-              (match (rewrite-expression (Box.peek scrutinee)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek scrutinee)
                                          calls
                                          inferred
                                          owner
                                          instance-substitution)
                 (Result.Success rewritten-scrutinee)
-                  (match (rewrite-branches branches
+                  (match (rewrite-branches context
+                                           state
+                                           branches
                                            calls
                                            inferred
                                            owner
@@ -2795,7 +2640,9 @@ per-expression trace scan becomes an array lookup.")
                     (Result.Error error) (Result.Error error))
                 (Result.Error error) (Result.Error error))
             (CoreExpr.Annotation _ inner annotation)
-              (match (rewrite-expression (Box.peek inner)
+              (match (rewrite-expression context
+                                         state
+                                         (Box.peek inner)
                                          calls
                                          inferred
                                          owner
@@ -2809,15 +2656,17 @@ per-expression trace scan becomes an array lookup.")
                 (Result.Error error) (Result.Error error)))
         (Result.Error error) (Result.Error error))))
 
-  (defn rewrite-body [body calls inferred owner signature]
-    (match (scheme-for (InferredModule.environment inferred) owner)
+  (defn rewrite-body [context state body calls inferred owner signature]
+    (match (scheme-for context (InferredModule.environment inferred) owner)
       (Maybe.Just scheme)
         (let [empty (Type.empty-substitution)]
           (match (Type.unify-strict (Box.peek (TypeScheme.body &scheme))
                                     signature
                                     &empty)
             (Result.Success instance-substitution)
-              (rewrite-expression body
+              (rewrite-expression context
+                                  state
+                                  body
                                   calls
                                   inferred
                                   &(Maybe.Just (CoreRef.copy owner))
@@ -2833,7 +2682,13 @@ per-expression trace scan becomes an array lookup.")
 
   (private materialize-output-from)
   (hidden materialize-output-from)
-  (defn materialize-output-from [core inferred instances first dependencies]
+  (defn materialize-output-from [context
+                                 state
+                                 core
+                                 inferred
+                                 instances
+                                 first
+                                 dependencies]
     ;; Accumulate payload arrays directly. Rebuilding a SpecializationModule
     ;; through a borrowed Result on every iteration copies all earlier bodies.
     (let-do [bodies (the (Array SpecializedBody) [])
@@ -2851,13 +2706,17 @@ per-expression trace scan becomes an array lookup.")
                   signature (Box.peek (Specialization.signature instance))]
               (match (function-for functions reference)
                 (Maybe.Just function)
-                  (match (materialize-calls core
+                  (match (materialize-calls context
+                                            state
+                                            core
                                             inferred
                                             instances
                                             (Array.unsafe-nth dependencies
                                                               (Int.- i first)))
                     (Result.Success calls)
-                      (match (rewrite-body (Box.peek (CoreFunction.body &function))
+                      (match (rewrite-body context
+                                           state
+                                           (Box.peek (CoreFunction.body &function))
                                            &calls
                                            inferred
                                            reference
@@ -2873,13 +2732,17 @@ per-expression trace scan becomes an array lookup.")
                 (Maybe.Nothing)
                   (match (value-for values reference)
                     (Maybe.Just value)
-                      (match (materialize-calls core
+                      (match (materialize-calls context
+                                                state
+                                                core
                                                 inferred
                                                 instances
                                                 (Array.unsafe-nth dependencies
                                                                   (Int.- i first)))
                         (Result.Success calls)
-                          (match (rewrite-body (Box.peek (CoreValue.body &value))
+                          (match (rewrite-body context
+                                               state
+                                               (Box.peek (CoreValue.body &value))
                                                &calls
                                                inferred
                                                reference
@@ -2898,7 +2761,9 @@ per-expression trace scan becomes an array lookup.")
                         (let [lowering (match (PrimitiveRegistry.lowering-for reference)
                                 (Maybe.Just found) found
                                 (Maybe.Nothing) (PrimitiveLowering.Intrinsic))]
-                          (match (materialize-calls core
+                          (match (materialize-calls context
+                                                    state
+                                                    core
                                                     inferred
                                                     instances
                                                     (Array.unsafe-nth dependencies
@@ -2916,11 +2781,13 @@ per-expression trace scan becomes an array lookup.")
           (Maybe.Just _) ()))
       (match failure
         (Maybe.Nothing)
-          (match (materialize-root-calls core inferred instances)
+          (match (materialize-root-calls context state core inferred instances)
             (Result.Success calls)
               (let [empty (Type.empty-substitution)
                     owner (the (Maybe CoreRef) (Maybe.Nothing))]
-                (match (rewrite-expressions (CoreModule.expressions core)
+                (match (rewrite-expressions context
+                                            state
+                                            (CoreModule.expressions core)
                                             &calls
                                             inferred
                                             &owner
@@ -2938,9 +2805,6 @@ per-expression trace scan becomes an array lookup.")
             (Result.Error error) (Result.Error error))
         (Maybe.Just error) (Result.Error error))))
 
-  (doc module "starts from top-level global calls, creates one instance per
-function/signature pair, and traverses the global calls recorded in each newly
-specialized function body.")
   (doc delete-request "builds a specialization request that demands the concrete
 `delete` implementation for `type`, routed through the same interface selection
 as ordinary calls. Used by the driver to close a specialized module over the
@@ -2971,8 +2835,46 @@ it in.")
                                                 (MonoLifetime.Static)))]
                          (Box.init (MonoType.copy type))))
                      (Maybe.Nothing))
-      (String.copy "closure capture copy")))
+      (String.copy "closure capture copy"))))
 
+(defmodule SpecializationDemands
+  (doc create "starts empty managed-demand streams for one ownership closure.")
+  (defn create [] (SpecializationDemands.init (Set.create) (Set.create) [] []))
+
+  (doc count "the number of distinct copier and deleter demands.")
+  (defn count [demands]
+    (Int.+
+      (Array.length (SpecializationDemands.deletes demands))
+      (Array.length (SpecializationDemands.copies demands))))
+
+  (private require!)
+  (hidden require!)
+  (defn require! [keys requests type copier]
+    (let [key (CAbi.type-key type)]
+      (unless-do (Set.contains? keys &key)
+        (Set.put! keys &key)
+        (Array.push-back! requests
+                          (if copier
+                            (Specialize.copy-request type)
+                            (Specialize.delete-request type))))))
+
+  (doc require-delete! "adds a deleter demand only when its ABI key is new.")
+  (defn require-delete! [demands type]
+    (require!
+      (SpecializationDemands.delete-keys demands)
+      (SpecializationDemands.deletes demands)
+      type
+      false))
+
+  (doc require-copy! "adds a copier demand independently of deleter demands.")
+  (defn require-copy! [demands type]
+    (require!
+      (SpecializationDemands.copy-keys demands)
+      (SpecializationDemands.copies demands)
+      type
+      true)))
+
+(defmodule Specialize
   (private name-in?)
   (hidden name-in?)
   (defn name-in? [names name]
@@ -2982,16 +2884,17 @@ it in.")
         (when (String.= (Array.unsafe-nth names i) name) (set! found true)))
       found))
 
-  (doc named-requests "builds a specialization demand for every function whose
+  (doc named-requests-in
+    "builds a specialization demand for every function whose
 qualified name appears in `names` and whose inferred scheme is concrete. The
 driver seeds these for definitions in the compiled file itself, so they are
 ownership- and borrow-checked even when nothing calls them, the way the
 reference compiler checks every definition.")
   (private named-request-for!)
   (hidden named-request-for!)
-  (defn named-request-for! [inferred reference names result]
+  (defn named-request-for! [context inferred reference names result]
     (when (name-in? names (CoreRef.name reference))
-      (match (scheme-for (InferredModule.environment inferred) reference)
+      (match (scheme-for context (InferredModule.environment inferred) reference)
         (Maybe.Just scheme)
           (let [signature (Type.apply (InferredModule.substitution inferred)
                                       (Box.peek (TypeScheme.body &scheme)))]
@@ -3005,16 +2908,15 @@ reference compiler checks every definition.")
                                   (String.copy "<definition>")))))
         (Maybe.Nothing) ())))
 
-  (defn named-requests [core inferred names]
-    (let-do [_ignored-index (prime-schemes! (InferredModule.environment inferred))
-             _ignored-trace (prime-trace! inferred)
-             result (the (Array SpecializationRequest) [])
+  (defn named-requests-in [context core inferred names]
+    (let-do [result (the (Array SpecializationRequest) [])
              functions (CoreModule.functions core)
              builtins (CoreModule.builtins core)
              n (Array.length functions)
              m (Array.length builtins)]
       (for [i 0 n]
-        (named-request-for! inferred
+        (named-request-for! context
+                            inferred
                             (CoreFunction.reference (Array.unsafe-nth functions
                                                                       i))
                             names
@@ -3022,22 +2924,21 @@ reference compiler checks every definition.")
       ;; registered builtins (e.g. `IO.println`) are demandable by name too —
       ;; the echo plan needs their specialized symbol.
       (for [i 0 m]
-        (named-request-for! inferred
+        (named-request-for! context
+                            inferred
                             (CoreBuiltin.reference (Array.unsafe-nth builtins i))
                             names
                             &result))
       result))
 
-  (doc echo-request "builds the specialization demand for rendering a
+  (doc echo-request-in "builds the specialization demand for rendering a
 top-level result of `type` through the `str` interface, the way the reference
 echoes top-level expression results into `main`. Derived strs take their
 argument by reference, scalar strs by value, so the by-reference form is
 probed first. Returns the request paired with by-ref?, or Nothing when no str
 implementation exists for the type.")
-  (defn echo-request [core inferred type]
-    (let [_ignored-index (prime-schemes! (InferredModule.environment inferred))
-          _ignored-trace (prime-trace! inferred)
-          by-ref (CallSite.init -1
+  (defn echo-request-in [context state core inferred type]
+    (let [by-ref (CallSite.init -1
                                 (PrimitiveRegistry.str-reference)
                                 (Box.init
                                   (MonoType.Function
@@ -3046,7 +2947,7 @@ implementation exists for the type.")
                                                            (MonoLifetime.Static)))]
                                     (Box.init (MonoType.String))))
                                 (Maybe.Nothing))]
-      (match (implementation-for core inferred &by-ref)
+      (match (implementation-for context state core inferred &by-ref)
         (Result.Success _)
           (Maybe.Just
             (Pair.init
@@ -3059,7 +2960,7 @@ implementation exists for the type.")
                                           (MonoType.Function [(Box.init (MonoType.copy type))]
                                                              (Box.init (MonoType.String))))
                                         (Maybe.Nothing))]
-            (match (implementation-for core inferred &by-value)
+            (match (implementation-for context state core inferred &by-value)
               (Result.Success _)
                 (Maybe.Just
                   (Pair.init
@@ -3068,23 +2969,26 @@ implementation exists for the type.")
               (Result.Error _)
                 (the (Maybe (Pair SpecializationRequest Bool)) (Maybe.Nothing)))))))
 
-  (doc module-with-known "specializes the reachable program plus
-`extra-requests`, seeded with concrete instances already compiled by an
-incremental session. The returned module contains only newly discovered
+  (private append-requests!)
+  (hidden append-requests!)
+  (defn append-requests! [queue requests]
+    (for [i 0 (Array.length requests)]
+      (Array.push-back! queue @(Array.unsafe-nth requests i))))
+
+  (doc module-with-known-in "specializes the reachable program plus
+deleter, copier and seed requests, seeded with concrete instances already
+compiled by an incremental session. The returned module contains only newly discovered
 definitions while its instance cache contains both old and new instances.")
-  (defn module-with-known [core inferred extra-requests known]
-    (let-do [_ignored-index (prime-schemes! (InferredModule.environment inferred))
-             _ignored-trace (prime-trace! inferred)
-             _ignored-buckets (buckets-reset! (CoreIR.max-declared-global-id core))
-             _ignored-implementations (let-do [implementations (CoreModule.implementations core)
-                                               keys (the (Array Int) [])]
-               (for [i 0 (Array.length implementations)]
-                 (Array.push-back! &keys
-                                   @(CoreRef.id
-                                     (CoreImplementation.interface (Array.unsafe-nth implementations
-                                                                                     i)))))
-               (set! *implementation-buckets* (bucket-positions &keys))
-               (set! *implementations-ready* true))
+  (defn module-with-known-in [context
+                              state
+                              core
+                              inferred
+                              deletes
+                              copies
+                              seeds
+                              known]
+    (let-do [_ignored-buckets (buckets-reset! state
+                                              (CoreIR.max-declared-global-id core))
              instances (Array.copy known)
              first-new (Array.length &instances)
              ;; each new instance's dependencies, for materialization
@@ -3111,28 +3015,29 @@ definitions while its instance cache contains both old and new instances.")
                                    @(CoreBuiltin.reference (Array.unsafe-nth builtins
                                                                              i)))))
              defined-positions (reference-positions &defined)
-             queue-result (root-requests core inferred)
+             queue-result (root-requests context state core inferred)
              queue (match-ref &queue-result
                (Result.Success found) (Array.copy found)
                (Result.Error _) [])
              cursor 0]
       (for [i 0 first-new]
         (let [reference (Specialization.reference (Array.unsafe-nth &instances i))]
-          (buckets-note! reference i)))
+          (buckets-note! state reference i)))
       (match-ref &queue-result
         (Result.Success _) ()
         (Result.Error error)
           (do
             (set! failed true)
             (set! failure (String.copy (SpecializeError.message error)))))
-      (let-do [extra-count (Array.length extra-requests)]
-        (for [i 0 extra-count]
-          (Array.push-back! &queue @(Array.unsafe-nth extra-requests i))))
+      (append-requests! &queue deletes)
+      (append-requests! &queue copies)
+      (append-requests! &queue seeds)
       (while-do (Int.< cursor (Array.length &queue))
         (unless-do failed
           (let [request (Array.unsafe-nth &queue cursor)
                 origin (String.copy (SpecializationRequest.origin request))
-                call (normalize-call inferred
+                call (normalize-call state
+                                     inferred
                                      (SpecializationRequest.call request))
                 reference (CoreRef.copy (CallSite.reference &call))
                 signature (MonoType.copy (Box.peek (CallSite.type &call)))]
@@ -3140,7 +3045,7 @@ definitions while its instance cache contains both old and new instances.")
             ;; whose free variables are pinned by the unique matching
             ;; implementation resolves through the dispatch substitution.
             (if (interface? interfaces &reference)
-              (match (implementation-for core inferred &call)
+              (match (implementation-for context state core inferred &call)
                 (Result.Success implementation)
                   (when (concrete-signature?
                       (Box.peek (CallSite.type &implementation)))
@@ -3156,7 +3061,7 @@ definitions while its instance cache contains both old and new instances.")
               (when (concrete-signature? &signature)
                 (match (overload-for core &reference)
                   (Maybe.Just overload)
-                    (match (candidate-for inferred &call &overload)
+                    (match (candidate-for context inferred &call &overload)
                       (Result.Success candidate)
                         (Array.push-back! &queue
                                           (SpecializationRequest.init candidate
@@ -3169,22 +3074,27 @@ definitions while its instance cache contains both old and new instances.")
                                                              (SpecializeError.message &error)))))
                   (Maybe.Nothing)
                     (if (indexed-has? &defined-positions &defined &reference)
-                      (unless-do (contains-instance? &instances
+                      (unless-do (contains-instance? state
+                                                     &instances
                                                      &reference
                                                      &signature)
-                        (match (dependencies-for core
+                        (match (dependencies-for context
+                                                 state
+                                                 core
                                                  inferred
                                                  &reference
                                                  &signature)
                           (Result.Success dependencies)
-                            (let-do [symbol (symbol-for core
+                            (let-do [symbol (symbol-for context
+                                                        core
                                                         &reference
                                                         &signature)]
                               (Array.push-back! &instances
                                                 (Specialization.init (CoreRef.copy &reference)
                                                                      (Box.init (MonoType.copy &signature))
                                                                      symbol))
-                              (buckets-note! &reference
+                              (buckets-note! state
+                                             &reference
                                              (Int.dec (Array.length &instances)))
                               (let [n (Array.length &dependencies)]
                                 (for [i 0 n]
@@ -3210,32 +3120,119 @@ definitions while its instance cache contains both old and new instances.")
                               (contextual-specialize-error &origin
                                                            "call has no function or builtin definition")))))))))
         (set! cursor (Int.inc cursor)))
-      (let-do [result (if failed
-                 (Result.Error (SpecializeError.init failure))
-                 (match (materialize-output-from core
-                                                 inferred
-                                                 &instances
-                                                 first-new
-                                                 &instance-dependencies)
-                   (Result.Success delta)
-                     (Result.Success
-                       (IncrementalSpecialization.init delta instances))
-                   (Result.Error error) (Result.Error error)))]
-        (clear-caches!)
-        result)))
+      (if failed
+        (Result.Error (SpecializeError.init failure))
+        (match (materialize-output-from context
+                                        state
+                                        core
+                                        inferred
+                                        &instances
+                                        first-new
+                                        &instance-dependencies)
+          (Result.Success delta)
+            (Result.Success (IncrementalSpecialization.init delta instances))
+          (Result.Error error) (Result.Error error)))))
 
-  (doc module-with "specializes the reachable program plus `extra-requests`
-(e.g. ownership delete demands), sharing one worklist so introduced calls use
-the same interface selection and instance deduplication as user calls.")
-  (defn module-with [core inferred extra-requests]
+  (private array-filter-template-dependencies)
+  (hidden array-filter-template-dependencies)
+  (private array-set-template-dependencies)
+  (hidden array-set-template-dependencies)
+  (private echo-request-in)
+  (hidden echo-request-in)
+
+  (private module-with-known-in)
+  (hidden module-with-known-in)
+  (private named-requests-in)
+  (hidden named-requests-in))
+
+(defmodule Specialize
+  (private implementation-buckets)
+  (hidden implementation-buckets)
+  (defn implementation-buckets [core]
+    (let-do [items (CoreModule.implementations core)
+             keys (the (Array Int) [])]
+      (for [i 0 (Array.length items)]
+        (Array.push-back! &keys
+                          @(CoreRef.id
+                            (CoreImplementation.interface (Array.unsafe-nth items
+                                                                            i)))))
+      (PositionBuckets.from-keys &keys)))
+
+  (doc prepare
+    "builds the reusable indexes for one unchanged Core/inference input and snapshots the current native naming policy. The context owns no materialized IR or per-pass type cache.")
+  (defn prepare [core inferred]
+    (SpecializeContext.init
+      (scheme-index (InferredModule.environment inferred))
+
+      (owner-buckets inferred)
+      (call-buckets inferred)
+      (implementation-buckets core)
+      @&*specialization-symbol-salt*
+      @&*specialization-symbol-references*
+      @&*specialization-binding-versions*))
+
+  (doc module-with-context
+    "specializes against the context's unchanged Core/inference input. Every call owns and releases its worklist, normalized types and dispatch memo before returning; only compact indexes persist between rounds.")
+  (defn module-with-context [context core inferred extra known]
+    (let-do [state (work-for inferred)]
+      (module-with-known-in context &state core inferred &[] &[] extra known)))
+
+  (doc module-with-demands "specializes with borrowed managed-demand streams,
+followed by seeds. Requests are copied once into the work queue; the accumulator
+retains its keys and requests for the next closure round.")
+  (defn module-with-demands [context core inferred demands seeds known]
+    (let [state (work-for inferred)]
+      (module-with-known-in context
+                            &state
+                            core
+                            inferred
+                            (SpecializationDemands.deletes demands)
+                            (SpecializationDemands.copies demands)
+                            seeds
+                            known)))
+
+  (doc named-requests-with-context
+    "builds named demands using the invocation's scheme index, without allocating a trace memo.")
+  (defn named-requests-with-context [context core inferred names]
+    (if (Array.empty? names) [] (named-requests-in context core inferred names)))
+
+  (doc echo-request-with-context
+    "builds an echo demand using the invocation's scheme and implementation indexes, without allocating a trace memo.")
+  (defn echo-request-with-context [context core inferred type]
+    (let-do [state (work-for inferred)]
+      (echo-request-in context &state core inferred type)))
+
+  (doc module-with-known
+    "specializes one invocation with the current naming defaults and a known concrete instance cache.")
+  (defn module-with-known [core inferred extra known]
+    (let-do [context (prepare core inferred)]
+      (module-with-context &context core inferred extra known)))
+
+  (doc named-requests
+    "builds concrete named demands with an invocation-owned index.")
+  (defn named-requests [core inferred names]
+    (if (Array.empty? names)
+      []
+      (let-do [context (prepare core inferred)]
+        (named-requests-with-context &context core inferred names))))
+
+  (doc echo-request
+    "builds an echo demand with invocation-owned indexes and temporary state.")
+  (defn echo-request [core inferred type]
+    (let-do [context (prepare core inferred)]
+      (echo-request-with-context &context core inferred type)))
+
+  (doc module-with
+    "specializes reachable roots plus explicit demands, with invocation-owned caches.")
+  (defn module-with [core inferred extra]
     (match (module-with-known core
                               inferred
-                              extra-requests
+                              extra
                               &(the (Array Specialization) []))
-      (Result.Success incremental)
-        (Result.Success @(IncrementalSpecialization.module &incremental))
+      (Result.Success (IncrementalSpecialization.init module _))
+        (Result.Success module)
       (Result.Error error) (Result.Error error)))
 
-  (doc module "specializes the reachable program from its roots.")
+  (doc module "specializes reachable roots with invocation-owned caches.")
   (defn module [core inferred]
     (module-with core inferred &(the (Array SpecializationRequest) []))))
