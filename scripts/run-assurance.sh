@@ -9,7 +9,7 @@
 #   run-assurance.sh sanitize  the reference suite again, every generated
 #                           program built with AddressSanitizer
 #   run-assurance.sh llvm   the LLVM backend's tests and its memory fixtures
-#                           under both drivers (needs libLLVM, see LLVM.setup)
+#                           under both backends (needs libLLVM, see LLVM.setup)
 #   run-assurance.sh all    phase and self (not sanitize or llvm, which CI
 #                           runs as their own jobs)
 #
@@ -170,7 +170,7 @@ run_sanitize() {
 run_llvm() {
   bootstrap
   cd "$repo_root"
-  "$compiler" -c "$core_dir" --optimize -b -o out/carp-compiler-llvm main-llvm.carp
+  "$compiler" -c "$core_dir" --optimize -b -o out/metacarp main-metacarp.carp
   # the backend's own tests resolve their fixtures relative to its directory
   (
     cd carp-llvm-backend

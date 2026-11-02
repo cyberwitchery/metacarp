@@ -25,15 +25,16 @@ carp -b --optimize main.carp
 
 This produces `./out/carp-compiler`.
 
-The optional LLVM driver additionally requires LLVM 21 or later with development
-headers and a linkable `libLLVM`. The session JIT also needs Clang from the same
-installation. Linux CI uses LLVM and Clang 22:
+`metacarp` is the same compiler plus the LLVM backend and the terminal REPL.
+It requires LLVM 21 or later with development headers and a linkable
+`libLLVM`. The session JIT also needs Clang from the same installation. Linux
+CI uses LLVM and Clang 22. Build it with the compiler above:
 
 ```sh
-carp -b --optimize main-llvm.carp
+./out/carp-compiler -c "$CARP_DIR/core" --optimize -b -o out/metacarp main-metacarp.carp
 ```
 
-This produces `./out/carp-compiler-llvm`. The LLVM bindings use
+The LLVM bindings use
 `brew --prefix llvm` on macOS and `llvm-config --prefix` elsewhere. Embedders
 can pass an explicit installation prefix to `LLVM.setup`.
 
@@ -49,6 +50,8 @@ carp-compiler [options] <source.carp>
   -o, --output <file>   output path — the C file, or the executable under -b
                         (default under -b: <output-directory>/<title>
                         from Project.config, out/Untitled unless set)
+  --emit c|llvm         the backend (llvm only in metacarp); llvm without
+                        -b/-x writes textual IR
   --optimize            build -b/-x executables with clang -O3 -D NDEBUG
   --log-memory          build -b/-x executables with LOG_MEMORY, so
                         Debug.memory-balance counts allocations
@@ -121,13 +124,13 @@ Compile and run a program that uses the standard library:
 
 ### LLVM backend
 
-`carp-compiler-llvm` shares the complete compiler front end with the C driver.
+`metacarp --emit llvm` shares the complete compiler front end with the C driver.
 It writes LLVM IR by default, or emits and links a native object under `-b` and
 `-x`:
 
 ```sh
-./out/carp-compiler-llvm -c "$CARP_DIR/core" -o /tmp/squares.ll examples/squares.carp
-./out/carp-compiler-llvm -x -c "$CARP_DIR/core" examples/squares.carp
+./out/metacarp --emit llvm -c "$CARP_DIR/core" -o /tmp/squares.ll examples/squares.carp
+./out/metacarp --emit llvm -x -c "$CARP_DIR/core" examples/squares.carp
 ```
 
 Pass `-g` or `--debug` to preserve source texts and attach DWARF locations from
@@ -145,22 +148,16 @@ describes both modes, and `metacarp repl --help` lists REPL commands and keys.
 The [terminal REPL](carp-repl/README.md) uses the warm session and LLVM JIT on
 macOS. It provides persistent definitions and typed results, mixed-input
 transactions, editable source history, completion, docs, highlighting,
-ownership and generated-code queries, and array/record inspection. Build it
-with a compiler rebuilt from current source. The reader editing API is included
-in the pinned `carp-reader@0.5.0` dependency:
+ownership and generated-code queries, and array/record inspection. Build
+`metacarp` as under [Build](#build). The reader editing API is included in the
+pinned `carp-reader@0.5.0` dependency:
 
 ```sh
-./out/carp-compiler -c "$CARP_DIR/core" --optimize -b \
-  -o out/carp-compiler-next main.carp
-./out/carp-compiler-next -c "$CARP_DIR/core" --optimize -b \
-  -o out/metacarp main-metacarp.carp
 ./out/metacarp
 # or: ./out/metacarp repl --core "$CARP_DIR/core" --no-history
 ```
 
-The combined executable requires the REPL's LLVM and libedit dependencies.
-`main.carp` still builds the C-only `carp-compiler` for bootstrapping;
-`main-repl.carp` builds the standalone `metacarp-repl` using the same REPL driver.
+The REPL also needs system libedit.
 
 The [umbrella RFC](docs/metacarp-repl.md) records the editor, introspection,
 editable-history, and inspection milestones. The Carp editor uses system libedit

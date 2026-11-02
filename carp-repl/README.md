@@ -5,21 +5,18 @@ A Carp terminal REPL over the existing compiler session and LLVM JIT. The
 and remaining hardening work.
 
 Requires macOS, clang, the existing LLVM bindings, a linkable libLLVM, and Carp
-Core. Build the compiler from current source before building the REPL:
+Core. From the repository root, with `out/carp-compiler` built from current
+source (see the [top-level README](../README.md#build)):
 
 ```sh
-./out/carp-compiler -c "$CARP_DIR/core" --optimize -b \
-  -o out/carp-compiler-next main.carp
-./out/carp-compiler-next -c "$CARP_DIR/core" --optimize -b \
-  -o out/metacarp main-metacarp.carp
+./out/carp-compiler -c "$CARP_DIR/core" --optimize -b -o out/metacarp main-metacarp.carp
 ./out/metacarp
 ```
 
 With no arguments, `metacarp` opens the REPL using `$CARP_DIR/core`. Use
 `metacarp repl --core <dir> --no-history` for explicit options. File arguments
 still compile, for example `metacarp -x program.carp`. The C-only bootstrap
-entry point remains `main.carp`; `main-repl.carp` builds a standalone
-`metacarp-repl` from the same driver.
+entry point remains `main.carp`.
 
 The pinned `carp-reader@0.5.0` dependency includes `Reader.read-syntax`.
 For reader development, `--package-override <reference>=<source.carp>` overrides

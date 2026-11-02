@@ -1,4 +1,4 @@
-;; carp-compiler-llvm — the LLVM driver: the same front half as main.carp
+;; The LLVM driver behind `metacarp --emit llvm`: the same front half as the C driver
 ;; (loading, expansion, resolution, inference, specialization, ownership,
 ;; lowering), then carp-llvm-backend instead of C rendering. The default
 ;; action prints LLVM IR; -b/-x emit a native object through the LLVM target
@@ -9,41 +9,8 @@
 ;; carp-llvm-backend/README.md). Unsupported constructs are reported as
 ;; errors, never mis-lowered. Requires libLLVM (see LLVM.setup).
 
-(load "carp-compiler.carp")
-(load "driver-load.carp")
+(load "driver.carp")
 (load "carp-llvm-backend/carp-llvm-backend.carp")
-(Project.config "title" "carp-compiler-llvm")
-(Project.no-echo)
-;; same stack reservation as the C driver: the compile-time evaluator recurses
-;; deeply through dynamic Map code
-(when (= (host-os) "darwin") (add-cflag "-Wl,-stack_size,0x20000000"))
-
-(defn print-llvm-help []
-  (do
-    (IO.println "usage: carp-compiler-llvm [options] <source.carp>")
-    (IO.println "")
-    (IO.println
-      "  -b, --build           compile to an executable instead of IR (needs --core)")
-    (IO.println
-      "  -x, --execute         compile to an executable and run it (needs --core)")
-    (IO.println
-      "  -c, --core <dir>      compile against the Carp standard library in <dir>")
-    (IO.println "                        (default: $CARP_DIR/core)")
-    (IO.println
-      "  -o, --output <file>   output path — the IR file, or the executable under -b")
-    (IO.println
-      "                        (default under -b: <output-directory>/<title>")
-    (IO.println
-      "                        from Project.config, out/Untitled unless set)")
-    (IO.println "  --no-core             skip the implicit Core load")
-    (IO.println
-      "  -g, --debug           emit DWARF line information from Carp source spans")
-    (IO.println "  -h, --help            show this help and exit")
-    (IO.println "  -v, --version         show version and exit")
-    (IO.println "")
-    (IO.println
-      "with no -b/-x, the LLVM IR is written to standard output (or -o).")
-    (IO.println "diagnostics go to standard error and name the rejecting phase.")))
 
 (defn lower-input [input core-dir no-core]
   (match (load-with-core input core-dir no-core)
@@ -167,15 +134,13 @@ int carp_llvm_roots(void);
            shim-c (fmt "/tmp/carp-llvm-%d-shim.c" (compiler-process-id))
            ok false]
     (match (emit-llvm backend core-dir &(Maybe.Just @&obj))
-      (Result.Error e) (IO.errorln &(fmt "carp-compiler-llvm: %s" &e))
+      (Result.Error e) (report-error &(fmt "%s" &e))
       (Result.Success _)
         (match (executable-shim backend)
-          (Result.Error e) (IO.errorln &(fmt "carp-compiler-llvm: %s" &e))
+          (Result.Error e) (report-error &(fmt "%s" &e))
           (Result.Success shim)
             (match (IO.write-file &shim &shim-c)
-              (Result.Error e)
-                (IO.errorln
-                  &(fmt "carp-compiler-llvm: cannot write shim: %s" &e))
+              (Result.Error e) (report-error &(fmt "cannot write shim: %s" &e))
               (Result.Success _)
                 (if (Int.= 0
                            (System.system
@@ -192,9 +157,9 @@ int carp_llvm_roots(void);
                            (String.= &(compiler-host-os) "darwin"))
                     (if (Int.= 0 (System.system &(fmt "dsymutil %s" binary)))
                       (set! ok true)
-                      (IO.errorln "carp-compiler-llvm: dsymutil failed"))
+                      (report-error "dsymutil failed"))
                     (set! ok true))
-                  (IO.errorln "carp-compiler-llvm: clang failed")))))
+                  (report-error "clang failed")))))
     (compiler-remove-file &obj)
     (compiler-remove-file &shim-c)
     ok))
@@ -204,10 +169,7 @@ int carp_llvm_roots(void);
           (Maybe.Just p) @p
           (Maybe.Nothing) (project-binary))]
     (if (build-llvm backend core-dir &binary log-memory debug true)
-      (do
-        (IO.println
-          &(String.append "carp-compiler-llvm: wrote executable " &binary))
-        0)
+      (do (report &(String.append "wrote executable " &binary)) 0)
       1)))
 
 (defn llvm-execute-action [backend core-dir log-memory debug]
@@ -218,27 +180,27 @@ int carp_llvm_roots(void);
 
 (defn llvm-emit-action [backend core-dir output]
   (match (emit-llvm backend core-dir &(the (Maybe String) (Maybe.Nothing)))
-    (Result.Error e) (do (IO.errorln &(fmt "carp-compiler-llvm: %s" &e)) 1)
+    (Result.Error e) (do (report-error &(fmt "%s" &e)) 1)
     (Result.Success ir)
       (match-ref output
         (Maybe.Just path)
           (match (IO.write-file &ir path)
             (Result.Success _) 0
             (Result.Error e)
-              (do
-                (IO.errorln
-                  &(fmt "carp-compiler-llvm: cannot write '%s': %s" path &e))
-                1))
+              (do (report-error &(fmt "cannot write '%s': %s" path &e)) 1))
         (Maybe.Nothing) (do (IO.print &ir) 0))))
 
 (defn run-llvm [input core-dir output action no-core log-memory debug]
   (do
     (set! *want-source-map* debug)
+    ;; the driver's builds always link the shim, so IR-side heap operations go
+    ;; through its CARP_MALLOC/CARP_FREE helpers
+    (LLVMBackend.use-carp-allocator!)
     (match (effective-core-dir core-dir)
       (Maybe.Nothing)
         (do
-          (IO.errorln
-            "carp-compiler-llvm: --core <dir> or CARP_DIR is required (--no-core still needs it for load resolution)")
+          (report-error
+            "--core <dir> or CARP_DIR is required (--no-core still needs it for load resolution)")
           1)
       (Maybe.Just dir)
         (match (lower-input input &dir no-core)
@@ -250,78 +212,3 @@ int carp_llvm_roots(void);
               (Int.= action 2)
                 (llvm-execute-action &backend &dir log-memory debug)
               (llvm-emit-action &backend &dir output))))))
-
-(defn main []
-  (let-do [args &System.args
-           n (StaticArray.length args)
-           input (the (Maybe String) (Maybe.Nothing))
-           output (the (Maybe String) (Maybe.Nothing))
-           core-dir (the (Maybe String) (Maybe.Nothing))
-           have-input false
-           no-core false
-           log-memory false
-           debug false
-           action 0
-           ; 0 = compile, 1 = help, 2 = version, 3 = argument error
-           mode 0
-           i 1]
-    (while-do (and (Int.< i n) (Int.= mode 0))
-      (let-do [arg @(StaticArray.unsafe-nth args i)]
-        (cond
-          (or (String.= &arg "-h") (String.= &arg "--help")) (set! mode 1)
-          (or (String.= &arg "-v") (String.= &arg "--version")) (set! mode 2)
-          (or (String.= &arg "-b") (String.= &arg "--build")) (set! action 1)
-          (or (String.= &arg "-x") (String.= &arg "--execute")) (set! action 2)
-          (String.= &arg "--no-core") (set! no-core true)
-          (String.= &arg "--log-memory") (set! log-memory true)
-          (or (String.= &arg "-g") (String.= &arg "--debug")) (set! debug true)
-          (or (String.= &arg "-o") (String.= &arg "--output"))
-            (if (Int.< (Int.inc i) n)
-              (do
-                (set! output
-                      (Maybe.Just @(StaticArray.unsafe-nth args (Int.inc i))))
-                (set! i (Int.inc i)))
-              (do
-                (IO.errorln
-                  "carp-compiler-llvm: option '-o' requires a file argument")
-                (set! mode 3)))
-          (or (String.= &arg "-c") (String.= &arg "--core"))
-            (if (Int.< (Int.inc i) n)
-              (do
-                (set! core-dir
-                      (Maybe.Just @(StaticArray.unsafe-nth args (Int.inc i))))
-                (set! i (Int.inc i)))
-              (do
-                (IO.errorln
-                  "carp-compiler-llvm: option '-c' requires a directory argument")
-                (set! mode 3)))
-          (String.starts-with? &arg "-")
-            (do
-              (IO.errorln &(fmt "carp-compiler-llvm: unknown option '%s'" &arg))
-              (set! mode 3))
-          have-input
-            (do
-              (IO.errorln "carp-compiler-llvm: more than one input file given")
-              (set! mode 3))
-          (do (set! input (Maybe.Just @&arg)) (set! have-input true))))
-      (set! i (Int.inc i)))
-    (cond
-      (Int.= mode 1) (print-llvm-help)
-      (Int.= mode 2) (IO.println &(String.append "carp-compiler-llvm " version))
-      (Int.= mode 3)
-        (do
-          (IO.errorln "try 'carp-compiler-llvm --help' for usage.")
-          (System.exit 2))
-      (match input
-        (Maybe.Just path)
-          (do
-            ;; the driver's builds always link the shim, so IR-side heap
-            ;; operations go through its CARP_MALLOC/CARP_FREE helpers
-            (LLVMBackend.use-carp-allocator!)
-            (System.exit
-              (run-llvm &path &core-dir &output action no-core log-memory debug)))
-        (Maybe.Nothing)
-          (do
-            (IO.errorln "carp-compiler-llvm: no input file")
-            (IO.errorln "try 'carp-compiler-llvm --help' for usage.")
-            (System.exit 2))))))

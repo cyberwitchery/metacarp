@@ -20,7 +20,7 @@ instructions, and current limits.
 The combined executable is built from `main-metacarp.carp`. Bare `metacarp`
 opens the REPL, `metacarp repl [options]` selects it explicitly, and file
 arguments use the C compiler. `driver.carp` and `carp-repl/cli.carp` expose
-callable entry points to the combined executable and the standalone drivers.
+callable entry points to both executables; `driver-llvm.carp` adds `--emit llvm`.
 The C-only `main.carp` bootstrap does not load LLVM or the terminal editor.
 
 The boundary is one language service shared by highlighting,
