@@ -625,30 +625,31 @@ hit and miss counts when the question is whether the caches are working at
 all.
 
 
-### 34. Specialization's module-level caches must be primed per entry [implementation]
+### 34. A specialization context belongs to one fixed input [implementation]
 
-`*normalized-node-types*` and now `*module-solver*` (an indexed
-`Type.solver-from-substitution` view of `InferredModule.substitution`) are
-process globals holding data derived from ONE inferred module. Every public
-entry — `named-requests`, `echo-request`, `module-with-known` — calls
-`prime-trace!` before anything downstream can reach them, and `clear-caches!`
-drops them afterwards. A new entry that forgets `prime-trace!` applies one
-module's substitution to another module's types, which the suites would show
-as a wrong type rather than a crash.
+`Specialize.prepare` builds a `SpecializeContext` from ONE core module and ONE
+inferred module: the scheme index, the owner and call buckets over the
+inference traces, and the implementations grouped by interface. Nothing checks
+that a later call passes the same pair, and no entry falls back to a scan when
+they differ. A context used against a different core or inferred module (one
+that a cell has since appended to, or another module entirely) answers
+positions into arrays it was not built from, which the suites would show as a
+wrong type or a wrong dispatch rather than a crash. A caller that keeps a
+context across calls has to drop it whenever either input changes; the
+session drops its cached one with the resident lowering views.
+
+Per-call state lives in `SpecializeWork`, made by each entry and released
+before it returns: the indexed module solver, the normalized node-type slots,
+the per-owner trace positions and the interface dispatch memo. The memo is
+keyed by the interface id and an exact spelling of the call type, and the key
+must tell apart every pair of types unification does. `Type.render` cannot
+serve: it drops lifetimes and renames variables by order of appearance.
 
 Do NOT memoize `normalize-call` by `CallSite.id`. Expression and call ids
-repeat across owners — that is why `*trace-positions*` is rebuilt per owner —
+repeat across owners — that is why the work record's trace positions are
+rebuilt per owner —
 so an id-keyed memo returns one function's type for another's call. The
 specialize suites catch it.
-
-`module-with-known` primes two more, valid only until its own `clear-caches!`:
-the interface dispatch memo (`*implementations*`, keyed by the interface id and
-an exact spelling of the call type) and the implementations grouped by
-interface (`*implementation-buckets*`). Both depend on the core module as well
-as the inferred one, which is why only `module-with-known` turns them on;
-`implementation-for` outside it searches without them. The memo key must tell
-apart every pair of types unification does. `Type.render` cannot serve: it
-drops lifetimes and renames variables by order of appearance.
 
 The worklist also records each new instance's dependencies, in instance
 order, and materialization reads them back by position instead of calling
@@ -760,7 +761,7 @@ anything else needs the skip widened to cover it.
 Enforcement: `overload-choice-refiltered-when-a-candidate-settles?`
 (integration suite).
 
-## Five things that look fragile but are actually safe
+## Four things that look fragile but are actually safe
 
 1. **`-g` vs release divergence**: the debug path allocates ids differently
    (`module-ceiling`), but emitted C is byte-identical modulo `#line` and
@@ -773,9 +774,6 @@ Enforcement: `overload-choice-refiltered-when-a-candidate-settles?`
 3. **The exact-count `known_gaps` carve-outs** in run-carp-suite-self.sh:
    deliberately brittle — any drift in a gap's shape becomes a hard failure
    instead of a quietly widening exemption. Do not loosen.
-4. **The dead stack-closure renderer** (`render-closure-construction`,
-   unreferenced) and `LineMap.reset!`: inert. Deleting them is safe;
-   resurrecting the stack env without consulting the ownership pass is not.
-5. **`infer-cell` advancing the live allocator**: burns id space, but
+4. **`infer-cell` advancing the live allocator**: burns id space, but
    emission determinism is unaffected because emit copies (verified with
    interleaved queries). Cosmetic, not a correctness hole.
