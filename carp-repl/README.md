@@ -346,7 +346,9 @@ unknown. Quiet diagnostics appear after 450 ms.
 
 Ctrl-C cancels editing. During execution or a native inspection callback, it
 terminates the worker's process group and returns to the editor. A crash or
-unexpected worker exit uses the same recovery path. Native values and view
+unexpected worker exit uses the same recovery path. The worker writes no core
+dump (its soft core limit is 0), so a crash returns at once instead of waiting
+for a core of the whole compiler to be written. Native values and view
 handles are discarded; accepted source and the journal stay in the parent.
 `:history`, `:defs`, and export remain available while execution is stopped.
 
