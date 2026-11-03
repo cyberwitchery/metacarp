@@ -335,7 +335,8 @@ or suspension to the original signal disposition. Libedit's asynchronous signal
 handlers are disabled because their rearming depends on its builtin reader.
 The caller's signal mask is restored when input finishes.
 
-Semantic previews have a two-million-unit work budget and a 500 ms deadline.
+Semantic previews have a two-million-unit work budget and a 500 ms deadline;
+an F2 check has the same budget and a 5 s deadline, since Ctrl-C cancels it.
 They restore compile-time state and never commit source or publish native code.
 The VM checks the budget at every instruction. Automatic previews refuse
 compile-time file reads; F2 explicitly permits them within the same bounds.

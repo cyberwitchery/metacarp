@@ -96,9 +96,10 @@ not changed by analysis.
 
 The compiler checks a two-million-unit work budget at expansion, resolution,
 inference, type solving, compile-time lowering, and every VM instruction.
-Size-growing VM builtins also charge for produced data. A 500 ms monotonic
-deadline uses those cooperative cancellation points. Automatic previews refuse
-compile-time file reads; explicit F2 permits them under the same work limits.
+Size-growing VM builtins also charge for produced data. A monotonic deadline
+uses those cooperative cancellation points: 500 ms for automatic previews, 5 s
+for an explicit F2 check, which Ctrl-C also cancels. Automatic previews refuse
+compile-time file reads; explicit F2 permits them under the same work budget.
 These cooperative bounds do not stop a blocked native call. Explicit
 cancellation can instead terminate the execution process after the compiler
 service's cancellation grace period. Buffers over 256 KiB report analysis unavailable.
