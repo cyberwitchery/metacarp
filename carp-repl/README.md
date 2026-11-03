@@ -4,8 +4,8 @@ A Carp terminal REPL over the existing compiler session and LLVM JIT. The
 [umbrella RFC](../docs/metacarp-repl.md) records the six milestones, contracts,
 and remaining hardening work.
 
-Requires macOS, clang, the existing LLVM bindings, a linkable libLLVM, and Carp
-Core. From the repository root, with `out/carp-compiler` built from current
+Runs on macOS and Linux. Requires clang, the existing LLVM bindings, a linkable
+libLLVM, libedit (`libedit-dev` on Debian and Ubuntu), and Carp Core. From the repository root, with `out/carp-compiler` built from current
 source (see the [top-level README](../README.md#build)):
 
 ```sh
@@ -374,6 +374,7 @@ scripts/check-repl.sh
 ```
 
 Input and reader-to-editor tests also run in the compiler phase suite.
-Native display, browser, and service checks run with the macOS REPL check.
+Native display, browser, and service checks run with the REPL check, on macOS and
+Linux.
 The shared view runtime and engine handle checks also run in LLVM assurance.
 Session, JIT, C backend, and LLVM backend tests cover the underlying contracts.

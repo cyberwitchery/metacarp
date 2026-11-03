@@ -159,9 +159,10 @@ its declarations even if its runtime body never returns.
 
 Each worker has an independent scratch directory and a parent lifeline. Cleanup
 removes known compiler artifacts through a physical directory traversal, retaining
-unknown files. The current terminal integration targets macOS: libedit, terminal
-signal handling, spawn flags, kqueue wakeups, and native process/PTY primitives
-live behind the terminal and process interfaces.
+unknown files. Libedit, terminal signal handling, spawn flags, event wakeups,
+and native process/PTY primitives live behind the terminal and process
+interfaces, which select the macOS or Linux primitives when the REPL is
+compiled.
 
 ## Milestone 2: terminal editing
 
@@ -452,12 +453,22 @@ to ordinary evaluation latency at this sample size.
 
 ## Platform boundary
 
-The current terminal host has Darwin-specific clock and errno bindings,
-an Apple linker stack-size option, and a Darwin-only check-script guard.
-libedit and the compiler/session interfaces are not inherently macOS-specific.
-The LLVM backend already has non-Darwin support-clang lookup and Linux process
-symbol linking. Porting the terminal requires selecting the corresponding
-clock, errno, and linker conventions and validating the host on that platform.
+The terminal host runs on macOS and Linux. `if-linux` in `native.carp` picks
+each platform's primitives when the REPL is compiled, and only the chosen one
+is emitted:
+
+| | macOS | Linux |
+|---|---|---|
+| wakeups | kqueue, `EVFILT_PROC` for worker exit | epoll, a pidfd for worker exit |
+| worker descriptors | `POSIX_SPAWN_CLOEXEC_DEFAULT` | `posix_spawn_file_actions_addclosefrom_np` |
+| executable, environment | `_NSGetExecutablePath`, `_NSGetEnviron` | `/proc/self/exe`, `environ` |
+| SIGPIPE on private writers | `F_SETNOSIGPIPE` per descriptor | ignored in the frontend, reset in the worker |
+| errno | `__error` | `__errno_location` |
+
+The worker's channels are descriptors 3 to 6 on both. Text width is measured
+under a `C.UTF-8` locale where one exists, because glibc's `wcwidth` measures
+nothing beyond ASCII in the `C` locale a program starts in. CI runs the REPL
+check on both platforms.
 
 ## Validation and performance
 

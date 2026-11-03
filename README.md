@@ -153,7 +153,7 @@ use the C compiler, for example `metacarp -x program.carp`. `metacarp --help`
 describes both modes, and `metacarp repl --help` lists REPL commands and keys.
 
 The [terminal REPL](carp-repl/README.md) uses the warm session and LLVM JIT on
-macOS. It provides persistent definitions and typed results, mixed-input
+macOS and Linux. It provides persistent definitions and typed results, mixed-input
 transactions, editable source history, completion, docs, highlighting,
 ownership and generated-code queries, and array/record inspection. Build
 `metacarp` as under [Build](#build). The reader editing API is included in the
@@ -164,7 +164,7 @@ pinned `carp-reader@0.5.0` dependency:
 # or: ./out/metacarp repl --core "$CARP_DIR/core" --no-history
 ```
 
-The REPL also needs system libedit.
+The REPL also needs libedit (part of macOS; `libedit-dev` on Debian and Ubuntu).
 
 The [umbrella RFC](docs/metacarp-repl.md) records the editor, introspection,
 editable-history, and inspection milestones. The Carp editor uses system libedit

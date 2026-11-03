@@ -2,16 +2,25 @@
 (system-include "spawn.h")
 (system-include "sys/wait.h")
 (system-include "sys/ioctl.h")
-(system-include "util.h")
 (system-include "termios.h")
-(system-include "crt_externs.h")
-(system-include "mach-o/dyld.h")
+(if (= (host-os) "linux")
+  (do
+    ; posix_spawn_file_actions_addclosefrom_np and environ are GNU extensions
+    (add-cflag "-D_GNU_SOURCE")
+    (system-include "pty.h")
+    (add-lib "-lutil"))
+  (do
+    (system-include "util.h")
+    (system-include "crt_externs.h")
+    (system-include "mach-o/dyld.h")))
 (register-type ReplSpawnActions "posix_spawn_file_actions_t")
 (register-type ReplSpawnAttributes "posix_spawnattr_t")
 (register-type ReplProcessWindow "struct winsize")
 (register-type ReplProcessExit "siginfo_t" [si_pid Int])
-(register-type ReplProcessTTYFlags "tcflag_t")
-(register-type ReplProcessTermios "struct termios" [c_lflag ReplProcessTTYFlags])
+; tcflag_t is an unsigned long on macOS and an unsigned int on Linux
+(if-linux
+  (register-type ReplProcessTermios "struct termios" [c_lflag Uint32])
+  (register-type ReplProcessTermios "struct termios" [c_lflag Uint64]))
 
 (defmodule ReplProcessNative
   (register actions-init
@@ -40,9 +49,15 @@
     "posix_spawnattr_setsigdefault")
   (do
     (register SPAWN-SESSION Int "POSIX_SPAWN_SETSID")
-    (register SPAWN-CLOSE Int "POSIX_SPAWN_CLOEXEC_DEFAULT")
     (register SPAWN-MASK Int "POSIX_SPAWN_SETSIGMASK")
     (register SPAWN-DEFAULT Int "POSIX_SPAWN_SETSIGDEF"))
+  ; macOS closes every descriptor the spawn does not name with a flag; Linux
+  ; closes the range above the worker's descriptors with an action instead
+  (if-linux
+    (register actions-close-from
+      (Fn [(Ptr ReplSpawnActions) Int] Int)
+      "posix_spawn_file_actions_addclosefrom_np")
+    (register SPAWN-CLOSE Int "POSIX_SPAWN_CLOEXEC_DEFAULT"))
   (register spawn
     (Fn
       [(Ptr Int)
@@ -53,10 +68,17 @@
        (Ptr (Ptr CChar))]
       Int)
     "posix_spawn")
-  (register executable-path
-    (Fn [(Ptr CChar) (Ptr Uint32)] Int)
-    "_NSGetExecutablePath")
-  (register environment (Fn [] (Ptr (Ptr (Ptr CChar)))) "_NSGetEnviron")
+  (if-linux
+    (do
+      (register read-link (Fn [(Ptr CChar) (Ptr CChar) Long] Long) "readlink")
+      (register environment (Ptr (Ptr CChar)) "environ"))
+    (do
+      (register executable-path
+        (Fn [(Ptr CChar) (Ptr Uint32)] Int)
+        "_NSGetExecutablePath")
+      (register environment-pointer
+        (Fn [] (Ptr (Ptr (Ptr CChar))))
+        "_NSGetEnviron")))
   (register openpty
     (Fn [(Ptr Int) (Ptr Int) (Ptr CChar) (Ptr ReplProcessTermios) (Ptr ())] Int)
     "openpty")
@@ -98,54 +120,74 @@
    lifeline Int
    master Int
    slave Int
+   ; the descriptor that watches for exit, when the platform needs one
+   exit-watch Int
    reaped Bool])
 
 (defmodule ReplProcessHost
-  (def request-fd 193)
-  (def reply-fd 194)
-  (def acknowledgement-fd 195)
-  (def lifeline-fd 196)
+  ; the worker's channels sit directly above stdio; everything from
+  ; first-free-fd up is closed in the worker
+  (def request-fd 3)
+  (def reply-fd 4)
+  (def acknowledgement-fd 5)
+  (def lifeline-fd 6)
+  (def first-free-fd 7)
 
   (defn canonical? [settings]
-    (let-do [bits (Uint64.from-long 0l)
-             source (Pointer.address
-               (ReplProcessTermios.c_lflag (Pointer.to-ref settings)))
-             count (Pointer.width source)]
-      (assert (Long.= count (Pointer.width (Pointer.address &bits))))
-      (ignore
-        (ReplProcessNative.copy-bytes (Pointer.address &bits) source count))
-      (Uint64./=
-        (Uint64.bit-and bits
-                        (Uint64.from-long
-                          (Long.from-int ReplProcessNative.CANONICAL)))
-        (Uint64.from-long 0l))))
-  (defn executable []
-    (let-do [size (Uint32.from-long 4096l)
-             buffer (Array.replicate 4096 &0b)]
-      (if (Int.=
-          (ReplProcessNative.executable-path
-            (the (Ptr CChar)
-                 (Unsafe.coerce (Pointer.address (Array.unsafe-nth &buffer 0))))
-            (Pointer.address &size))
-          0)
-        (Result.Success
-          (String.from-cstr
-            (the (Ptr CChar)
-                 (Unsafe.coerce (Pointer.address (Array.unsafe-nth &buffer 0))))))
-        (let-do [large (Array.replicate (Long.to-int (Uint32.to-long size)) &0b)]
-          (if (Int.=
-              (ReplProcessNative.executable-path
-                (the (Ptr CChar)
-                     (Unsafe.coerce
-                       (Pointer.address (Array.unsafe-nth &large 0))))
-                (Pointer.address &size))
-              0)
-            (Result.Success
-              (String.from-cstr
-                (the (Ptr CChar)
-                     (Unsafe.coerce
-                       (Pointer.address (Array.unsafe-nth &large 0))))))
-            (Result.Error @"cannot locate REPL executable"))))))
+    (let [flags (ReplProcessTermios.c_lflag (Pointer.to-ref settings))]
+      (if-linux
+        (Uint32./=
+          (Uint32.bit-and @flags
+                          (Uint32.from-long
+                            (Long.from-int ReplProcessNative.CANONICAL)))
+          (Uint32.from-long 0l))
+        (Uint64./=
+          (Uint64.bit-and @flags
+                          (Uint64.from-long
+                            (Long.from-int ReplProcessNative.CANONICAL)))
+          (Uint64.from-long 0l)))))
+  (if-linux
+    (defn executable []
+      (let-do [size 4096
+               buffer (Array.replicate size &0b)
+               length (ReplProcessNative.read-link (String.cstr "/proc/self/exe")
+                                                   (the (Ptr CChar)
+                                                        (Unsafe.coerce
+                                                          (Pointer.address (Array.unsafe-nth &buffer
+                                                                                             0))))
+                                                   (Long.from-int size))]
+        (if (and (Long.> length 0l) (Long.< length (Long.from-int size)))
+          (Result.Success
+            (String.from-bytes &(Array.prefix &buffer (Long.to-int length))))
+          (Result.Error @"cannot locate REPL executable"))))
+    (defn executable []
+      (let-do [size (Uint32.from-long 4096l)
+               buffer (Array.replicate 4096 &0b)]
+        (if (Int.=
+            (ReplProcessNative.executable-path
+              (the (Ptr CChar)
+                   (Unsafe.coerce (Pointer.address (Array.unsafe-nth &buffer 0))))
+              (Pointer.address &size))
+            0)
+          (Result.Success
+            (String.from-cstr
+              (the (Ptr CChar)
+                   (Unsafe.coerce (Pointer.address (Array.unsafe-nth &buffer 0))))))
+          (let-do [large (Array.replicate (Long.to-int (Uint32.to-long size))
+                                          &0b)]
+            (if (Int.=
+                (ReplProcessNative.executable-path
+                  (the (Ptr CChar)
+                       (Unsafe.coerce
+                         (Pointer.address (Array.unsafe-nth &large 0))))
+                  (Pointer.address &size))
+                0)
+              (Result.Success
+                (String.from-cstr
+                  (the (Ptr CChar)
+                       (Unsafe.coerce
+                         (Pointer.address (Array.unsafe-nth &large 0))))))
+              (Result.Error @"cannot locate REPL executable")))))))
 
   (defn- close-fds! [fds]
     (for [i 0 (Array.length fds)]
@@ -270,14 +312,24 @@
             (for [i 0 (Array.length &signals)]
               (ignore
                 (ReplNative.signal-add defaults @(Array.unsafe-nth &signals i)))))
+          ; the frontend may ignore SIGPIPE (see private-writer!); the worker
+          ; and the programs it runs start with the default
+          (ignore (ReplNative.signal-add defaults ReplNative.SIGNAL-PIPE))
           (set! status (install! actions &sources &targets &duplicates))
+          (if-linux
+            (when (Int.= status 0)
+              (set! status
+                    (ReplProcessNative.actions-close-from actions first-free-fd)))
+            ())
           (when (Int.= status 0)
             (set! status
                   (ReplProcessNative.attributes-flags attributes
                                                       (Int.bit-or ReplProcessNative.SPAWN-SESSION
-                                                                  (Int.bit-or ReplProcessNative.SPAWN-CLOSE
-                                                                              (Int.bit-or ReplProcessNative.SPAWN-MASK
-                                                                                          ReplProcessNative.SPAWN-DEFAULT))))))
+                                                                  (Int.bit-or
+                                                                    (if-linux 0
+                                                                              ReplProcessNative.SPAWN-CLOSE)
+                                                                    (Int.bit-or ReplProcessNative.SPAWN-MASK
+                                                                                ReplProcessNative.SPAWN-DEFAULT))))))
           (when (Int.= status 0)
             (set! status (ReplProcessNative.attributes-mask attributes mask)))
           (when (Int.= status 0)
@@ -297,7 +349,8 @@
                                              attributes
                                              (Pointer.address (Array.unsafe-nth &argv
                                                                                 0))
-                                             (Pointer.to-value (ReplProcessNative.environment))))))))
+                                             (if-linux ReplProcessNative.environment
+                                                       (Pointer.to-value (ReplProcessNative.environment-pointer)))))))))
       (when actions-ready (ignore (ReplProcessNative.actions-destroy actions)))
       (when attributes-ready
         (ignore (ReplProcessNative.attributes-destroy attributes)))
@@ -318,6 +371,7 @@
                                            @(Array.unsafe-nth &owned 7)
                                            master
                                            slave
+                                           -1
                                            false)]
           (close-fds!
             &[@(Array.unsafe-nth &owned 0)
@@ -379,10 +433,12 @@
           @(ReplProcess.acknowledgement process)
           @(ReplProcess.lifeline process)
           @(ReplProcess.master process)
-          @(ReplProcess.slave process)])
+          @(ReplProcess.slave process)
+          @(ReplProcess.exit-watch process)])
       (ReplProcess.set-reader! process -1)
       (ReplProcess.set-writer! process -1)
       (ReplProcess.set-acknowledgement! process -1)
       (ReplProcess.set-lifeline! process -1)
       (ReplProcess.set-master! process -1)
-      (ReplProcess.set-slave! process -1))))
+      (ReplProcess.set-slave! process -1)
+      (ReplProcess.set-exit-watch! process -1))))
