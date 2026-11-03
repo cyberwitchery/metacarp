@@ -1,0 +1,156 @@
+(load "../carp-types/core-instantiation.carp")
+
+(doc PatternSlotTypes "the bound payloads and ignored payload types of one
+pattern, each in depth-first order. The record owns both arrays.")
+(deftype PatternSlotTypes
+  [bound (Array (Pair CoreRef MonoType))
+   unbound (Array MonoType)])
+
+(doc PatternTyping "assigns constructor field types to Core pattern slots.
+Ownership can request both slot sets in one walk; lowering can request only
+ignored slots without allocating bound entries.")
+(defmodule PatternTyping
+  (private lookup-variable)
+  (hidden lookup-variable)
+  (defn lookup-variable [subst name]
+    (let-do [result (MonoType.Unit)
+             n (Array.length subst)]
+      (for [i 0 n]
+        (when (String.= (Pair.a (Array.unsafe-nth subst i)) name)
+          (set! result (MonoType.copy (Pair.b (Array.unsafe-nth subst i))))))
+      (Result.Success result)))
+
+  (doc field-type "instantiates a pattern field with last-binding precedence
+and Unit recovery for missing variables, preserving the pattern typing policy.")
+  (defn field-type [core-type subst]
+    (Result.from-success
+      (CoreInstantiation.type-with core-type subst &lookup-variable)
+      (Type.unit)))
+
+  (private collect-slots!)
+  (hidden collect-slots!)
+  (sig collect-slots!
+       (Fn
+         [(Ref CorePattern)
+          (Ref MonoType)
+          (Ref (Array CoreConstructorDeclaration))
+          Bool
+          Bool
+          (Ref (Array (Pair CoreRef MonoType)))
+          (Ref (Array MonoType))]
+         ()))
+  (defn collect-slots! [pattern
+                        scrutinee-type
+                        constructors
+                        want-bound
+                        want-unbound
+                        bound
+                        ignored]
+    (match-ref pattern
+      (CorePattern.Ignore)
+        (when want-unbound
+          (Array.push-back! ignored (MonoType.copy scrutinee-type)))
+      (CorePattern.Bind reference)
+        (when want-bound
+          (Array.push-back! bound
+                            (Pair.init (CoreRef.copy reference)
+                                       (MonoType.copy scrutinee-type))))
+      (CorePattern.Constructor reference children)
+        (let-do [found false
+                 n (Array.length constructors)]
+          (for [i 0 n]
+            (let [declaration (Array.unsafe-nth constructors i)]
+              (when-do (and (not found)
+                            (CoreIR.same-ref?
+                              (CoreConstructorDeclaration.reference declaration)
+                              reference))
+                (set! found true)
+                (let-do [subst (the (Array (Pair String MonoType)) [])]
+                  (match-ref (Box.peek
+                      (CoreConstructorDeclaration.result declaration))
+                    (CoreType.Named _ result-arguments)
+                      (match-ref scrutinee-type
+                        (MonoType.Named _ mono-arguments)
+                          (let [pairs (Int.min (Array.length result-arguments)
+                                               (Array.length mono-arguments))]
+                            (for [j 0 pairs]
+                              (match-ref (Box.peek (Array.unsafe-nth result-arguments
+                                                                     j))
+                                (CoreType.Variable variable)
+                                  (Array.push-back! &subst
+                                                    (Pair.init (String.copy variable)
+                                                               (MonoType.copy
+                                                                 (Box.peek (Array.unsafe-nth mono-arguments
+                                                                                             j)))))
+                                _ ())))
+                        _ ())
+                    _ ())
+                  (let [fields (CoreConstructorDeclaration.arguments declaration)
+                        pairs (Int.min (Array.length fields)
+                                       (Array.length children))]
+                    (for [j 0 pairs]
+                      (let [field-mono (field-type (Box.peek (Array.unsafe-nth fields
+                                                                               j))
+                                                   &subst)]
+                        (collect-slots! (Box.peek (Array.unsafe-nth children j))
+                                        &field-mono
+                                        constructors
+                                        want-bound
+                                        want-unbound
+                                        bound
+                                        ignored))))))))
+          ())))
+
+  (doc analyze "types bound and ignored slots together, without walking the
+pattern or copying the scrutinee type separately for each output.")
+  (defn analyze [pattern type constructors]
+    (let-do [bound (the (Array (Pair CoreRef MonoType)) [])
+             ignored (the (Array MonoType) [])]
+      (collect-slots! pattern type constructors true true &bound &ignored)
+      (PatternSlotTypes.init bound ignored)))
+
+  (doc bound-slot-types "returns bound references and their concrete payload
+types in depth-first order, including bindings unused by a branch body.")
+  (defn bound-slot-types [pattern type constructors]
+    (let-do [bound (the (Array (Pair CoreRef MonoType)) [])
+             ignored (the (Array MonoType) [])]
+      (collect-slots! pattern type constructors true false &bound &ignored)
+      bound))
+
+  (doc unbound-slot-types "returns ignored payload types in depth-first order,
+including the whole scrutinee for a root Ignore. Only ignored entries allocate.")
+  (defn unbound-slot-types [pattern type constructors]
+    (let-do [bound (the (Array (Pair CoreRef MonoType)) [])
+             ignored (the (Array MonoType) [])]
+      (collect-slots! pattern type constructors false true &bound &ignored)
+      ignored))
+
+  (doc bind-unbound-slots "replaces selected Ignore slots with bindings from
+refs. The mask and cursor follow the same order as unbound-slot-types.")
+  (sig bind-unbound-slots
+       (Fn
+         [(Ref CorePattern)
+          (Ref (Array CoreRef))
+          (Ref (Array Bool))
+          (Ref (Array Int))]
+         CorePattern))
+  (defn bind-unbound-slots [pattern refs mask cursor]
+    (match-ref pattern
+      (CorePattern.Ignore)
+        (let-do [index @(Array.unsafe-nth cursor 0)]
+          (Array.aset! cursor 0 (Int.inc index))
+          (if @(Array.unsafe-nth mask index)
+            (CorePattern.Bind (CoreRef.copy (Array.unsafe-nth refs index)))
+            (CorePattern.Ignore)))
+      (CorePattern.Bind reference) (CorePattern.Bind (CoreRef.copy reference))
+      (CorePattern.Constructor reference children)
+        (let-do [rewritten (the (Array (Box CorePattern)) [])]
+          (for [i 0 (Array.length children)]
+            (Array.push-back! &rewritten
+                              (Box.init
+                                (bind-unbound-slots (Box.peek (Array.unsafe-nth children
+                                                                                i))
+                                                    refs
+                                                    mask
+                                                    cursor))))
+          (CorePattern.Constructor (CoreRef.copy reference) rewritten)))))

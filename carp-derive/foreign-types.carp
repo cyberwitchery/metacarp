@@ -1,0 +1,289 @@
+(load "carp-derive.carp")
+
+(defmodule Derive
+  (private member-mono)
+
+  (hidden member-mono)
+
+  (defn member-mono [core-type]
+    (match-ref core-type
+      (CoreType.Integer) (MonoType.Integer)
+      (CoreType.String) (MonoType.String)
+      (CoreType.Boolean) (MonoType.Boolean)
+      (CoreType.Unit) (MonoType.Unit)
+      (CoreType.Named name arguments)
+        (let-do [types (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &types
+                              (Box.init
+                                (member-mono
+                                  (Box.peek (Array.unsafe-nth arguments i))))))
+          (MonoType.Named @name types))
+      (CoreType.Reference inner _)
+        (MonoType.Reference
+          (Box.init (member-mono (Box.peek inner)))
+          (MonoLifetime.Static))
+      (CoreType.Function arguments result)
+        (let-do [types (the (Array (Box MonoType)) [])]
+          (for [i 0 (Array.length arguments)]
+            (Array.push-back! &types
+                              (Box.init
+                                (member-mono
+                                  (Box.peek (Array.unsafe-nth arguments i))))))
+          (MonoType.Function types (Box.init (member-mono (Box.peek result)))))
+      _ (MonoType.Unit)))
+
+  (private has-builtin-source?)
+
+  (hidden has-builtin-source?)
+
+  (defn has-builtin-source? [core reference]
+    (Array.any?
+      &(fn [source]
+        (CoreIR.same-ref? (CoreBuiltinSource.reference source) reference))
+      (CoreModule.builtin-sources core)))
+
+  (private defines-function?)
+
+  (hidden defines-function?)
+
+  (defn defines-function? [core name]
+    (Array.any?
+      &(fn [function]
+        (String.= (CoreRef.name (CoreFunction.reference function)) name))
+      (CoreModule.functions core)))
+
+  (private add-accessor-source!)
+
+  (hidden add-accessor-source!)
+
+  (doc add-accessor-source! "gives the builtin the resolver declared for a
+registered type's accessor `name` its C source, as a template whose
+declaration spells `$NAME` and whose body opens with `$DECL`. The module
+may provide the name itself, with a definition or with a `register` or
+`deftemplate` whose C it keeps; a name it neither provides nor has a derived
+builtin for goes to `missing`, so it fails the compile instead of the C link.")
+
+  (defn add-accessor-source! [core sources missing name declaration body]
+    (let-do [builtins (CoreModule.builtins core)
+             provided (defines-function? core name)]
+      (for [i 0 (Array.length builtins)]
+        (let [builtin (Array.unsafe-nth builtins i)]
+          (when-do (String.= (CoreRef.name (CoreBuiltin.reference builtin)) name)
+            (set! provided true)
+            ;; a builtin with a source of its own is one the module declared
+            ;; with `register` or `deftemplate`; its C stays.
+            (unless (has-builtin-source? core (CoreBuiltin.reference builtin))
+              (Array.push-back! sources
+                                (CoreBuiltinSource.init @(CoreBuiltin.reference builtin)
+                                                        @(CoreBuiltin.signature builtin)
+                                                        (CoreBuiltinPayload.Template @&declaration
+                                                                                     @&body)))))))
+      (unless provided (Array.push-back! missing @name))))
+
+  (doc register-type-typedefs "a `register-type` with a C representation string
+(e.g. `(register-type A \"void*\")`) aliases that existing C type to the name
+the backend renders for it, and a `register-type` with a member array gets its
+field accessors, setters, and constructor emitted against the existing C
+struct. The typedef rides the verbatim preamble; each accessor becomes the C
+source of the builtin the resolver declared for it, so the backend renders it
+like any `deftemplate`: only when used, and with the linkage a library gives
+its own definitions. An accessor without its builtin is an error.")
+
+  (defn register-type-typedefs [core]
+    (let-do [includes (Array.copy (CoreModule.system-includes core))
+             sources (Array.copy (CoreModule.builtin-sources core))
+             missing (the (Array String) [])
+             declarations (CoreModule.type-declarations core)
+             n (Array.length declarations)]
+      (for [i 0 n]
+        (let [declaration (Array.unsafe-nth declarations i)]
+          (match-ref (CoreTypeDeclaration.representation declaration)
+            (Maybe.Just representation)
+              (Array.push-back! &includes
+                                (String.concat
+                                  &[@"typedef "
+                                    (String.copy representation)
+                                    @" "
+                                    (CAbi.nominal-symbol (CoreTypeDeclaration.name declaration))
+                                    @";"]))
+            (Maybe.Nothing) ())))
+      (for [i 0 n]
+        (let-do [declaration (Array.unsafe-nth declarations i)
+                 type-name (CoreTypeDeclaration.name declaration)
+                 c-name (CAbi.nominal-symbol type-name)
+                 members (CoreTypeDeclaration.members declaration)
+                 mcount (Array.length members)
+                 init-params (StringBuf.create)
+                 init-body (StringBuf.create)
+                 str-format (StringBuf.create)
+                 str-args (StringBuf.create)]
+          (for [m 0 mcount]
+            (let-do [member (Array.unsafe-nth members m)
+                     f-name (Pair.a member)
+                     f-mono (member-mono (Pair.b member))
+                     f-c (match (CAbi.render-type &f-mono)
+                       (Result.Success rendered) rendered
+                       (Result.Error _) (String.copy "int"))]
+              ;; member rendering for the derived str: format specifier plus
+              ;; the C expression that supplies it. Members whose type has no
+              ;; printf rendering show as a literal `?` with no argument.
+              (StringBuf.append-str &str-format " ")
+              (match-ref &f-mono
+                (MonoType.Integer)
+                  (do
+                    (StringBuf.append-str &str-format "%d")
+                    (StringBuf.append-str &str-args ", p->")
+                    (StringBuf.append-str &str-args f-name))
+                (MonoType.String)
+                  (do
+                    (StringBuf.append-str &str-format "%s")
+                    (StringBuf.append-str &str-args ", p->")
+                    (StringBuf.append-str &str-args f-name))
+                (MonoType.Boolean)
+                  (do
+                    (StringBuf.append-str &str-format "%s")
+                    (StringBuf.append-str &str-args ", (p->")
+                    (StringBuf.append-str &str-args f-name)
+                    (StringBuf.append-str &str-args " ? \"true\" : \"false\")"))
+                (MonoType.Named fn-name _)
+                  (if (or (String.= fn-name "Double")
+                          (or (String.= fn-name "Float")
+                              (String.= fn-name "Long")))
+                    (do
+                      (StringBuf.append-str &str-format
+                                            (if (String.= fn-name "Long")
+                                              "%lld"
+                                              "%g"))
+                      (StringBuf.append-str &str-args ", p->")
+                      (StringBuf.append-str &str-args f-name))
+                    (StringBuf.append-str &str-format "?"))
+                _ (StringBuf.append-str &str-format "?"))
+              (when (Int.> m 0) (StringBuf.append-str &init-params ", "))
+              (StringBuf.append-str &init-params &f-c)
+              (StringBuf.append-str &init-params " a")
+              (StringBuf.append-str &init-params &(Int.str m))
+              (StringBuf.append-str &init-body " r.")
+              (StringBuf.append-str &init-body f-name)
+              (StringBuf.append-str &init-body " = a")
+              (StringBuf.append-str &init-body &(Int.str m))
+              (StringBuf.append-str &init-body ";")
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @"."
+                                        (String.copy f-name)])
+                                    (String.concat
+                                      &[(String.copy &f-c)
+                                        @"* $NAME("
+                                        (String.copy &c-name)
+                                        @"* p)"])
+                                    (String.concat
+                                      &[@"$DECL { return &(p->"
+                                        (String.copy f-name)
+                                        @"); }"]))
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @".set-"
+                                        (String.copy f-name)])
+                                    (String.concat
+                                      &[(String.copy &c-name)
+                                        @" $NAME("
+                                        (String.copy &c-name)
+                                        @" p, "
+                                        (String.copy &f-c)
+                                        @" v)"])
+                                    (String.concat
+                                      &[@"$DECL { p."
+                                        (String.copy f-name)
+                                        @" = v; return p; }"]))
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat
+                                      &[(String.copy type-name)
+                                        @".set-"
+                                        (String.copy f-name)
+                                        @"!"])
+                                    (String.concat
+                                      &[@"void $NAME("
+                                        (String.copy &c-name)
+                                        @"* p, "
+                                        (String.copy &f-c)
+                                        @" v)"])
+                                    (String.concat
+                                      &[@"$DECL { p->"
+                                        (String.copy f-name)
+                                        @" = v; }"]))))
+          (when (Int.> mcount 0)
+            (add-accessor-source! core
+                                  &sources
+                                  &missing
+                                  &(String.concat &[(String.copy type-name)
+                                                    @".init"])
+                                  (String.concat
+                                    &[(String.copy &c-name)
+                                      @" $NAME("
+                                      (StringBuf.into-string init-params)
+                                      @")"])
+                                  (String.concat
+                                    &[@"$DECL { "
+                                      (String.copy &c-name)
+                                      @" r;"
+                                      (StringBuf.into-string init-body)
+                                      @" return r; }"])))
+          ;; the derived str for a registered struct renders like a deftype's:
+          ;; `(Banana 2.3 1000)`. It rides the same verbatim channel as the
+          ;; accessors because the struct layout is external C.
+          (when (Int.> mcount 0)
+            (let [format (String.concat
+                    &[@"("
+                      (String.copy type-name)
+                      (StringBuf.into-string str-format)
+                      @")"])
+                  ;; drained once: `to-string` empties the buffer, so a second
+                  ;; call emitted a format string with no arguments.
+                  args-text (StringBuf.into-string str-args)]
+              (add-accessor-source! core
+                                    &sources
+                                    &missing
+                                    &(String.concat &[(String.copy type-name)
+                                                      @".str"])
+                                    (String.concat
+                                      &[@"String $NAME("
+                                        (String.copy &c-name)
+                                        @"* p)"])
+                                    (String.concat
+                                      &[@"$DECL { int size = snprintf(NULL, 0, \""
+                                        (String.copy &format)
+                                        @"\""
+                                        (String.copy &args-text)
+                                        @") + 1; String buffer = CARP_MALLOC(size); snprintf(buffer, size, \""
+                                        (String.copy &format)
+                                        @"\""
+                                        (String.copy &args-text)
+                                        @"); return buffer; }"]))))))
+      (if (Array.empty? &missing)
+        (Result.Success
+          (CoreModule.init @(CoreModule.functions core)
+                           @(CoreModule.values core)
+                           @(CoreModule.builtins core)
+                           sources
+                           @(CoreModule.signatures core)
+                           @(CoreModule.type-declarations core)
+                           @(CoreModule.constructors core)
+                           @(CoreModule.recursive-types core)
+                           @(CoreModule.interfaces core)
+                           @(CoreModule.implementations core)
+                           @(CoreModule.overloads core)
+                           includes
+                           @(CoreModule.expressions core)))
+        (Result.Error
+          (String.append
+            "register-type: no builtin for the accessor "
+            &(String.join ", " &missing)))))))

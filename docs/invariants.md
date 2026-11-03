@@ -35,8 +35,8 @@ global id, :1964).
 `identify-generated`), carp-infer (node-types keyed by (owner, id)),
 carp-specialize (calls resolved by id), carp-ownership (`OwnershipAction`
 sites, duplicate-id rejection per context), carp-backend (`ScopeDelete.site`,
-match-temp naming), the source map (`install-source-map!`,
-carp-compiler.carp:3670, keyed by id), carp-session provenance
+match-temp naming), the source map (`backend-line-map` and
+`BackendLineMap` lookups, keyed by id), carp-session provenance
 (`CoreProvenance.node-span`).
 
 **Why.** Ids are the only cross-phase join key. Types, spans, ownership
@@ -59,7 +59,7 @@ history). The global id collision bug (length-based ids aliasing env
 bindings) is the ancestral incident.
 
 **Before changing, inspect.** `Ownership.prepare`'s id validation;
-`cleanup-for`'s (binder, site) matching; `install-source-map!`;
+`cleanup-for`'s (binder, site) matching; `backend-line-map`;
 `Resolve.module-with-provenance-against-reusing`; `identify-generated`.
 
 ### 2. Id ranges must never carry semantics [implementation]
@@ -122,11 +122,12 @@ phase suites.
 (`CarpCompiler.compile-inferred-module-with`, carp-compiler.carp:3756) that
 was merged from several inference runs must contain no trace type that still
 needs any substitution; its `substitution` field is empty by construction.
-`normalized-analysis` / `concat-analysis`
-(carp-session/carp-session.carp:99-200) are the only sanctioned merge path.
+`InferenceAnalysis.normalize` and `InferenceAnalysis.append` in
+`carp-infer/analysis.carp` own this merge boundary. `NormalizedAnalysis` has
+no substitution and is the only input accepted by `append`.
 
 **Why.** Batch code (carp-specialize :986, :1010, :1871 and the
-`*normalized-node-types*` memo) repairs raw traces by applying
+`SpecializeWork.normalized-node-types` memo) repairs raw traces by applying
 `InferredModule.substitution` — which for a merged module is empty, and
 `Type.apply`'s empty fast path (carp-types:206) makes the omission silent.
 
@@ -135,7 +136,8 @@ later commit makes a dormant polymorphic definition reachable, then fail with
 an unresolved-variable/non-concrete rejection days after the actual mistake.
 Lived in-tree 2026-07-29 (`7142ddc`) to 2026-08-01 (`f61045a`).
 
-**Enforced by.** Convention + docstring (carp-session:99-103) + one real-Core
+**Enforced by.** The `NormalizedAnalysis` input type, the independent solver
+space test in `carp-infer/test/analysis.carp`, and one real-Core
 regression test (`emits-after-committed-empty-map?`,
 carp-session/test/core.carp:60). Adversarially re-tested 2026-08-24 (chained
 overlay dormancy, closures, generic-instance derivation, redefinition,
@@ -143,8 +145,8 @@ interleaved-query determinism) — held; see the history of `f61045a` and
 `37d4fbc` for how the invariant was found.
 
 **Before changing.** Anything that caches or persists a trace type across a
-merge boundary; `inferred-environment-with-analysis`; `session-analysis`;
-`append-inferred-analysis` call sites in the four `finish-*-overlay`
+merge boundary; `InferenceAnalysis.with-environment`; `session-analysis`;
+`InferenceAnalysis.append-inferred` call sites in the four `finish-*-overlay`
 committers.
 
 `Infer.module-from-base` (see 39) is not a merge in this sense. It continues
@@ -220,7 +222,7 @@ direction, the leak direction only trips the memory-flavored suites.
 
 ### 10. Derive pass order is semantic: copies before deletes, strs before close-generics [implementation]
 
-**Invariant.** `derive-core-owned` (carp-compiler.carp:3557) runs
+**Invariant.** `CompilerFrontend.derive-core-owned` runs
 typedefs → accessors → pair-refs → **copies → deletes** → **strs →
 close-generics**. `Derive.derive-target-keys` excludes types that already
 have a deleter, so running deletes first silently suppresses copier
@@ -239,9 +241,9 @@ exclusion logic; the `strs`-vs-instance-str dispatch.
 ### 11. Ownership reports; only the driver iterates [implementation]
 
 **Invariant.** `Ownership.prepare` never calls specialize. Requirements
-(`DeleteFunction[T]`, copier demands, closure-capture copiers via
-`with-closure-delete-requirements`, carp-compiler:2833) are data; the
-`specialize-closed` fixpoint (carp-compiler.carp:2913) is the only loop, and
+(`DeleteFunction[T]` and copier/deleter demands for owned closure captures)
+are data; the
+`specialize-closed-known` fixpoint in `carp-compiler.carp` is the only loop, and
 termination rests on requirement types deduping by `CAbi.type-key` into a
 finite set.
 
@@ -253,13 +255,14 @@ detector**. The reference compiler shares this exposure (polymorphic
 recursion); it is not a reason to add a cap casually, but know it is absent.
 
 **Enforced by.** Architecture + tests (`plans-delete-requirement?`,
-`specializes-delete-on-demand?`). **Before changing:** `new-delete-types`,
-`new-types-among`, `closure-capture-types`, and the dedup key they share.
+`specializes-delete-on-demand?`, managed-demand characterization).
+**Before changing:** `SpecializationDemands`, `require-captures!`, the ABI-key
+deduplication policy, and deleter/copier/seed queue order.
 
 ### 12. Every managed-element array that reaches a delete site must have its deep deleter demanded; the sentinel is a fallback for unmanaged elements only [implementation, historically fatal]
 
-**Invariant.** `lookup-delete-symbol` (carp-backend.carp:295) consults the
-driver-built table first; the `__carp_array_free` sentinel (shallow
+**Invariant.** `CAbi.symbol-for-key` consults the selected module table first;
+the `__carp_array_free` sentinel (shallow
 `CARP_FREE(data)`) fires only on a miss (sites :475, :1442-1447, :1624-1640,
 :1733, :1761). Soundness = the ownership fixpoint demanded an `ArrayDelete`
 instance for every managed-element array type, so the table always hits for
@@ -275,17 +278,17 @@ added 2026-08-24; covers let-bound and hoisted sites). A cheap upgrade:
 error, under a debug flag, when the sentinel is selected while the element
 type classifies owned.
 
-**Before changing.** `delete-symbols-for` (driver :2990) keying,
+**Before changing.** `BackendSymbolSelection.for-module` keying,
 `array-free-symbol`, and every fallback site above.
 
 ### 13. Symbol tables key asymmetrically: deleters by arg0 type, copiers by return type [implementation]
 
-`delete-symbols-for` keys by the deleter's argument type-key;
-`copy-symbols-for` (:3018) by the copier's **return** type-key (copy takes a
+`BackendSymbolSelection.for-module` keys deleters by the argument type-key
+and copiers by the **return** type-key (copy takes a
 ref, returns the owned value). Unifying them "for consistency" empties one
 table; everything still compiles; closures stop deep-copying captures or
 deletes stop resolving. Enforced by code + the closure-capture and copier
-integration tests. Inspect both functions together, always.
+integration tests. Inspect both selection branches together, always.
 
 ---
 
@@ -566,7 +569,7 @@ byte-identical.
 
 1. `render-value-expression`'s GlobalCall cond (carp-c-expressions:256-558)
    — every arm silently outranks the declaration table (#14, #15, #16).
-2. The `specialize-closed` fixpoint and its requirement generators
+2. The `specialize-closed-known` fixpoint and its requirement generators
    (carp-compiler:2913, 2815-2870) — termination and memory-soundness both
    live here, uncapped (#11, #12).
 3. The Derive blocks in carp-compiler.carp — order-sensitive (#10) and

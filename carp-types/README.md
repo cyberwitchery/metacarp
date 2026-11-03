@@ -24,6 +24,20 @@ preserve lifetime aliases. `Type.same?` includes lifetime identity, while
 `Type.same-representation?` deliberately ignores it for specialization and ABI
 layout.
 
+`core-instantiation.carp` is an optional bridge to Core IR. Derivation,
+specialization, and both backends share its structural conversion of concrete
+field types. Callers supply borrowed binding storage and a variable lookup
+function, retaining their own binding precedence, fallback, and diagnostic
+rules. Concrete reference lifetimes become Static. Inference keeps its separate
+fresh-variable and lifetime translation; the base type algebra stays independent
+of Core IR.
+
+`pattern-typing.carp` owns constructor-driven pattern payload typing and masked
+binding of ignored slots. `PatternTyping.analyze` returns bound and ignored
+types together in one owning `PatternSlotTypes` record. Ownership uses this
+joint analysis; lowering can request only ignored slots. Both preserve the
+same constructor identity checks, generic substitutions, and traversal order.
+
 ```bash
 carp -x test/carp-types.carp
 ```

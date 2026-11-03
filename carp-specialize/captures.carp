@@ -1,0 +1,199 @@
+(load "carp-specialize.carp")
+
+; Capture analysis borrows the concrete IR. It does not rewrite bodies or
+; allocate backend symbols, and is shared by ownership closure and lifting.
+(defmodule CaptureAnalysis
+  (private ref-id-listed?)
+
+  (hidden ref-id-listed?)
+
+  (defn ref-id-listed? [ids target]
+    (let-do [found false]
+      (for [i 0 (Array.length ids)]
+        (when (Int.= @(Array.unsafe-nth ids i) target) (set! found true)))
+      found))
+
+  (private capture-listed?)
+
+  (hidden capture-listed?)
+
+  (defn capture-listed? [captures target]
+    (let-do [found false]
+      (for [i 0 (Array.length captures)]
+        (when (Int.= @(CoreRef.id (Pair.a (Array.unsafe-nth captures i))) target)
+          (set! found true)))
+      found))
+
+  (private collect-free)
+
+  (hidden collect-free)
+
+  (private collect-free-array)
+
+  (hidden collect-free-array)
+
+  (sig collect-free
+       (Fn
+         [(Ref SpecializedExpr)
+          (Ref (Array Int))
+          (Ref (Array (Pair CoreRef (Box MonoType))))]
+         ()))
+
+  (sig collect-free-array
+       (Fn
+         [(Ref (Array (Box SpecializedExpr)))
+          (Ref (Array Int))
+          (Ref (Array (Pair CoreRef (Box MonoType))))]
+         ()))
+
+  (defn collect-free-array [es bound acc]
+    (for [i 0 (Array.length es)]
+      (collect-free (Box.peek (Array.unsafe-nth es i)) bound acc)))
+
+  (doc collect-free "accumulates the free local-variable references of `expr`
+into `acc` (deduplicated): references not bound by `bound` (an id set extended at
+every binding form). Local variables always appear as `Reference` nodes; globals
+never do, so they are naturally excluded.")
+
+  (defn collect-free [expr bound acc]
+    (match-ref expr
+      (SpecializedExpr.Reference _ type reference)
+        (let [rid @(CoreRef.id reference)]
+          (unless (or (ref-id-listed? bound rid) (capture-listed? acc rid))
+            (Array.push-back! acc
+                              (Pair.init @reference
+                                         (Box.init (MonoType.copy (Box.peek type)))))))
+      (SpecializedExpr.Let _ _ reference value body)
+        (do
+          (collect-free (Box.peek value) bound acc)
+          (let-do [inner (Array.copy bound)]
+            (Array.push-back! &inner @(CoreRef.id reference))
+            (collect-free (Box.peek body) &inner acc)))
+      (SpecializedExpr.Lambda _ _ parameters body)
+        (let-do [inner (Array.copy bound)]
+          (for [i 0 (Array.length parameters)]
+            (Array.push-back! &inner
+                              @(CoreRef.id (Array.unsafe-nth parameters i))))
+          (collect-free (Box.peek body) &inner acc))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (do
+          (collect-free (Box.peek scrutinee) bound acc)
+          (for [i 0 (Array.length branches)]
+            (let-do [branch (Array.unsafe-nth branches i)
+                     bindings (SpecializedMatchBranch.bindings branch)
+                     inner (Array.copy bound)]
+              (for [j 0 (Array.length bindings)]
+                (Array.push-back! &inner
+                                  @(CoreRef.id (Array.unsafe-nth bindings j))))
+              (collect-free
+                (Box.peek (SpecializedMatchBranch.body branch))
+                &inner
+                acc))))
+      (SpecializedExpr.If _ _ condition then-branch else-branch)
+        (do
+          (collect-free (Box.peek condition) bound acc)
+          (collect-free (Box.peek then-branch) bound acc)
+          (collect-free (Box.peek else-branch) bound acc))
+      (SpecializedExpr.While _ _ condition body)
+        (do
+          (collect-free (Box.peek condition) bound acc)
+          (collect-free (Box.peek body) bound acc))
+      (SpecializedExpr.Set _ _ _ value)
+        (collect-free (Box.peek value) bound acc)
+      (SpecializedExpr.Call _ _ callee args)
+        (do
+          (collect-free (Box.peek callee) bound acc)
+          (collect-free-array args bound acc))
+      (SpecializedExpr.GlobalCall _ _ _ _ _ args)
+        (collect-free-array args bound acc)
+      (SpecializedExpr.ArrayLit _ _ es) (collect-free-array es bound acc)
+      (SpecializedExpr.StaticArrayLit _ _ es) (collect-free-array es bound acc)
+      (SpecializedExpr.Do _ _ es) (collect-free-array es bound acc)
+      (SpecializedExpr.Annotation _ _ inner _)
+        (collect-free (Box.peek inner) bound acc)
+      _ ()))
+
+  (doc free-variables
+    "returns each free local binding and its concrete type once, excluding the supplied parameters.")
+  (defn free-variables [body parameters]
+    (let-do [bound (the (Array Int) [])
+             acc (the (Array (Pair CoreRef (Box MonoType))) [])]
+      (for [i 0 (Array.length parameters)]
+        (Array.push-back! &bound @(CoreRef.id (Array.unsafe-nth parameters i))))
+      (collect-free body &bound &acc)
+      acc)))
+
+(defmodule CaptureAnalysis
+  (private collect-lambdas!)
+  (hidden collect-lambdas!)
+  (private collect-array!)
+  (hidden collect-array!)
+  (sig collect-lambdas!
+       (Fn
+         [(Ref SpecializedExpr)
+          (Ref (Array (Array (Pair CoreRef (Box MonoType)))))]
+         ()))
+  (sig collect-array!
+       (Fn
+         [(Ref (Array (Box SpecializedExpr)))
+          (Ref (Array (Array (Pair CoreRef (Box MonoType)))))]
+         ()))
+
+  (defn collect-array! [expressions captures]
+    (for [i 0 (Array.length expressions)]
+      (collect-lambdas! (Box.peek (Array.unsafe-nth expressions i)) captures)))
+
+  (defn collect-lambdas! [expression captures]
+    (match-ref expression
+      (SpecializedExpr.Lambda _ _ parameters body)
+        (let-do [free (free-variables (Box.peek body) parameters)]
+          (collect-lambdas! (Box.peek body) captures)
+          (unless (Array.empty? &free) (Array.push-back! captures free)))
+      (SpecializedExpr.Let _ _ _ value body)
+        (do
+          (collect-lambdas! (Box.peek value) captures)
+          (collect-lambdas! (Box.peek body) captures))
+      (SpecializedExpr.If _ _ condition consequent alternative)
+        (do
+          (collect-lambdas! (Box.peek condition) captures)
+          (collect-lambdas! (Box.peek consequent) captures)
+          (collect-lambdas! (Box.peek alternative) captures))
+      (SpecializedExpr.While _ _ condition body)
+        (do
+          (collect-lambdas! (Box.peek condition) captures)
+          (collect-lambdas! (Box.peek body) captures))
+      (SpecializedExpr.Match _ _ _ scrutinee branches)
+        (do
+          (collect-lambdas! (Box.peek scrutinee) captures)
+          (for [i 0 (Array.length branches)]
+            (collect-lambdas!
+              (Box.peek
+                (SpecializedMatchBranch.body (Array.unsafe-nth branches i)))
+              captures)))
+      (SpecializedExpr.Call _ _ callee arguments)
+        (do
+          (collect-lambdas! (Box.peek callee) captures)
+          (collect-array! arguments captures))
+      (SpecializedExpr.GlobalCall _ _ _ _ _ arguments)
+        (collect-array! arguments captures)
+      (SpecializedExpr.Set _ _ _ value)
+        (collect-lambdas! (Box.peek value) captures)
+      (SpecializedExpr.ArrayLit _ _ elements) (collect-array! elements captures)
+      (SpecializedExpr.StaticArrayLit _ _ elements)
+        (collect-array! elements captures)
+      (SpecializedExpr.Do _ _ elements) (collect-array! elements captures)
+      (SpecializedExpr.Annotation _ _ inner _)
+        (collect-lambdas! (Box.peek inner) captures)
+      _ ()))
+
+  (doc module
+    "returns the free local values captured by each concrete closure, without lambda lifting or backend state.")
+  (defn module [specialized]
+    (let-do [captures (the (Array (Array (Pair CoreRef (Box MonoType)))) [])
+             bodies (SpecializationModule.bodies specialized)]
+      (for [i 0 (Array.length bodies)]
+        (collect-lambdas!
+          (Box.peek (SpecializedBody.body (Array.unsafe-nth bodies i)))
+          &captures))
+      (collect-array! (SpecializationModule.roots specialized) &captures)
+      captures)))

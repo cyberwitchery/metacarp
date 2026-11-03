@@ -1,0 +1,139 @@
+(load "../carp-backend.carp")
+(Project.no-echo)
+(load "Test.carp")
+(use-all Test)
+
+(defmodule BackendLower
+  (defn test-cleanup-selection [actions context symbols]
+    (match (resolve-cleanup actions symbols)
+      (Result.Success cleanup)
+        (Result.Success (cleanup-deletes &cleanup context))
+      (Result.Error error) (Result.Error error))))
+
+(defn widget [] (Type.named "Widget" []))
+(defn other [] (Type.named "Other" []))
+(defn binding [id] (OwnershipResource.Binding (CoreRef.init id @"value" false)))
+(defn deletion [context site id type]
+  (OwnershipAction.Delete (OwnershipSite.init context site)
+                          (binding id)
+                          (Box.init type)))
+
+(defn symbols []
+  [(Pair.init (CAbi.type-key &(widget)) @"drop_first")
+   (Pair.init (CAbi.type-key &(other)) @"drop_other")
+   (Pair.init (CAbi.type-key &(widget)) @"drop_last")])
+
+(defn fixture-actions []
+  [(deletion 4 11 2 (widget))
+   (OwnershipAction.Borrow (OwnershipSite.init 4 9)
+                           (OwnershipBorrowMode.Shared)
+                           (OwnershipPlace.init (binding 2) []))
+   (deletion 0 11 1 (other))
+   (deletion 4 12 2 (widget))
+   (deletion 2147483600 7 3 (widget))
+   (deletion -7 6 4 (widget))
+   (OwnershipAction.Delete (OwnershipSite.init 4 13)
+                           (OwnershipResource.Temporary 9)
+                           (Box.init (Type.named "Missing" [])))
+   (OwnershipAction.Move (OwnershipSite.init 4 14)
+                         (binding 2)
+                         (OwnershipResource.Result)
+                         (Box.init (widget)))])
+
+(defn descriptions [deletes]
+  (let-do [result (the (Array String) [])]
+    (for [i 0 (Array.length deletes)]
+      (let [delete (Array.unsafe-nth deletes i)]
+        (Array.push-back! &result
+                          (fmt "%d:%d:%d:%s"
+                               @(ScopeDelete.context delete)
+                               @(ScopeDelete.site delete)
+                               @(CoreRef.id (ScopeDelete.binder delete))
+                               (ScopeDelete.symbol delete)))))
+    (String.join "|" &result)))
+
+(defn selection-is? [context expected]
+  (match (BackendLower.test-cleanup-selection &(fixture-actions)
+                                              context
+                                              &(symbols))
+    (Result.Success deletes) (String.= &(descriptions &deletes) expected)
+    (Result.Error _) false))
+
+(defn missing-context? []
+  (match (BackendLower.test-cleanup-selection &(fixture-actions)
+                                              2147483601
+                                              &(symbols))
+    (Result.Success deletes) (Array.empty? &deletes)
+    (Result.Error _) false))
+
+(defn array-fallback? []
+  (match (BackendLower.test-cleanup-selection
+      &[(deletion 0 5 1 (Type.named "Array" [(Box.init (Type.integer))]))]
+      0
+      &[])
+    (Result.Success deletes)
+      (String.=
+        (ScopeDelete.symbol (Array.unsafe-nth &deletes 0))
+        "__carp_array_free")
+    (Result.Error _) false))
+
+(defn missing-deleter? []
+  (match (BackendLower.test-cleanup-selection &[(deletion 0 5 1 (widget))] 0 &[])
+    (Result.Success _) false
+    (Result.Error error)
+      (String.= (BackendError.message &error)
+                "no concrete deleter for an owned local")))
+
+(defn non-binding-deletes? []
+  (match (BackendLower.test-cleanup-selection
+      &[(OwnershipAction.Delete (OwnershipSite.init 0 5)
+                                (OwnershipResource.Result)
+                                (Box.init (widget)))
+        (OwnershipAction.Delete (OwnershipSite.init 0 6)
+                                (OwnershipResource.Temporary 7)
+                                (Box.init (widget)))]
+      0
+      &[])
+    (Result.Success deletes) (Array.empty? &deletes)
+    (Result.Error _) false))
+
+(defn public-error-is? [contexts expected]
+  (let [specialized (SpecializationModule.init [] [] [] [] [] [] [])
+        ownership (OwnershipPlan.init @contexts [(deletion 999 5 1 (widget))] [])]
+    (match (BackendLower.module-with-ownership &specialized &ownership &[] &[])
+      (Result.Success _) false
+      (Result.Error error) (String.= (BackendError.message &error) expected))))
+
+(deftest t
+  (assert-true t
+    (selection-is? 4 "4:11:2:drop_last|4:12:2:drop_last")
+    "context selection preserves relative order and last-symbol precedence")
+  (assert-true t
+    (selection-is? -1
+                   "4:11:2:drop_last|0:11:1:drop_other|4:12:2:drop_last|2147483600:7:3:drop_last|-7:6:4:drop_last")
+    "wildcard cleanup preserves global action order across interleaved contexts")
+  (assert-true t
+    (selection-is? -7
+                   "4:11:2:drop_last|0:11:1:drop_other|4:12:2:drop_last|2147483600:7:3:drop_last|-7:6:4:drop_last")
+    "every negative query retains the legacy wildcard policy")
+  (assert-true t
+    (and
+      (selection-is? 2147483600 "2147483600:7:3:drop_last")
+      (missing-context?))
+    "sparse context IDs select exactly their deletes and absent contexts are empty")
+  (assert-true t
+    (array-fallback?)
+    "array deletes retain their shallow-free fallback")
+  (assert-true t
+    (missing-deleter?)
+    "an unresolved concrete deleter retains its diagnostic")
+  (assert-true t
+    (non-binding-deletes?)
+    "non-binding delete resources need no native symbol")
+  (assert-true t
+    (public-error-is? &[] "ownership plan has no root context")
+    "the empty-plan diagnostic retains priority over a missing deleter")
+  (assert-true t
+    (public-error-is? &[(OwnershipContext.Roots 0)]
+                      "no concrete deleter for an owned local")
+    "even unused context deletes are validated when there are no closures"))

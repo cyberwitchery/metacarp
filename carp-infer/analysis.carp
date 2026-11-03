@@ -1,0 +1,179 @@
+(load "carp-infer.carp")
+
+; Loaded after inference types. Normalized traces cannot carry the solver of
+; either producing run, so independent runs can only be joined in this form.
+(doc NormalizedAnalysis
+  "contains inference traces after their producing substitution has been applied. Batch InferredModule values retain their substitution until converted explicitly.")
+(deftype NormalizedAnalysis
+  [environment (Array SchemeBinding)
+   expression-types (Array (Box MonoType))
+   calls (Array CallSite)
+   node-types (Array InferredNodeType)
+   binding-types (Array InferredBindingType)])
+
+(defmodule InferenceAnalysis
+  (doc normalize
+    "normalizes all trace types with the producing run's substitution before any merge.")
+  (defn normalize [module]
+    (let-do [environment (Array.copy (InferredModule.environment module))
+             expression-types (the (Array (Box MonoType)) [])
+             calls (the (Array CallSite) [])
+             node-types (the (Array InferredNodeType) [])
+             binding-types (the (Array InferredBindingType) [])
+             ;; An indexed view, built once. `Type.apply` looks every variable
+             ;; up by scanning the substitution, which is linear in its size
+             ;; and runs once per trace — on a compiler-sized base that is
+             ;; quadratic, and normalization stops finishing in any time a
+             ;; caller is willing to wait.
+             solver (Type.solver-from-substitution (InferredModule.substitution module))]
+      (for [i 0 (Array.length (InferredModule.expression-types module))]
+        (Array.push-back! &expression-types
+                          (Box.init
+                            (Type.solver-apply &solver
+                                               (Box.peek
+                                                 (Array.unsafe-nth (InferredModule.expression-types module)
+                                                                   i))))))
+      (for [i 0 (Array.length (InferredModule.calls module))]
+        (let [call (Array.unsafe-nth (InferredModule.calls module) i)]
+          (Array.push-back! &calls
+                            (CallSite.init @(CallSite.id call)
+                                           (CoreRef.copy (CallSite.reference call))
+                                           (Box.init
+                                             (Type.solver-apply &solver
+                                                                (Box.peek (CallSite.type call))))
+                                           (match-ref (CallSite.owner call)
+                                             (Maybe.Just owner)
+                                               (Maybe.Just (CoreRef.copy owner))
+                                             (Maybe.Nothing) (Maybe.Nothing))))))
+      (for [i 0 (Array.length (InferredModule.node-types module))]
+        (let [node (Array.unsafe-nth (InferredModule.node-types module) i)]
+          (Array.push-back! &node-types
+                            (InferredNodeType.init @(InferredNodeType.id node)
+                                                   (match-ref (InferredNodeType.owner node)
+                                                     (Maybe.Just owner)
+                                                       (Maybe.Just (CoreRef.copy owner))
+                                                     (Maybe.Nothing)
+                                                       (Maybe.Nothing))
+                                                   (Box.init
+                                                     (Type.solver-apply &solver
+                                                                        (Box.peek (InferredNodeType.type node))))))))
+      (for [i 0 (Array.length (InferredModule.binding-types module))]
+        (let [binding (Array.unsafe-nth (InferredModule.binding-types module) i)]
+          (Array.push-back! &binding-types
+                            (InferredBindingType.init
+                              (CoreRef.copy (InferredBindingType.reference binding))
+                              (match-ref (InferredBindingType.owner binding)
+                                (Maybe.Just owner)
+                                  (Maybe.Just (CoreRef.copy owner))
+                                (Maybe.Nothing) (Maybe.Nothing))
+                              (Box.init
+                                (Type.solver-apply &solver
+                                                   (Box.peek (InferredBindingType.type binding))))))))
+      (NormalizedAnalysis.init environment
+                               expression-types
+                               calls
+                               node-types
+                               binding-types)))
+  (doc append
+    "joins two normalized analyses without sharing their former solver variable spaces.")
+  (private append-copies!)
+  (hidden append-copies!)
+  (defn append-copies! [target source]
+    (for [i 0 (Array.length source)]
+      (Array.push-back! target @(Array.unsafe-nth source i))))
+
+  (private joined)
+  (hidden joined)
+  (defn joined [left right]
+    (let-do [result @left] (append-copies! &result right) result))
+
+  (defn append [base overlay]
+    (NormalizedAnalysis.init
+      (joined (NormalizedAnalysis.environment base)
+              (NormalizedAnalysis.environment overlay))
+      (joined
+        (NormalizedAnalysis.expression-types base)
+        (NormalizedAnalysis.expression-types overlay))
+      (joined (NormalizedAnalysis.calls base) (NormalizedAnalysis.calls overlay))
+      (joined (NormalizedAnalysis.node-types base)
+              (NormalizedAnalysis.node-types overlay))
+      (joined (NormalizedAnalysis.binding-types base)
+              (NormalizedAnalysis.binding-types overlay))))
+  (doc with-environment
+    "restores a visible scheme environment around normalized traces for ordinary specialization. The result needs no substitution.")
+  (defn with-environment [environment analysis]
+    (InferredModule.init
+      (Array.copy (InferredModule.environment environment))
+      (Array.copy (NormalizedAnalysis.expression-types analysis))
+      (Array.copy (NormalizedAnalysis.calls analysis))
+      (Array.copy (NormalizedAnalysis.node-types analysis))
+      (Array.copy (NormalizedAnalysis.binding-types analysis))
+      (Type.empty-substitution)))
+
+  (doc append-inferred
+    "applies each independent run’s substitution before merging its environment and traces.")
+  (defn append-inferred [left right]
+    (let [base (normalize left)
+          overlay (normalize right)]
+      (InferredModule.init
+        (joined (NormalizedAnalysis.environment &base)
+                (NormalizedAnalysis.environment &overlay))
+        (joined
+          (NormalizedAnalysis.expression-types &base)
+          (NormalizedAnalysis.expression-types &overlay))
+        (joined (NormalizedAnalysis.calls &base)
+                (NormalizedAnalysis.calls &overlay))
+        (joined (NormalizedAnalysis.node-types &base)
+                (NormalizedAnalysis.node-types &overlay))
+        (joined (NormalizedAnalysis.binding-types &base)
+                (NormalizedAnalysis.binding-types &overlay))
+        (Type.empty-substitution)))))
+
+(defmodule InferenceAnalysis
+  (private retract-array!)
+
+  (hidden retract-array!)
+
+  (defn retract-array! [target length]
+    (while-do (Int.> (Array.length target) length)
+      (ignore (Array.pop-back! target))))
+
+  (doc mark
+    "records append-only boundaries in a resident inference view with normalized traces.")
+  (defn mark [inferred]
+    [(Array.length (InferredModule.environment inferred))
+     (Array.length (InferredModule.expression-types inferred))
+     (Array.length (InferredModule.calls inferred))
+     (Array.length (InferredModule.node-types inferred))
+     (Array.length (InferredModule.binding-types inferred))])
+
+  (doc append!
+    "appends normalized traces to a resident view built by with-environment, retaining its visible environment and empty substitution.")
+  (defn append! [target extra]
+    (do
+      (append-copies! (InferredModule.environment target)
+                      (NormalizedAnalysis.environment extra))
+      (append-copies! (InferredModule.expression-types target)
+                      (NormalizedAnalysis.expression-types extra))
+      (append-copies! (InferredModule.calls target)
+                      (NormalizedAnalysis.calls extra))
+      (append-copies! (InferredModule.node-types target)
+                      (NormalizedAnalysis.node-types extra))
+      (append-copies! (InferredModule.binding-types target)
+                      (NormalizedAnalysis.binding-types extra))))
+
+  (doc retract!
+    "retracts a resident inference view to its own append-only checkpoint.")
+  (defn retract! [inferred lengths]
+    (do
+      (retract-array! (InferredModule.environment inferred)
+                      @(Array.unsafe-nth lengths 0))
+      (retract-array!
+        (InferredModule.expression-types inferred)
+        @(Array.unsafe-nth lengths 1))
+      (retract-array! (InferredModule.calls inferred)
+                      @(Array.unsafe-nth lengths 2))
+      (retract-array! (InferredModule.node-types inferred)
+                      @(Array.unsafe-nth lengths 3))
+      (retract-array! (InferredModule.binding-types inferred)
+                      @(Array.unsafe-nth lengths 4)))))

@@ -19,6 +19,39 @@ elided, pattern-binding extraction, the parameterized primitive templates
 final translation unit with `carp_init_globals` and `main`. C names come from
 `carp-c-abi`'s mangling.
 
+Cleanup uses one body rewrite for ordinary functions and lifted callbacks,
+preserving context-specific deleters and the distinction between parameter-exit
+and assignment-site deletes. It resolves binding deletes once, then uses a
+shared `PositionBuckets` index to select each context without rescanning the
+ownership action list. Resolution handles missing-deleter errors; body, root,
+and closure rewriting then use the same resolved plan. Negative contexts
+retain the complete action order. The plan is released before backend
+materialization.
+
+Cleanup consumes the lifted module and closure array. Each body expression is
+replaced in its existing record, releasing its old tree before the next body.
+Signatures, parameters, capture descriptions, specialization metadata, and the
+body and closure arrays retain their storage. Root rewriting replaces only the
+root array. Public lowering entry points still borrow their inputs.
+
+The optional `symbols.carp` pass selects native copier, deleter, and echo
+symbols from a closed specialization module. It indexes implementation roles
+once, preserving full reference identity, then walks concrete instances in
+order. Echo demands carry accepted type keys; the selected `str` signature
+determines the calling convention.
+
+Expression rendering borrows its `BackendModule`, including the constructor,
+copier, and deleter tables. Lowering does not prime C-emission symbol state.
+Full translation units and standalone function sections use the same module
+tables, so lowering another module cannot replace a deferred module's capture
+copiers or field deleters.
+
+C source directives also read that module's `BackendLineMap` directly, without
+installing or copying it into process state. Shared line, column, and file
+lookups preserve independent bounds and missing-location defaults for C and
+LLVM. An unmapped module emits no source directives or reset marks, including
+when rendered after a mapped module.
+
 Deletes name their concrete deleter symbol (resolved from the ownership
 plan's requirements) — the shallow `__carp_array_free` sentinel is only a
 fallback for arrays whose element type is unmanaged.

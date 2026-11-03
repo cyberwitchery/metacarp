@@ -1,4 +1,5 @@
-(load "../carp-specialize/carp-specialize.carp")
+(load "../carp-types/pattern-typing.carp")
+(load "../carp-specialize/captures.carp")
 (load "../carp-ownership/carp-ownership.carp")
 (load "../carp-c-abi/carp-c-abi.carp")
 (load "git@github.com:carpentry-org/strbuf@0.3.0")
@@ -84,7 +85,35 @@ the compiler generated that expression and no caller source owns it.")
 
 (defmodule BackendLineMap
   (doc empty "is a source map with no caller-owned locations.")
-  (defn empty [] (BackendLineMap.init [] [] [])))
+  (defn empty [] (BackendLineMap.init [] [] []))
+
+  (doc enabled?
+    "whether the map carries a line table, including generated locations.")
+  (defn enabled? [map] (Int.> (Array.length (BackendLineMap.lines map)) 0))
+
+  (doc line-of
+    "the line at an expression identity, or -1 outside the line table.")
+  (defn line-of [map id]
+    (let [lines (BackendLineMap.lines map)]
+      (if (and (Int.>= id 0) (Int.< id (Array.length lines)))
+        @(Array.unsafe-nth lines id)
+        -1)))
+
+  (doc column-of
+    "the byte column at an expression identity, or 0 outside the column table.")
+  (defn column-of [map id]
+    (let [columns (BackendLineMap.columns map)]
+      (if (and (Int.>= id 0) (Int.< id (Array.length columns)))
+        @(Array.unsafe-nth columns id)
+        0)))
+
+  (doc file-of
+    "the exact source file at an expression identity, or an empty string outside the file table.")
+  (defn file-of [map id]
+    (let [files (BackendLineMap.files map)]
+      (if (and (Int.>= id 0) (Int.< id (Array.length files)))
+        @(Array.unsafe-nth files id)
+        @""))))
 
 (deftype BackendModule
   [declarations (Array BackendDeclaration)
@@ -115,6 +144,12 @@ delete.")
    type (Box MonoType)
    site Int
    context Int])
+
+(doc BackendCleanup "owns resolved binding deletes and their context index for
+one lowering invocation. It carries no expression tree and is freed before
+backend materialization.")
+(deftype BackendCleanup [deletes (Array ScopeDelete)
+                         contexts PositionBuckets])
 
 (doc EchoStr "how one concrete type renders for top-level result echo: the
 specialized str C symbol and whether it takes its argument by reference.")
@@ -162,26 +197,6 @@ reflift wrapper's binding type, which would mislabel the result.")
       (tail-expression-type (Box.peek annotated))
     _ (Specialize.expression-type expression)))
 
-;; type key -> copier C symbol, seeded per rendered module. A capturing
-;; lambda whose environment outlives the frame must OWN what it captured: the
-;; environment deleter frees its fields, so a field that merely aliases the
-;; capturing scope's value is freed twice, and read after the scope ends. The
-;; construction site deep-copies managed captures with these.
-(def *closure-copy-symbols* (the (Array (Pair String String)) []))
-
-(defn seed-closure-copy-symbols! [symbols]
-  (set! *closure-copy-symbols* (Array.copy symbols)))
-
-(defn closure-capture-copier [capture-type]
-  (let-do [result (the (Maybe String) (Maybe.Nothing))
-           key (CAbi.type-key capture-type)
-           n (Array.length &*closure-copy-symbols*)]
-    (for [i 0 n]
-      (let [entry (Array.unsafe-nth &*closure-copy-symbols* i)]
-        (when (String.= (Pair.a entry) &key)
-          (set! result (Maybe.Just (String.copy (Pair.b entry)))))))
-    result))
-
 (defmodule BackendLower
   (private concrete?)
   (hidden concrete?)
@@ -220,8 +235,7 @@ reflift wrapper's binding type, which would mislabel the result.")
   declarations. It rejects residual type variables rather than delegating them
   to a backend.")
   (defn module [specialized closures delete-symbols copy-symbols]
-    (let-do [_seeded (seed-closure-copy-symbols! copy-symbols)
-             declarations (the (Array BackendDeclaration) [])
+    (let-do [declarations (the (Array BackendDeclaration) [])
              symbols (the (Array Specialization) [])
              failure (the (Maybe BackendError) (Maybe.Nothing))
              bodies (SpecializationModule.bodies specialized)
@@ -331,18 +345,6 @@ reflift wrapper's binding type, which would mislabel the result.")
                                 symbols
                                 []
                                 @(SpecializationModule.type-declarations specialized))))))
-
-  (private lookup-delete-symbol)
-  (hidden lookup-delete-symbol)
-  (defn lookup-delete-symbol [delete-symbols key]
-    (let-do [result (the (Maybe String) (Maybe.Nothing))
-             n (Array.length delete-symbols)]
-      (for [i 0 n]
-        (when (String.= (Pair.a (Array.unsafe-nth delete-symbols i)) key)
-          (set! result
-                (Maybe.Just
-                  (String.copy (Pair.b (Array.unsafe-nth delete-symbols i)))))))
-      result))
 
   (private cleanup-for)
   (hidden cleanup-for)
@@ -725,115 +727,6 @@ hoisted temporaries the same C name (issue seen in produces-output/globals).")
       (set! *hoist-serial* @(Array.unsafe-nth &counter 0))
       lifted))
 
-  (private ref-id-listed?)
-  (hidden ref-id-listed?)
-  (defn ref-id-listed? [ids target]
-    (let-do [found false]
-      (for [i 0 (Array.length ids)]
-        (when (Int.= @(Array.unsafe-nth ids i) target) (set! found true)))
-      found))
-
-  (private capture-listed?)
-  (hidden capture-listed?)
-  (defn capture-listed? [captures target]
-    (let-do [found false]
-      (for [i 0 (Array.length captures)]
-        (when (Int.= @(CoreRef.id (Pair.a (Array.unsafe-nth captures i))) target)
-          (set! found true)))
-      found))
-
-  (private collect-free)
-  (hidden collect-free)
-  (private collect-free-array)
-  (hidden collect-free-array)
-  (sig collect-free
-       (Fn
-         [(Ref SpecializedExpr)
-          (Ref (Array Int))
-          (Ref (Array (Pair CoreRef (Box MonoType))))]
-         ()))
-  (sig collect-free-array
-       (Fn
-         [(Ref (Array (Box SpecializedExpr)))
-          (Ref (Array Int))
-          (Ref (Array (Pair CoreRef (Box MonoType))))]
-         ()))
-  (defn collect-free-array [es bound acc]
-    (for [i 0 (Array.length es)]
-      (collect-free (Box.peek (Array.unsafe-nth es i)) bound acc)))
-
-  (doc collect-free "accumulates the free local-variable references of `expr`
-into `acc` (deduplicated): references not bound by `bound` (an id set extended at
-every binding form). Local variables always appear as `Reference` nodes; globals
-never do, so they are naturally excluded.")
-  (defn collect-free [expr bound acc]
-    (match-ref expr
-      (SpecializedExpr.Reference _ type reference)
-        (let [rid @(CoreRef.id reference)]
-          (unless (or (ref-id-listed? bound rid) (capture-listed? acc rid))
-            (Array.push-back! acc
-                              (Pair.init @reference
-                                         (Box.init (MonoType.copy (Box.peek type)))))))
-      (SpecializedExpr.Let _ _ reference value body)
-        (do
-          (collect-free (Box.peek value) bound acc)
-          (let-do [inner (Array.copy bound)]
-            (Array.push-back! &inner @(CoreRef.id reference))
-            (collect-free (Box.peek body) &inner acc)))
-      (SpecializedExpr.Lambda _ _ parameters body)
-        (let-do [inner (Array.copy bound)]
-          (for [i 0 (Array.length parameters)]
-            (Array.push-back! &inner
-                              @(CoreRef.id (Array.unsafe-nth parameters i))))
-          (collect-free (Box.peek body) &inner acc))
-      (SpecializedExpr.Match _ _ _ scrutinee branches)
-        (do
-          (collect-free (Box.peek scrutinee) bound acc)
-          (for [i 0 (Array.length branches)]
-            (let-do [branch (Array.unsafe-nth branches i)
-                     bindings (SpecializedMatchBranch.bindings branch)
-                     inner (Array.copy bound)]
-              (for [j 0 (Array.length bindings)]
-                (Array.push-back! &inner
-                                  @(CoreRef.id (Array.unsafe-nth bindings j))))
-              (collect-free
-                (Box.peek (SpecializedMatchBranch.body branch))
-                &inner
-                acc))))
-      (SpecializedExpr.If _ _ condition then-branch else-branch)
-        (do
-          (collect-free (Box.peek condition) bound acc)
-          (collect-free (Box.peek then-branch) bound acc)
-          (collect-free (Box.peek else-branch) bound acc))
-      (SpecializedExpr.While _ _ condition body)
-        (do
-          (collect-free (Box.peek condition) bound acc)
-          (collect-free (Box.peek body) bound acc))
-      (SpecializedExpr.Set _ _ _ value)
-        (collect-free (Box.peek value) bound acc)
-      (SpecializedExpr.Call _ _ callee args)
-        (do
-          (collect-free (Box.peek callee) bound acc)
-          (collect-free-array args bound acc))
-      (SpecializedExpr.GlobalCall _ _ _ _ _ args)
-        (collect-free-array args bound acc)
-      (SpecializedExpr.ArrayLit _ _ es) (collect-free-array es bound acc)
-      (SpecializedExpr.StaticArrayLit _ _ es) (collect-free-array es bound acc)
-      (SpecializedExpr.Do _ _ es) (collect-free-array es bound acc)
-      (SpecializedExpr.Annotation _ _ inner _)
-        (collect-free (Box.peek inner) bound acc)
-      _ ()))
-
-  (private free-vars)
-  (hidden free-vars)
-  (defn free-vars [body parameters]
-    (let-do [bound (the (Array Int) [])
-             acc (the (Array (Pair CoreRef (Box MonoType))) [])]
-      (for [i 0 (Array.length parameters)]
-        (Array.push-back! &bound @(CoreRef.id (Array.unsafe-nth parameters i))))
-      (collect-free body &bound &acc)
-      acc))
-
   (private lift-in-expr)
   (hidden lift-in-expr)
   (private lift-array-elems)
@@ -899,7 +792,8 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
                                            counter
                                            lifted
                                            closures)
-                 captures (free-vars &lifted-body parameters)
+                 captures (CaptureAnalysis.free-variables &lifted-body
+                                                          parameters)
                  fresh-id (if *stable-lambda-symbols* @id (next-hoist counter))]
           (if (Int.= 0 (Array.length &captures))
             (let-do [symbol (if *stable-lambda-symbols*
@@ -1639,9 +1533,9 @@ arguments and array literals whose values are consumed, not dropped).")
               ;; at branch exit, alongside the scheduled binding deletes.
               ;; Slots without a deleter stay `Ignore`.
               (unless @by-reference
-                (let [slots (Specialize.unbound-slot-types (SpecializedMatchBranch.pattern branch)
-                                                           &scrutinee-type
-                                                           constructors)]
+                (let [slots (PatternTyping.unbound-slot-types (SpecializedMatchBranch.pattern branch)
+                                                              &scrutinee-type
+                                                              constructors)]
                   (unless (Int.= 0 (Array.length &slots))
                     (let-do [fresh (the (Array CoreRef) [])
                              symbols (the (Array (Maybe String)) [])
@@ -1650,8 +1544,8 @@ arguments and array literals whose values are consumed, not dropped).")
                              cursor (the (Array Int) [0])]
                       (for [j 0 (Array.length &slots)]
                         (let-do [slot (Array.unsafe-nth &slots j)
-                                 symbol (match (lookup-delete-symbol delete-symbols
-                                                                     &(CAbi.type-key slot))
+                                 symbol (match (CAbi.symbol-for-key delete-symbols
+                                                                    &(CAbi.type-key slot))
                                    (Maybe.Just found) (Maybe.Just found)
                                    (Maybe.Nothing)
                                      (if (array-managed-type? slot)
@@ -1666,10 +1560,10 @@ arguments and array literals whose values are consumed, not dropped).")
                           (Array.push-back! &symbols symbol)))
                       (when-do any
                         (set! pattern
-                              (Specialize.bind-unbound-slots (SpecializedMatchBranch.pattern branch)
-                                                             &fresh
-                                                             &mask
-                                                             &cursor))
+                              (PatternTyping.bind-unbound-slots (SpecializedMatchBranch.pattern branch)
+                                                                &fresh
+                                                                &mask
+                                                                &cursor))
                         (for [j 0 (Array.length &slots)]
                           (match-ref (Array.unsafe-nth &symbols j)
                             (Maybe.Just symbol)
@@ -1819,47 +1713,63 @@ arguments and array literals whose values are consumed, not dropped).")
                                                   constructors)))
       _ (SpecializedExpr.copy expr)))
 
-  (private deletes-for-context)
-  (hidden deletes-for-context)
-  (defn deletes-for-context [actions context-id delete-symbols]
-    (let-do [result (the (Array ScopeDelete) [])
-             failed false
-             n (Array.length actions)]
-      (for [i 0 n]
+  (private resolve-cleanup)
+  (hidden resolve-cleanup)
+  (defn resolve-cleanup [actions delete-symbols]
+    (let-do [deletes (the (Array ScopeDelete) [])
+             keys (the (Array Int) [])
+             failed false]
+      (for [i 0 (Array.length actions)]
         (match-ref (Array.unsafe-nth actions i)
-          (OwnershipAction.Delete site resource type)
-            (when (or (Int.< context-id 0)
-                      (Int.= @(OwnershipSite.context site) context-id))
-              (match-ref resource
-                (OwnershipResource.Binding binder)
-                  (match (lookup-delete-symbol delete-symbols
-                                               &(CAbi.type-key (Box.peek type)))
-                    (Maybe.Just symbol)
-                    (set! result
-                          (Array.push-back result
-                                           (ScopeDelete.init (CoreRef.copy binder)
-                                                             symbol
-                                                             (Box.init (MonoType.copy (Box.peek type)))
-                                                             @(OwnershipSite.expression site)
-                                                             @(OwnershipSite.context site))))
-                    (Maybe.Nothing)
-                    ;; arrays whose deleter instance was not demanded fall back
-                    ;; to the shallow data free.
-                    (if (array-managed-type? (Box.peek type))
-                      (set! result
-                            (Array.push-back result
-                                             (ScopeDelete.init (CoreRef.copy binder)
-                                                               (array-free-symbol)
-                                                               (Box.init (MonoType.copy (Box.peek type)))
-                                                               @(OwnershipSite.expression site)
-                                                               @(OwnershipSite.context site))))
-                      (set! failed true)))
-                _ ()))
+          (OwnershipAction.Delete site (OwnershipResource.Binding binder) type)
+            (let-do [value-type (Box.peek type)
+                     symbol (CAbi.symbol-for-type delete-symbols value-type)]
+              (when (and (Maybe.nothing? &symbol)
+                         (array-managed-type? value-type))
+                (set! symbol (Maybe.Just (array-free-symbol))))
+              (match symbol
+                (Maybe.Just name)
+                  (do
+                    (Array.push-back! &deletes
+                                      (ScopeDelete.init @binder
+                                                        name
+                                                        (Box.init @value-type)
+                                                        @(OwnershipSite.expression site)
+                                                        @(OwnershipSite.context site)))
+                    (Array.push-back! &keys @(OwnershipSite.context site)))
+                (Maybe.Nothing) (set! failed true)))
           _ ()))
       (if failed
         (Result.Error
           (BackendError.init @"no concrete deleter for an owned local"))
-        (Result.Success result))))
+        (Result.Success
+          (BackendCleanup.init deletes (PositionBuckets.from-keys &keys))))))
+
+  (private cleanup-range)
+  (hidden cleanup-range)
+  (defn cleanup-range [cleanup context]
+    (if (Int.< context 0)
+      (Pair.init 0 (Array.length (BackendCleanup.deletes cleanup)))
+      (PositionBuckets.range (BackendCleanup.contexts cleanup) &context)))
+
+  (private cleanup-at)
+  (hidden cleanup-at)
+  (defn cleanup-at [cleanup context at]
+    (Array.unsafe-nth (BackendCleanup.deletes cleanup)
+                      (if (Int.< context 0)
+                        at
+                        @(Array.unsafe-nth
+                          (PositionBuckets.items (BackendCleanup.contexts cleanup))
+                          at))))
+
+  (private cleanup-deletes)
+  (hidden cleanup-deletes)
+  (defn cleanup-deletes [cleanup context]
+    (let-do [range (cleanup-range cleanup context)
+             deletes (the (Array ScopeDelete) [])]
+      (for [i @(Pair.a &range) @(Pair.b &range)]
+        (Array.push-back! &deletes @(cleanup-at cleanup context i)))
+      deletes))
 
   (private echo-str-for)
   (hidden echo-str-for)
@@ -1943,7 +1853,7 @@ the text, delete the text, delete the result when owned.")
       ;; a by-value str consumed the result; a by-ref str left it live, so an
       ;; owned result still needs its deleter.
       (when by-ref
-        (match (lookup-delete-symbol delete-symbols &(CAbi.type-key root-type))
+        (match (CAbi.symbol-for-key delete-symbols &(CAbi.type-key root-type))
           (Maybe.Just symbol)
             (Array.push-back! &elements
                               (Box.init
@@ -1971,8 +1881,8 @@ owned value in a temporary binding plus its deleter, since a root expression
 always discards its result. Roots that produce unmanaged values are left as-is.")
   (defn rewrite-root [root delete-symbols]
     (let [root-type (Specialize.expression-type root)]
-      (match (match (lookup-delete-symbol delete-symbols
-                                          &(CAbi.type-key &root-type))
+      (match (match (CAbi.symbol-for-key delete-symbols
+                                         &(CAbi.type-key &root-type))
           (Maybe.Just symbol) (Maybe.Just symbol)
           (Maybe.Nothing)
             (if (array-managed-type? &root-type)
@@ -2077,138 +1987,119 @@ function exit on exactly the paths that do not consume them.")
 
   (private rewrite-bodies)
   (hidden rewrite-bodies)
-  (defn rewrite-bodies [specialized ownership delete-symbols echo]
-    (let-do [bodies (SpecializationModule.bodies specialized)
-             actions (OwnershipPlan.actions ownership)
-             contexts (OwnershipPlan.contexts ownership)
-             new-bodies (the (Array SpecializedBody) [])
-             failure (the (Maybe BackendError) (Maybe.Nothing))
-             n (Array.length bodies)]
-      (for [i 0 n]
-        (match-ref &failure
-          (Maybe.Nothing)
-            (let [body (Array.unsafe-nth bodies i)]
-              ;; Lambda lifting appends noncapturing callbacks after the
-              ;; ownership contexts were numbered. The Roots context at the
-              ;; first appended index is not a definition's cleanup context.
-              ;; Their local ids are
-              ;; module-unique, so matching them against the complete delete
-              ;; set safely recovers the actions planned while they were
-              ;; nested in their source context.
-              (match (deletes-for-context actions
-                                          (if (Int.< i (Array.length contexts))
-                                            (match-ref (Array.unsafe-nth contexts
-                                                                         i)
-                                              (OwnershipContext.Definition _
-                                                                           _
-                                                                           _
-                                                                           _)
-                                                i
-                                              (OwnershipContext.Roots _) -1)
-                                            -1)
-                                          delete-symbols)
-                (Result.Success all-deletes)
-                  (let-do [params (SpecializedBody.parameters body)
-                           root-id (Specialize.expression-id (Box.peek (SpecializedBody.body body)))
-                           locals (the (Array ScopeDelete) [])
-                           param-dels (the (Array ScopeDelete) [])]
-                    (for [j 0 (Array.length &all-deletes)]
-                      (let [sd (Array.unsafe-nth &all-deletes j)]
-                        ;; parameter deletes are the ones sited at the body
-                        ;; root; a set!-site delete on a parameter stays local.
-                        (if (and
-                            (binder-in? params (ScopeDelete.binder sd))
-                            (Int.= @(ScopeDelete.site sd) root-id))
-                          (set! param-dels (Array.push-back param-dels @sd))
-                          (set! locals (Array.push-back locals @sd)))))
-                    (set! new-bodies
-                          (Array.push-back new-bodies
-                                           (SpecializedBody.init @(SpecializedBody.specialization body)
-                                                                 @(SpecializedBody.parameters body)
-                                                                 (Box.init
-                                                                   (wrap-params
-                                                                     (insert-cleanup
-                                                                       &(hoist-array-literals (Box.peek (SpecializedBody.body body)))
-                                                                       &locals
-                                                                       delete-symbols
-                                                                       (SpecializationModule.constructors specialized))
-                                                                     &param-dels))
-                                                                 @(SpecializedBody.value body)))))
-                (Result.Error e) (set! failure (Maybe.Just e))))
-          (Maybe.Just _) ()))
-      (match failure
-        (Maybe.Just e) (Result.Error e)
-        (Maybe.Nothing)
-          (match (deletes-for-context actions
-                                      (roots-context-id ownership)
-                                      delete-symbols)
-            (Result.Error e) (Result.Error e)
-            (Result.Success root-deletes)
-              (Result.Success
-                (SpecializationModule.init
-                  @(SpecializationModule.instances specialized)
-                  new-bodies
-                  @(SpecializationModule.primitives specialized)
-                  (rewrite-roots-array (SpecializationModule.roots specialized)
-                                       &root-deletes
-                                       delete-symbols
-                                       echo
-                                       (SpecializationModule.constructors specialized))
-                  @(SpecializationModule.constructors specialized)
-                  @(SpecializationModule.system-includes specialized)
-                  @(SpecializationModule.type-declarations specialized)))))))
+  (private rewrite-cleanup-body)
+  (hidden rewrite-cleanup-body)
+  (doc rewrite-cleanup-body "shares cleanup insertion for ordinary and lifted
+bodies. Only deletes at the body root for an owned parameter are exit cleanup;
+other sites remain local. A negative context retains the legacy wildcard.")
+  (defn rewrite-cleanup-body [body
+                              parameters
+                              cleanup
+                              context
+                              delete-symbols
+                              constructors]
+    (let-do [root-id (Specialize.expression-id body)
+             range (cleanup-range cleanup context)
+             locals (the (Array ScopeDelete) [])
+             param-deletes (the (Array ScopeDelete) [])]
+      (for [i @(Pair.a &range) @(Pair.b &range)]
+        (let [delete (cleanup-at cleanup context i)]
+          (if (and
+              (binder-in? parameters (ScopeDelete.binder delete))
+              (Int.= @(ScopeDelete.site delete) root-id))
+            (Array.push-back! &param-deletes @delete)
+            (Array.push-back! &locals @delete))))
+      (wrap-params
+        (insert-cleanup &(hoist-array-literals body)
+                        &locals
+                        delete-symbols
+                        constructors)
+        &param-deletes)))
+
+  (doc rewrite-bodies "consumes lambda lifting's intermediate module. Replaces
+only body expressions and roots; body records and unchanged metadata retain
+their owned storage.")
+  (defn rewrite-bodies [specialized ownership cleanup delete-symbols echo]
+    (let-do [bodies (SpecializationModule.bodies &specialized)
+             contexts (OwnershipPlan.contexts ownership)]
+      (for [i 0 (Array.length bodies)]
+        (let [body (Array.unsafe-nth bodies i)
+              context (if (Int.< i (Array.length contexts))
+                (match-ref (Array.unsafe-nth contexts i)
+                  (OwnershipContext.Definition _ _ _ _) i
+                  (OwnershipContext.Roots _) -1)
+                -1)]
+          ; Lambda lifting appends noncapturing callbacks after context numbering.
+          ; Their module-unique locals recover their original cleanup through
+          ; the complete-delete-set fallback.
+          (SpecializedBody.set-body! body
+                                     (Box.init
+                                       (rewrite-cleanup-body (Box.peek (SpecializedBody.body body))
+                                                             (SpecializedBody.parameters body)
+                                                             cleanup
+                                                             context
+                                                             delete-symbols
+                                                             (SpecializationModule.constructors &specialized))))))
+      (let [root-deletes (cleanup-deletes cleanup (roots-context-id ownership))]
+        (let [roots (rewrite-roots-array
+                (SpecializationModule.roots &specialized)
+                &root-deletes
+                delete-symbols
+                echo
+                (SpecializationModule.constructors &specialized))]
+          (SpecializationModule.set-roots specialized roots)))))
 
   (private rewrite-closures)
   (hidden rewrite-closures)
-  (doc rewrite-closures "applies ownership actions planned for nested lambda
+  (doc rewrite-closures
+    "consumes the lifted closure array, replacing only body expressions.
+Applies ownership actions planned for nested lambda
 bodies after lambda lifting has moved capturing callbacks outside the ordinary
 specialized-body list. Each closure is matched only against the context it was
 lifted out of: one generic body instantiated twice yields two closures whose
 locals share binder ids and sites but not types, so a context-blind match picks
 an arbitrary instance's delete and frees a value through the wrong type's
 deleter.")
-  (defn rewrite-closures [closures ownership delete-symbols constructors]
-    (match (deletes-for-context (OwnershipPlan.actions ownership)
-                                -1
-                                delete-symbols)
-      (Result.Error error) (Result.Error error)
-      (Result.Success deletes)
-        (let-do [result (the (Array ClosureFunction) [])]
-          (for [i 0 (Array.length closures)]
-            (let-do [closure-fn (Array.unsafe-nth closures i)
-                     parameters (ClosureFunction.parameters closure-fn)
-                     original-body (Box.peek (ClosureFunction.body closure-fn))
-                     root-id (Specialize.expression-id original-body)
-                     context @(ClosureFunction.context closure-fn)
-                     param-deletes (the (Array ScopeDelete) [])
-                     local-deletes (the (Array ScopeDelete) [])]
-              (for [j 0 (Array.length &deletes)]
-                (let [sd (Array.unsafe-nth &deletes j)]
-                  (when (or (Int.< context 0)
-                            (Int.= @(ScopeDelete.context sd) context))
-                    (if (and
-                        (binder-in? parameters (ScopeDelete.binder sd))
-                        (Int.= @(ScopeDelete.site sd) root-id))
-                      (Array.push-back! &param-deletes @sd)
-                      (Array.push-back! &local-deletes @sd)))))
-              (set! result
-                    (Array.push-back result
-                                     (ClosureFunction.init
-                                       (String.copy (ClosureFunction.symbol closure-fn))
-                                       (Box.init
-                                         (MonoType.copy
-                                           (Box.peek (ClosureFunction.signature closure-fn))))
-                                       @(ClosureFunction.captures closure-fn)
-                                       @(ClosureFunction.parameters closure-fn)
-                                       (Box.init
-                                         (wrap-params
-                                           (insert-cleanup &(hoist-array-literals original-body)
-                                                           &local-deletes
-                                                           delete-symbols
-                                                           constructors)
-                                           &param-deletes))
-                                       context)))))
-          (Result.Success result))))
+  (defn rewrite-closures [closures cleanup delete-symbols constructors]
+    (do
+      (for [i 0 (Array.length &closures)]
+        (let [closure-fn (Array.unsafe-nth &closures i)]
+          (ClosureFunction.set-body! closure-fn
+                                     (Box.init
+                                       (rewrite-cleanup-body
+                                         (Box.peek (ClosureFunction.body closure-fn))
+                                         (ClosureFunction.parameters closure-fn)
+                                         cleanup
+                                         @(ClosureFunction.context closure-fn)
+                                         delete-symbols
+                                         constructors)))))
+      closures))
+
+  (private prepare-cleanup)
+  (hidden prepare-cleanup)
+  (doc prepare-cleanup "shares one resolved cleanup index across body, root
+and closure rewriting. The plan is released here before backend materialization;
+the rewritten owners transfer to the result.")
+  (defn prepare-cleanup [specialized ownership delete-symbols echo]
+    (match (lift-lambdas specialized)
+      (Pair.init lifted captured)
+        (if (Int.> (Array.length (OwnershipPlan.contexts ownership)) 0)
+          (match (resolve-cleanup (OwnershipPlan.actions ownership)
+                                  delete-symbols)
+            (Result.Success cleanup)
+              (let [rewritten (rewrite-bodies lifted
+                                              ownership
+                                              &cleanup
+                                              delete-symbols
+                                              echo)
+                    closures (rewrite-closures captured
+                                               &cleanup
+                                               delete-symbols
+                                               (SpecializationModule.constructors specialized))]
+                (Result.Success (Pair.init rewritten closures)))
+            (Result.Error error) (Result.Error error))
+          (Result.Error
+            (BackendError.init @"ownership plan has no root context")))))
 
   (doc module-with-ownership-echoed "like module-with-ownership, additionally
 echoing each non-unit root result through the driver's echo plan (top-level
@@ -2220,29 +2111,13 @@ REPL-echo semantics compiled into `main`).")
                                       echo]
     (do
       (seed-backend-locals! specialized)
-      ;; the hoist stream also names lifted-lambda globals: keep it above both
-      ;; its legacy floor (positive C-name suffixes) and every specialized
-      ;; global id.
+      ; The hoist stream also names lifted globals; keep it above user IDs.
       (set! *hoist-serial*
             (Int.max 20000000 (Int.inc (Specialize.max-global-id specialized))))
-      (let [contexts (OwnershipPlan.contexts ownership)
-            lifted-pair (lift-lambdas specialized)]
-        (if (Int.> (Array.length contexts) 0)
-          (match (rewrite-bodies (Pair.a &lifted-pair)
-                                 ownership
-                                 delete-symbols
-                                 echo)
-            (Result.Success rewritten)
-              (match (rewrite-closures (Pair.b &lifted-pair)
-                                       ownership
-                                       delete-symbols
-                                       (SpecializationModule.constructors specialized))
-                (Result.Success closures)
-                  (module &rewritten &closures delete-symbols copy-symbols)
-                (Result.Error e) (Result.Error e))
-            (Result.Error e) (Result.Error e))
-          (Result.Error
-            (BackendError.init @"ownership plan has no root context"))))))
+      (match (prepare-cleanup specialized ownership delete-symbols echo)
+        (Result.Success (Pair.init rewritten closures))
+          (module &rewritten &closures delete-symbols copy-symbols)
+        (Result.Error error) (Result.Error error))))
 
   (doc module-with-ownership "lowers a specialized module after the ownership
 phase has established its side table, rewriting each body to insert the concrete

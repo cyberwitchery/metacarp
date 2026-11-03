@@ -1,3 +1,5 @@
+(load "../carp-types/core-instantiation.carp")
+
 ; Emission fragments retain the exact text assembled into a translation unit.
 (deftype CArtifactEntity
   [symbol String
@@ -25,50 +27,7 @@ and dependencies. Fragments are excerpts; translation units carry their headers.
 ;; mangled form). Plain names let `Unsafe.C.asm` macros reference locals.
 (def *plain-local-ids* (the (Array Int) []))
 
-;; Where the Carp behind the C is, for a build that wants to be debugged. Both
-;; arrays are indexed by expression ID, which a provenanced resolve hands out
-;; from a monotonic allocator, so a lookup is an index rather than a search.
-;; Empty unless a caller installed a map, and then nothing here emits anything.
-(def *line-node-files* (the (Array String) []))
-(def *line-node-lines* (the (Array Int) []))
-(def *line-node-columns* (the (Array Int) []))
-(def *emit-line-directives* false)
-;; the place the last directive claimed, so a line is not restated before every
-;; statement that shares it
-(def *line-last-file* @"")
-(def *line-last-line* -1)
-
 (defmodule LineMap
-  (doc reset! "forgets the source map, and stops emitting line directives.")
-  (defn reset! []
-    (do
-      (set! *line-node-files* [])
-      (set! *line-node-lines* [])
-      (set! *line-node-columns* [])
-      (set! *emit-line-directives* false)
-      (set! *line-last-file* @"")
-      (set! *line-last-line* -1)))
-
-  (doc install! "installs the explicit source map carried by a backend module
-for the duration of one C rendering.")
-  (defn install! [line-map]
-    (do
-      (set! *line-node-files* (Array.copy (BackendLineMap.files line-map)))
-      (set! *line-node-lines* (Array.copy (BackendLineMap.lines line-map)))
-      (set! *line-node-columns* (Array.copy (BackendLineMap.columns line-map)))
-      (set! *emit-line-directives*
-            (Int.> (Array.length (BackendLineMap.lines line-map)) 0))
-      (set! *line-last-file* @"")
-      (set! *line-last-line* -1)))
-
-  (doc line-of "the line an expression was written on, or -1 when the map has
-nothing for it. Code a phase generated was written nowhere, and says so rather
-than borrowing a line from whatever it was derived from.")
-  (defn line-of [id]
-    (if (and (Int.>= id 0) (Int.< id (Array.length &*line-node-lines*)))
-      @(Array.unsafe-nth &*line-node-lines* id)
-      -1))
-
   (doc reset-mark "the text a boundary is marked with, and what a later pass
 looks for. It is a comment so a translation unit carrying one still compiles
 even if nothing resolves it.")
@@ -82,16 +41,10 @@ Rendering cannot write the directive itself. A directive has to name the line
 it stands on, and the line is only known once the whole unit has been built —
 so this leaves a mark, and `Carp.resolve-line-resets` turns it into a
 directive once there is an output to count lines in.")
-  (defn mark-reset! [buffer]
-    (when-do *emit-line-directives* (StringBuf.append-str buffer "
+  (defn mark-reset! [line-map buffer]
+    (when-do (BackendLineMap.enabled? line-map) (StringBuf.append-str buffer "
 ") (StringBuf.append-str buffer &(reset-mark)) (StringBuf.append-str buffer "
-") (set! *line-last-line* -1) (set! *line-last-file* @"")))
-
-  (doc file-of "the file an expression was written in.")
-  (defn file-of [id]
-    (if (and (Int.>= id 0) (Int.< id (Array.length &*line-node-files*)))
-      (String.copy (Array.unsafe-nth &*line-node-files* id))
-      @"")))
+"))))
 
 ;; the C symbol whose declaration is currently being rendered; diagnostic
 ;; context only (set per declaration, read by render guards).
@@ -126,6 +79,8 @@ directive once there is an output to count lines in.")
 (defn unit-type? [type] (match-ref type (MonoType.Unit) true _ false))
 
 (defmodule CBackend
+  (private managed-symbol)
+  (hidden managed-symbol)
   (private sanitize)
   (hidden sanitize)
   (private valid-system-include?)
@@ -158,22 +113,14 @@ directive once there is an output to count lines in.")
   (hidden render-statement-value)
   (sig render-statement-value
        (Fn
-         [(Ref (Array CoreConstructorDeclaration)) (Ref SpecializedExpr)]
+         [(Ref BackendModule) (Ref SpecializedExpr)]
          (Result String BackendError)))
-  (private render-closure-construction)
-  (hidden render-closure-construction)
-  (sig render-closure-construction
-       (Fn
-         [(Ref (Array CoreConstructorDeclaration))
-          (Ref String)
-          (Ref (Array (Box SpecializedExpr)))]
-         (Result String BackendError)))
+
   (private render-env-fields)
   (hidden render-env-fields)
   (sig render-env-fields
        (Fn
-         [(Ref (Array CoreConstructorDeclaration))
-          (Ref (Array (Box SpecializedExpr)))]
+         [(Ref BackendModule) (Ref (Array (Box SpecializedExpr)))]
          (Result String BackendError)))
   (private unmanaged-type?)
   (hidden unmanaged-type?)
@@ -189,7 +136,7 @@ directive once there is an output to count lines in.")
   (hidden append-cached-while!)
   (sig append-cached-while!
        (Fn
-         [(Ref (Array CoreConstructorDeclaration))
+         [(Ref BackendModule)
           (Ref StringBuf)
           (Ref SpecializedExpr)
           (Ref SpecializedExpr)
@@ -197,16 +144,13 @@ directive once there is an output to count lines in.")
          (Result Unit BackendError)))
   (sig append-statement!
        (Fn
-         [(Ref (Array CoreConstructorDeclaration))
-          (Ref StringBuf)
-          (Ref SpecializedExpr)
-          Int]
+         [(Ref BackendModule) (Ref StringBuf) (Ref SpecializedExpr) Int]
          (Result Unit BackendError)))
   (private append-result!)
   (hidden append-result!)
   (sig append-result!
        (Fn
-         [(Ref (Array CoreConstructorDeclaration))
+         [(Ref BackendModule)
           (Ref StringBuf)
           (Ref SpecializedExpr)
           (Ref ResultDestination)
@@ -316,7 +260,7 @@ directive once there is an output to count lines in.")
   (hidden append-match!)
   (sig append-match!
        (Fn
-         [(Ref (Array CoreConstructorDeclaration))
+         [(Ref BackendModule)
           (Ref StringBuf)
           Int
           Bool
@@ -538,59 +482,31 @@ deduplicated source-requested system includes.")
               (BackendError.init @"template expected a function type")))))
 
   (defn concretize-core-arguments [bindings arguments]
-    (let-do [result (the
-               (Result (Array (Box MonoType)) BackendError)
-               (Result.Success []))
-             n (Array.length arguments)]
+    (match (CoreInstantiation.arguments-with arguments
+                                             bindings
+                                             &lookup-layout-variable)
+      (Result.Success concrete) (Result.Success concrete)
+      (Result.Error error) (Result.Error (BackendError.init error))))
+
+  (private lookup-layout-variable)
+  (hidden lookup-layout-variable)
+  (defn lookup-layout-variable [bindings name]
+    (let-do [result (the (Result MonoType String)
+                         (Result.Error
+                           @"nominal layout variable has no concrete binding"))
+             n (Array.length bindings)]
       (for [i 0 n]
-        (match-ref &result
-          (Result.Success concrete)
-            (match (concretize-core-type bindings
-                                         (Box.peek (Array.unsafe-nth arguments i)))
-              (Result.Success argument)
-                (Array.push-back! concrete (Box.init argument))
-              (Result.Error error) (set! result (Result.Error error)))
-          (Result.Error _) ()))
+        (let [binding (Array.unsafe-nth bindings i)]
+          (when (= (TemplateTypeBinding.name binding) name)
+            (set! result
+                  (Result.Success
+                    (MonoType.copy (Box.peek (TemplateTypeBinding.type binding))))))))
       result))
 
   (defn concretize-core-type [bindings type]
-    (match-ref type
-      (CoreType.Integer) (Result.Success (Type.integer))
-      (CoreType.String) (Result.Success (Type.string))
-      (CoreType.Boolean) (Result.Success (Type.boolean))
-      (CoreType.Unit) (Result.Success (Type.unit))
-      (CoreType.Variable name)
-        (let-do [result (the (Result MonoType BackendError)
-                             (Result.Error
-                               (BackendError.init
-                                 @"nominal layout variable has no concrete binding")))
-                 n (Array.length bindings)]
-          (for [i 0 n]
-            (let [binding (Array.unsafe-nth bindings i)]
-              (when (= (TemplateTypeBinding.name binding) name)
-                (set! result
-                      (Result.Success
-                        (MonoType.copy
-                          (Box.peek (TemplateTypeBinding.type binding))))))))
-          result)
-      (CoreType.Named name arguments)
-        (match (concretize-core-arguments bindings arguments)
-          (Result.Success concrete) (Result.Success (Type.named name concrete))
-          (Result.Error error) (Result.Error error))
-      (CoreType.Reference inner _)
-        (match (concretize-core-type bindings (Box.peek inner))
-          (Result.Success concrete)
-            (Result.Success (Type.reference concrete (MonoLifetime.Static)))
-          (Result.Error error) (Result.Error error))
-      (CoreType.Function arguments result)
-        (match (concretize-core-arguments bindings arguments)
-          (Result.Success concrete-arguments)
-            (match (concretize-core-type bindings (Box.peek result))
-              (Result.Success concrete-result)
-                (Result.Success
-                  (Type.function concrete-arguments concrete-result))
-              (Result.Error error) (Result.Error error))
-          (Result.Error error) (Result.Error error))))
+    (match (CoreInstantiation.type-with type bindings &lookup-layout-variable)
+      (Result.Success concrete) (Result.Success concrete)
+      (Result.Error error) (Result.Error (BackendError.init error))))
 
   (defn render-core-type [bindings type]
     (match (concretize-core-type bindings type)
