@@ -744,7 +744,13 @@ class ReplTests(unittest.TestCase):
             terminal.send(f"(defmacro blocked-preview [] (read-file {json.dumps(str(fifo))}))\r".encode())
             terminal.next_prompt()
             terminal.send(b"(blocked-preview)\x1bOQ")
-            terminal.read_for(.15)
+            # Cancel only once the check is blocked opening the fifo: earlier,
+            # it stops cooperatively and the worker survives. Nothing shows
+            # that point portably, and opening the write end to detect it
+            # would send the check into Core's read-file, which cannot read a
+            # fifo. Two seconds is a margin, not a guarantee: a whole F2 check
+            # of a mixed macro took under a second in an arm64 Linux container.
+            terminal.read_for(2)
             terminal.send(b"\x03")
             terminal.until(b"Use :reinit")
             terminal.until("λ> ".encode())

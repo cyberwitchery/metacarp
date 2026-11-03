@@ -20,7 +20,7 @@ instructions, and current limits.
 The combined executable is built from `main-metacarp.carp`. Bare `metacarp`
 opens the REPL, `metacarp repl [options]` selects it explicitly, and file
 arguments use the C compiler. `driver.carp` and `carp-repl/cli.carp` expose
-callable entry points to the combined executable and the standalone drivers.
+callable entry points to both executables; `driver-llvm.carp` adds `--emit llvm`.
 The C-only `main.carp` bootstrap does not load LLVM or the terminal editor.
 
 The boundary is one language service shared by highlighting,
@@ -96,9 +96,10 @@ not changed by analysis.
 
 The compiler checks a two-million-unit work budget at expansion, resolution,
 inference, type solving, compile-time lowering, and every VM instruction.
-Size-growing VM builtins also charge for produced data. A 500 ms monotonic
-deadline uses those cooperative cancellation points. Automatic previews refuse
-compile-time file reads; explicit F2 permits them under the same work limits.
+Size-growing VM builtins also charge for produced data. A monotonic deadline
+uses those cooperative cancellation points: 500 ms for automatic previews, 5 s
+for an explicit F2 check, which Ctrl-C also cancels. Automatic previews refuse
+compile-time file reads; explicit F2 permits them under the same work budget.
 These cooperative bounds do not stop a blocked native call. Explicit
 cancellation can instead terminate the execution process after the compiler
 service's cancellation grace period. Buffers over 256 KiB report analysis unavailable.
@@ -159,9 +160,10 @@ its declarations even if its runtime body never returns.
 
 Each worker has an independent scratch directory and a parent lifeline. Cleanup
 removes known compiler artifacts through a physical directory traversal, retaining
-unknown files. The current terminal integration targets macOS: libedit, terminal
-signal handling, spawn flags, kqueue wakeups, and native process/PTY primitives
-live behind the terminal and process interfaces.
+unknown files. Libedit, terminal signal handling, spawn flags, event wakeups,
+and native process/PTY primitives live behind the terminal and process
+interfaces, which select the macOS or Linux primitives when the REPL is
+compiled.
 
 ## Milestone 2: terminal editing
 
@@ -452,12 +454,22 @@ to ordinary evaluation latency at this sample size.
 
 ## Platform boundary
 
-The current terminal host has Darwin-specific clock and errno bindings,
-an Apple linker stack-size option, and a Darwin-only check-script guard.
-libedit and the compiler/session interfaces are not inherently macOS-specific.
-The LLVM backend already has non-Darwin support-clang lookup and Linux process
-symbol linking. Porting the terminal requires selecting the corresponding
-clock, errno, and linker conventions and validating the host on that platform.
+The terminal host runs on macOS and Linux. `if-linux` in `native.carp` picks
+each platform's primitives when the REPL is compiled, and only the chosen one
+is emitted:
+
+| | macOS | Linux |
+|---|---|---|
+| wakeups | kqueue, `EVFILT_PROC` for worker exit | epoll, a pidfd for worker exit |
+| worker descriptors | `POSIX_SPAWN_CLOEXEC_DEFAULT` | `posix_spawn_file_actions_addclosefrom_np` |
+| executable, environment | `_NSGetExecutablePath`, `_NSGetEnviron` | `/proc/self/exe`, `environ` |
+| SIGPIPE on private writers | `F_SETNOSIGPIPE` per descriptor | ignored in the frontend, reset in the worker |
+| errno | `__error` | `__errno_location` |
+
+The worker's channels are descriptors 3 to 6 on both. Text width is measured
+under a `C.UTF-8` locale where one exists, because glibc's `wcwidth` measures
+nothing beyond ASCII in the `C` locale a program starts in. CI runs the REPL
+check on both platforms.
 
 ## Validation and performance
 

@@ -4,22 +4,19 @@ A Carp terminal REPL over the existing compiler session and LLVM JIT. The
 [umbrella RFC](../docs/metacarp-repl.md) records the six milestones, contracts,
 and remaining hardening work.
 
-Requires macOS, clang, the existing LLVM bindings, a linkable libLLVM, and Carp
-Core. Build the compiler from current source before building the REPL:
+Runs on macOS and Linux. Requires clang, the existing LLVM bindings, a linkable
+libLLVM, libedit (`libedit-dev` on Debian and Ubuntu), and Carp Core. From the repository root, with `out/carp-compiler` built from current
+source (see the [top-level README](../README.md#build)):
 
 ```sh
-./out/carp-compiler -c "$CARP_DIR/core" --optimize -b \
-  -o out/carp-compiler-next main.carp
-./out/carp-compiler-next -c "$CARP_DIR/core" --optimize -b \
-  -o out/metacarp main-metacarp.carp
+./out/carp-compiler -c "$CARP_DIR/core" --optimize -b -o out/metacarp main-metacarp.carp
 ./out/metacarp
 ```
 
 With no arguments, `metacarp` opens the REPL using `$CARP_DIR/core`. Use
 `metacarp repl --core <dir> --no-history` for explicit options. File arguments
 still compile, for example `metacarp -x program.carp`. The C-only bootstrap
-entry point remains `main.carp`; `main-repl.carp` builds a standalone
-`metacarp-repl` from the same driver.
+entry point remains `main.carp`.
 
 The pinned `carp-reader@0.5.0` dependency includes `Reader.read-syntax`.
 For reader development, `--package-override <reference>=<source.carp>` overrides
@@ -338,7 +335,8 @@ or suspension to the original signal disposition. Libedit's asynchronous signal
 handlers are disabled because their rearming depends on its builtin reader.
 The caller's signal mask is restored when input finishes.
 
-Semantic previews have a two-million-unit work budget and a 500 ms deadline.
+Semantic previews have a two-million-unit work budget and a 500 ms deadline;
+an F2 check has the same budget and a 5 s deadline, since Ctrl-C cancels it.
 They restore compile-time state and never commit source or publish native code.
 The VM checks the budget at every instruction. Automatic previews refuse
 compile-time file reads; F2 explicitly permits them within the same bounds.
@@ -348,7 +346,9 @@ unknown. Quiet diagnostics appear after 450 ms.
 
 Ctrl-C cancels editing. During execution or a native inspection callback, it
 terminates the worker's process group and returns to the editor. A crash or
-unexpected worker exit uses the same recovery path. Native values and view
+unexpected worker exit uses the same recovery path. The worker writes no core
+dump (its soft core limit is 0), so a crash returns at once instead of waiting
+for a core of the whole compiler to be written. Native values and view
 handles are discarded; accepted source and the journal stay in the parent.
 `:history`, `:defs`, and export remain available while execution is stopped.
 
@@ -377,6 +377,7 @@ scripts/check-repl.sh
 ```
 
 Input and reader-to-editor tests also run in the compiler phase suite.
-Native display, browser, and service checks run with the macOS REPL check.
+Native display, browser, and service checks run with the REPL check, on macOS and
+Linux.
 The shared view runtime and engine handle checks also run in LLVM assurance.
 Session, JIT, C backend, and LLVM backend tests cover the underlying contracts.

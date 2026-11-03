@@ -125,8 +125,8 @@ carp -x test/carp-llvm-backend.carp
 CARP_DIR=<carp checkout> carp -x test/carp-session-jit.carp
 ```
 
-The backend also has a driver: `carp -b --optimize main-llvm.carp` at the
-repository root builds `out/carp-compiler-llvm`, which shares the C driver's
+The backend also has a driver, `metacarp --emit llvm` (`driver-llvm.carp`,
+built into `out/metacarp` from `main-metacarp.carp`), which shares the C driver's
 whole front half (`driver-load.carp`) and prints LLVM IR by default, or builds
 and runs a native executable under `-b`/`-x` (object file through the LLVM
 target machine, linked by clang against the C shim plus a generated `main`).
@@ -143,10 +143,9 @@ the C backend). `simple.carp` fails at link on its deliberately undefined
 `int_inc` in both drivers alike.
 
 The driver passes the reference test suite at parity with the C driver:
-`CARP_COMPILER=$PWD/out/carp-compiler-llvm scripts/run-carp-suite-self.sh`
-reports the same score as the C driver (every test and example, with the one
-suite-sanctioned `memory.carp` gap both drivers share). The driver is also
-self-hosting: gen-1 metacarp builds `main-llvm.carp` (compile-time
+`CARP_COMPILER=$PWD/out/metacarp CARP_COMPILER_FLAGS="--emit llvm" scripts/run-carp-suite-self.sh`
+reports the same score as the C driver: all 165 entries pass, with no gaps.
+The driver is also self-hosting: gen-1 metacarp builds `main-metacarp.carp` (compile-time
 `system-include`/`add-cflag` from `LLVM.setup` flow through expansion into
 the resolver and the clang command), and the self-built driver reproduces
 the same suite score.

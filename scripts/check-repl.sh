@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Build and exercise the terminal REPL against real Core, including PTY input.
+# Runs on macOS and Linux.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -16,9 +17,8 @@ if [[ -n "${CARP_READER_SOURCE:-}" ]]; then
   compiler_args+=(--package-override "git@github.com:carpentry-org/carp-reader@0.5.0=$CARP_READER_SOURCE")
 fi
 
-if [[ "$(uname -s)" != Darwin ]]; then
-  printf 'the REPL terminal host currently targets macOS\n' >&2
-  exit 2
+if [[ "$(uname -s)" == "Linux" ]]; then
+  ulimit -s 524288
 fi
 cd "$repo_root"
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/metacarp-repl-check.XXXXXX")
@@ -28,7 +28,6 @@ for suite in input syntax paint view-snapshot wire wire-derived native/display n
   "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" -b -o "$binary" "carp-repl/test/$suite.carp"
   CARP_DIR="$core_dir" "$binary"
 done
-"$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" --optimize -b -o out/metacarp-repl main-repl.carp
 "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" --optimize -b -o out/metacarp main-metacarp.carp
 "$compiler" ${compiler_args[@]+"${compiler_args[@]}"} -c "$core_dir" -b -o "$test_dir/remote" carp-repl/test/native/remote.carp
 "$test_dir/remote" "$repo_root/out/metacarp" "$core_dir"

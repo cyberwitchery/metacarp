@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run the LLVM backend's memory fixtures under both drivers.
+# Run the LLVM backend's memory fixtures under both backends.
 #
 # Each fixture in carp-llvm-backend/test/memory is built with --log-memory by
-# the C driver and by the LLVM driver. A fixture exits non-zero when its own
+# the C driver and by metacarp --emit llvm. A fixture exits non-zero when its own
 # Debug.memory-balance check fails, and both drivers must print the same
 # output, so a delete one backend places and the other drops fails here (#79).
 set -euo pipefail
@@ -10,12 +10,12 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 c_compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
-llvm_compiler=${CARP_LLVM_COMPILER:-"$repo_root/out/carp-compiler-llvm"}
+metacarp=${CARP_METACARP:-"$repo_root/out/metacarp"}
 carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 fixture_dir="$repo_root/carp-llvm-backend/test/memory"
 
-for compiler in "$c_compiler" "$llvm_compiler"; do
+for compiler in "$c_compiler" "$metacarp"; do
   if [[ ! -x "$compiler" ]]; then
     printf 'compiler not executable: %s\n' "$compiler" >&2
     exit 2
@@ -33,13 +33,13 @@ failed=0
 for fixture in "$fixture_dir"/*.carp; do
   name=$(basename "$fixture" .carp)
   for lane in c llvm; do
-    if [[ "$lane" == c ]]; then compiler=$c_compiler; else compiler=$llvm_compiler; fi
+    if [[ "$lane" == c ]]; then compiler=("$c_compiler"); else compiler=("$metacarp" --emit llvm); fi
     # -x builds into ./out, so each lane gets its own directory
     mkdir -p "$work_dir/$lane"
     # the programs' output is compared; the build's diagnostics (clang
     # warnings naming each driver's own temporary file) go to stderr apart
     if (cd "$work_dir/$lane" \
-      && "$compiler" -c "$core_dir" -x --log-memory "$fixture") \
+      && "${compiler[@]}" -c "$core_dir" -x --log-memory "$fixture") \
       >"$work_dir/$name.$lane.out" 2>"$work_dir/$name.$lane.err"
     then
       printf '[ok]   %s (%s)\n' "$name" "$lane"

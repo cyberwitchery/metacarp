@@ -30,6 +30,8 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
 compiler=${CARP_COMPILER:-"$repo_root/out/carp-compiler"}
+# extra arguments for every compile, split on spaces (e.g. "--emit llvm")
+compiler_flags=${CARP_COMPILER_FLAGS:-}
 carp_root=${CARP_ROOT:-${CARP_DIR:-"$repo_root/../../carp"}}
 core_dir=${CARP_CORE_DIR:-"$carp_root/core"}
 out_root=${CARP_SELF_SUITE_OUT:-"${TMPDIR:-/tmp}/carp-self-suite"}
@@ -106,7 +108,7 @@ check_output() {
   actual="$out_root/log/$name.actual"
 
   printf '[%s] %s\n' "$kind" "$file"
-  if ! "$compiler" -b --log-memory -c "$core_dir" -o "$bin" "$file" >"$log" 2>&1; then
+  if ! "$compiler" $compiler_flags -b --log-memory -c "$core_dir" -o "$bin" "$file" >"$log" 2>&1; then
     fail "$file" compile
     return
   fi
@@ -124,7 +126,7 @@ run_test() {
   log="$out_root/log/$name.log"
 
   printf '[test] %s\n' "$file"
-  if "$compiler" -x --log-memory -c "$core_dir" "$file" >"$log" 2>&1; then
+  if "$compiler" $compiler_flags -x --log-memory -c "$core_dir" "$file" >"$log" 2>&1; then
     passed=$((passed + 1))
   else
     fail "$file" run
@@ -138,7 +140,7 @@ build_only() {
   log="$out_root/log/$name.log"
 
   printf '[%s] %s\n' "$kind" "$file"
-  if "$compiler" -b -c "$core_dir" -o "$out_root/bin/$name" "$file" >"$log" 2>&1; then
+  if "$compiler" $compiler_flags -b -c "$core_dir" -o "$out_root/bin/$name" "$file" >"$log" 2>&1; then
     passed=$((passed + 1))
   else
     fail "$file" build
@@ -151,7 +153,7 @@ expect_reject() {
   log="$out_root/log/$name.log"
 
   printf '[reject] %s\n' "$file"
-  if "$compiler" -c "$core_dir" -o "$out_root/c/$name.c" "$file" >"$log" 2>&1; then
+  if "$compiler" $compiler_flags -c "$core_dir" -o "$out_root/c/$name.c" "$file" >"$log" 2>&1; then
     fail "$file" accepted
   else
     passed=$((passed + 1))
@@ -171,7 +173,7 @@ no_core_build() {
   log="$out_root/log/$name.log"
 
   printf '[no-core] %s\n' "$file"
-  if "$compiler" -b --no-core -c "$core_dir" -o "$out_root/bin/$name" "$file" >"$log" 2>&1; then
+  if "$compiler" $compiler_flags -b --no-core -c "$core_dir" -o "$out_root/bin/$name" "$file" >"$log" 2>&1; then
     passed=$((passed + 1))
   else
     fail "$file" no-core-build
