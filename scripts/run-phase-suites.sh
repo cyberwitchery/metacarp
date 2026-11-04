@@ -74,6 +74,8 @@ phase_tasks() {
   # Start the four heaviest tasks first so the worker pool does not finish
   # small module tests and leave one long session test as a serial tail.
   emit_task . test/carp-compiler.carp normal
+  emit_task . test/concrete-plans.carp normal
+  emit_task . test/emission-context.carp normal
   emit_task . carp-session/test/carp-session.carp normal
   emit_task . carp-session/test/prepared.carp normal
   emit_task . carp-session/test/core.carp normal
@@ -84,7 +86,7 @@ phase_tasks() {
   for directory in \
     carp-graph carp-c-abi carp-primitives carp-module carp-ct-env \
     carp-ct-eval carp-ir carp-resolve carp-types carp-infer carp-specialize \
-    carp-ownership carp-backend carp-expand carp-source carp-repl carp-views
+    carp-ownership carp-backend carp-expand carp-source carp-repl carp-views carp-frontend
   do
     for test_file in "$repo_root/$directory"/test/*.carp; do
       emit_task "$directory" "${test_file#"$repo_root/$directory/"}" normal

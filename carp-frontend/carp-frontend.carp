@@ -1,0 +1,300 @@
+(load "../carp-module/carp-module.carp")
+(load "../carp-expand/carp-expand.carp")
+(load "../carp-resolve/carp-resolve.carp")
+(load "../carp-derive/foreign-types.carp")
+(load "../carp-ir/validate.carp")
+
+(doc *want-source-map* "whether this compilation should be able to say which
+Carp line each piece of C came from. A debug build wants it; every other build
+pays nothing for it.")
+
+(def *want-source-map* false)
+
+(def *source-map* (CoreProvenance.init [] [] []))
+
+(def *source-map-files* (the (Array String) []))
+
+(def *source-map-texts* (the (Array String) []))
+
+(def *source-map-allocator* (IdAllocator.init [0]))
+
+(doc CompileError "identifies the compiler phase that rejected an input and
+retains that phase's diagnostic.")
+
+(deftype CompileError [phase String
+                       message String])
+
+(defmodule CompileError
+  (defn render [error]
+    (String.concat
+      &[(String.copy (CompileError.phase error))
+        @": "
+        (String.copy (CompileError.message error))])))
+
+(doc AnnotatedModule "is the front half of a compiled module: the derived
+core IR together with its inference result. Produced by
+`CarpCompiler.infer-module-with` for tooling that wants types without C.")
+
+(deftype AnnotatedModule [core CoreModule
+                          inferred InferredModule])
+
+(defmodule CompilerFrontend
+  (doc phase-mark!
+    "emits a compiler phase marker when CARP_DEBUG_PHASES is enabled.")
+  (defn phase-mark! [name]
+    (match (IO.getenv "CARP_DEBUG_PHASES")
+      (Maybe.Just _) (IO.errorln name)
+      (Maybe.Nothing) ()))
+
+  (private resolve-owned)
+
+  (hidden resolve-owned)
+
+  (doc resolve-owned "resolves the expanded module, collecting a source map
+when a caller asked to be able to debug what comes out.
+
+Resolving with provenance costs an entry per node and hands out node IDs from
+a monotonic allocator rather than the historical owner-relative ones, which is
+why it is not simply always on.")
+
+  (defn resolve-owned [expanded]
+    (if *want-source-map*
+      (match (let-do [_ignored-reset (Array.aset!
+                        (IdAllocator.cell &*source-map-allocator*)
+                        0
+                        0)]
+          (Resolve.module-with-provenance
+            &(SourcedSurfaceModule.init (SourceInput.init @"<program>" @"")
+                                        expanded)
+            &*source-map-allocator*))
+        (Result.Success provenanced)
+          (do
+            (set! *source-map*
+                  (CoreProvenance.copy
+                    (ProvenancedCoreModule.provenance &provenanced)))
+            (Result.Success
+              (CoreModule.copy (ProvenancedCoreModule.core &provenanced))))
+        (Result.Error error) (Result.Error error))
+      (Resolve.module &expanded)))
+
+  (private typedefs-owned)
+
+  (hidden typedefs-owned)
+
+  (defn typedefs-owned [core]
+    (let-do [next (Derive.register-type-typedefs &core)
+             _ignored (phase-mark! "phase: typedefs")]
+      next))
+
+  (private accessors-owned)
+
+  (hidden accessors-owned)
+
+  (defn accessors-owned [context core]
+    (let-do [next (Derive.accessors context &core)
+             _ignored (phase-mark! "phase: accessors")]
+      next))
+
+  (private pair-refs-owned)
+
+  (hidden pair-refs-owned)
+
+  (defn pair-refs-owned [context core] (Derive.pair-refs context &core))
+
+  (private copies-owned)
+
+  (hidden copies-owned)
+
+  (defn copies-owned [context core]
+    (let-do [next (Derive.copies context &core)
+             _ignored (phase-mark! "phase: copies")]
+      next))
+
+  (private deletes-owned)
+
+  (hidden deletes-owned)
+
+  (defn deletes-owned [context core]
+    (let-do [next (Derive.deletes context &core)
+             _ignored (phase-mark! "phase: deletes")]
+      next))
+
+  (private strs-owned)
+
+  (hidden strs-owned)
+
+  (defn strs-owned [context core]
+    (let-do [next (Derive.strs context &core)
+             _ignored (phase-mark! "phase: strs")]
+      next))
+
+  (private derive-core-using)
+  (hidden derive-core-using)
+  (defn derive-core-using [core preserve-ids finish]
+    (let [context (DeriveContext.init preserve-ids [])]
+      (match (typedefs-owned core)
+        (Result.Success typed)
+          (Derive.close-generics-owned-with &context
+                                            (strs-owned &context
+                                                        (deletes-owned &context
+                                                                       (copies-owned &context
+                                                                                     (pair-refs-owned &context
+                                                                                                      (accessors-owned &context
+                                                                                                                       typed)))))
+                                            finish)
+        (Result.Error message)
+          (Result.Error (CompileError.init @"derive" message)))))
+
+  (doc derive-module-for-inference "validates and derives a resolved module
+for warm tooling that needs the same accessor, copy, delete, string, and
+generic declarations as the normal compiler before inference.")
+
+  (private derive-for-inference)
+  (hidden derive-for-inference)
+  (private derived-core-only)
+  (hidden derived-core-only)
+  (defn derived-core-only [core _base]
+    (do (phase-mark! "phase: close-generics") (Result.Success core)))
+
+  (defn derive-for-inference [core preserve-ids]
+    (match (Validate.type-declarations core)
+      (Maybe.Just message)
+        (Result.Error (CompileError.init (String.copy "validate") message))
+      (Maybe.Nothing)
+        (derive-core-using (CoreModule.copy core)
+                           preserve-ids
+                           &derived-core-only)))
+  (defn derive-module-for-inference [core] (derive-for-inference core false))
+
+  (doc derive-module-for-inference-provenanced "derives a session module while
+preserving resolved user node identities, then gives every generated node a
+fresh ID from the session allocator and anchors it to the originating
+declaration when a fallback span is available.")
+
+  (defn derive-module-for-inference-provenanced [resolved allocator fallback]
+    (match (derive-for-inference (ProvenancedCoreModule.core resolved) true)
+      (Result.Success core)
+        (Result.Success
+          (CoreIR.identify-generated &core
+                                     (ProvenancedCoreModule.provenance resolved)
+                                     allocator
+                                     fallback))
+      (Result.Error error) (Result.Error error)))
+
+  (doc infer-module-with "runs the front half of the pipeline — expansion,
+resolution, derivation and type inference — answering the core module
+together with its inference result. The entry point for tooling that wants
+types without emitting C.")
+
+  (private dump-resolved)
+
+  (hidden dump-resolved)
+
+  (defn dump-resolved [resolved]
+    (match (IO.getenv "CARP_DEBUG_RESOLVED")
+      (Maybe.Just _)
+        (let-do [builtins (CoreModule.builtins resolved)
+                 constructors (CoreModule.constructors resolved)]
+          (for [i 0 (Array.length builtins)]
+            (let [b (Array.unsafe-nth builtins i)]
+              (IO.errorln
+                &(fmt "builtin %s (id %d): %s"
+                      (CoreRef.name (CoreBuiltin.reference b))
+                      @(CoreRef.id (CoreBuiltin.reference b))
+                      &(str (Box.peek (CoreBuiltin.signature b)))))))
+          (for [i 0 (Array.length constructors)]
+            (let [c (Array.unsafe-nth constructors i)]
+              (IO.errorln
+                &(fmt "constructor %s tag %d args %d"
+                      (CoreRef.name (CoreConstructorDeclaration.reference c))
+                      @(CoreConstructorDeclaration.tag c)
+                      (Array.length (CoreConstructorDeclaration.arguments c)))))))
+      (Maybe.Nothing) ()))
+
+  (private finish-inference-owned)
+
+  (hidden finish-inference-owned)
+
+  (private infer-owned-base)
+  (hidden infer-owned-base)
+  (defn infer-owned-base [core base]
+    (match-ref &base
+      (Maybe.Just previous) (Infer.module-from-base core previous)
+      (Maybe.Nothing) (Infer.module core)))
+
+  (private infer-owned-core)
+  (hidden infer-owned-core)
+  (defn infer-owned-core [core base]
+    (match (CoreIR.duplicate-global-id &core)
+      (Maybe.Just bad)
+        (Result.Error
+          (CompileError.init @"validate"
+                             (fmt
+                               "duplicate global reference id %d after derivation"
+                               bad)))
+      (Maybe.Nothing)
+        (do
+          (phase-mark! "phase: resolved+derived")
+          (match (IO.getenv "CARP_DEBUG_RESOLVED")
+            (Maybe.Just _)
+              (let [functions (CoreModule.functions &core)]
+                (for [i 0 (Array.length functions)]
+                  (let [f (Array.unsafe-nth functions i)]
+                    (IO.errorln
+                      &(fmt "function %s params=%d"
+                            (CoreRef.name (CoreFunction.reference f))
+                            (Array.length (CoreFunction.parameters f)))))))
+            (Maybe.Nothing) ())
+          (match (infer-owned-base &core base)
+            (Result.Success inferred)
+              (do
+                (phase-mark! "phase: inferred")
+                (Result.Success (AnnotatedModule.init core inferred)))
+            (Result.Error error)
+              (Result.Error
+                (CompileError.init @"infer" @(InferError.message &error)))))))
+
+  (private source-mapped-owned)
+  (hidden source-mapped-owned)
+  (defn source-mapped-owned [core _base]
+    (let-do [identified (CoreIR.identify-generated &core
+                                                   &*source-map*
+                                                   &*source-map-allocator*
+                                                   &(the (Maybe SourceSpan)
+                                                         (Maybe.Nothing)))]
+      (set! *source-map* @(ProvenancedCoreModule.provenance &identified))
+      @(ProvenancedCoreModule.core &identified)))
+
+  (defn finish-inference-owned [core base]
+    (do
+      (phase-mark! "phase: close-generics")
+      (if *want-source-map*
+        (infer-owned-core (source-mapped-owned core base)
+                          (the (Maybe InferenceBase) (Maybe.Nothing)))
+        (infer-owned-core core base))))
+
+  (defn infer-module-with [module config]
+    (match (MacroExpand.expand-module-with module config)
+      (Result.Success expanded)
+        (match (resolve-owned expanded)
+          (Result.Success resolved)
+            (do
+              (dump-resolved &resolved)
+              (match (Validate.type-declarations &resolved)
+                (Maybe.Just message)
+                  (Result.Error (CompileError.init @"validate" message))
+                (Maybe.Nothing)
+                  (derive-core-using resolved
+                                     *want-source-map*
+                                     &finish-inference-owned)))
+          (Result.Error error)
+            (Result.Error
+              (CompileError.init @"resolve"
+                                 (fmt "%s (line %d, column %d)"
+                                      (ResolveError.message &error)
+                                      @(Info.line
+                                        (SurfaceSpan.start (ResolveError.span &error)))
+                                      @(Info.col
+                                        (SurfaceSpan.start (ResolveError.span &error)))))))
+      (Result.Error error)
+        (Result.Error (CompileError.init @"expand" @(CtError.message &error))))))
