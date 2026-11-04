@@ -6,10 +6,17 @@
 instance cache, and accepted echo type keys. Backend planning selects native
 symbols from this final specialization before consuming it in lowering.")
 (deftype ConcretePlan
-  [specialized SpecializationModule
+  [prepared IncrementalSpecialization
    ownership OwnershipPlan
-   instances (Array Specialization)
    echo-types (Array String)])
+
+(defmodule ConcretePlan
+  (doc specialized "borrows the specialization delta retained by this plan.")
+  (defn specialized [plan]
+    (IncrementalSpecialization.module (ConcretePlan.prepared plan)))
+  (doc instances "borrows the complete cache retained by this plan.")
+  (defn instances [plan]
+    (IncrementalSpecialization.instances (ConcretePlan.prepared plan))))
 
 (doc IncrementalLowering "is the backend delta for one cell plus the complete
 concrete specialization cache to commit after that cell succeeds.")
@@ -75,11 +82,14 @@ concrete owned types.")
                                                &demands
                                                seeds
                                                known)
-          (Result.Success
-            (IncrementalSpecialization.init raw-specialized instances))
-            (let [specialized (RefLift.module-with-source-map &raw-specialized
-                                                              *want-source-map*)]
-              (match (Ownership.prepare &specialized facts)
+          (Result.Success incremental)
+            (let-do [specialized (RefLift.module-with-source-map
+                       (IncrementalSpecialization.module &incremental)
+                       *want-source-map*)]
+              (IncrementalSpecialization.set-module! &incremental specialized)
+              (match (Ownership.prepare
+                  (IncrementalSpecialization.module &incremental)
+                  facts)
                 (Result.Success ownership)
                   (let-do [requirements (OwnershipPlan.requirements &ownership)
                            previous (SpecializationDemands.count &demands)]
@@ -88,14 +98,15 @@ concrete owned types.")
                         (OwnershipRequirement.DeleteFunction type)
                           (SpecializationDemands.require-delete! &demands
                                                                  (Box.peek type))))
-                    (require-captures! &demands &specialized facts)
+                    (require-captures! &demands
+                                       (IncrementalSpecialization.module &incremental)
+                                       facts)
                     (when-do (Int.= previous
                                     (SpecializationDemands.count &demands))
                       (set! outcome
                             (Result.Success
-                              (ConcretePlan.init specialized
+                              (ConcretePlan.init incremental
                                                  ownership
-                                                 instances
                                                  (the (Array String) []))))
                       (set! done true)))
                 (Result.Error error)
@@ -123,7 +134,7 @@ prior-cell cache so the final delta retains every definition from this cell.")
     (let-do [roots (SpecializationModule.roots (ConcretePlan.specialized &plan))
              keys (the (Array String) [])
              seen (the (Set String) (Set.create))
-             requests (the (Array SpecializationRequest) [])]
+             requests (the (Array (Pair SpecializationRequest Bool)) [])]
       (for [i 0 (Array.length roots)]
         (let [type (Specialize.expression-type (Box.peek (Array.unsafe-nth roots
                                                                            i)))]
@@ -136,7 +147,7 @@ prior-cell cache so the final delta retains every definition from this cell.")
                                                                core
                                                                inferred
                                                                &type)
-                    (Maybe.Just (Pair.init request _))
+                    (Maybe.Just request)
                       (do
                         (Set.put! &seen &key)
                         (Array.push-back! &keys key)
@@ -144,7 +155,10 @@ prior-cell cache so the final delta retains every definition from this cell.")
                     (Maybe.Nothing) ()))))))
       (if (Int.= 0 (Array.length &requests))
         (Result.Success plan)
-        (let-do [all-seeds (append-requests (Array.copy seeds) &requests)]
+        (let-do [all-seeds (Array.copy seeds)]
+          (for [i 0 (Array.length &requests)]
+            (Array.push-back! &all-seeds
+                              @(Pair.a (Array.unsafe-nth &requests i))))
           (set! all-seeds
                 (append-requests all-seeds
                                  &(Specialize.named-requests-with-context context
@@ -284,23 +298,18 @@ function named in `check-names`, and — when `echo` — compiling top-level
 non-unit expression results into printed output the way the reference echoes
 REPL results.")
 
-  ;; Lowering and rendering each construct another large whole-program
-  ;; representation. Consume their inputs at function boundaries so the
-  ;; specialized Core IR, backend IR, and final C string do not all overlap.
+  ;; Keep each intermediate owner inside its invocation. Lowering borrows
+  ;; the retained plan, and rendering consumes the backend, so the specialized
+  ;; Core IR, backend IR, and final C string do not all overlap.
 
   (private lower-owned-raw)
   (hidden lower-owned-raw)
   (defn lower-owned-raw [plan symbols]
-    (match plan
-      (ConcretePlan.init specialized ownership instances _)
-        (match (BackendLower.module-with-ownership-echoed &specialized
-                                                          &ownership
-                                                          (BackendSymbols.deletes &symbols)
-                                                          (BackendSymbols.copies &symbols)
-                                                          (BackendSymbols.echo &symbols))
-          (Result.Success backend)
-            (Result.Success (IncrementalLowering.init backend instances))
-          (Result.Error error) (Result.Error error))))
+    (BackendLower.module-with-ownership-echoed (ConcretePlan.specialized plan)
+                                               (ConcretePlan.ownership plan)
+                                               (BackendSymbols.deletes symbols)
+                                               (BackendSymbols.copies symbols)
+                                               (BackendSymbols.echo symbols)))
 
   (private line-starts)
   (hidden line-starts)
@@ -412,11 +421,11 @@ came from.")
   (hidden lower-owned)
   (defn lower-owned [plan symbols]
     (match (lower-owned-raw plan symbols)
-      (Result.Success (IncrementalLowering.init backend instances))
+      (Result.Success backend)
         (do
           (when *want-source-map*
             (BackendModule.set-line-map! &backend (backend-line-map)))
-          (Result.Success (IncrementalLowering.init backend instances)))
+          (Result.Success backend))
       (Result.Error error) (Result.Error error)))
 
   (doc resolve-line-resets "turns the marks the backend left at function
@@ -462,20 +471,19 @@ because only here is the whole unit written.")
 
   (private lower-inferred-module-rooted)
   (hidden lower-inferred-module-rooted)
-  (defn lower-inferred-module-rooted [core inferred echo known names]
-    (let [context (Specialize.prepare core inferred)
-          seeds (Specialize.named-requests-with-context &context
-                                                        core
-                                                        inferred
-                                                        names)]
-      (lower-inferred-module-seeded &context core inferred echo known &seeds)))
 
   (private lower-inferred-module-seeded)
   (hidden lower-inferred-module-seeded)
   (doc lower-inferred-module-seeded "lowers against a specialization context
 the caller prepared for this `core` and `inferred`, starting from `seeds`
 built with that context.")
-  (defn lower-inferred-module-seeded [context core inferred echo known seeds]
+  (defn lower-inferred-module-seeded [context
+                                      core
+                                      inferred
+                                      echo
+                                      known
+                                      seeds
+                                      finish]
     (let-do [facts (OwnershipClassify.facts-from-module core)]
       (match (specialize-closed-known context core inferred &facts seeds known)
         (Result.Success plan)
@@ -493,8 +501,10 @@ built with that context.")
               (let [symbols (BackendSymbolSelection.for-module core
                                                                (ConcretePlan.specialized &final)
                                                                (ConcretePlan.echo-types &final))]
-                (match (lower-owned final symbols)
-                  (Result.Success lowered) (Result.Success lowered)
+                (match (lower-owned &final &symbols)
+                  (Result.Success backend)
+                    (Result.Success
+                      (~finish backend (ConcretePlan.instances &final)))
                   (Result.Error error)
                     (Result.Error
                       (CompileError.init @"backend"
@@ -507,27 +517,50 @@ built with that context.")
               (Maybe.Nothing) ())
             (Result.Error error)))))
 
+  (defn lower-inferred-module-rooted [core inferred echo known names finish]
+    (let [context (Specialize.prepare core inferred)
+          seeds (Specialize.named-requests-with-context &context
+                                                        core
+                                                        inferred
+                                                        names)]
+      (lower-inferred-module-seeded &context
+                                    core
+                                    inferred
+                                    echo
+                                    known
+                                    &seeds
+                                    finish)))
+
   (doc lower-inferred-module-with-known "lowers one inferred cell against
 concrete instances already compiled by its session. The backend module is a
 delta; the returned instance array is the complete cache to commit only after
 the cell succeeds.")
+  (private backend-only)
+  (hidden backend-only)
+  (defn backend-only [backend _instances] backend)
+
+  (private backend-with-cache)
+  (hidden backend-with-cache)
+  (defn backend-with-cache [backend instances]
+    (IncrementalLowering.init backend (Array.copy instances)))
+
   (defn lower-inferred-module-with-known [core inferred echo known]
     (lower-inferred-module-rooted core
                                   inferred
                                   echo
                                   known
-                                  &(the (Array String) [])))
+                                  &(the (Array String) [])
+                                  &backend-with-cache))
 
   (private lower-inferred-module-with)
   (hidden lower-inferred-module-with)
   (defn lower-inferred-module-with [core inferred echo]
-    (match (lower-inferred-module-with-known core
-                                             inferred
-                                             echo
-                                             &(the (Array Specialization) []))
-      (Result.Success (IncrementalLowering.init backend _))
-        (Result.Success backend)
-      (Result.Error error) (Result.Error error)))
+    (lower-inferred-module-rooted core
+                                  inferred
+                                  echo
+                                  &(the (Array Specialization) [])
+                                  &(the (Array String) [])
+                                  &backend-only))
 
   (doc lower-inferred-module "specializes, ownership-plans, and lowers an
 already derived and inferred module to its `BackendModule` without rendering
@@ -645,8 +678,9 @@ stay direct native calls.")
                                                inferred
                                                false
                                                &(the (Array Specialization) [])
-                                               &requests)
-            (Result.Success (IncrementalLowering.init backend _))
+                                               &requests
+                                               &backend-only)
+            (Result.Success backend)
               (match (render-library backend &(root-symbols core &requests))
                 (Result.Success c) (Result.Success c)
                 (Result.Error error)
@@ -661,14 +695,12 @@ pipeline up to but not including C rendering, for alternative backends.")
   (defn lower-module-full [module config check-names echo]
     (match (CompilerFrontend.infer-module-with module config)
       (Result.Success annotated)
-        (match (lower-inferred-module-rooted (AnnotatedModule.core &annotated)
-                                             (AnnotatedModule.inferred &annotated)
-                                             echo
-                                             &(the (Array Specialization) [])
-                                             check-names)
-          (Result.Success (IncrementalLowering.init backend _))
-            (Result.Success backend)
-          (Result.Error error) (Result.Error error))
+        (lower-inferred-module-rooted (AnnotatedModule.core &annotated)
+                                      (AnnotatedModule.inferred &annotated)
+                                      echo
+                                      &(the (Array Specialization) [])
+                                      check-names
+                                      &backend-only)
       (Result.Error error) (Result.Error error)))
 
   (doc compile-module-full "runs `lower-module-full` and renders the lowered
@@ -829,21 +861,26 @@ ownership planning — no C — demanding specialization of every function in
 for ownership tooling.")
   (defn plan-module-checked [module config check-names]
     (match (CompilerFrontend.infer-module-with module config)
-      (Result.Success (AnnotatedModule.init core inferred))
-        (let [context (Specialize.prepare &core &inferred)
-              facts (OwnershipClassify.facts-from-module &core)
+      (Result.Success annotated)
+        (let [core (AnnotatedModule.core &annotated)
+              inferred (AnnotatedModule.inferred &annotated)
+              context (Specialize.prepare core inferred)
+              facts (OwnershipClassify.facts-from-module core)
               seeds (Specialize.named-requests-with-context &context
-                                                            &core
-                                                            &inferred
+                                                            core
+                                                            inferred
                                                             check-names)]
           (match (specialize-closed-known &context
-                                          &core
-                                          &inferred
+                                          core
+                                          inferred
                                           &facts
                                           &seeds
                                           &(the (Array Specialization) []))
-            (Result.Success (ConcretePlan.init _ plan _ _))
-              (Result.Success (PlannedModule.init core inferred plan))
+            (Result.Success concrete)
+              (Result.Success
+                (PlannedModule.init @core
+                                    @inferred
+                                    @(ConcretePlan.ownership &concrete)))
             (Result.Error error) (Result.Error error)))
       (Result.Error error) (Result.Error error)))
 

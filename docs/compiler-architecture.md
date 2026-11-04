@@ -48,14 +48,19 @@ Preparation consumes intermediate modules at function boundaries so an earlier
 full-program representation does not remain alive through later phases.
 `CoreIR.index-call-sites` consumes its input and replaces only functions,
 values, and roots. The ten unchanged declaration arrays keep their storage.
-A derivation preserving provenance returns its constructed module directly. Prepared and lowered records are unpacked with owned constructor patterns, transferring their Core, inference, backend, and instance-cache fields into the next stage.
+A derivation preserving provenance returns its constructed module directly.
+Generic closure passes its owned module and optional inference base directly
+to the preparation result builder. Plain lowering likewise returns the backend
+directly; incremental lowering builds the result that also owns an instance
+cache. Neither path relies on product-type patterns in the reference compiler.
 
 `RefLift` belongs to ownership preparation. Its source-map identity policy is
 an explicit argument to `module-with-source-map`; the standalone `module`
 entry uses owner-local generated IDs. The pass no longer reads driver state.
 
-Backend lowering consumes lambda lifting's owned module and closure array.
-Cleanup replaces each body expression in its existing record, releasing the
+Backend lowering retains lambda lifting's module and closure array in their
+owned pair. Cleanup borrows the pair's fields and replaces each body expression
+in its existing record, releasing the
 previous tree before the next body. Body and closure arrays, signatures,
 parameters, capture descriptions, and specialization metadata retain their
 storage. Root rewriting replaces only the root array.
@@ -92,14 +97,16 @@ seeds. Capture analysis submits borrowed types to the same accumulator without
 building another deduplicated type array. The driver still owns convergence;
 neither ownership nor specialization starts another closure loop.
 
-`ConcretePlan` owns the closed specialization delta, ownership plan, complete
-instance cache, and accepted echo type keys. Specialization output is unpacked with
-an owned constructor pattern, transferring its module and cache into planning.
+`ConcretePlan` retains the complete specialization result alongside its
+ownership plan and accepted echo type keys. Its module and instance-cache
+accessors borrow fields from that owner. Reference lifting replaces the module
+in the retained result before ownership planning.
 Echo augmentation consumes this plan and returns it directly when no echo
 demands exist. Backend symbol selection resolves the final native tables and
-echo plan once. Lowering consumes those symbols and the concrete plan, transferring
-the cache into `IncrementalLowering`. These handoffs replace nested pairs and
-whole-result copies; ownership tooling uses the same closure entry point.
+echo plan once. Lowering borrows the symbols and concrete plan. Plain lowering
+returns its backend directly; incremental lowering copies the retained cache
+into its separately owned `IncrementalLowering` result. Ownership tooling uses
+the same closure entry point.
 
 `BackendSymbolSelection` owns this selection policy. It indexes the complete
 identity of each implementation reference, combining its copier, deleter, and

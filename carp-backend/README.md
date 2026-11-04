@@ -28,8 +28,9 @@ and closure rewriting then use the same resolved plan. Negative contexts
 retain the complete action order. The plan is released before backend
 materialization.
 
-Cleanup consumes the lifted module and closure array. Each body expression is
-replaced in its existing record, releasing its old tree before the next body.
+Cleanup retains the lifted module and closure array in their owned pair and
+rewrites them through borrowed fields. Each body expression is replaced in its
+existing record, releasing its old tree before the next body.
 Signatures, parameters, capture descriptions, specialization metadata, and the
 body and closure arrays retain their storage. Root rewriting replaces only the
 root array. Public lowering entry points still borrow their inputs.
