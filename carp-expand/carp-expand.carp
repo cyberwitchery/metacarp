@@ -56,6 +56,11 @@ compile-time snapshot produced while expanding it.")
   (Ambiguous []))
 
 (def *expand-recovering* false)
+(doc *expand-in-definition* "is true while the body of a runtime definition
+(`defn`, `def`) is expanded. Only there is a call to a `defndynamic` function
+evaluated at compile time: elsewhere at the top level the form is compile-time
+code itself, and expanding both arms of a top-level `if` must not run either.")
+(def *expand-in-definition* false)
 (def *expand-recovery-errors* (the (Array CtError) []))
 (deftype ObservedExpansion
   [result (Result SurfaceModule CtError)
@@ -370,6 +375,44 @@ compile-time snapshot produced while expanding it.")
             (MacroLookup.Missing)))
       _ (MacroLookup.Missing)))
 
+  (private closure-at?)
+  (hidden closure-at?)
+  (defn closure-at? [state path local]
+    (if (= path "")
+      (CtEval.closure-in-frame? state &(CtEval.root state) local)
+      (match (CtEval.module-frame state path)
+        (Maybe.Just frame) (CtEval.closure-in-frame? state &frame local)
+        (Maybe.Nothing) false)))
+
+  (private runtime-definition-head?)
+  (hidden runtime-definition-head?)
+  (defn runtime-definition-head? [name]
+    (or (= name "defn")
+        (or (= name "defn-") (or (= name "def") (= name "def-")))))
+
+  (private dynamic-function-call?)
+  (hidden dynamic-function-call?)
+  (doc dynamic-function-call? "whether a call in static code names a
+`defndynamic` function. The reference evaluates such a call at compile time
+and splices the result. Like the reference, the head resolves by its exact
+path, as written or under the current module, never through a `use` or the
+`Dynamic` prelude, so `(reduce ...)` under `(use Array)` stays static.")
+  (defn dynamic-function-call? [state scope name]
+    (let [segments (String.split-by name &[\.])
+          n (Array.length &segments)]
+      (if (Int.< n 1)
+        false
+        (let [local (Array.unsafe-nth &segments (Int.dec n))
+              written (String.join "." &(Array.prefix &segments (Int.dec n)))
+              scope-path (ExpandScope.path scope)
+              relative (cond
+                (= scope-path "") @&written
+                (= &written "") @scope-path
+                (qualified-name scope-path &written))]
+          (or (closure-at? state &written local)
+              (and (not (= &relative &written))
+                   (closure-at? state &relative local)))))))
+
   (private call-arguments)
   (hidden call-arguments)
   (defn call-arguments [items]
@@ -521,15 +564,21 @@ a macro explicitly returns it.")
                       (MacroLookup.Missing)
                       ;; a `Dynamic.`-qualified call in static code is dynamic
                       ;; by construction: the reference evaluates it at compile
-                      ;; time and splices the result.
-                      (if (String.starts-with? &name "Dynamic.")
+                      ;; time and splices the result. So does a call to a
+                      ;; `defndynamic` function named by its exact path.
+                      (if (or (String.starts-with? &name "Dynamic.")
+                              (and *expand-in-definition*
+                                   (dynamic-function-call? state scope &name)))
                         (CtEval.eval-template node
                                               state
                                               (ExpandScope.frame scope))
                         (let-do [result (the
                                    (Result (Array (Box SurfaceNode)) CtError)
                                    (Result.Success []))
-                                 n (Array.length items)]
+                                 n (Array.length items)
+                                 saved-in-definition *expand-in-definition*]
+                          (when (runtime-definition-head? &name)
+                            (set! *expand-in-definition* true))
                           (for [i 0 n]
                             (match-ref &result
                               (Result.Success children)
@@ -547,6 +596,7 @@ a macro explicitly returns it.")
                                       (set! result (Result.Error error))))
                               (Result.Error error)
                                 (set! result (Result.Error @error))))
+                          (set! *expand-in-definition* saved-in-definition)
                           (match result
                             (Result.Success children)
                               (Result.Success
