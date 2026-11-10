@@ -75,6 +75,15 @@ an environment struct of the captured values.")
    body (Box SpecializedExpr)
    context Int])
 
+(doc LiftedModule "a module after lambda lifting: its bodies with the
+non-capturing callbacks appended, the capturing callbacks as closures, and for
+each body the ownership context it was planned in (-1 for one lifted out of
+the roots).")
+(deftype LiftedModule
+  [module SpecializationModule
+   closures (Array ClosureFunction)
+   contexts (Array Int)])
+
 (doc BackendLineMap "is the backend-neutral source location table. Its arrays
 are indexed by expression identity; an empty file or a non-positive line means
 the compiler generated that expression and no caller source owns it.")
@@ -995,20 +1004,24 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
   (doc lift-lambdas "lifts every lambda in the module's bodies and roots to a
 top-level function. Non-capturing callbacks are appended to the module's bodies
 (emitted through the normal path); capturing callbacks are returned separately as
-`ClosureFunction`s for environment-aware rendering.")
+`ClosureFunction`s for environment-aware rendering. Every lifted callback keeps
+the ownership context of the body it came from.")
   (defn lift-lambdas [specialized]
     (let-do [counter (the (Array Int) [30000000])
              lifted (the (Array SpecializedBody) [])
+             lifted-contexts (the (Array Int) [])
              closures (the (Array ClosureFunction) [])
              bodies (SpecializationModule.bodies specialized)
              roots (SpecializationModule.roots specialized)
              new-bodies (the (Array SpecializedBody) [])
-             new-roots (the (Array (Box SpecializedExpr)) [])]
+             new-roots (the (Array (Box SpecializedExpr)) [])
+             contexts (the (Array Int) [])]
       (for [i 0 (Array.length bodies)]
         (let-do [body (Array.unsafe-nth bodies i)]
-          ;; body `i` is ownership context `i` (see `rewrite-bodies!`); a lambda
-          ;; lifted out of it keeps that context so its deletes stay matchable.
+          ; body `i` is ownership context `i` (see `rewrite-bodies!`); a lambda
+          ; lifted out of it keeps that context so its deletes stay matchable.
           (set! *lift-context* i)
+          (Array.push-back! &contexts i)
           (set! *lift-owner-symbol*
                 @(Specialization.symbol (SpecializedBody.specialization body)))
           (Array.push-back! &new-bodies
@@ -1019,7 +1032,9 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
                                                                   &counter
                                                                   &lifted
                                                                   &closures))
-                                                  @(SpecializedBody.value body)))))
+                                                  @(SpecializedBody.value body)))
+          (while (Int.< (Array.length &lifted-contexts) (Array.length &lifted))
+            (Array.push-back! &lifted-contexts i))))
       (set! *lift-context* -1)
       (set! *lift-owner-symbol* @"roots")
       (for [i 0 (Array.length roots)]
@@ -1030,8 +1045,13 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
                                           &lifted
                                           &closures))))
       (for [i 0 (Array.length &lifted)]
-        (Array.push-back! &new-bodies @(Array.unsafe-nth &lifted i)))
-      (Pair.init
+        (do
+          (Array.push-back! &new-bodies @(Array.unsafe-nth &lifted i))
+          (Array.push-back! &contexts
+                            (if (Int.< i (Array.length &lifted-contexts))
+                              @(Array.unsafe-nth &lifted-contexts i)
+                              -1))))
+      (LiftedModule.init
         (SpecializationModule.init
           @(SpecializationModule.instances specialized)
           new-bodies
@@ -1040,7 +1060,8 @@ top-level function. Non-capturing callbacks are appended to the module's bodies
           @(SpecializationModule.constructors specialized)
           @(SpecializationModule.system-includes specialized)
           @(SpecializationModule.type-declarations specialized))
-        closures)))
+        closures
+        contexts)))
 
   (doc use-stable-lambda-symbols!
     "uses provenanced expression identities, owning specialization symbols,
@@ -2022,21 +2043,30 @@ other sites remain local. A negative context retains the legacy wildcard.")
 
   (doc rewrite-bodies!
     "rewrites body expressions and roots through a borrowed module.
-The module remains in its caller-owned record; body records and unchanged
-metadata retain their storage.")
-  (defn rewrite-bodies! [specialized ownership cleanup delete-symbols echo]
+`body-contexts` names the ownership context each body was planned in. A lifted
+callback is matched only against the context of the body it came from: one
+generic body instantiated twice yields two callbacks whose locals share binder
+ids and sites but not types. The module remains in its caller-owned record;
+body records and unchanged metadata retain their storage.")
+  (defn rewrite-bodies! [specialized
+                         body-contexts
+                         ownership
+                         cleanup
+                         delete-symbols
+                         echo]
     (let-do [bodies (SpecializationModule.bodies specialized)
              contexts (OwnershipPlan.contexts ownership)]
       (for [i 0 (Array.length bodies)]
         (let [body (Array.unsafe-nth bodies i)
-              context (if (Int.< i (Array.length contexts))
-                (match-ref (Array.unsafe-nth contexts i)
-                  (OwnershipContext.Definition _ _ _ _) i
+              planned (if (Int.< i (Array.length body-contexts))
+                @(Array.unsafe-nth body-contexts i)
+                -1)
+              context (if (and (Int.>= planned 0)
+                               (Int.< planned (Array.length contexts)))
+                (match-ref (Array.unsafe-nth contexts planned)
+                  (OwnershipContext.Definition _ _ _ _) planned
                   (OwnershipContext.Roots _) -1)
                 -1)]
-          ; Lambda lifting appends noncapturing callbacks after context numbering.
-          ; Their module-unique locals recover their original cleanup through
-          ; the complete-delete-set fallback.
           (SpecializedBody.set-body! body
                                      (Box.init
                                        (rewrite-cleanup-body (Box.peek (SpecializedBody.body body))
@@ -2087,12 +2117,13 @@ the rewritten owners transfer to the result.")
       (match (resolve-cleanup (OwnershipPlan.actions ownership) delete-symbols)
         (Result.Success cleanup)
           (let-do [lifted (lift-lambdas specialized)]
-            (rewrite-bodies! (Pair.a &lifted)
+            (rewrite-bodies! (LiftedModule.module &lifted)
+                             (LiftedModule.contexts &lifted)
                              ownership
                              &cleanup
                              delete-symbols
                              echo)
-            (rewrite-closures! (Pair.b &lifted)
+            (rewrite-closures! (LiftedModule.closures &lifted)
                                &cleanup
                                delete-symbols
                                (SpecializationModule.constructors specialized))
@@ -2115,8 +2146,8 @@ REPL-echo semantics compiled into `main`).")
             (Int.max 20000000 (Int.inc (Specialize.max-global-id specialized))))
       (match (prepare-cleanup specialized ownership delete-symbols echo)
         (Result.Success rewritten)
-          (module (Pair.a &rewritten)
-                  (Pair.b &rewritten)
+          (module (LiftedModule.module &rewritten)
+                  (LiftedModule.closures &rewritten)
                   delete-symbols
                   copy-symbols)
         (Result.Error error) (Result.Error error))))
