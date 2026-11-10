@@ -1202,6 +1202,61 @@ frame.")
       (union-refs (BorrowState.moved left) (BorrowState.moved right))
       (join-origins (BorrowState.origins left) (BorrowState.origins right))))
 
+  (private refs-subset?)
+  (hidden refs-subset?)
+  (defn refs-subset? [left right]
+    (let-do [result true
+             n (Array.length left)]
+      (for [i 0 n]
+        (unless (contains-ref? right (Array.unsafe-nth left i))
+          (set! result false)))
+      result))
+
+  (private refs-same?)
+  (hidden refs-same?)
+  (doc refs-same? "whether two binder lists name the same binders, in any
+order.")
+  (defn refs-same? [left right]
+    (and (refs-subset? left right) (refs-subset? right left)))
+
+  (private origin-same?)
+  (hidden origin-same?)
+  (defn origin-same? [left right]
+    (match-ref left
+      (BorrowOrigin.Static) (match-ref right (BorrowOrigin.Static) true _ false)
+      (BorrowOrigin.External)
+        (match-ref right (BorrowOrigin.External) true _ false)
+      (BorrowOrigin.None) (match-ref right (BorrowOrigin.None) true _ false)
+      (BorrowOrigin.Local ls)
+        (match-ref right (BorrowOrigin.Local rs) (refs-same? ls rs) _ false)
+      (BorrowOrigin.Param ls)
+        (match-ref right (BorrowOrigin.Param rs) (refs-same? ls rs) _ false)))
+
+  (private origins-within?)
+  (hidden origins-within?)
+  (defn origins-within? [left right]
+    (let-do [result true
+             n (Array.length left)]
+      (for [i 0 n]
+        (let [pair (Array.unsafe-nth left i)]
+          (unless (and (origins-has? right (Pair.a pair))
+                       (origin-same? (Pair.b pair)
+                                     &(origins-lookup right (Pair.a pair))))
+            (set! result false))))
+      result))
+
+  (private state-same?)
+  (hidden state-same?)
+  (doc state-same? "whether two borrow states agree: the same moved owners
+and the same origin for every reference binding. A `while` iterates until its
+loop state stops changing.")
+  (defn state-same? [left right]
+    (and
+      (refs-same? (BorrowState.moved left) (BorrowState.moved right))
+      (and
+        (origins-within? (BorrowState.origins left) (BorrowState.origins right))
+        (origins-within? (BorrowState.origins right) (BorrowState.origins left)))))
+
   (private is-ref-call?)
   (hidden is-ref-call?)
   (defn is-ref-call? [callee args]
@@ -1587,21 +1642,28 @@ past any references to the closure.")
                 (do (set! joined @&branch-state) (set! seen true)))))
           joined)
       (SpecializedExpr.While _ _ c body)
-        (let [after-c (analyze (Box.peek c) state parameters facts flags false)
-              once (analyze (Box.peek body)
-                            &after-c
-                            parameters
-                            facts
-                            flags
-                            false)
-              merged (state-join &after-c &once)
-              twice (analyze (Box.peek body)
-                             &merged
-                             parameters
-                             facts
-                             flags
-                             false)]
-          (state-join &after-c &twice))
+        (let-do [entry @state
+                 done false]
+          ; the condition can be reached after any number of iterations, so
+          ; its state is the join over all of them: iterate until it stops
+          ; changing. a borrow handed along n `set!`s takes n passes to reach
+          ; its use. joins only grow, over the binders in scope, so this ends.
+          (while (not done)
+            (let [after-c (analyze (Box.peek c)
+                                   &entry
+                                   parameters
+                                   facts
+                                   flags
+                                   false)
+                  after-body (analyze (Box.peek body)
+                                      &after-c
+                                      parameters
+                                      facts
+                                      flags
+                                      false)
+                  next (state-join &entry &after-body)]
+              (if (state-same? &next &entry) (set! done true) (set! entry next))))
+          (analyze (Box.peek c) &entry parameters facts flags false))
       (SpecializedExpr.Set _ _ binder value)
         (let-do [after-value (analyze (Box.peek value)
                                       state
