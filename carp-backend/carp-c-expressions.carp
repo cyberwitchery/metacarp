@@ -1,5 +1,5 @@
-;; Expression, control-flow, closure-construction, and pattern rendering.
-;; Loaded by carp-c-backend.carp after the shared CBackend API is declared.
+;; renders expressions, control flow, closure construction and patterns.
+;; carp-c-backend.carp loads it into `CBackend`.
 
 (defn unmanaged-type? [constructors type]
   (if (CAbi.unmanaged-scalar? type)
@@ -87,11 +87,7 @@
 
 (private managed-renderable?)
 (hidden managed-renderable?)
-(doc managed-renderable? "reports whether a managed-typed expression is safe to
-render directly as a C value. A local reference renders as its C variable (an
-ownership move, sound because the ownership phase has verified the use is
-linear); a global call renders as the call that produces the owned value. Other
-managed forms still require dedicated lowering.")
+(doc escape-c-string "returns `value` escaped for a C string literal.")
 (defn escape-c-string [value]
   (let-do [buffer (StringBuf.create)
            n (String.length value)]
@@ -106,6 +102,9 @@ managed forms still require dedicated lowering.")
           (StringBuf.append-char &buffer byte))))
     (StringBuf.into-string buffer)))
 
+(doc managed-renderable? "checks whether the managed expression `expression` can
+be rendered as a plain C value. Array literals, `set!`, lambdas and references
+to globals cannot; they need their own lowering.")
 (defn managed-renderable? [expression]
   (match-ref expression
     (SpecializedExpr.Reference _ _ reference)
@@ -140,9 +139,7 @@ managed forms still require dedicated lowering.")
     _
     false))
 
-;; the full-precision formatters print a bare mantissa (e.g. "2" or "3.14e5");
-;; ensure a decimal point so clang reads it as floating point, and add the `f`
-;; suffix for `float` literals.
+(doc has-dot? "checks whether the number text `s` has a `.` or an exponent.")
 (defn has-dot? [s]
   (let-do [found false]
     (for [i 0 (String.length s)]
@@ -150,14 +147,20 @@ managed forms still require dedicated lowering.")
         (when (or (= c \.) (or (= c \e) (= c \E))) (set! found true))))
     found))
 
+(doc c-float-literal "returns the number text `s` as a C float literal: with a
+decimal point if it has none, and an `f` suffix.")
 (defn c-float-literal [s]
   (if (has-dot? s)
     (String.concat &[(String.copy s) @"f"])
     (String.concat &[(String.copy s) @".0f"])))
 
+(doc c-double-literal "returns the number text `s` as a C double literal, with a
+decimal point if it has none.")
 (defn c-double-literal [s]
   (if (has-dot? s) (String.copy s) (String.concat &[(String.copy s) @".0"])))
 
+(doc literal-int "returns the value of an `Int` literal, through annotations, or
+-1.")
 (defn literal-int [expression]
   (match-ref expression
     (SpecializedExpr.IntLit _ _ value) @value
@@ -354,8 +357,8 @@ managed forms still require dedicated lowering.")
                     (Int.= @(CoreRef.id reference) 75)))
             (Int.= (Array.length arguments) 1))
           (Result.Success (String.copy "((void)0)"))
-          ;; the array-free sentinel frees the heap `data` of an `(Array a)`;
-          ;; Array is a builtin with no runtime deleter function.
+          ; the array-free sentinel frees only the data of an array, not its
+          ; elements
           (and (String.= symbol "__carp_array_free")
                (Int.= (Array.length arguments) 1))
           (match (render-value-expression module
@@ -695,11 +698,12 @@ managed forms still require dedicated lowering.")
               &[@"expression form is not supported in unmanaged bodies: "
                 (expression-form-name expression)])))))))
 
-(doc unit-valued? "whether an expression's concrete type is `()`. A unit
-binding has no C storage, so an assignment to one has no place to write: the
-value still runs, for its effects.")
+(doc unit-valued? "checks whether `expression` has type `()`. Such a value has
+no C storage, so assigning it writes nothing; it still runs for its effects.")
 (defn unit-valued? [expression] (unit-type? &(specialized-type expression)))
 
+(doc expression-form-name "returns the name of the form of `expression`, for
+error messages.")
 (defn expression-form-name [expression]
   (match-ref expression
     (SpecializedExpr.Set _ _ _ _) (String.copy "set!")
@@ -712,9 +716,8 @@ value still runs, for its effects.")
     (SpecializedExpr.Reference _ _ _) (String.copy "reference")
     _ (String.copy "unknown")))
 
-(doc render-argument-types "the C parameter list of a closure callback's
-arguments. A unit argument has no C storage, so it is left out, as it is from
-the callback's definition and from the call's values.")
+(doc render-argument-types "returns the C parameter types of a closure
+callback's arguments, without unit arguments, which have no storage.")
 (defn render-argument-types [argument-types]
   (let-do [rendered (the String (String.copy ""))
            failure (the (Maybe BackendError) (Maybe.Nothing))
@@ -736,9 +739,9 @@ the callback's definition and from the call's values.")
       (Maybe.Just error) (Result.Error @error)
       (Maybe.Nothing) (Result.Success rendered))))
 
-(doc render-closure-call "renders an indirect call through a `Lambda` closure
-value: dispatches at runtime on the captured environment, calling
-`callback(env, args)` for capturing closures and `callback(args)` otherwise.")
+(doc render-closure-call "renders a call through the function value `callee`:
+`callback(env, args)` if it has an environment and `callback(args)` otherwise. A
+closure built at the call is freed after it.")
 (defn render-closure-call [module callee arguments]
   (let [callee-type (specialized-type callee)]
     (match-ref &callee-type
@@ -802,15 +805,12 @@ value: dispatches at runtime on the captured environment, calling
           (Result.Error error) (Result.Error error))
       _ (Result.Error (BackendError.init @"call target is not a function type")))))
 
-(doc render-statement-value
-  "renders a statement-shaped form (do/let/while/match)
-used in value position as a GNU statement expression: the result is assigned to a
-temporary whose value the expression yields. The temporary name is fixed and
-relies on C block scoping (nested statement expressions shadow it).")
-;; the value a statement-shaped form yields is its tail: a `let` evaluates to its
-;; body, a `do` to its last element. The top node's own type field can lie (the
-;; hoist wrapper stamps a `let` with the hoisted binding's type), so recurse to
-;; the tail for the storage type of the `({ ... })` statement expression.
+(doc render-statement-value "renders a statement form, such as `do`, `let`,
+`while`, `match` or a managed `if`, used as a value: a GNU statement expression
+that assigns the result to a temporary. A unit result is run for its effects and
+assigns nothing.")
+(doc statement-result-type "returns the type of the value a statement form
+yields, from its tail.")
 (defn statement-result-type [expression] (tail-expression-type expression))
 
 (defn render-statement-value [module expression]
@@ -843,14 +843,8 @@ relies on C block scoping (nested statement expressions shadow it).")
               (Result.Error error) (Result.Error error)))
         (Result.Error error) (Result.Error error)))))
 
-(doc render-env-field-value "one captured value as the environment stores it.
-A managed capture is deep-copied: the environment's deleter frees its fields,
-so storing the capturing scope's own value would free it twice and read it
-after that scope ended. Captures are always plain variable references, so the
-address taken here is always an lvalue.")
-(doc capture-inner "the value a capture argument reads. Lifting wraps each
-capture in `ref` so the construction does not read as a move; the environment
-still stores the value, copied.")
+(doc capture-inner "returns the value a capture argument reads, without the
+`ref` that lifting puts around it.")
 (defn capture-inner [expression]
   (match-ref expression
     (SpecializedExpr.GlobalCall _ _ reference _ _ arguments)
@@ -860,6 +854,8 @@ still stores the value, copied.")
         expression)
     _ expression))
 
+(doc capture-copier-for "returns the C symbol that copies the value the capture
+`expression` reads, if its type has one.")
 (defn capture-copier-for [module expression]
   (match-ref (capture-inner expression)
     (SpecializedExpr.Reference _ type _)
@@ -908,6 +904,9 @@ still stores the value, copied.")
       (Maybe.Just error) (Result.Error @error)
       (Maybe.Nothing) (Result.Success rendered))))
 
+(doc render-recursive-env-fields "renders the environment fields of a closure
+that captures `self`, the binding it is assigned to. It returns the fields and
+the assignments that store `self` after construction.")
 (defn render-recursive-env-fields [module arguments self]
   (let-do [fields (the String (String.copy ""))
            assignments (the String (String.copy ""))
@@ -960,6 +959,8 @@ still stores the value, copied.")
       (Maybe.Just error) (Result.Error @error)
       (Maybe.Nothing) (Result.Success (Pair.init fields assignments)))))
 
+(doc render-recursive-closure-construction "renders the construction of the
+closure `symbol` that captures `self`, the binding it is assigned to.")
 (defn render-recursive-closure-construction [module symbol arguments self]
   (let [lambda-symbol (String.concat
           &[@"_carp_lambda_" (String.suffix symbol 14)])
@@ -987,10 +988,9 @@ still stores the value, copied.")
               @" _carp_self; })"]))
       (Result.Error error) (Result.Error error))))
 
-(doc render-closure-construction-heap "renders a closure construction whose
-Lambda escapes the constructing function (return position): the environment
-must outlive the stack frame, so it is heap-allocated and carries its generated
-environment deleter.")
+(doc render-closure-construction-heap "renders the construction of the closure
+`symbol` with `arguments`: its environment is allocated on the heap, and the
+value carries the environment's delete and copy functions.")
 (defn render-closure-construction-heap [module symbol arguments]
   (let [lambda-symbol (String.concat
           &[@"_carp_lambda_" (String.suffix symbol 14)])
@@ -1019,8 +1019,9 @@ environment deleter.")
 (defn append-indent! [buffer depth]
   (for [i 0 depth] (StringBuf.append-str buffer "  ")))
 
-(doc append-line-directive! "emits a source directive from this module's map.
-An unmapped expression in a mapped module resets attribution to generated C.")
+(doc append-line-directive! "appends a `#line` directive for `expression` from
+the module's source map. An expression with no position resets attribution to
+the generated C.")
 (defn append-line-directive! [module buffer id]
   (let [line-map (BackendModule.line-map module)]
     (when (BackendLineMap.enabled? line-map)
@@ -1036,6 +1037,8 @@ An unmapped expression in a mapped module resets attribution to generated C.")
 "))
           (LineMap.mark-reset! line-map buffer))))))
 
+(doc array-element-type "returns the element type of the array type
+`array-type`, through references, if it has one.")
 (defn array-element-type [array-type]
   (let [storage-type (deref-type array-type)]
     (match-ref &storage-type
@@ -1045,6 +1048,8 @@ An unmapped expression in a mapped module resets attribution to generated C.")
           (Maybe.Nothing))
       _ (Maybe.Nothing))))
 
+(doc render-static-array-literal "renders a static array literal with `elements`
+of `array-type`.")
 (defn render-static-array-literal [module array-type elements]
   (match (array-element-type array-type)
     (Maybe.Nothing)
@@ -1090,10 +1095,9 @@ An unmapped expression in a mapped module resets attribution to generated C.")
               (Result.Error error) (Result.Error error)))
         (Result.Error error) (Result.Error error))))
 
-(doc append-array-literal! "lowers a managed `(Array a)` literal to the
-reference form: a heap allocation sized to the elements, then one assignment per
-element into the malloc'd data. Emitted as the initializer statements of a local
-binding so the value is the binding itself.")
+(doc append-array-literal! "appends a heap array literal, as the reference
+renders it: an allocation sized for the elements, then one assignment per
+element.")
 (defn append-array-literal! [module buffer reference array-type elements depth]
   (match (array-element-type array-type)
     (Maybe.Nothing)
@@ -1143,10 +1147,9 @@ binding so the value is the binding itself.")
             result)
         (Result.Error error) (Result.Error error))))
 
-(doc append-static-array-storage! "lowers a static array literal bound by
-value (RefLift's scope temporary) to the reference form: element storage in
-the enclosing block, an `Array` header over it, then one assignment per
-element, in order. The binding is the header; borrows of it are the literal.")
+(doc append-static-array-storage! "appends a static array literal bound by
+value, as RefLift binds it: element storage in the enclosing block and an
+`Array` header that points at it.")
 (defn append-static-array-storage! [module
                                     buffer
                                     reference
@@ -1203,8 +1206,8 @@ element, in order. The binding is the header; borrows of it are the literal.")
             result)
         (Result.Error error) (Result.Error error))))
 
-(doc append-bound-declaration! "declares a local of the value's storage type
-and initializes it from the rendered value.")
+(doc append-bound-declaration! "appends a local of the storage type of `value`,
+initialized with it.")
 (defn append-bound-declaration! [module buffer reference value depth]
   ;; a scope-shaped value (e.g. RefLift's lifted `let`) evaluates to its tail,
   ;; whose type is the true storage type; the node's own type field can be the
@@ -1267,12 +1270,16 @@ and initializes it from the rendered value.")
         (append-bound-declaration! module buffer reference value depth))
     _ (append-bound-declaration! module buffer reference value depth)))
 
+(doc array-reference-expression? "checks whether `expression` is an array or
+static array, through references.")
 (defn array-reference-expression? [expression]
   (match-ref &(deref-type &(specialized-type expression))
     (MonoType.Named name _)
       (or (String.= name "Array") (String.= name "StaticArray"))
     _ false))
 
+(doc index-or-length-primitive? "checks whether `reference` is one of the
+primitives that read an array's length or elements.")
 (defn index-or-length-primitive? [reference]
   (let [id @(CoreRef.id reference)]
     (or (Int.= id 8)
@@ -1280,6 +1287,8 @@ and initializes it from the rendered value.")
             (or (Int.= id 10)
                 (or (Int.= id 11) (or (Int.= id 12) (Int.= id 13))))))))
 
+(doc arguments-contain-array-reference? "checks whether any of `arguments` is an
+array.")
 (defn arguments-contain-array-reference? [arguments]
   (let-do [found false]
     (for [i 0 (Array.length arguments)]
@@ -1288,6 +1297,9 @@ and initializes it from the rendered value.")
         (set! found true)))
     found))
 
+(doc loop-array-cache-safe? "checks whether `expression` can neither change nor
+reallocate an array: every call that gets an array is a length or index
+primitive. Only then can a loop cache an array's data pointer.")
 (defn loop-array-cache-safe? [expression]
   (match-ref expression
     (SpecializedExpr.GlobalCall _ _ reference _ _ arguments)
@@ -1351,6 +1363,7 @@ and initializes it from the rendered value.")
     _
     true))
 
+(doc index-candidate-listed? "checks whether `candidates` holds `reference`.")
 (defn index-candidate-listed? [candidates reference]
   (let-do [found false]
     (for [i 0 (Array.length candidates)]
@@ -1360,6 +1373,8 @@ and initializes it from the rendered value.")
 
 (sig collect-loop-index-candidates!
      (Fn [(Ref SpecializedExpr) (Ref (Array (Pair CoreRef (Box MonoType))))] ()))
+(doc collect-loop-index-candidates! "adds to `candidates` the arrays that
+`expression` indexes directly, with their types.")
 (defn collect-loop-index-candidates! [expression candidates]
   (match-ref expression
     (SpecializedExpr.GlobalCall _ result-type reference _ _ arguments)
@@ -1737,8 +1752,8 @@ and initializes it from the rendered value.")
 ")
                       (Result.Success ()))
                   (Result.Error error) (Result.Error error)))
-              ;; a closure constructed directly in return position escapes its
-              ;; frame: its environment moves to the heap.
+              ; every closure environment is on the heap, so this path gives
+              ; the same output as the other
               (match (match-ref expression
                   (SpecializedExpr.GlobalCall _ _ _ _ call-symbol call-arguments)
                     (if (String.starts-with? call-symbol "_carp_closure_")
@@ -1777,11 +1792,8 @@ and initializes it from the rendered value.")
 
 (private renderable-signature?)
 (hidden renderable-signature?)
-(doc renderable-signature? "reports whether a function signature can be lowered.
-Managed parameters and a managed result are both allowed now: the ownership
-plan schedules a deleter for every owned parameter the body does not consume,
-and a managed result is a move-out to the caller. Only the function shape is
-required; concreteness is enforced separately.")
+(doc renderable-signature? "checks whether `signature` is a function type.
+Managed parameters and results are allowed.")
 (defn renderable-signature? [-constructors signature]
   (match-ref signature (MonoType.Function _ _) true _ false))
 
@@ -1796,6 +1808,7 @@ required; concreteness is enforced separately.")
           (set! result (Maybe.Just @constructor)))))
     result))
 
+(doc unqualified-suffix "returns the part of `name` after its last `.`.")
 (defn unqualified-suffix [name]
   (let-do [last-dot -1
            n (String.length name)]
@@ -1804,11 +1817,8 @@ required; concreteness is enforced separately.")
       (String.copy name)
       (String.suffix name (Int.inc last-dot)))))
 
-(doc constructor-for-pattern "the constructor a pattern names. An ambiguous
-bare pattern name (two sumtypes sharing a constructor name under `use`)
-resolves to a synthetic overload reference that names no constructor directly;
-the scrutinee's concrete type then picks the real one — the same type-directed
-choice the reference's multisym resolution makes.")
+(doc constructor-for-pattern "returns the constructor a pattern names. A bare
+name that two types share under `use` is chosen by the type of the subject.")
 (defn constructor-for-pattern [constructors reference subject-type]
   (match (constructor-for-reference constructors reference)
     (Maybe.Just constructor) (Maybe.Just constructor)
@@ -1838,11 +1848,9 @@ choice the reference's multisym resolution makes.")
               result)
           _ (the (Maybe CoreConstructorDeclaration) (Maybe.Nothing))))))
 
-(doc record-field-names "the field names of a nominal that is a record — one
-constructor, with named fields. The reference lays such a type out flat
-(`struct Box__int { int* data; }`), and core's own C templates write those
-fields by name, so the layout is ABI. A sum type has no field names and keeps
-the tagged union.")
+(doc record-field-names "returns the field names of a record: a type with one
+constructor and named fields. The reference renders such a type as a flat
+struct.")
 (defn record-field-names [constructors name]
   (let-do [result (the (Array String) [])]
     (when (single-constructor-name? constructors name)
@@ -1857,8 +1865,8 @@ the tagged union.")
             _ ()))))
     result))
 
-(doc member-place "the C path from a nominal value to one of its members: a
-record's own field, or the tagged union's slot in a sum.")
+(doc member-place "returns the C path from a nominal value to one of its
+members: a record's own field, or the slot in a sum's tagged union.")
 (defn member-place [constructors type-name tag index]
   (let [fields (record-field-names constructors type-name)]
     (if (Int.< index (Array.length &fields))
@@ -1867,8 +1875,8 @@ record's own field, or the tagged union's slot in a sum.")
       (String.concat
         &[@".data.variant_" (Int.str tag) @".member_" (Int.str index)]))))
 
-(doc constructor-member-place "`member-place`, keyed by the constructor whose
-member it is.")
+(doc constructor-member-place "returns `member-place` for a member of
+`constructor`.")
 (defn constructor-member-place [constructors constructor index]
   (match-ref (Box.peek (CoreConstructorDeclaration.result constructor))
     (CoreType.Named type-name _)
@@ -1883,7 +1891,7 @@ member it is.")
           @".member_"
           (Int.str index)])))
 
-(doc nominal-type-name "the name of a nominal type, through any references.")
+(doc nominal-type-name "returns the name of a nominal type, through references.")
 (defn nominal-type-name [type]
   (match-ref type
     (MonoType.Named name _) (Maybe.Just (String.copy name))
@@ -2096,6 +2104,8 @@ member it is.")
           (Result.Error error) (Result.Error error)))
     (Result.Error error) (Result.Error error)))
 
+(doc deref-type "returns the type `type` refers to, or `type` itself if it is
+not a reference.")
 (defn deref-type [type]
   (match-ref type
     (MonoType.Reference inner _) (MonoType.copy (Box.peek inner))

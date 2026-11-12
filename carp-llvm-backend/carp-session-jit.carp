@@ -1,35 +1,39 @@
-;; carp-session-jit — the LLVM session JIT: runs a session cell natively
-;; through one persistent ORC LLJIT instead of emitting C for a clang round-trip.
-;;
-;; The split keeps carp-session free of libLLVM: `Session.lower-cell` stops
-;; the transactional cell pipeline at the lowered BackendModule, and this
-;; component (loaded only by hosts that want the JIT) does the LLVM work.
-;;
-;; Each cell emits an incremental LLVM module. Native templates and ABI
-;; helpers are rendered through the C backend, compiled by the matching clang
-;; to IR, and added with that module under one ORC resource tracker. Publication
-;; commits code, materialization caches, and artifacts only after lookup succeeds;
-;; failure removes the whole transaction. Already published support is imported
-;; by later cells, so cells with no new C dependencies avoid clang.
-;;
-;; Published code and global storage persist across cells. A committed edit
-;; retires both C-derived and LLVM modules while retaining the LLJIT and context;
-;; the next cell republishes the new dependency world.
-
 (load "../carp-session/carp-session.carp")
 (load "inspection-layout.carp")
 
 (load "session-artifacts.carp")
 
+(doc NativePublication "is the layout data of one publication. `serial` is
+its number. `environment` holds the inputs needed to compute its value
+layouts. `closures` holds the layouts of its closures.")
 (deftype NativePublication
   [serial Int
    environment NativeLayoutEnvironment
    closures (Array NativeClosureLayout)])
+(doc NativeLayoutCache "is a cached value layout. `publication` is the
+publication it belongs to and `key` is the ABI key of its type. `layout` is
+the layout.")
 (deftype NativeLayoutCache [publication Int
                             key String
                             layout NativeValueLayout])
+(doc NativeCallbackCache "is the cached `address` of the published function
+`symbol`.")
 (deftype NativeCallbackCache [symbol String
                               address Long])
+(doc JitSession "is a session's JIT. `context`, `thread-context`, `jit` and
+`dylib` are the LLVM context and ORC LLJIT that every cell shares. `machine`,
+`data` and `triple` describe the target. `core-dir` holds the runtime headers,
+and `scratch` holds generated C and IR files. `materialized` holds the symbols
+of published C support, and `code` the symbols of published code. `instances`
+holds the published specializations. `last-declarations` is the number of
+declarations in the last published module. `serial` numbers the next
+publication. `artifacts` and `c-artifacts` hold the published LLVM modules and
+C support. `publications` holds the layout data of each publication. `layouts`
+and `callbacks` cache value layouts and closure addresses. `context-id`
+numbers this JIT. `last-executed` is the address of the roots function that
+ran last. `generation` counts the times published code was removed.
+`foreign-layout-cache` caches C type layouts. `versions`, `revision` and
+`retired` are the binding state, as in `JitRevisionPlan`.")
 (deftype JitSession
   [context LLVMContext
    thread-context LLVMOrcThreadSafeContext
@@ -61,11 +65,14 @@
 (load "native-support.carp")
 (load "session-invalidation.carp")
 
+(doc SessionJit "compiles session cells to native code and runs them in
+process, through one ORC LLJIT. Each cell becomes an LLVM module. The C
+support it needs is compiled by clang and published with it. Published code
+stays until a committed change removes it.")
 (defmodule SessionJit
-  (doc create "creates a warm JIT for one session: one thread-safe LLVM
-context, LLJIT, target machine, and data layout are shared by every cell.
-`core-dir` locates the runtime
-headers native support compiles against; `scratch` holds its C and IR files.")
+  (doc create "creates a JIT for one session. Every cell shares its LLVM
+context, LLJIT and target. `core-dir` holds the runtime headers that C support
+is compiled against. `scratch` holds the generated C and IR files.")
   (defn create [core-dir scratch]
     (let-do [context-id *jit-context-serial*
              _context (set! *jit-context-serial* (Int.inc context-id))
@@ -117,9 +124,9 @@ headers native support compiles against; `scratch` holds its C and IR files.")
                        0
                        [])))
 
-  (doc reset-code! "removes every published module while retaining the LLJIT,
-thread-safe context and target state. C support, LLVM code, materialization
-caches, and artifacts share this invalidation boundary.")
+  (doc reset-code! "removes every published module and the records of what was
+published. The LLJIT and the target stay. It returns an error message, or the
+empty string.")
   (defn reset-code! [js]
     (let-do [error (LLVM.orc-clear-dylib (LLVM.dup (JitSession.dylib js)))]
       (when-do (String.empty? &error)
@@ -140,8 +147,7 @@ caches, and artifacts share this invalidation boundary.")
         (JitSession.set-generation! js (Int.inc @(JitSession.generation js))))
       error))
 
-  (doc dispose "frees the persistent JIT, thread-safe context, target data,
-and target machine.")
+  (doc dispose "frees the JIT and its target.")
   (defn dispose [js]
     (do
       (LLVM.orc-dispose-lljit (LLVM.dup (JitSession.jit js)))
@@ -200,8 +206,8 @@ and target machine.")
                   1000000.0)))
       (Maybe.Nothing) ()))
 
-  ; Use the compiler from the LLVM installation selected by LLVM.setup.
-  ; System clang can produce IR with an incompatible target data layout.
+  (doc support-clang "expands to the path of the clang from the LLVM
+installation in use.")
   (defmacro support-clang [] (ForeignLayouts.compiler))
 
   (private prepare-support)
@@ -479,13 +485,9 @@ and target machine.")
       (Specialize.clear-binding-versions!)
       lowered))
 
-  (doc run-cell "checks, lowers, JIT-compiles, and RUNS `input` against the
-session: `Session.lower-cell-plain`'s transactional BackendModule is emitted
-into a fresh incremental LLVM module, ORC adds only symbols not already
-published in the shared LLJIT; C support joins the same publication tracker,
-and the roots function executes in-process.
-Returns the cell's value: the last integer-typed top-level's result, 0
-otherwise.")
+  (doc run-cell "checks, compiles and runs `input` against `session`. Code
+that is published already is not added again. It returns the value of the
+last top-level form of type `Int`, or 0.")
   (defn run-cell [js session input]
     (match (publish-lowered js
                             input
@@ -497,10 +499,8 @@ otherwise.")
           (Result.Success answer))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
-  (doc run-cell-echoed "as `run-cell`, but with the driver's top-level result
-echo: the cell's value is PRINTED to stdout by the same `str` a driver-built
-binary would pick, and the returned Int is the echoed roots value (0 — the
-echo wrapping consumes the top level).")
+  (doc run-cell-echoed "runs `input` as `run-cell` does, and prints the
+cell's value with `str`, as a compiled program does. It returns 0.")
   (defn run-cell-echoed [js session input]
     (match (publish-lowered js
                             input
@@ -512,11 +512,10 @@ echo wrapping consumes the top level).")
           (Result.Success answer))
       (Result.Error diagnostic) (Result.Error diagnostic)))
 
-  (doc compile-f32-function "checks, lowers, and publishes a transactional
-cell, then returns the address of its named `(Fn [Float] Float)` definition.
-The cell must make the definition reachable, normally by ending with a dummy
-call. Every successful call uses a fresh symbol namespace, so returned
-addresses remain valid until reset-code! or disposal.")
+  (doc compile-f32-function "checks and publishes `input`, and returns the
+address of its definition `name`, of type `(Fn [Float] Float)`. The cell must
+use the definition, for example by calling it. The address stays valid until
+`reset-code!` or `dispose`.")
   (defn compile-f32-function [js session input name]
     (publish-lowered js
                      input
@@ -525,8 +524,8 @@ addresses remain valid until reset-code! or disposal.")
 
   (private invalidated-after)
   (hidden invalidated-after)
-  (doc invalidated-after "invalidates published native code once a session
-commit has succeeded, answering the commit's own result.")
+  (doc invalidated-after "returns `committed`. If the commit succeeded, it
+first removes all published code.")
   (defn invalidated-after [js committed]
     (match committed
       (Result.Error diagnostic) (Result.Error diagnostic)
@@ -538,36 +537,33 @@ commit has succeeded, answering the commit's own result.")
               (jit-diagnostic
                 (fmt "cannot invalidate published code: %s" &error)))))))
 
-  (doc upsert "commits a definition and invalidates published native code.
-The LLJIT and shared context remain alive; the next cell republishes the new
-definition world.")
+  (doc upsert "commits the definition `input` to `session` and removes all
+published code.")
   (defn upsert [js session input]
     (invalidated-after js (Session.upsert session input)))
 
-  (doc upsert-input "commits a whole input with however many definitions it
-holds, as `Session.upsert-input` does, and invalidates published native code
-like `upsert`.")
+  (doc upsert-input "commits every definition in `input` to `session`, as
+`Session.upsert-input` does, and removes all published code.")
   (defn upsert-input [js session input]
     (invalidated-after js (Session.upsert-input session input)))
 
-  (doc remove "removes a definition and invalidates published native code,
-retaining the LLJIT and shared context.")
+  (doc remove "removes the definition `name` from `session` and removes all
+published code.")
   (defn remove [js session name]
     (invalidated-after js (Session.remove session name))))
 
 (defmodule SessionJit
-  (doc compile-cell "Publishes a checked cell without running its roots.
-The caller may commit a candidate semantic session before calling the returned
-address. A preparation failure never executes the cell.")
+  (doc compile-cell "checks and publishes `input` without running it. It
+returns the address of the cell's roots function. If `echo` is true, the cell
+prints its value when run.")
   (defn compile-cell [js session input echo]
     (publish-lowered js
                      input
                      (lower-cell js session input echo)
                      &(the (Maybe String) (Maybe.Nothing))))
 
-  (doc compile-expanded-cell "publishes already expanded caller syntax
-without invoking its macros again. It has the same preparation and ownership
-boundaries as compile-cell.")
+  (doc compile-expanded-cell "publishes `sourced`, which is already
+macro-expanded, as `compile-cell` does.")
   (defn compile-expanded-cell [js session sourced]
     (let-do [salt (fmt "jit%d_" @(JitSession.serial js))
              _salt (BackendLower.use-lambda-symbol-salt! &salt)
@@ -584,8 +580,8 @@ boundaries as compile-cell.")
                        &(the (Maybe String) (Maybe.Nothing))))))
 
 (defmodule SessionJit
-  (doc value-layout
-    "returns a cached layout from the publication that owns a live value.")
+  (doc value-layout "returns the layout of `type` in publication
+`publication`. It is an error if that publication is gone.")
   (defn value-layout [js publication type]
     (let-do [key (CAbi.type-key type)
              result (Result.Error @"native publication is no longer live")
@@ -614,8 +610,8 @@ boundaries as compile-cell.")
           (Result.Error _) ()))
       result))
 
-  (doc closure-layout
-    "matches a live callback to its compiler-recorded environment.")
+  (doc closure-layout "returns the layout of the closure whose function is at
+`callback`, if a publication made it.")
   (defn closure-layout [js callback]
     (let-do [result (the (Maybe NativeClosureLayout) (Maybe.Nothing))
              publications (JitSession.publications js)]

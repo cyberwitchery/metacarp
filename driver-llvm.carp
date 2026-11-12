@@ -1,17 +1,13 @@
-;; The LLVM driver behind `metacarp --emit llvm`: the same front half as the C driver
-;; (loading, expansion, resolution, inference, specialization, ownership,
-;; lowering), then carp-llvm-backend instead of C rendering. The default
-;; action prints LLVM IR; -b/-x emit a native object through the LLVM target
-;; machine and link it with clang against the C shim (deftemplate sources,
-;; primitive templates, and a generated main).
-;;
-;; The backend passes the reference suite at parity with the C driver (see
-;; carp-llvm-backend/README.md). Unsupported constructs are reported as
-;; errors, never mis-lowered. Requires libLLVM (see LLVM.setup).
+; the LLVM driver behind `metacarp --emit llvm`. it runs the same pipeline as
+; the C driver up to lowering, then emits LLVM instead of C. without -b or -x
+; it prints the IR. -b and -x emit an object file and link it with clang against
+; the C support and a generated `main`. it needs libLLVM (see `LLVM.setup`).
 
 (load "driver.carp")
 (load "carp-llvm-backend/carp-llvm-backend.carp")
 
+(doc lower-input "loads `input` with Core and lowers it to a `BackendModule`. It
+reports errors and returns `Nothing` on failure.")
 (defn lower-input [input core-dir no-core]
   (match (load-with-core input core-dir no-core)
     (Maybe.Nothing) (the (Maybe BackendModule) (Maybe.Nothing))
@@ -26,9 +22,9 @@
             (IO.errorln &(CompileError.render &error))
             (the (Maybe BackendModule) (Maybe.Nothing))))))
 
-(doc emit-llvm "emits `backend` into a fresh module for the host target and
-returns its textual IR, additionally writing a native object file when
-`obj-path` is given. The module is verified before anything is produced.")
+(doc emit-llvm "emits `backend` into a new LLVM module for the host and returns
+its IR. If `obj-path` is given, it also writes an object file there. The module
+is verified first.")
 (defn emit-llvm [backend core-dir obj-path]
   (let-do [ctx (LLVM.context-create)
            builder (LLVM.builder-create ctx)
@@ -90,9 +86,10 @@ returns its textual IR, additionally writing a native object file when
     (LLVM.context-dispose ctx)
     result))
 
-(doc executable-shim "the C translation unit linked beside the emitted object:
-the C-native declarations plus a `main` that runs the synthesized roots
-function (which itself runs the global initializers first).")
+(doc executable-shim "returns the C to link beside the object file: the C
+support of `backend` and a `main`. The `main` sets `System.args`, runs the roots
+function, and calls the program's `main` if it has one. It returns that
+function's `Int`, or 0.")
 (defn executable-shim [backend]
   (match (LLVMBackend.shim-translation-unit backend)
     (Result.Success shim)
@@ -129,6 +126,9 @@ int carp_llvm_roots(void);
 " main-c])))
     (Result.Error error) (Result.Error @(BackendError.message &error))))
 
+(doc build-llvm "builds `backend` into the executable `binary`: an object file
+linked with clang against the C support. On macOS, a debug build with
+`bundle-debug` also runs `dsymutil`. It returns whether it succeeded.")
 (defn build-llvm [backend core-dir binary log-memory debug bundle-debug]
   (let-do [obj (fmt "/tmp/carp-llvm-%d.o" (compiler-process-id))
            shim-c (fmt "/tmp/carp-llvm-%d-shim.c" (compiler-process-id))
@@ -164,6 +164,8 @@ int carp_llvm_roots(void);
     (compiler-remove-file &shim-c)
     ok))
 
+(doc llvm-build-action "builds `backend` into `output`, or the project's binary
+path. It returns the exit code.")
 (defn llvm-build-action [backend core-dir output log-memory debug]
   (let [binary (match-ref output
           (Maybe.Just p) @p
@@ -172,12 +174,16 @@ int carp_llvm_roots(void);
       (do (report &(String.append "wrote executable " &binary)) 0)
       1)))
 
+(doc llvm-execute-action "builds `backend` and runs it. It returns the program's
+exit code, or 1 if it could not be built.")
 (defn llvm-execute-action [backend core-dir log-memory debug]
   (let [binary (project-binary)]
     (if (build-llvm backend core-dir &binary log-memory debug false)
       (let [status (System.system &binary)] (compiler-system-exit-code status))
       1)))
 
+(doc llvm-emit-action "writes the LLVM IR of `backend` to `output`, or to
+standard output. It returns the exit code.")
 (defn llvm-emit-action [backend core-dir output]
   (match (emit-llvm backend core-dir &(the (Maybe String) (Maybe.Nothing)))
     (Result.Error e) (do (report-error &(fmt "%s" &e)) 1)
@@ -190,6 +196,9 @@ int carp_llvm_roots(void);
               (do (report-error &(fmt "cannot write '%s': %s" path &e)) 1))
         (Maybe.Nothing) (do (IO.print &ir) 0))))
 
+(doc run-llvm "compiles `input` with the LLVM backend and runs `action` on it,
+as `run` does for C. It needs a Core directory, also with `no-core`, to resolve
+loads. It returns the exit code.")
 (defn run-llvm [input core-dir output action no-core log-memory debug]
   (do
     (set! *want-source-map* debug)

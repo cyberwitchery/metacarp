@@ -1,9 +1,7 @@
 (load "carp-compiler.carp")
 (load "driver-load.carp")
 
-;; These are compiled into the compiler binary from the C implementation's
-;; target macros. They describe the machine actually running this compiler,
-;; unlike the old aarch64/darwin literals in the synthetic Core prelude.
+(doc print-help "prints the usage of the compiler, named `command`.")
 (defn print-help [command]
   (do
     (IO.println
@@ -36,19 +34,20 @@
     (IO.println
       "                        Debug.memory-balance counts allocations")
     (IO.println
-      "  -g, --debug           build with debug info, keeping the C beside the")
+      "  -g, --debug           build -b executables with debug info and no")
     (IO.println
-      "                        binary so a debugger can read what it runs")
+      "                        optimization, keeping the C beside the binary")
     (IO.println
-      "  --annotate            emit inferred types of global definitions as JSON")
+      "  --annotate            emit the inferred types of definitions, top-level")
+    (IO.println "                        expressions and locals as JSON")
     (IO.println
       "  --ownership           emit the move/borrow/delete plan as JSON")
     (IO.println
       "  --library             emit a C translation unit without main (needs Core)")
     (IO.println
-      "  --no-core             skip the implicit Core load; the source's own")
+      "  --no-core             skip the implicit Core load; with a Core directory,")
     (IO.println
-      "                        (load \"X.carp\") directives still resolve in Core")
+      "                        (load \"X.carp\") directives still resolve there")
     (IO.println "  --package-override <git-reference>=<source.carp>")
     (IO.println
       "                        use a local package source for this invocation")
@@ -66,7 +65,8 @@
     (IO.println
       "is required unless --no-core is given. diagnostics go to stderr.")))
 
-; the standard-library load set, resolved by the module loader from Core.carp.
+(doc compile-standalone "compiles the file `input` to C without Core. It reports
+errors and returns `Nothing` on failure.")
 (defn compile-standalone [input]
   (match (IO.read-file input)
     (Result.Success source)
@@ -84,7 +84,9 @@
         (report-error &(fmt "cannot read '%s': %s" input &e))
         (the (Maybe String) (Maybe.Nothing)))))
 
-; is `node` a `(load "X")` or `(load-once "X")` head symbol?
+(doc compile-with-core "loads `input` with the Core in `core-dir` and compiles
+it to C, or to a library unit if `library` is true. It reports errors and
+returns `Nothing` on failure.")
 (defn compile-with-core [input core-dir no-core library]
   (match (load-with-core input core-dir no-core)
     (Maybe.Nothing) (the (Maybe String) (Maybe.Nothing))
@@ -103,6 +105,8 @@
             (IO.errorln &(CompileError.render &error))
             (the (Maybe String) (Maybe.Nothing))))))
 
+(doc produce-c "compiles `input` to C, with Core if `core-dir` is given and
+without it otherwise. A library needs Core.")
 (defn produce-c [input core-dir no-core library]
   (match-ref core-dir
     (Maybe.Just dir) (compile-with-core input dir no-core library)
@@ -115,27 +119,29 @@
 
 ; --- emitting / building ---
 
+(doc temp-c-path "returns the path of the temporary C file for this process.")
 (defn temp-c-path [] (fmt "/tmp/carp-compiler-out-%d.c" (compiler-process-id)))
 
+(doc write-temp-c "writes `c` to `path`. It reports an error and returns false
+on failure.")
 (defn write-temp-c [c path]
   (match (IO.write-file c path)
     (Result.Success _) true
     (Result.Error e)
       (do (report-error &(fmt "cannot write temporary C: %s" &e)) false)))
 
-; where a debug build keeps its C: beside the binary rather than in a temporary
-; directory. A debugger reads the source a binary was built from, and the path
-; is recorded in the binary itself, so it has to outlive the build.
+(doc debug-c-path "returns the path a debug build keeps its C at: `binary` with
+`.c` appended.")
 (defn debug-c-path [binary] (String.append binary ".c"))
 
-; clang the temp C into `binary`, linking against the runtime headers in core-dir.
+(doc clang-build "compiles `temp-c` with clang into `binary`, with the headers
+in `core-dir`, the program's C flags and `CARP_EXTRA_CFLAGS`. `optimize`,
+`debug` and `log-memory` add their flags. It returns whether clang succeeded.")
 (defn clang-build [core-dir binary temp-c log-memory optimize debug]
   (let [cmd (String.concat
           &[@"clang "
             (if optimize @"-O3 -D NDEBUG " @"")
-            ;; -O0 as well as -g: an optimized build has no line to stop at for
-            ;; much of the program, and its locals live in registers rather
-            ;; than under the names a debugger can show
+            ; -g also means -O0, and comes after -O3, so it wins
             (if debug @"-g -O0 " @"")
             (if log-memory @"-D LOG_MEMORY " @"")
             ;; `-I .` lets `relative-include`/`add-c` quoted includes resolve
@@ -160,6 +166,8 @@
       true
       (do (report-error "clang failed") false))))
 
+(doc emit-c "writes `c` to `output`, or to standard output. It returns the exit
+code.")
 (defn emit-c [c output]
   (match-ref output
     (Maybe.Just path)
@@ -169,6 +177,9 @@
           (do (report-error &(fmt "cannot write '%s': %s" path &e)) 1))
     (Maybe.Nothing) (do (IO.print c) 0)))
 
+(doc build "compiles `c` to an executable at `output`, or at the project's
+binary path. A debug build keeps its C next to the executable. It returns the
+exit code.")
 (defn build [c core-dir output log-memory optimize debug]
   (match-ref core-dir
     (Maybe.Nothing) (do (report-error "-b requires --core <dir> or CARP_DIR") 1)
@@ -199,6 +210,8 @@
             0)
           1))))
 
+(doc execute "compiles `c` to an executable and runs it. It returns the
+program's exit code, or 1 if it could not be built.")
 (defn execute [c core-dir log-memory optimize]
   (match-ref core-dir
     (Maybe.Nothing) (do (report-error "-x requires --core <dir> or CARP_DIR") 1)
@@ -214,20 +227,23 @@
                                          false))]
           (compiler-remove-file &temp-c)
           (if built
-            ;; Normalize the raw wait status without losing signal termination;
-            ;; WEXITSTATUS alone turns an abort into success on Darwin and hid
-            ;; failing self-suite executables.
+            ; WEXITSTATUS of a status from a signal is 0, so a crash would
+            ; look like success. `compiler-system-exit-code` keeps signals.
             (let [status (System.system &binary)]
               (compiler-system-exit-code status))
             1)))))
 
+(doc usage-hint "prints how to get help for `command` and exits with code 2.")
 (defn usage-hint [command]
   (do (IO.errorln &(fmt "try '%s --help' for usage." command)) (System.exit 2)))
 
-; action: 0 = emit C, 1 = build executable, 2 = build and run.
+; action: 0 = emit C, 1 = build executable, 2 = build and run, 3 = annotate,
+; 4 = ownership.
 ; --- annotation (--annotate) ---
 ; Emits the inferred type of every global definition as JSON, for tooling.
 
+(doc annotate-escape "escapes `s` for a JSON string. Other control characters
+become spaces.")
 (defn annotate-escape [s]
   (let-do [out @""]
     (for [i 0 (String.length s)]
@@ -241,17 +257,17 @@
                 (String.append &out &(String.from-bytes &[(Byte.from-int c)]))))))
     out))
 
+(doc type-string "returns `type` as Carp writes it.")
 (sig type-string (Fn [(Ref MonoType)] String))
 (defn type-string [type] (Type.render type))
 
 ; --- local bindings ---
-; A Let binder's type is its bound expression's inferred node type; lambda
-; parameters come from the lambda node's own arrow type. Emitted in body
-; traversal order per owning definition. Match-pattern binders are skipped
-; for now.
+; a let binder's type is the type of its value. lambda parameters take their
+; types from the lambda's function type. match-pattern binders are skipped.
 
-(doc node-type-map "(owner, node id) to inferred type with the final
-substitution applied; node ids alone collide across definitions.")
+(doc node-type-map "maps `owner/id` of every node of `annotated` to its inferred
+type, with the final substitution applied. Node ids repeat across definitions,
+so the owner is part of the key.")
 (defn node-type-map [annotated]
   (let-do [types (InferredModule.node-types (AnnotatedModule.inferred annotated))
            n (Array.length types)
@@ -268,6 +284,8 @@ substitution applied; node ids alone collide across definitions.")
           (Map.put! &result &key &applied))))
     result))
 
+(doc resolved-node-type "returns the type of node `id` in `owner` from `types`,
+as a string, if it is known.")
 (defn resolved-node-type [types owner id]
   (let [key (fmt "%s/%d" owner id)]
     (match (Map.get-maybe types &key)
@@ -281,6 +299,8 @@ substitution applied; node ids alone collide across definitions.")
         (Ref (Map String MonoType))
         (Ref (Array String))]
        ()))
+(doc collect-locals! "appends to `out` a JSON object for each let binder and
+lambda parameter in `expression`, with its owner, name and type.")
 (defn collect-locals! [expression owner types out]
   (match-ref expression
     (CoreExpr.Let _ binder value body)
@@ -372,6 +392,8 @@ substitution applied; node ids alone collide across definitions.")
       (collect-locals! (Box.peek inner) owner types out)
     _ ()))
 
+(doc locals-json "returns the local bindings of every function of `annotated` as
+a JSON array.")
 (defn locals-json [annotated]
   (let-do [types (node-type-map annotated)
            functions (CoreModule.functions (AnnotatedModule.core annotated))
@@ -416,6 +438,8 @@ substitution applied; node ids alone collide across definitions.")
         (set! out (String.append &out (Array.unsafe-nth &rows i)))))
     (String.append &out "]")))
 
+(doc annotations-json "returns the inferred types of `annotated` as JSON: the
+global definitions, the top-level expressions and the locals.")
 (defn annotations-json [annotated]
   (let-do [bindings (InferredModule.environment (AnnotatedModule.inferred annotated))
            n (Array.length bindings)
@@ -457,17 +481,23 @@ substitution applied; node ids alone collide across definitions.")
 ; --- ownership (--ownership) ---
 ; Emits the move/borrow/delete plan per concrete definition as JSON.
 
+(doc ownership-resource-json "returns the name of `resource` for the ownership
+JSON.")
 (defn ownership-resource-json [resource]
   (match-ref resource
     (OwnershipResource.Binding reference) @(CoreRef.name reference)
     (OwnershipResource.Temporary n) (fmt "«tmp %d»" @n)
     (OwnershipResource.Result) @"«result»"))
 
+(doc ownership-borrow-mode-json "returns the name of `mode` for the ownership
+JSON.")
 (defn ownership-borrow-mode-json [mode]
   (match-ref mode
     (OwnershipBorrowMode.Shared) @"shared"
     (OwnershipBorrowMode.Unique) @"unique"))
 
+(doc ownership-context-strings "returns the owner name and signature of context
+`index` in `contexts`.")
 (defn ownership-context-strings [contexts index]
   (if (or (< index 0) (>= index (Array.length contexts)))
     (Pair.init @"" @"")
@@ -476,6 +506,7 @@ substitution applied; node ids alone collide across definitions.")
         (Pair.init @(CoreRef.name reference) (type-string (Box.peek type)))
       (OwnershipContext.Roots _) (Pair.init @"«roots»" @""))))
 
+(doc ownership-json "returns the ownership actions of `planned` as JSON.")
 (defn ownership-json [planned]
   (let-do [plan (PlannedModule.plan planned)
            contexts (OwnershipPlan.contexts plan)
@@ -521,6 +552,8 @@ substitution applied; node ids alone collide across definitions.")
         (set! out (String.append &out &row))))
     (String.append &out "]}")))
 
+(doc ownership-with-core "loads `input` with Core, plans its ownership and
+prints the plan as JSON. It returns the exit code.")
 (defn ownership-with-core [input core-dir no-core]
   (match (load-with-core input core-dir no-core)
     (Maybe.Nothing) 1
@@ -531,6 +564,8 @@ substitution applied; node ids alone collide across definitions.")
         (Result.Error error) (do (IO.errorln &(CompileError.render &error)) 1)
         (Result.Success planned) (do (IO.println &(ownership-json &planned)) 0))))
 
+(doc annotate-with-core "loads `input` with Core, infers it and prints the types
+as JSON. It returns the exit code.")
 (defn annotate-with-core [input core-dir no-core]
   (match (load-with-core input core-dir no-core)
     (Maybe.Nothing) 1
@@ -541,18 +576,24 @@ substitution applied; node ids alone collide across definitions.")
         (Result.Success annotated)
           (do (IO.println &(annotations-json &annotated)) 0))))
 
+(doc annotate-input "prints the inferred types of `input` as JSON. It needs a
+Core directory.")
 (defn annotate-input [input core-dir no-core]
   (match-ref core-dir
     (Maybe.Just dir) (annotate-with-core input dir no-core)
     (Maybe.Nothing)
       (do (report-error "--annotate requires --core <dir> or CARP_DIR") 1)))
 
+(doc ownership-input "prints the ownership plan of `input` as JSON. It needs a
+Core directory.")
 (defn ownership-input [input core-dir no-core]
   (match-ref core-dir
     (Maybe.Just dir) (ownership-with-core input dir no-core)
     (Maybe.Nothing)
       (do (report-error "--ownership requires --core <dir> or CARP_DIR") 1)))
 
+(doc run "loads the package overrides from the environment and runs `action` on
+`input`. It returns the exit code.")
 (defn run [input
            core-dir
            output
@@ -579,6 +620,8 @@ substitution applied; node ids alone collide across definitions.")
                      debug
                      library))))
 
+(doc run-produce "compiles `input` to C, then emits, builds or runs it,
+depending on `action`. It returns the exit code.")
 (defn run-produce [input
                    core-dir
                    output
@@ -600,9 +643,9 @@ substitution applied; node ids alone collide across definitions.")
           (Int.= action 2) (execute &c core-dir log-memory optimize)
           (emit-c &c output)))))
 
-(doc compiler-main "runs `command` over the arguments from index `first`.
-`run-llvm` compiles an `--emit llvm` invocation; a driver without the LLVM
-backend passes one that refuses.")
+(doc compiler-main "parses the command-line arguments from index `first` and
+runs the compiler. `command` is the name shown in help and errors. `run-llvm`
+handles `--emit llvm`.")
 (defn compiler-main [first command run-llvm]
   (let-do [_command (set! *command* @command)
            args &System.args

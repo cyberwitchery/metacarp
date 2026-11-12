@@ -55,13 +55,14 @@ carp-compiler [options] <source.carp>
   --optimize            build -b/-x executables with clang -O3 -D NDEBUG
   --log-memory          build -b/-x executables with LOG_MEMORY, so
                         Debug.memory-balance counts allocations
-  -g, --debug           build with debug info, keeping the C beside the
-                        binary so a debugger can read what it runs
-  --annotate            emit inferred types of global definitions as JSON
+  -g, --debug           build -b executables with debug info and no
+                        optimization, keeping the C beside the binary
+  --annotate            emit the inferred types of definitions, top-level
+                        expressions and locals as JSON
   --ownership           emit the move/borrow/delete plan as JSON
   --library             emit a C translation unit without main (needs Core)
-  --no-core             skip the implicit Core load; the source's own
-                        (load "X.carp") directives still resolve in Core
+  --no-core             skip the implicit Core load; with a Core directory,
+                        (load "X.carp") directives still resolve there
   --package-override <git-reference>=<source.carp>
                         use a local package source for this invocation
                         CARP_PACKAGE_OVERRIDES supplies newline-separated defaults

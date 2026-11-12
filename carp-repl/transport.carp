@@ -2,14 +2,19 @@
 (load "wire.carp")
 
 (defmodule ReplTransportNative
+  (doc errno "returns the address of this thread's `errno`.")
   (defn errno [] (ReplNative.errno))
   (register INTERRUPTED Int "EINTR")
   (if-linux () (register SET-NO-SIGPIPE Int "F_SETNOSIGPIPE"))
   (register SET-FD Int "F_SETFD")
   (register CLOSE-ON-EXEC Int "FD_CLOEXEC"))
 
-; Descriptors belong to the caller. Buffers belong to this endpoint. Pumping is
-; bounded and never blocks the editor, including under pipe backpressure.
+(doc ReplChannel "is one end of a channel of framed messages to another
+process. `reader` and `writer` are the descriptors it reads and writes, which
+the caller owns. `input` holds bytes read but not yet taken as frames. `output`
+holds bytes not yet written, from `output-at` on. `eof` is whether the other
+side has closed. `error` is the first error, or empty. Reading and writing
+never block.")
 (deftype ReplChannel
   [reader Int
    writer Int
@@ -20,8 +25,10 @@
    error String])
 
 (defmodule ReplTransport
+  (doc max-frame "is the largest payload of a frame, 64 MiB.")
   (def max-frame 67108864)
 
+  (doc nonblocking! "makes `fd` non-blocking. Returns whether it succeeded.")
   (defn nonblocking! [fd]
     (let [flags (ReplNative.flags fd ReplNative.GET-FLAGS 0)]
       (and (Int.>= flags 0)
@@ -32,9 +39,9 @@
              0))))
 
   (doc private-writer! "makes `fd` a write end that reports a closed reader as
-EPIPE instead of raising SIGPIPE, and that a spawned process does not inherit.
-macOS does this per descriptor; Linux can only ignore SIGPIPE in the whole
-process, and spawned workers reset it to its default.")
+an error instead of raising SIGPIPE, and that spawned processes do not inherit.
+On Linux it ignores SIGPIPE in the whole process. Returns whether it
+succeeded.")
   (defn private-writer! [fd]
     (and
       (if-linux
@@ -46,6 +53,8 @@ process, and spawned workers reset it to its default.")
                           ReplTransportNative.CLOSE-ON-EXEC)
         0)))
 
+  (doc create "returns a channel over `reader` and `writer`, made non-blocking.
+Its `error` is set if they cannot be set up.")
   (defn create [reader writer]
     (ReplChannel.init reader
                       writer
@@ -62,6 +71,9 @@ process, and spawned workers reset it to its default.")
   (defn- append! [target bytes start end]
     (for [i start end] (Array.push-back! target @(Array.unsafe-nth bytes i))))
 
+  (doc send! "queues `payload` as a frame: its length in 4 bytes, big-endian,
+then the payload. Sets the channel's error if the payload is empty or too
+large, or if too much output is queued.")
   (defn send! [channel payload]
     (let-do [count (Array.length payload)
              output (ReplChannel.output channel)]
@@ -88,6 +100,7 @@ process, and spawned workers reset it to its default.")
       (or (Int.= error ReplNative.AGAIN)
           (Int.= error ReplTransportNative.INTERRUPTED))))
 
+  (doc flush! "writes as much queued output as the writer accepts.")
   (defn flush! [channel]
     (let-do [output (ReplChannel.output channel)
              start @(ReplChannel.output-at channel)
@@ -110,6 +123,7 @@ process, and spawned workers reset it to its default.")
               (ReplChannel.set-error! channel @"worker channel write failed")
             ())))))
 
+  (doc pump! "writes queued output, then reads the available input.")
   (defn pump! [channel]
     (do
       (flush! channel)
@@ -134,6 +148,8 @@ process, and spawned workers reset it to its default.")
               (ReplChannel.set-error! channel @"worker channel read failed")
             ())))))
 
+  (doc poll! "takes the payload of the next complete frame. Returns `Nothing` if
+no frame is complete yet, and an error if the channel failed or closed.")
   (sig poll! (Fn [(Ref ReplChannel)] (Result (Maybe (Array Byte)) String)))
   (defn poll! [channel]
     (let-do [input (ReplChannel.input channel)
@@ -163,12 +179,16 @@ process, and spawned workers reset it to its default.")
               @"truncated worker frame"))
         (Result.Success (Maybe.Nothing)))))
 
+  (doc pending? "checks whether output is queued.")
   (defn pending? [channel]
     (Int.>
       (Array.length (ReplChannel.output channel))
       @(ReplChannel.output-at channel))))
 
 (defmodule ReplTransport
+  (doc wait "waits up to `milliseconds` until one of `readers` is readable or
+`writer` is writable. Negative descriptors are skipped. Returns the result of
+`select`, or -1 if a descriptor is too large for it.")
   (defn wait [readers writer milliseconds]
     (let-do [fds (the (Ptr ReplNativeFdSet)
                       (ReplNative.allocate

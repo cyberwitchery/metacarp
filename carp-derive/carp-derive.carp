@@ -1,26 +1,28 @@
 (load "../carp-ownership/carp-ownership.carp")
 (load "../carp-types/core-instantiation.carp")
 
-(doc DeriveContext
-  "one derivation invocation's identity policy and the derived string functions it generated. Separate invocations share no mutable derivation state.")
+(doc DeriveContext "is the state of one derivation run.
+`preserve-expression-ids` is whether expression ids are kept, as a session
+needs, instead of renumbered. `fallback-str-ids` holds the ids of the field-less
+`str` functions derived for generic types, which per-instance derivation may
+replace.")
 (deftype DeriveContext
   [preserve-expression-ids Bool
    fallback-str-ids (Array Int)])
 
-(doc Derive "generates memberwise `delete` and `copy` implementations for
-concrete and generic deftypes that own memory through their fields, mirroring
-the reference compiler's derivation. Each derived function is a real IR match
-over the type's constructors (deleting every managed field, or reconstructing
-while deep-copying managed fields and blitting the rest) inserted before
-inference, so it flows through the normal pipeline. Generic instances are
-discovered from inference and closed over their nested managed instances.")
+(doc Derive "derives functions that the reference compiler derives for types:
+`delete` and `copy` for types that own memory through their fields, `str` and
+`prn`, and record accessors, setters and updaters. It also gives
+`Pair.init-from-refs` and registered C types their bodies. Each derived function
+is a core IR function added before inference, so the normal pipeline handles it.
+Generic instances are found from inference and closed over the instances nested
+in them.")
 
 (defmodule Derive
   (private finish-indexing)
   (hidden finish-indexing)
-  (doc finish-indexing "keeps the historical owner-local indexing for normal
-compilation. A provenanced session derivation preserves resolved IDs here and
-assigns fresh identities to generated nodes once, after all derivation passes.")
+  (doc finish-indexing "renumbers the call sites of `core`, unless `context`
+keeps expression ids.")
   (defn finish-indexing [context core]
     (if @(DeriveContext.preserve-expression-ids context)
       core
@@ -58,8 +60,8 @@ assigns fresh identities to generated nodes once, after all derivation passes.")
   (sig core->mono
        (Fn [(Ref CoreType) (Ref (Array (Pair String MonoType)))] MonoType))
 
-  (doc core->mono "instantiates a resolved field type to a concrete MonoType
-under a substitution mapping type-variable names to concrete types.")
+  (doc core->mono "returns the field type `core-type` with the type variables in
+`subst` replaced by concrete types.")
   (defn core->mono [core-type subst]
     (Result.from-success
       (CoreInstantiation.type-with core-type subst &subst-lookup)
@@ -67,9 +69,8 @@ under a substitution mapping type-variable names to concrete types.")
 
   (private build-subst)
   (hidden build-subst)
-  (doc build-subst "recovers the type-variable substitution for a concrete
-instance by aligning a constructor's result-type arguments (type variables)
-with the instance's concrete type arguments.")
+  (doc build-subst "returns the type variable bindings that make `result-type`,
+a constructor's result, equal to the concrete `instance`.")
   (defn build-subst [result-type instance]
     (let-do [subst (the (Array (Pair String MonoType)) [])]
       (match-ref result-type
@@ -106,9 +107,9 @@ with the instance's concrete type arguments.")
           (Ref (Array String))]
          Bool))
 
-  (doc managed-mono? "reports whether a concrete type owns memory: strings and
-keys with a deleter are managed; a generic nominal instance is managed when any
-of its instantiated fields is (checked per instance).")
+  (doc managed-mono? "checks whether the concrete type `mono` owns memory:
+strings, functions, arrays, types in `base-managed`, types with a deleter for
+all their instances, and generic instances with a managed field.")
   (defn managed-mono? [mono constructors base-managed]
     (match-ref mono
       (MonoType.String) true
@@ -159,9 +160,8 @@ of its instantiated fields is (checked per instance).")
           found)
       _ false))
 
-  (doc core-type-key "the concrete ABI type key of a resolved field or result
-type, or Nothing for generic (type-variable) or non-nominal types, which this
-first derivation pass does not handle.")
+  (doc core-type-key "returns the ABI key of a field or result type: for a
+string or a named type without arguments. Other types give `Nothing`.")
   (private core-type-key)
   (hidden core-type-key)
   (defn core-type-key [core-type]
@@ -194,14 +194,11 @@ first derivation pass does not handle.")
 
   (private field-managed?)
   (hidden field-managed?)
-  ; a generic application can hold memory even though it has no bare type
-  ; key: builtin containers (Array/StaticArray) always do, a type with a
-  ; deleter for all its instances does, and a user generic (Maybe/Pair/...)
-  ; does when instantiated over a managed argument.
-  ; Without this, a type whose memory is held ONLY through containers (e.g.
-  ; InferEnvironment's `(Array SchemeBinding)`) derived a SHALLOW copier
-  ; whose copies alias the container buffers (found via a self-hosting
-  ; divergence). `Ptr` stays a raw, unmanaged pointer.
+  ; a generic application can hold memory though it has no bare type key:
+  ; Array and StaticArray always do, a type with a deleter for all its
+  ; instances does, and a user generic does when applied to a managed argument.
+  ; otherwise a type that holds memory only through containers would get a
+  ; shallow copier. `Ptr` is an unmanaged raw pointer.
   (defn field-managed? [field-type managed]
     (match-ref field-type
       ; Strings own storage even when a session delta omits Core's deleters.
@@ -256,10 +253,10 @@ first derivation pass does not handle.")
           (set! found true)))
       found))
 
-  (doc managed-keys "the fixed point of type keys that own memory: the keys with
-an explicit deleter, plus every deftype that (transitively) has a managed
-field. A generic deftype is keyed by its base name, and is in the set only when
-a field owns memory with its type variables taken as unmanaged.")
+  (doc managed-keys "returns the keys of the types that own memory: `owned`, the
+types with a deleter, plus every type with a managed field, transitively. A
+generic type is keyed by its name and counts if a field owns memory whatever its
+type variables are.")
   (private managed-keys)
   (hidden managed-keys)
   (defn managed-keys [core owned]
@@ -281,9 +278,9 @@ a field owns memory with its type variables taken as unmanaged.")
               (Maybe.Nothing) ()))))
       managed))
 
-  (doc derive-target-keys "the concrete deftype keys that need a derived
-deleter: those that are managed through their fields but have no explicit
-deleter of their own.")
+  (doc derive-target-keys "returns the keys of the concrete types that need a
+derived deleter: they own memory through their fields and have no deleter of
+their own.")
   (defn derive-target-keys [core]
     (let-do [facts (OwnershipClassify.facts-from-module core)
              owned (OwnershipTypeFacts.owned &facts)
@@ -317,22 +314,9 @@ deleter of their own.")
             (set! found true))))
       found))
 
-  ;; every sum type: reference Carp derives `copy` for every deftype. Generic
-  ;; sums need one polymorphic body that can specialize to both managed and
-  ;; unmanaged fields; unmanaged sums such as `Color.Id` still need one when
-  ;; they flow through `copy`. Records are covered by resolve's scalar-copy, so
-  ;; only sum types are collected here.
-  ;;
-  ;; A nonzero tag means "has more than one constructor", which misses a sum
-  ;; with a SINGLE one. Such a type gets no copier from here, and if it is
-  ;; unmanaged it gets none from `derive-target-keys` either, so a `<T>.copy`
-  ;; call site links against a body nothing emits.
-  ;;
-  ;; Only concrete single-constructor sums are added. Managed ones already
-  ;; arrive through `derive-target-keys`, and a GENERIC one cannot be judged
-  ;; from its declaration at all — `(deftype (Pair a b) (Init [a b]))` holds
-  ;; memory or not depending on the instance, and it has its own path through
-  ;; the managed instances.
+  (doc sum-keys "returns the keys of the types that `copies` derives a `copy`
+for besides the managed ones: types with more than one constructor, and concrete
+unmanaged types with one constructor and no fields that are not records.")
   (defn sum-keys [core managed]
     (let-do [constructors (CoreModule.constructors core)
              declarations (CoreModule.type-declarations core)
@@ -430,10 +414,9 @@ deleter of their own.")
             (CoreExpr.UnitLit -1)
             (CoreExpr.Do -1 body-exprs))))))
 
-  (doc deletes "returns `core` extended with a derived `delete` implementation
-for every concrete deftype that owns memory through its fields. Each is a real
-IR function (a match over the type's constructors deleting each managed field),
-so inference, specialization, ownership and the backend handle it normally.")
+  (doc deletes "returns `core` with a derived `delete` for every concrete type
+that owns memory through its fields and has no deleter of its own. Each matches
+over the constructors and deletes every managed field.")
   (defn deletes [context core]
     (let-do [targets (derive-target-keys core)
              facts (OwnershipClassify.facts-from-module core)
@@ -520,8 +503,8 @@ so inference, specialization, ownership and the backend handle it normally.")
                                  (mono->core (Box.peek (Array.unsafe-nth args i)))))))
       result))
 
-  (doc mono->core "converts a concrete MonoType back to a resolved CoreType, for
-building the argument type of a per-instance deleter's signature.")
+  (doc mono->core "returns `mono` as a core type, for the signatures of
+per-instance functions. Every type variable becomes `a`.")
   (defn mono->core [mono]
     (match-ref mono
       (MonoType.Integer) (CoreType.Integer)
@@ -571,8 +554,8 @@ building the argument type of a per-instance deleter's signature.")
 
   (private declared-type-names)
   (hidden declared-type-names)
-  (doc declared-type-names "the type names `constructors` declare, for the
-membership test `constructors-declared?` answers by scanning.")
+  (doc declared-type-names "returns the names of the types that `constructors`
+declare.")
   (defn declared-type-names [constructors]
     (let-do [names (the (Set String) (Set.create))]
       (for [i 0 (Array.length constructors)]
@@ -597,9 +580,8 @@ membership test `constructors-declared?` answers by scanning.")
     (match-ref type
       (MonoType.Named name args)
         (do
-          ;; builtin containers (Array/StaticArray/Box) are managed but have
-          ;; template copy/delete — deriving over their (absent) constructor
-          ;; declarations would collide with the template symbols.
+          ; only declared types are derived: Array and StaticArray have no
+          ; constructors and use template copy and delete
           ;; `keys` holds every instance already classified, managed or
           ;; not: whether one is managed depends only on the type
           (when (and (Int.> (Array.length args) 0) (Set.contains? declared name))
@@ -639,10 +621,9 @@ membership test `constructors-declared?` answers by scanning.")
                               acc))
       _ ()))
 
-  (doc discover "the concrete managed generic instances a program uses, read
-from the inferred module's node types (which include the concrete instances at
-call sites and roots). Reading from inference, not specialization, lets this run
-before the derived copy/delete implementations those instances need exist.")
+  (doc discover "returns the concrete instances of managed generic types that
+the program uses, read from the inferred node types. It runs before the derived
+functions those instances need exist.")
   (defn discover [inferred constructors base-managed]
     (let-do [instances (the (Array MonoType) [])
              keys (the (Set String) (Set.create))
@@ -697,8 +678,8 @@ before the derived copy/delete implementations those instances need exist.")
           (extract-any-instances! (Box.peek ret) declared keys acc))
       _ ()))
 
-  (doc discover-any "every concrete generic deftype instance the program uses,
-managed or not — `str` derivation must cover unmanaged instances too.")
+  (doc discover-any "returns every concrete instance of a generic type that the
+program uses, managed or not, for `str`.")
   (private discover-any)
   (hidden discover-any)
   (defn discover-any [inferred constructors]
@@ -734,12 +715,9 @@ managed or not — `str` derivation must cover unmanaged instances too.")
           (Ref (Array String))
           (Ref (Array MonoType))]
          ()))
-  (doc queue-instances! "queues every concrete instance a field's type holds,
-not only the field's own. A field typed `(Array (Bucket String Int))` needs
-the BUCKET's deleter as much as the array's: `Array` declares no
-constructors, so the worklist skips it and, with nothing derived for the
-element, its deleter falls back to freeing the array's buffer and leaking
-everything the elements own.")
+  (doc queue-instances! "adds to the worklist each managed generic instance that
+`type` holds, nested ones included, such as the element of `(Array (Bucket
+String Int))`. Function types are not searched.")
   (defn queue-instances! [type constructors base-managed acc]
     (match-ref type
       (MonoType.Named _ arguments)
@@ -815,9 +793,9 @@ everything the elements own.")
 
   (private instance-deleter!)
   (hidden instance-deleter!)
-  (doc instance-deleter! "generates the concrete deleter for one managed generic
-instance (appending function, implementation and signature) and returns the
-generic instances its managed fields introduce, for the worklist.")
+  (doc instance-deleter! "adds the deleter of the managed generic instance
+`inst`, with its implementation and signature, and returns the generic instances
+its managed fields hold.")
   (defn instance-deleter! [inst
                            constructors
                            base-managed
@@ -871,10 +849,9 @@ generic instances its managed fields introduce, for the worklist.")
 
   (private generic-copy-branch)
   (hidden generic-copy-branch)
-  (doc generic-copy-branch "one match-ref branch of a per-instance generic
-`copy`: binds every field by reference and reconstructs through the constructor,
-deep-copying managed fields (`copy`) and blitting the rest (`deref`), enqueueing
-any managed generic-instance field for the worklist.")
+  (doc generic-copy-branch "returns a match branch of a per-instance `copy`: it
+binds every field by reference and builds a new value, copying managed fields
+and blitting the rest. Managed generic fields are added to the worklist.")
   (defn generic-copy-branch [constructor
                              inst
                              constructors
@@ -985,10 +962,9 @@ any managed generic-instance field for the worklist.")
 
   (private instance-copier!)
   (hidden instance-copier!)
-  (doc instance-copier! "generates the concrete `copy` for one managed generic
-instance (by-reference match over its constructors, appending function and
-implementation, plus a signature pinning it to the instance) and returns the
-generic instances its managed fields introduce.")
+  (doc instance-copier! "adds the `copy` of the managed generic instance `inst`,
+with its implementation and a signature for the instance, and returns the
+generic instances its managed fields hold.")
   (defn instance-copier! [inst
                           constructors
                           base-managed
@@ -1102,10 +1078,9 @@ generic instances its managed fields introduce.")
 
   (private instance-str-branch)
   (hidden instance-str-branch)
-  (doc instance-str-branch "one match-ref branch of a per-instance `str`:
-`(CtorName field-strs..)`, each field rendered through `str` (dereferenced
-first when the field type's `str` takes its argument by value). Nested generic
-fields are enqueued for the worklist.")
+  (doc instance-str-branch "returns a match branch of a per-instance `str`:
+`(Ctor field..)`, with each field rendered through `prn`. Generic fields are
+added to the worklist.")
   (defn instance-str-branch [constructor
                              inst
                              cell
@@ -1210,10 +1185,9 @@ fields are enqueued for the worklist.")
 
   (private instance-strfn!)
   (hidden instance-strfn!)
-  (doc instance-strfn! "generates the concrete `str` for one generic deftype
-instance and registers it, pinned to the instance, as the `str` and the `prn`
-implementation the user has not written (`derive-str?`, `derive-prn?`).
-Returns nested generic instances for the worklist.")
+  (doc instance-strfn! "adds the `str` of the generic instance `instance`, and
+registers it as the `str` and `prn` implementations the user did not write. It
+returns the generic instances nested in its fields.")
   (defn instance-strfn! [context
                          inst
                          constructors
@@ -1315,10 +1289,10 @@ Returns nested generic instances for the worklist.")
 
   (private derive-instance-strs)
   (hidden derive-instance-strs)
-  (doc derive-instance-strs "extends `core` with a per-instance `str` for every
-concrete generic deftype instance the program uses (the reference derives str
-per concretization, rendering constructor name plus field values). Types with a
-user-written `<T>.str` keep it.")
+  (doc derive-instance-strs "returns `core` with a `str` for every concrete
+generic instance the program uses, as the reference derives `str` per instance.
+Types with a `str` of their own keep it. Without `String.concat`, it returns
+`core` unchanged.")
   (defn derive-instance-strs [context core inferred]
     (let-do [functions (Array.copy (CoreModule.functions core))
              impls (Array.copy (CoreModule.implementations core))
@@ -1407,19 +1381,9 @@ user-written `<T>.str` keep it.")
   (hidden polymorphic-core-type?)
   (private generic-delete-declared?)
   (hidden generic-delete-declared?)
-  (doc generic-delete-declared? "whether a `<base>.delete` written once for
-every instance of the type is already in scope — core's
-`(sig delete (Fn [(Box a)] ()))`. Such a body specializes correctly for every
-instance and must stay the sole implementation: a concrete deleter derived
-beside it wins dispatch and deletes only the fields the DECLARATION shows,
-which for `(deftype (Box a) [data (Ptr a)])` is nothing at all. The signature,
-not the name, is what tells it apart from the per-instance deleters this
-worklist itself appends.
-
-Only for a type whose members are all indirections. Everywhere else the
-derived per-instance deleter is the right one — it frees the fields the
-instance actually holds — and suppressing it in favour of a generic body
-leaves an instance like `(Bucket Bool String)` with nothing to dispatch to.")
+  (doc generic-delete-declared? "checks whether `sigs` declare a
+`<base-name>.delete` for every instance of the type, such as Core's for `Box`.
+That deleter specializes for every instance, so no per-instance one is derived.")
   (defn generic-delete-declared? [sigs constructors base-name]
     (let-do [found false
              name (String.concat &[(String.copy base-name) @".delete"])
@@ -1518,19 +1482,9 @@ leaves an instance like `(Bucket Bool String)` with nothing to dispatch to.")
                                         @(CoreModule.system-includes core)
                                         @(CoreModule.expressions core)))))
 
-  (doc close-generics "extends `core` with a per-instance `copy` and `delete`
-for every concrete managed generic instance the program uses (discovered from
-inference, then closed over nested instances). Discovery reads inferred node
-types rather than specialized ones so it runs before the derived implementations
-those instances need exist. Best-effort: if inference fails here, returns core
-unchanged and lets the driver report the error.
-
-The inference it ran comes back with the module: everything here only adds
-definitions (the module's own are reindexed to the ids they already have), so
-`Infer.module-from-base` can infer the result from it without starting over.")
-  (doc close-generics-owned-with "closes an owned module and passes its module
-and optional inference base directly to `finish`. The source module is released
-before the continuation runs.")
+  (doc close-generics-owned-with "derives as `close-generics` does and passes
+the result and the inference base to `finish`. If inference fails, `finish` gets
+`core` unchanged and `Nothing`.")
   (defn close-generics-owned-with [context core finish]
     (match (Infer.module-resumable &core)
       (Result.Success base)
@@ -1551,6 +1505,12 @@ before the continuation runs.")
       (Result.Error _)
         (~finish core (the (Maybe InferenceBase) (Maybe.Nothing)))))
 
+  (doc close-generics "returns `core` with a `copy`, `delete`, `str` and `prn`
+for every concrete managed generic instance the program uses, and the inference
+base, as a pair. It infers `core` to find the instances. The derived functions
+take over builtin declarations under their ids, so `Infer.module-from-base` can
+infer the result from the base. If inference fails, it returns `core` unchanged
+and `Nothing`.")
   (defn close-generics [context core]
     (close-generics-owned-with context @core &Pair.init)))
 
@@ -1576,9 +1536,9 @@ before the continuation runs.")
               (set! found true)))
           found)
       _ false))
-  (doc copy-branch "one match-ref branch of a derived `copy`: binds every field
-by reference and reconstructs the value through the constructor, deep-copying
-managed fields (via `copy`) and blitting the rest (via `deref`).")
+  (doc copy-branch "returns a match branch of a derived `copy`: it binds every
+field by reference and builds a new value, copying managed and polymorphic
+fields and blitting the rest.")
   (defn copy-branch [constructor managed copy-ref deref-ref cell]
     (let-do [fields (CoreConstructorDeclaration.arguments constructor)
              nf (Array.length fields)
@@ -1638,14 +1598,11 @@ managed fields (via `copy`) and blitting the rest (via `deref`).")
             (set! result (Maybe.Just @builtin)))))
       result))
 
-  ;; builds `(defn getter [self] (match-ref self (Ctor f0 f1 ..) fN))`: a by-ref
-  ;; match that binds every field and returns a reference to field `fi`.
-  (private make-getter)
-  (hidden make-getter)
-  ;; builds a record accessor by kind: 0 getter `(match-ref self (Ctor f..) fN)`;
-  ;; 1 setter `(match self (Ctor f..) (Ctor f0 .. value .. fk))`; 2 updater with
-  ;; `(f fN)` at the target; 3 copy `(match-ref self (Ctor f..) (Ctor ~f0 ~f1 ..))`.
-  ;; getter/copy read by reference; setter/updater consume and reconstruct.
+  ; builds a record accessor by kind: 0 getter `(match-ref self (Ctor f..) fN)`,
+  ; 1 setter `(match self (Ctor f..) (Ctor f0 .. value .. fk))`, 2 updater with
+  ; `(f fN)` at the target, 3 copy `(match-ref self (Ctor f..) (Ctor (copy f0)
+  ; ..))`. the getter and copy read by reference. the setter and updater consume
+  ; the value and build a new one.
   (private make-field-fn)
   (hidden make-field-fn)
   (defn make-field-fn [fref decl-ref result-type nf fi kind cell]
@@ -1689,14 +1646,10 @@ managed fields (via `copy`) and blitting the rest (via `deref`).")
                                                [(Box.init
                                                   (CoreExpr.Reference -1
                                                                       (CoreRef.copy &bref)))])
-                                ;; the copy body deep-copies EVERY field
-                                ;; through the `copy` interface (like
-                                ;; `init-from-refs`): dispatch picks the
-                                ;; derived deep copier for managed fields and
-                                ;; the blit for unmanaged ones, per
-                                ;; instantiation. A `deref` blit here aliased
-                                ;; managed fields of generic instantiations
-                                ;; (found via a self-hosting double free).
+                                ; the copy body copies every field through
+                                ; the `copy` interface, so each instance picks
+                                ; a deep copy for managed fields and a blit for
+                                ; the rest. a `deref` would alias managed fields.
                                 (Int.= kind 3)
                                 (CoreExpr.Call -1
                                                (Box.init
@@ -1784,10 +1737,9 @@ managed fields (via `copy`) and blitting the rest (via `deref`).")
           (Array.push-back! removed @name))
       (Maybe.Nothing) ()))
 
-  (doc accessors "returns `core` with real bodies for record field accessors.
-Resolution registers a getter as a body-less builtin; here each record
-constructor's fields generate a `(match-ref self (Ctor f..) fN)` body, and the
-matching builtin is dropped so the function is emitted and links.")
+  (doc accessors "returns `core` with bodies for the record accessors that
+resolution declared: getters, setters, updaters, mutating setters and
+`<T>.copy`. Each replaces the declared builtin under the same reference.")
   (defn accessors [context core]
     (let-do [constructors (CoreModule.constructors core)
              builtins (CoreModule.builtins core)
@@ -1929,8 +1881,8 @@ matching builtin is dropped so the function is emitted and links.")
                                                                (CoreExpr.Reference -1
                                                                                    (CoreRef.copy &b-ref)))]))])))))
 
-  (doc pair-refs "supplies the body for the `Pair.init-from-refs` builtin so it
-links; a no-op when the builtin is absent.")
+  (doc pair-refs "returns `core` with a body for the builtin
+`Pair.init-from-refs`, if it is declared.")
   (defn pair-refs [context core]
     (let-do [builtins (CoreModule.builtins core)
              new-functions (Array.copy (CoreModule.functions core))
@@ -1979,8 +1931,8 @@ links; a no-op when the builtin is absent.")
             (set! found (Maybe.Just (CoreRef.copy reference))))))
       found))
 
-  ;; one match branch for a constructor whose body is the constructor's name as
-  ;; a literal string (a simple faithful `str`; field values are not recursed).
+  ; one match branch whose body is the constructor's name as a string, without
+  ; its fields
   (private str-branch)
   (hidden str-branch)
   (defn str-branch [c -cell]
@@ -1989,10 +1941,9 @@ links; a no-op when the builtin is absent.")
              patterns (the (Array (Box CorePattern)) [])
              ctor-ref (CoreConstructorDeclaration.reference c)
              ctor-name @(CoreRef.name ctor-ref)
-             ;; the reference compiler wraps the name in parentheses, e.g. `(A)`
-             ;; or `(Just)`. A record's constructor is `Type.init`, whose display
-             ;; is the type name; a sum's constructor keeps its own name. Field
-             ;; values are not recursed yet.
+             ; the name in parentheses. a record's constructor `Type.init`
+             ; shows as the type name, a sum's as its qualified name, such as
+             ; `(Maybe.Just)`. the reference shows `(Just)`.
              display (if (String.ends-with? &ctor-name ".init")
                (named-type-name (Box.peek (CoreConstructorDeclaration.result c)))
                (String.copy &ctor-name))
@@ -2011,11 +1962,9 @@ links; a no-op when the builtin is absent.")
                                                                             "copy")))
                          [(Box.init (CoreExpr.StringLit -1 formatted))])))))
 
-  (doc strs "generates a `str` for every deftype (record and sum) and registers
-it as a `str` implementation, the way the reference compiler derives it. Output
-is the matched constructor's name; a body-less builtin would not link and the
-Test framework calls `str` on every asserted value. Types that already define
-their own `<T>.str` (e.g. via a user `derive`) are left alone.")
+  (doc strs "returns `core` with a `str` and a `prn` for every type that does
+not define them. A concrete type renders its fields. A generic type gets a
+field-less fallback, `(Ctor)`, which per-instance strs replace.")
   (defn strs [context core]
     (let-do [_ignored-reset (DeriveContext.set-fallback-str-ids! context [])
              constructors (CoreModule.constructors core)
@@ -2156,15 +2105,9 @@ their own `<T>.str` (e.g. via a user `derive`) are left alone.")
                                         @(CoreModule.expressions core))))))
 
 (defmodule Derive
-  (doc copies "returns `core` extended with a derived `copy` for every managed
-deftype and every sum type: a `(match-ref ref (Ctor f..) (Ctor (copy f)..))`
-that deep-copies managed or polymorphic fields and blits the rest, so generic
-sums retain a real specializable body instead of a body-less Core declaration.")
   (private replace-function-named)
   (hidden replace-function-named)
-  ;; Overwrite the one matching function in place. Rebuilding the array
-  ;; instead deep-copies every OTHER function to replace one of them, and
-  ;; `copies` calls this once per managed type.
+  ; replaces the function in place, without copying the others
   (defn replace-function-named [functions name parameter body]
     (let-do [n (Array.length &functions)
              at -1]
@@ -2202,6 +2145,9 @@ sums retain a real specializable body instead of a body-less Core declaration.")
             (Maybe.Nothing) ())))
       result))
 
+  (doc copies "returns `core` with a derived `copy` for every managed type and
+the types in `sum-keys`. It copies managed and polymorphic fields and blits the
+rest. A defined `<T>.copy` gets the derived body in place.")
   (defn copies [context core]
     (let-do [targets (derive-target-keys core)
              facts (OwnershipClassify.facts-from-module core)
@@ -2226,9 +2172,8 @@ sums retain a real specializable body instead of a body-less Core declaration.")
                  type-name (deftype-name constructors tkey)
                  result-type (deftype-core-type constructors tkey)
                  fn-name (String.concat &[(String.copy &type-name) @".copy"])
-                 ;; `accessors` already supplies a `<T>.copy` when resolution
-                 ;; declared one (a qualified `(T.copy &x)` call site); deriving
-                 ;; a second one collides on the same C symbol.
+                 ; whether the module already defines `<T>.copy`, from
+                 ; `accessors` or the user
                  already (function-named? (CoreModule.functions core) &fn-name)
                  builtin (builtin-ref-by-name builtins &fn-name)
                  fn-ref (match-ref &builtin
@@ -2249,11 +2194,9 @@ sums retain a real specializable body instead of a body-less Core declaration.")
                                                     &deref-ref
                                                     &cell))))))
           (if already
-            ;; `accessors` already materialized the declared `<T>.copy` with a
-            ;; shallow blit body. A type that owns memory through a field must
-            ;; deep-copy it, so the deep body REPLACES the shallow one — under
-            ;; the same reference, keeping the existing implementation entry
-            ;; and any call sites valid.
+            ; a defined `<T>.copy` gets the derived body in place, under
+            ; the same reference, so its implementation and call sites stay
+            ; valid
             (when (contains-key? &managed tkey)
               (set! new-functions
                     (replace-function-named new-functions

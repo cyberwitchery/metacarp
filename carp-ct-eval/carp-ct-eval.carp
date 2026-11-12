@@ -1,126 +1,111 @@
 (load "../carp-surface/carp-surface.carp")
-;; `type` answers with the type of an expression, so the compile-time
-;; evaluator needs the two passes that produce one. Neither loads this file,
-;; so the dependency runs one way.
+; `type` needs resolution and inference
 (load "../carp-resolve/carp-resolve.carp")
 (load "../carp-infer/carp-infer.carp")
 (load "../carp-ct-env/carp-ct-env.carp")
 (load "carp-ct-lower.carp")
 
-(doc CtValue "is a value in the compile-time evaluator. Syntax is kept
-separate from closures and computed collections so macro execution never has
-to use generated-program values.")
+(doc CtValue "is a value of the compile-time evaluator. `Syntax` holds a form.
+`Closure` holds a compile-time function. `Builtin` holds a builtin's name.
+`Collection` holds the values of an array. `Macro` holds a closure whose
+arguments are bound unevaluated and whose result is evaluated again. Macros live
+in the environment, as in the reference, so the evaluator can expand one it
+meets inside other code.")
 (deftype CtValue
   (Syntax [(Box SurfaceNode)])
   (Closure [(Box CtClosure)])
   (Builtin [String])
   (Collection [(Array (Box CtValue))])
-  ;; a macro is a compile-time closure whose arguments bind UNEVALUATED and
-  ;; whose result is evaluated again. Registering macros as environment
-  ;; citizens (the reference's model) lets the evaluator expand macros it
-  ;; meets mid-evaluation — the unification that makes real Core macro code
-  ;; runnable.
   (Macro [(Box CtClosure)]))
 
-(doc CtClosure "is a lexical compile-time function: a prototype, the stable
-ID of the frame it closed over, and the file it was written in so a step
-inside its body can say where it is. The file is empty when the closure was
-defined from source that had none.
-
-Everything about the FUNCTION — parameters, rest parameter, lowered body —
-lives in the prototype, which is lowered once where the function is written.
-A closure is therefore three words, and copying one out of the environment to
-call it copies three words rather than a syntax tree.")
+(doc CtClosure "is a compile-time function. `proto` is the index of its
+prototype, which holds its parameters and body, lowered once where it is
+written. `defining-frame` is the frame it closed over. `file` is the file it was
+written in, or the empty string, so a step in its body can say where it is.")
 (deftype CtClosure [proto Int
                     defining-frame FrameId
                     file String])
 
+(doc CtParameters "is a compile-time parameter list. `fixed` holds the fixed
+parameters and `rest` the rest parameter, if any.")
 (deftype CtParameters [fixed (Array String)
                        rest (Maybe String)])
 
-(doc CtModuleFrame "records the compile-time frame for one module path.")
+(doc CtModuleFrame "is the compile-time frame `frame` of the module `path`.")
 (deftype CtModuleFrame [path String
                         frame FrameId])
 (load "carp-ct-lookup.carp")
 
-(doc CtState "owns the persistent frame-and-cell store for one compile-time
-evaluation session.")
+(doc CtState "is the state of one compile-time evaluation session. `environment`
+holds the frames and cells. `root` is the root frame. `modules` holds the module
+frames.")
 (deftype CtState
   [environment (CtEnvStore CtValue)
    root FrameId
    modules (Array CtModuleFrame)])
 
-(doc CtError "is an error raised while evaluating compile-time syntax. The
-span points to the macro body or invocation that caused the failure.")
+(doc CtError "is an error of compile-time evaluation. `message` describes it and
+`span` points at the macro body or call that failed.")
 (deftype CtError [message String
                   span SurfaceSpan])
 
-(doc CtNumber "is a compile-time number the way the reference evaluator holds
-one: a value in either the integral or the floating domain, plus the width
-the literal will be rendered at. Widths follow the reference's promotion
-ladder -- 0 Byte, 1 Int, 2 Long, 3 Float, 4 Double -- so promotion is a max
-and width 3 or above means the floating field carries the value.")
+(doc CtNumber "is a compile-time number, as the reference evaluator holds one.
+`width` is the width it is rendered at: 0 Byte, 1 Int, 2 Long, 3 Float, 4
+Double. Promotion takes the larger width. Below 3, `integral` holds the value,
+and from 3 `floating` does.")
 (deftype CtNumber [width Int
                    integral Long
                    floating Double])
 
 (load "carp-ct-work.carp")
 
-;; the compile-time load stack: the filesystem path of every file whose forms
-;; are currently being expanded, innermost last. Maintained by the expander
-;; from the loader's `Unsafe.load-stack-push!`/`-pop!` markers; `current-file`
-;; (Core Dynamic) reads it through the `Unsafe.load-stack` builtin.
+(doc *ct-load-stack* "holds the path of each file whose forms are being
+expanded, innermost last. The expander maintains it from the loader's
+`Unsafe.load-stack-push!` and `-pop!` markers. `current-file` reads it through
+the `Unsafe.load-stack` builtin.")
 (def *ct-load-stack* (the (Array String) []))
 
-;; metadata a `meta-set!` recorded, as (qualified name + key) to the value
-;; syntax. The reference keeps this on the binder it annotates; expansion here
-;; runs before any binding exists, so the table lives beside the load stack
-;; and `meta` reads it back. Append-only: a later `meta-set!` for the same
-;; name and key shadows the earlier one, which is what a lookup takes.
+(doc *ct-meta* "holds the metadata that `meta-set!` and `doc` recorded, by name
+and key, oldest first. A later entry for the same name and key wins. Expansion
+runs before any binding exists, so the table lives here instead of on the
+binder.")
 (def *ct-meta* (the (Array (Pair String (Box SurfaceNode))) []))
 
-;; the top-level forms expansion has finished so far, in source order. `type`
-;; infers against them: the reference can ask its global environment because
-;; it evaluates and types a form at a time, and this compiler expands
-;; everything before it resolves anything, so the forms are what there is.
+(doc *ct-typing-forms* "holds the top-level forms expanded so far, in source
+order, for `type` to infer against.")
 (def *ct-typing-forms* (the (Array (Box SurfaceNode)) []))
 
-;; compile-time build commands (`system-include`, `add-cflag`, `add-lib`,
-;; `add-pkg`) applied as dynamic functions: includes become synthesized
-;; top-level forms the expansion drains into its output, flags accumulate for
-;; the driver's compiler invocation.
+(doc *ct-pending-includes* "holds the `system-include` forms that compile-time
+code ran. Expansion appends them to its result.")
 (def *ct-pending-includes* (the (Array SurfaceNode) []))
+(doc *ct-collected-cflags* "holds the C flags: those of `add-cflag`, the
+`--cflags` query of `add-pkg`, or the list `Project.config` sets for `cflag`.")
 (def *ct-collected-cflags* (the (Array String) []))
+(doc *ct-collected-libflags* "holds the linker flags: those of `add-lib`, the
+`--libs` query of `add-pkg`, or the list `Project.config` sets for `libflag`.")
 (def *ct-collected-libflags* (the (Array String) []))
 
-;; the rest of the project configuration (`Project.config`), latest setting
-;; last. The reference keeps it in its context; the flag lists above are its
-;; "cflag" and "libflag", and the driver reads the rest of what it builds with
-;; (title, output-directory) from here once compile-time evaluation is done.
+(doc *ct-project-config* "holds the other `Project.config` settings, such as
+`title` and `output-directory`, the latest last.")
 (def *ct-project-config* (the (Array (Pair String (Box SurfaceNode))) []))
+(doc *ct-pkgconfig-flags* "holds the list `Project.config` sets for
+`pkgconfigflag`.")
 (def *ct-pkgconfig-flags* (the (Array String) []))
 
-;; where the FORMS BEING EVALUATED are written, innermost last. This is not
-;; the load stack: `current-file` (and so `relative-include`) means the file
-;; being loaded, which stays the caller's while a macro from another file
-;; runs. A debugger needs the opposite — the file the running body is written
-;; in — and the two must not be confused for each other.
+(doc *ct-step-files* "holds the file each running body is written in, innermost
+last. This is not the load stack: while a macro from another file runs, the load
+stack still names the caller's file.")
 (def *ct-step-files* (the (Array String) []))
 
-(doc CtBinding "one name in scope at a step, and what it held at that moment.
-The value is text because that is all a reader of a recording can use: the
-value itself belongs to an evaluation that has already finished.")
+(doc CtBinding "is a name in scope at a step. `name` is the name and `value` its
+value then, as text.")
 (deftype CtBinding [name String
                     value String])
 
-(doc CtStep "one step of compile-time evaluation: the form that was about to
-be evaluated, where it came from, which frame it ran in, how deep in the
-evaluation it was, and what was in scope. A trace of these is what the
-dynamic debugger walks.
-
-Scope is captured per step rather than reconstructed afterwards: a binding
-can be rebound as evaluation proceeds, so the environment at the end does not
-say what a step in the middle saw.")
+(doc CtStep "is one recorded step of compile-time evaluation. `form` is the form
+about to be evaluated, as text. `file` and `span` say where it is written.
+`frame` is the frame it ran in and `depth` how deeply nested it was. `bindings`
+holds what was in scope. Only macro calls are recorded.")
 (deftype CtStep
   [form String
    file String
@@ -129,17 +114,21 @@ say what a step in the middle saw.")
    depth Int
    bindings (Array CtBinding)])
 
-;; Compile-time evaluation is deterministic, so a debugger does not have to
-;; suspend it: record every step of one run, and stepping is walking the
-;; recording. Off by default — a compiler that is not being debugged pays one
-;; boolean test per form.
+(doc *ct-tracing* "is whether steps are recorded. It is off unless a debugger
+asks.")
 (def *ct-tracing* false)
+(doc *ct-trace* "holds the steps recorded so far.")
 (def *ct-trace* (the (Array CtStep) []))
+(doc *ct-depth* "is how deeply nested the current evaluation is.")
 (def *ct-depth* 0)
 
 (load "carp-ct-checkpoint.carp")
 
+(doc CtEval
+  "evaluates compile-time code: macros, dynamic functions and compile-time
+commands.")
 (defmodule CtEval
+  (doc reset-load-stack! "empties the load stack.")
   (defn reset-load-stack! [] (set! *ct-load-stack* []))
 
   (private meta-entry-key)
@@ -147,24 +136,26 @@ say what a step in the middle saw.")
   (defn meta-entry-key [name key]
     (String.concat &[(String.copy name) @" " (String.copy key)]))
 
-  (doc reset-meta! "drops recorded metadata; a fresh compile-time session
-annotates nothing.")
+  (doc reset-meta! "drops the recorded metadata.")
   (defn reset-meta! [] (set! *ct-meta* []))
 
-  (doc reset-typing-forms! "drops the forms `type` infers against.")
+  (doc reset-typing-forms! "drops the forms that `type` infers against.")
   (defn reset-typing-forms! [] (set! *ct-typing-forms* []))
 
-  (doc record-typing-form! "keeps one finished top-level form for `type`.")
+  (doc record-typing-form!
+    "keeps the finished top-level form `form` for `type`.")
   (defn record-typing-form! [form]
     (Array.push-back! &*ct-typing-forms* (Box.init (SurfaceNode.copy form))))
 
-  (doc record-meta! "records one metadata entry for a qualified name.")
+  (doc record-meta! "records `value` for `name` and `key`. The expander passes
+qualified names.")
   (defn record-meta! [name key value]
     (Array.push-back! &*ct-meta*
                       (Pair.init (meta-entry-key name key)
                                  (Box.init (SurfaceNode.copy value)))))
 
-  (doc meta-value "the value recorded for a name and key, latest first.")
+  (doc meta-value "returns the latest value recorded for `name` and `key`, if
+any.")
   (defn meta-value [name key]
     (let-do [composed (meta-entry-key name key)
              result (the (Maybe (Box SurfaceNode)) (Maybe.Nothing))
@@ -175,19 +166,16 @@ annotates nothing.")
             (set! result (Maybe.Just (Box.copy (Pair.b entry)))))))
       result))
 
-  (doc drain-pending-includes! "the `(system-include ...)` forms compile-time
-evaluation requested since the last drain, cleared on return; the expansion
-appends them to its output so resolution collects them like written ones.")
+  (doc drain-pending-includes! "returns the `system-include` forms that
+compile-time code ran since the last call, and clears them. Expansion appends
+them to its result.")
   (defn drain-pending-includes! []
     (let-do [drained (Array.copy &*ct-pending-includes*)]
       (set! *ct-pending-includes* [])
       drained))
 
-  (doc collected-cflags "the deduplicated compiler flags (`add-cflag`,
-`add-lib`, `add-pkg`, and the project's \"cflag\" and \"libflag\")
-compile-time evaluation has requested, for the driver's C compiler
-invocation: compiler flags before library flags, as the reference passes
-them, and each in first-use order.")
+  (doc collected-cflags "returns the C and linker flags compile-time code set,
+without duplicates, for the driver's C compiler.")
   (defn collected-cflags []
     (let-do [flags (the (Array String) [])
              requested (Array.concat
@@ -200,19 +188,18 @@ them, and each in first-use order.")
 
   (private pkg-config-query)
   (hidden pkg-config-query)
-  (doc pkg-config-query "the start of the `pkg-config` command the
-reference's `add-pkg` adds for `package`, with the project's
-\"pkgconfigflag\" after it.")
+  (doc pkg-config-query "returns the start of the `pkg-config` command that the
+reference's `add-pkg` adds for `package`, with the `pkgconfigflag` settings
+after it.")
   (defn pkg-config-query [package]
     (String.join " "
                  &(Array.concat
                    &[[@"`pkg-config" @package]
                      (Array.copy &*ct-pkgconfig-flags*)])))
 
-  (doc record-build-command! "applies one build command (`add-cflag`,
-`add-lib` or `add-pkg`) to the project's flags. A package becomes the two
-`pkg-config` queries the reference adds for it, which the shell running the C
-compiler expands.")
+  (doc record-build-command! "applies the build command `command` (`add-cflag`,
+`add-lib` or `add-pkg`) with `argument`. A package becomes the two `pkg-config`
+queries the reference adds for it, which the shell runs when the C is compiled.")
   (defn record-build-command! [command argument]
     (cond
       (String.= command "add-lib")
@@ -227,8 +214,8 @@ compiler expands.")
 
   (private config-default-string)
   (hidden config-default-string)
-  (doc config-default-string "the reference's default for a string-valued
-project key, or `Nothing` when `key` is not one.")
+  (doc config-default-string "returns the reference's default for the string
+project key `key`, or `Nothing` if it is not one.")
   (defn config-default-string [key]
     (cond
       (String.= key "title") (Maybe.Just @"Untitled")
@@ -246,8 +233,8 @@ project key, or `Nothing` when `key` is not one.")
 
   (private config-default-bool)
   (hidden config-default-bool)
-  (doc config-default-bool "the reference's default for a bool-valued
-project key, or `Nothing` when `key` is not one.")
+  (doc config-default-bool "returns the reference's default for the bool project
+key `key`, or `Nothing` if it is not one.")
   (defn config-default-bool [key]
     (cond
       (String.= key "echo-c") (Maybe.Just false)
@@ -263,10 +250,10 @@ project key, or `Nothing` when `key` is not one.")
 
   (private config-kind)
   (hidden config-kind)
-  (doc config-kind "what a project key holds, after the reference's
-`projectKeyMap`: 0 a string, 1 a bool, 2 a list of strings set whole, 3 a
-list of strings set one string at a time, 4 a read-only value, and -1 for a
-key the reference does not know.")
+  (doc config-kind "returns what the project key `key` holds, as in the
+reference's `projectKeyMap`: 0 a string, 1 a bool, 2 a list of strings set
+whole, 3 a list of strings set one at a time, 4 a read-only value, or -1 for an
+unknown key.")
   (defn config-kind [key]
     (cond
       (or (String.= key "cflag")
@@ -282,7 +269,8 @@ key the reference does not know.")
 
   (private recorded-config)
   (hidden recorded-config)
-  (doc recorded-config "the value `Project.config` last gave `key`.")
+  (doc recorded-config "returns the value `Project.config` last gave `key`, if
+any.")
   (defn recorded-config [key]
     (let-do [result (the (Maybe SurfaceNode) (Maybe.Nothing))]
       (for [i 0 (Array.length &*ct-project-config*)]
@@ -298,9 +286,8 @@ key the reference does not know.")
     (Array.push-back! &*ct-project-config*
                       (Pair.init @key (Box.init (SurfaceNode.copy value)))))
 
-  (doc project-string "the project's string setting `key` (\"title\",
-\"output-directory\", ...) as `Project.config` left it, or the reference's
-default.")
+  (doc project-string "returns the string project setting `key`, such as `title`
+or `output-directory`, as `Project.config` left it, or the reference's default.")
   (defn project-string [key]
     (let [default (Maybe.from (config-default-string key) @"")]
       (match (recorded-config key)
@@ -310,57 +297,53 @@ default.")
             _ default)
         (Maybe.Nothing) default)))
 
-  (doc push-step-file! "enters a file for the purpose of recording steps: the
-body about to run is written there. Push the empty string when the file is
-unknown, so a body cannot inherit its caller's.")
+  (doc push-step-file! "enters the file `path` for recording steps: the body
+about to run is written there. Push the empty string if the file is unknown, so
+a body does not inherit its caller's.")
   (defn push-step-file! [path] (Array.push-back! &*ct-step-files* @path))
 
+  (doc pop-step-file! "leaves the file entered by `push-step-file!`.")
   (defn pop-step-file! []
     (when (Int.> (Array.length &*ct-step-files*) 0)
       (ignore (Array.pop-back! &*ct-step-files*))))
 
   (private current-step-file)
   (hidden current-step-file)
-  (doc current-step-file "the file the forms being evaluated are written in,
-or the empty string when nothing has claimed one.")
+  (doc current-step-file "returns the file the running body is written in, or
+the empty string.")
   (defn current-step-file []
     (let [n (Array.length &*ct-step-files*)]
       (if (Int.= n 0) @"" @(Array.unsafe-nth &*ct-step-files* (Int.dec n)))))
 
-  (doc current-load-file "the file being loaded, innermost first. This stays
-the caller's file while a macro from somewhere else runs, which is what
-`current-file` and so `relative-include` mean by it. Where the running body
-is written is a different question, and `current-step-file` answers it.")
+  (doc current-load-file "returns the innermost file being loaded, or the empty
+string. While a macro from another file runs, this is still the caller's file,
+which is what `current-file` and `relative-include` mean.")
   (defn current-load-file []
     (let [n (Array.length &*ct-load-stack*)]
       (if (Int.= n 0) @"" @(Array.unsafe-nth &*ct-load-stack* (Int.dec n)))))
 
-  (doc definition-file "the file a definition being read is written in. A
-file being loaded says so through the load stack; source handed over as text
-says so through the step file, which is the only thing that knows where a
-macro defined in a cell lives.")
+  (doc definition-file "returns the file a definition being read is written in:
+the step file if there is one, else the innermost file being loaded.")
   (defn definition-file []
     (let [inner (current-step-file)]
       (if (String.empty? &inner) (current-load-file) inner)))
 
-  (doc trace-on! "starts recording compile-time steps, dropping whatever an
-earlier run recorded.")
+  (doc trace-on! "starts recording compile-time steps and drops what an earlier
+run recorded.")
   (defn trace-on! []
     (do (set! *ct-tracing* true) (set! *ct-trace* []) (set! *ct-depth* 0)))
 
-  (doc trace-off! "stops recording. What was recorded stays until the next
-run starts.")
+  (doc trace-off! "stops recording. The recording stays until the next run
+starts.")
   (defn trace-off! [] (set! *ct-tracing* false))
 
-  (doc trace "the steps the last recorded run took, in the order it took
-them.")
+  (doc trace "returns the recorded steps, in order.")
   (defn trace [] (Array.copy &*ct-trace*))
 
   (private binding-text)
   (hidden binding-text)
-  (doc binding-text "what a compile-time value looks like to a reader of a
-recording. Syntax renders as the code it is; the rest say what they are,
-because a closure or a builtin has no text worth showing.")
+  (doc binding-text "returns `value` as a recording shows it. Syntax is shown as
+code. Other values say what they are.")
   (defn binding-text [value]
     (match-ref value
       (CtValue.Syntax syntax) (Surface.render (Box.peek syntax))
@@ -371,13 +354,9 @@ because a closure or a builtin has no text worth showing.")
 
   (private step-bindings)
   (hidden step-bindings)
-  (doc step-bindings "what is in scope at a step: the names bound in its frame
-and in the frames it is nested inside, innermost first.
-
-The root frame is left out on purpose. It holds every global the session
-knows, so including it would bury the handful of names a reader is actually
-looking at, and would copy that list once per recorded step. The walk is
-capped for the same reason.")
+  (doc step-bindings "returns what is in scope at a step in `frame`: the names
+in it and the frames around it, innermost first, without the root frame. At most
+8 frames and 64 names are shown.")
   (defn step-bindings [state frame]
     (let-do [result (the (Array CtBinding) [])
              store (CtState.environment state)
@@ -419,11 +398,8 @@ capped for the same reason.")
                                    *ct-depth*
                                    (step-bindings state frame))))
 
-  (doc enter-call! "records a call the expander is about to run the body of,
-and enters it. Expanding a macro evaluates its body without ever evaluating
-the call, so without this the recording starts inside the macro and a reader
-has no way to see what invoked it. The call is recorded before the macro's
-file is entered, so it keeps the caller's.")
+  (doc enter-call! "records `call`, whose body the expander is about to run, as
+a step, and enters it, if tracing is on. Only these calls are recorded.")
   (defn enter-call! [call state frame]
     (when-do *ct-tracing*
       (record-step! call state frame)
@@ -433,8 +409,10 @@ file is entered, so it keeps the caller's.")
   (defn leave-call! []
     (when *ct-tracing* (set! *ct-depth* (Int.dec *ct-depth*))))
 
+  (doc push-load-file! "enters the file `path` on the load stack.")
   (defn push-load-file! [path] (Array.push-back! &*ct-load-stack* @path))
 
+  (doc pop-load-file! "leaves the innermost file on the load stack.")
   (defn pop-load-file! []
     (when (Int.> (Array.length &*ct-load-stack*) 0)
       (ignore (Array.pop-back! &*ct-load-stack*))))
@@ -498,7 +476,7 @@ file is entered, so it keeps the caller's.")
                     (Array.push-back result (Box.init (SurfaceNode.copy item)))))))
       result))
 
-  (doc state "creates a compile-time state with one root frame.")
+  (doc state "returns a new compile-time state with one root frame.")
   (defn state []
     (let-do [environment (CtEnv.empty)
              root (CtEnv.root! &environment)]
@@ -506,31 +484,32 @@ file is entered, so it keeps the caller's.")
                     root
                     [(CtModuleFrame.init @"" (FrameId.copy &root))])))
 
-  (doc root "returns the root frame of a compile-time state.")
+  (doc root "returns the root frame of `state`.")
   (defn root [state] @(CtState.root state))
 
-  (doc child! "allocates a lexical child frame.")
+  (doc child! "returns a new child frame of `parent`.")
   (defn child! [state parent] (CtEnv.child! (CtState.environment state) parent))
 
-  (doc define! "defines a value in a compile-time frame.")
+  (doc define! "binds `name` to `value` in `frame` and changes the environment
+epoch.")
   (defn define! [state frame name value]
     (CtEnv.define! (CtState.environment state) frame name value))
 
-  (doc define-local! "binds a name that only this frame's own code can see —
-a macro's parameters, a call's arguments. Resolutions cached elsewhere cannot
-be affected by one, so it leaves the binding epoch alone.")
+  (doc define-local! "binds `name` to `value` in `frame` without changing the
+environment epoch, for parameters and arguments. Child frames see it, but cached
+resolutions cannot depend on it.")
   (defn define-local! [state frame name value]
     (CtEnv.define-local! (CtState.environment state) frame name value))
 
-  (doc alias! "binds `name` to an existing compile-time cell.")
+  (doc alias! "binds `name` in `frame` to the existing `cell`.")
   (defn alias! [state frame name cell]
     (CtEnv.bind-cell! (CtState.environment state) frame name cell))
 
-  (doc import! "adds an imported compile-time frame.")
+  (doc import! "makes `frame` see the frame `imported`.")
   (defn import! [state frame imported]
     (CtEnv.add-import! (CtState.environment state) frame imported))
 
-  (doc register-module! "records the compile-time frame for a module path.")
+  (doc register-module! "records the frame of the module `path`.")
   (defn register-module! [state path frame]
     (let-do [known false
              modules (CtState.modules state)
@@ -541,16 +520,15 @@ be affected by one, so it leaves the binding epoch alone.")
       (unless known (Array.push-back! modules (CtModuleFrame.init @path @frame)))
       true))
 
-  (doc module-frame "looks up the compile-time frame for a module path.")
+  (doc module-frame "returns the frame of the module `path`, if any.")
   (defn module-frame [state path]
     (CtLookup.module-frame (CtState.modules state) path))
 
-  (doc lookup-value "looks up a compile-time binding by name.")
+  (doc lookup-value "returns the value bound to `name`, looked up from `frame`,
+if any.")
   (defn lookup-value [state frame name]
     (CtEnv.lookup (CtState.environment state) frame name))
 
-  (doc lookup-status "resolves a compile-time name while preserving import
-ambiguity.")
   (private module-member-lookup)
   (hidden module-member-lookup)
   (defn module-member-lookup [state path local]
@@ -561,15 +539,11 @@ ambiguity.")
 
   (private static-definition-value?)
   (hidden static-definition-value?)
-  ;; a static definition's recorded source syntax is not evaluable; dynamic
-  ;; evaluation must not let it shadow a same-named `Dynamic` binding (the
-  ;; reference's dynamic lookup preference) — e.g. `(length m)` inside the
-  ;; `Map` module means `Dynamic.length`, not the static `Map.length` source.
   (private definition-head?)
   (hidden definition-head?)
-  (doc definition-head? "whether `name` heads a static definition form. The
-first byte settles it for everything that is not one, which matters because
-this runs on every name that resolves to a piece of list syntax.")
+  (doc definition-head? "checks whether `name` heads a static definition form.
+The first character rules out most names quickly, which matters because this
+runs on every name bound to list syntax.")
   (defn definition-head? [name]
     (let [first (String.char-at name 0)]
       (cond
@@ -585,6 +559,9 @@ this runs on every name that resolves to a piece of list syntax.")
         (Char.= first \r) (String.= name "register")
         false)))
 
+  ; the recorded source of a static definition cannot be evaluated, so it must
+  ; not shadow a `Dynamic` binding of the same name: inside `Map`, `(length m)`
+  ; is `Dynamic.length`, not the source of `Map.length`.
   (defn static-definition-value? [value]
     (match-ref value
       (CtValue.Syntax boxed)
@@ -600,6 +577,8 @@ this runs on every name that resolves to a piece of list syntax.")
           _ false)
       _ false))
 
+  (doc lookup-status "resolves `name` from `frame` with `CtLookup.status`. An
+import that makes it ambiguous is reported as such.")
   (defn lookup-status [state frame name]
     (CtLookup.status (CtState.environment state)
                      (CtState.modules state)
@@ -607,9 +586,9 @@ this runs on every name that resolves to a piece of list syntax.")
                      name
                      &static-definition-value?))
 
-  (doc closure-in-frame? "whether `name` is bound to a compile-time function
-directly in `frame`, ignoring imports and parents. Static code names a
-dynamic function by its exact path, so a `use`d or prelude module must not
+  (doc closure-in-frame? "checks whether `name` is bound to a compile-time
+function directly in `frame`, not through imports or parents. Static code names
+a dynamic function by its exact path, so a `use`d or prelude module must not
 supply one.")
   (defn closure-in-frame? [state frame name]
     (match (CtEnv.local-cell (CtState.environment state) frame name)
@@ -619,12 +598,11 @@ supply one.")
           _ false)
       (Maybe.Nothing) false))
 
-  (doc read-cell "copies a compile-time value from a resolved cell.")
+  (doc read-cell "returns a copy of the value in `cell`.")
   (defn read-cell [state cell]
     (CtEnv.read-cell (CtState.environment state) cell))
 
-  (doc lookup "looks up syntax bound to `name`. It remains public for clients
-that only need syntax parameters; closures and collections return `Nothing`.")
+  (doc lookup "returns the syntax bound to `name`, if it is bound to syntax.")
   (defn lookup [state frame name]
     (match (lookup-value state frame name)
       (Maybe.Just value)
@@ -806,12 +784,8 @@ that only need syntax parameters; closures and collections return `Nothing`.")
             (Maybe.Nothing) ())
           (Result.Success frame)))))
 
-  (doc define-function "creates a lexical compile-time closure from a
-parameter array and body. Macro loaders use this for `defndynamic` bindings.
-
-The closure keeps the file it is being defined in, which is the only moment
-that file is known: by the time it is called, the caller's file is the one
-being loaded.")
+  (doc define-function "returns a compile-time closure over `frame` with
+`parameters` and `body`, for `defndynamic`. It keeps the file it is defined in.")
   (defn define-function [parameters body frame]
     (match (closure-parameters parameters)
       (Result.Success parsed)
@@ -825,8 +799,8 @@ being loaded.")
               (error-at parameters @"compile-time fn parameters must be symbols")))
       (Result.Error error) (Result.Error error)))
 
-  (doc define-dynamic-function "creates a top-level `defndynamic` closure in
-its definition frame.")
+  (doc define-dynamic-function "returns a `defndynamic` closure over `frame`
+with `parameters` and `body`.")
   (defn define-dynamic-function [parameters body frame]
     (define-function parameters body frame))
 
@@ -915,8 +889,8 @@ its definition frame.")
                                                                                    i)))))))))
       result))
 
-  (doc syntax-value? "whether a compile-time value is still syntax. Syntax is
-never applicable, and evaluating it answers with itself.")
+  (doc syntax-value? "checks whether `value` is syntax. Syntax cannot be
+applied, and evaluates to itself.")
   (defn syntax-value? [value] (match-ref value (CtValue.Syntax _) true _ false))
 
   (private syntax-collection-values)
@@ -954,9 +928,8 @@ never applicable, and evaluating it answers with itself.")
                       "compile-time list operation expects a list or array: "
                       &(operation-name call))))))
 
-  (doc collection-values "the items of a list-like value, each as a value of
-its own. A syntax value's children are read where they lie rather than after
-copying the whole node.")
+  (doc collection-values "returns the items of a list-like value, each as a
+value of its own.")
   (defn collection-values [call value]
     (match-ref value
       (CtValue.Collection values) (Result.Success @values)
@@ -1171,9 +1144,8 @@ copying the whole node.")
 
   (private syntax-number)
   (hidden syntax-number)
-  (doc syntax-number "renders a computed number back to the literal its
-promoted width dictates, so an expansion carries the type the reference
-would give it.")
+  (doc syntax-number "returns `number` as a literal of the width it was promoted
+to, so an expansion has the type the reference gives it.")
   (defn syntax-number [call number]
     (let [width @(CtNumber.width number)]
       (CtValue.Syntax
@@ -1196,10 +1168,9 @@ would give it.")
 
   (private ct-arith)
   (hidden ct-arith)
-  (doc ct-arith "adds, subtracts, or multiplies two numbers (operation 0, 1,
-and 2) the way the reference's commandArith does: the result width is the
-promoted one, and any floating operand moves the operation to the floating
-domain.")
+  (doc ct-arith "adds, subtracts or multiplies `left` and `right` (operation 0,
+1 or 2) as the reference's `commandArith` does: the result has the promoted
+width, and a floating operand makes it floating.")
   (defn ct-arith [call operation left right]
     (match (ct-number-argument call left)
       (Result.Success a)
@@ -1234,9 +1205,9 @@ domain.")
 
   (private ct-divide)
   (hidden ct-divide)
-  (doc ct-divide "divides like the reference's commandDiv: two integral
-operands use floor division (Haskell `div`, which Core's dynamic `imod`
-depends on), anything floating divides in the floating domain.")
+  (doc ct-divide "divides `left` by `right` as the reference's `commandDiv`
+does: two integral operands use floor division, which Core's dynamic `imod`
+relies on, and otherwise it divides as floating.")
   (defn ct-divide [call left right]
     (match (ct-number-argument call left)
       (Result.Success a)
@@ -1534,8 +1505,7 @@ depends on), anything floating divides in the floating domain.")
 
   (private list-item)
   (hidden list-item)
-  (doc list-item "the item at `index` of a list-like value. A collection or a
-syntax list answers with a copy of that one item.")
+  (doc list-item "returns a copy of the item at `index` of a list-like value.")
   (defn list-item [call value index]
     (match-ref value
       (CtValue.Collection values)
@@ -1582,8 +1552,7 @@ syntax list answers with a copy of that one item.")
 
   (private list-tail)
   (hidden list-tail)
-  (doc list-tail "the items of a list-like value from `start` on. A syntax
-list's tail is copied once, straight into the result.")
+  (doc list-tail "returns the items of a list-like value from `start` on.")
   (defn list-tail [call value start]
     (match-ref value
       (CtValue.Syntax syntax)
@@ -1664,7 +1633,8 @@ list's tail is copied once, straight into the result.")
 
   (private load-stack-value)
   (hidden load-stack-value)
-  (doc load-stack-value "the files being loaded, innermost first.")
+  (doc load-stack-value "returns the files being loaded as syntax, innermost
+first.")
   (defn load-stack-value [call]
     (let-do [items (the (Array (Box CtValue)) [])
              n (Array.length &*ct-load-stack*)]
@@ -1682,8 +1652,8 @@ list's tail is copied once, straight into the result.")
 
   (private string-list-syntax)
   (hidden string-list-syntax)
-  (doc string-list-syntax "`strings` as a list of string literals, or an
-array of them when `array?`.")
+  (doc string-list-syntax "returns `strings` as a list of string literals, or an
+array if `array?` is true.")
   (defn string-list-syntax [call strings array?]
     (let-do [items (the (Array (Box SurfaceNode)) [])]
       (for [i 0 (Array.length strings)]
@@ -1701,8 +1671,8 @@ array of them when `array?`.")
 
   (private config-strings)
   (hidden config-strings)
-  (doc config-strings "the strings a list or array of string literals
-holds, or `Nothing` when `node` is anything else.")
+  (doc config-strings "returns the strings of a list or array of string
+literals, or `Nothing` if `node` is anything else.")
   (defn config-strings [node]
     (let-do [items (match-ref (SurfaceNode.form node)
                (SurfaceForm.List items) (Maybe.Just @items)
@@ -1729,8 +1699,8 @@ holds, or `Nothing` when `node` is anything else.")
 
   (private configure)
   (hidden configure)
-  (doc configure "`(Project.config key value)`: records `value` for `key`
-with the reference's rules for what each key accepts.")
+  (doc configure "runs `(Project.config key value)`: it records `value` for
+`key`, with the reference's rules for what each key takes.")
   (defn configure [call key value]
     (let [kind (config-kind key)
           done (Result.Success (syntax-empty call))]
@@ -1784,8 +1754,8 @@ with the reference's rules for what each key accepts.")
 
   (private configuration)
   (hidden configuration)
-  (doc configuration "`(Project.get-config key)`: what `Project.config` last
-set for `key`, or the reference's default.")
+  (doc configuration "runs `(Project.get-config key)`: it returns what
+`Project.config` last set for `key`, or the reference's default.")
   (defn configuration [call key]
     (let [kind (config-kind key)]
       (cond
@@ -2477,8 +2447,8 @@ set for `key`, or the reference's default.")
           (Result.Success value)
             (match (syntax-from-value call &value)
               (Result.Success syntax)
-              ;; any deterministic hash works: dynamic maps only need
-              ;; internal consistency, and the suite compares unordered.
+              ; djb2, kept to 30 bits. dynamic maps only need a hash that
+              ; is the same every time.
               (let-do [rendered (str &syntax)
                        hashed 5381
                        n (String.length &rendered)]
@@ -2562,9 +2532,9 @@ set for `key`, or the reference's default.")
   (hidden array-syntax)
   (private type-syntax)
   (hidden type-syntax)
-  (doc type-syntax "renders a concrete type as the syntax the reference
-reifies it to: a name is a symbol, an application is a list of them, and a
-function is `(Fn [args] result)`.")
+  (doc type-syntax "returns the concrete `type` as the reference writes it as
+syntax, at `span`: a name is a symbol, an application a list, and a function
+`(Fn [args] result)`.")
   (sig type-syntax (Fn [(Ref SurfaceSpan) (Ref MonoType)] SurfaceNode))
   (defn type-syntax [span type]
     (match-ref type
@@ -2619,18 +2589,8 @@ function is `(Fn [args] result)`.")
 
   (private special-type)
   (hidden special-type)
-  (doc special-type "the type of an expression, inferred against everything
-expansion has finished so far. The reference annotates the form against its
-global environment, which it has because it evaluates and types a form at a
-time; here the equivalent is to resolve and infer the forms seen so far with
-this expression appended as the last root, and read that root's type back.
-Costly by construction — every call types the program again — and `type` is
-rare enough for that to be the right trade.
-
-The forms belong to one expansion, and a warm session expands a cell against a
-snapshot that carries none: `type` there sees the cell alone, so an expression
-naming a base binding fails to resolve and says so rather than answering with
-the wrong type.")
+  (doc special-type "runs `(type x)`: it infers the type of `argument` against
+the forms expanded so far.")
   (defn special-type [call argument]
     (let-do [forms (Array.copy &*ct-typing-forms*)
              count 0]
@@ -2674,14 +2634,13 @@ the wrong type.")
 
   (private special-meta)
   (hidden special-meta)
-  (doc special-meta "reads back what a `meta-set!` recorded for a binding.
-An annotation the program never made answers with the empty list, the way the
-reference answers with dynamic nil. A qualified name is read as written; a bare
-one from the module the read happens in outward (`scoped-meta-value`).")
+  (doc special-meta "runs `(meta name key)`: it returns what was recorded for
+`name`, or the empty list, as the reference returns nil. A qualified name is
+read as written, and a bare one through `scoped-meta-value`.")
   (private enclosing-module-path)
   (hidden enclosing-module-path)
-  (doc enclosing-module-path "the path of the innermost module whose frame
-encloses `frame`, or the root's empty path.")
+  (doc enclosing-module-path "returns the path of the innermost module whose
+frame encloses `frame`, or the empty string at the root.")
   (defn enclosing-module-path [state frame]
     (let-do [result (the (Maybe String) (Maybe.Nothing))
              current (Maybe.Just @frame)
@@ -2703,9 +2662,9 @@ encloses `frame`, or the root's empty path.")
 
   (private scoped-meta-value)
   (hidden scoped-meta-value)
-  (doc scoped-meta-value "the metadata a name read in `frame` refers to:
-metadata is recorded under qualified names, so a bare `f` read inside `A.B`
-means `A.B.f`, then `A.f`, then `f`, as the reference resolves it.")
+  (doc scoped-meta-value "returns the metadata for `key` of the bare `name`
+read in `frame`. Metadata is recorded under qualified names, so inside `A.B` it
+tries `A.B.f`, then `A.f`, then `f`, as the reference does.")
   (defn scoped-meta-value [state frame name key]
     (let-do [path (enclosing-module-path state frame)
              segments (if (String.empty? &path)
@@ -2878,10 +2837,8 @@ means `A.B.f`, then `A.f`, then `f`, as the reference resolves it.")
 
   (private eval-closure-body)
   (hidden eval-closure-body)
-  (doc eval-closure-body "evaluates a closure's body in the closure's own
-file. Stepping through a compile-time function is stepping through the file
-that defines it, and a closure that does not know its file says so rather
-than inheriting the caller's.")
+  (doc eval-closure-body "runs the body of `closure` with the closure's file as
+the step file. A closure without a file pushes the empty string.")
   (defn eval-closure-body [closure state frame]
     (let-do [_pushed (push-step-file! (CtClosure.file closure))
              result (run-code
@@ -2899,11 +2856,9 @@ than inheriting the caller's.")
       (CtValue.Syntax syntax)
         (match (eval-node (Box.peek syntax) state frame)
           (Result.Success evaluated)
-          ;; syntax in head position is evaluated once and then applied. It
-          ;; is evaluated only once on purpose: a self-evaluating literal
-          ;; answers with itself, so recursing on a result that is still
-          ;; syntax would never terminate. `(1)` used to overflow the stack
-          ;; here instead of being rejected.
+          ; syntax in head position is evaluated once, then applied. a
+          ; literal evaluates to itself, so evaluating again would never end:
+          ; `(1)` is an error.
           (if (syntax-value? &evaluated)
             (Result.Error
               (error-at call
@@ -2970,10 +2925,6 @@ than inheriting the caller's.")
             (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy node))))))
       _ (Result.Success (CtValue.Syntax (Box.init (SurfaceNode.copy node))))))
 
-  (doc eval-template "evaluates a macro body and requires its result to be
-syntax. The evaluator also supports lexical `fn` closures and computed array
-collections internally; a macro must still return syntax to the expander.")
-
   (private macro-rest-syntax)
   (hidden macro-rest-syntax)
   (defn macro-rest-syntax [call arguments start]
@@ -2991,16 +2942,14 @@ collections internally; a macro must still return syntax to the expander.")
   (hidden expand-ct-macro)
   (private expand-ct-macro-args)
   (hidden expand-ct-macro-args)
-  (doc expand-ct-macro "binds the raw argument syntax (fixed then :rest) in a
-child of the macro's defining frame and evaluates the body, yielding the
-EXPANSION as syntax. Callers decide whether to evaluate it (a macro call) or
-keep it as data (a macro reached through `apply`).")
+  (doc expand-ct-macro "binds the argument syntax `items`, fixed then rest, in a
+child of the macro's frame, evaluates its body and returns the expansion as
+syntax. The caller decides whether to evaluate it.")
   (defn expand-ct-macro [call closure items state]
     (expand-ct-macro-args call closure &(Array.suffix items 1) state))
 
-  (doc expand-ct-macro-args "expands a macro from its argument syntax. A
-lowered call site already holds the arguments as syntax, so it expands
-without first rebuilding them out of the call form.")
+  (doc expand-ct-macro-args "expands a macro from its argument syntax, as
+`expand-ct-macro` does, without taking the arguments from the call form.")
   (defn expand-ct-macro-args [call closure arguments state]
     (let [prototype (Box.peek
             (Array.unsafe-nth &*ct-protos* @(CtClosure.proto closure)))
@@ -3050,10 +2999,9 @@ without first rebuilding them out of the call form.")
 
   (private apply-macro-to-values)
   (hidden apply-macro-to-values)
-  (doc apply-macro-to-values "applies a macro reached as a VALUE (`apply`,
-higher-order use): each argument value converts back to the syntax it wraps
-and binds unevaluated, matching the reference's first-class treatment of
-macros in dynamic code (e.g. ControlMacros' `(apply ignore* forms)`).")
+  (doc apply-macro-to-values "applies a macro reached as a value, as `apply`
+does: each argument value is turned back into syntax and bound unevaluated, as
+in the reference.")
   (defn apply-macro-to-values [call closure values state -frame]
     (let-do [items (the (Array (Box SurfaceNode))
                         [(Box.init (SurfaceNode.copy call))])
@@ -3076,18 +3024,16 @@ macros in dynamic code (e.g. ControlMacros' `(apply ignore* forms)`).")
             (Result.Success (CtValue.Syntax (Box.init expansion)))
           (Result.Error error) (Result.Error error)))))
 
-  (doc pure-string-command? "the pure string commands this evaluator
-implements with the reference's load-time semantics, including bounds errors
-(see the String.char-at/slice/index-of builtin arms). The expander consults
-this to evaluate literal-argument top-level calls the way the reference's
-REPL does — the knowledge lives here, beside the implementations.")
+  (doc pure-string-command? "checks whether `name` is a string command that a
+top-level call runs at load time, as in the reference: `String.char-at` can fail
+on a bad index, while the others clamp or return -1.")
   (defn pure-string-command? [name]
     (or (String.= name "String.char-at")
         (or (String.= name "String.slice") (String.= name "String.index-of"))))
 
-  (doc register-macro! "binds a macro into the compile-time environment as a
-CtValue.Macro, making it visible to mid-evaluation expansion. The macro keeps
-the file it is defined in, the same way a compile-time function does.")
+  (doc register-macro! "binds `name` in `frame` to the macro with `fixed`,
+`rest` and `body`, defined in `defining-frame`, so evaluation can expand it. The
+macro keeps the file it is defined in.")
   (defn register-macro! [state frame name fixed rest body defining-frame]
     (ignore
       (define! state
@@ -3100,20 +3046,14 @@ the file it is defined in, the same way a compile-time function does.")
                      defining-frame
                      (definition-file)))))))
 
-  (doc span-anchor "a node carrying only a span, for the helpers that build
-syntax or errors relative to the form they came from. Lowered code keeps
-spans rather than whole forms, so an anchor is made where one is needed.")
+  (doc span-anchor "returns an empty list at `span`, to build syntax and errors
+relative to a lowered form, which keeps only its span.")
   (defn span-anchor [span] (SurfaceNode.generated @span (SurfaceForm.List [])))
 
   (defn error-at-span [span message] (CtError.init message @span))
 
-  (doc resolve-free "resolves a free name, through the inline cache when the
-cache line still answers for this body's defining frame at this epoch.
-
-The answer is a cell index, or one of the negative codes. Caching it is what
-turns a walk out to a module frame holding all of Core — a string comparison
-per binding on the way — into an array read.")
-  (doc resolve-now "resolves a name through the frame chain, uncached.")
+  (doc resolve-now "resolves `name` through the frames from `frame`, without a
+cache.")
   (defn resolve-now [state frame name]
     (match (let-do [_counted (CtIRStore.count-name-resolution!)]
         (lookup-status state frame name))
@@ -3121,6 +3061,9 @@ per binding on the way — into an array read.")
       (CtEnvLookup.Ambiguous) (CtCacheCode.ambiguous)
       (CtEnvLookup.Missing) (CtCacheCode.missing)))
 
+  (doc resolve-free "resolves `name` through inline cache `cache`, if the cache
+answers for `base` at the current epoch, and fills it otherwise. It returns a
+cell index or a code from `CtCacheCode`.")
   (defn resolve-free [state frame base cache name]
     (let [epoch (CtEnv.epoch (CtState.environment state))]
       (if (CtIRStore.cache-hit? cache base epoch)
@@ -3129,12 +3072,9 @@ per binding on the way — into an array read.")
           (CtIRStore.cache-fill! cache base epoch answer)
           answer))))
 
-  (doc resolve-ref "resolves a lowered reference to a cell index, or to one
-of the negative codes. A slot is two array indices; a free name is one array
-read when its inline cache still answers.
-
-A slot that is not where lowering said it would be falls back to resolving
-the name, so a frame chain the lowerer did not model stays correct.")
+  (doc resolve-ref "resolves the lowered reference `reference` to a cell index
+or a code from `CtCacheCode`. A `Name` is resolved through the frames and a
+`Free` through its inline cache.")
   (defn resolve-ref [state frame base reference name]
     (match-ref reference
       (CtRef.Name) (resolve-now state frame name)
@@ -3143,18 +3083,17 @@ the name, so a frame chain the lowerer did not model stays correct.")
   (defn cell-value [state index]
     (CtEnv.read-cell (CtState.environment state) &(CtEnv.cell-at index)))
 
-  (doc macro-in-cell "the macro a resolved cell holds, if it holds one. The
-cell is borrowed rather than read, so a call that is not a macro call does
-not copy the value it found.")
+  (doc macro-in-cell "returns the macro in cell `index`, if it holds one,
+without copying other values.")
   (defn macro-in-cell [state index]
     (match-ref (CtEnv.peek-cell (CtState.environment state)
                                 &(CtEnv.cell-at index))
       (CtValue.Macro closure) (Maybe.Just @(Box.peek closure))
       _ (the (Maybe CtClosure) (Maybe.Nothing))))
 
-  (doc run-call-values "applies a resolved head to already-evaluated
-arguments: a builtin beats a binding, and a binding that is syntax naming a
-function resolves through evaluation.")
+  (doc run-call-values "applies a resolved head to evaluated arguments. A
+builtin is used before a binding, and a binding to syntax that names a function
+is evaluated first.")
   (defn run-call-values [call builtin resolved state frame values]
     (cond
       (Int.>= builtin 0)
@@ -3188,14 +3127,14 @@ function resolves through evaluation.")
 
   (private bool-at)
   (hidden bool-at)
-  (doc bool-at "reads a value as a Bool the way `when`, `while`, `cond`,
-`and` and `or` do.")
+  (doc bool-at "reads a value as a Bool as `when`, `while`, `cond`, `and` and
+`or` do.")
   (defn bool-at [value span] (bool-argument &(span-anchor span) value))
 
   (private strict-bool-at)
   (hidden strict-bool-at)
-  (doc strict-bool-at "reads a value as a Bool the way `if` does, which is
-Bool syntax and nothing else — the reference is no more forgiving.")
+  (doc strict-bool-at "reads a value as a Bool as `if` does: only Bool syntax
+counts, as in the reference.")
   (defn strict-bool-at [value span]
     (match-ref value
       (CtValue.Syntax syntax)
@@ -3212,10 +3151,9 @@ Bool syntax and nothing else — the reference is no more forgiving.")
 
   (private pop-arguments!)
   (hidden pop-arguments!)
-  (doc eval-node "lowers, compiles and runs one form. This is how a form
-that only exists at run time — the expansion of a macro, the argument of
-`eval`, a top-level compile-time call — is evaluated: through the same
-compiler as everything else, so there is one description of the language.")
+  (doc eval-node "lowers, compiles and runs `node` in `frame`. Expansions,
+`eval` arguments and top-level compile-time calls run this way. It also records
+the environment for editing.")
   (register observe-environment!
     (Fn [(Ref SurfaceNode) (Ref CtState) (Ref FrameId)] Unit))
 
@@ -3230,8 +3168,9 @@ compiler as everything else, so there is one description of the language.")
 
   (private special-apply)
   (hidden special-apply)
-  (doc special-apply "`(apply f args)`: `f` stays syntax so that a named
-function can be applied as source, `args` is the evaluated argument list.")
+  (doc special-apply "runs `(apply f args)`. A name bound to a closure is
+applied to the evaluated `args`. A qualified, builtin, unbound or syntax-bound
+name gives the call form unevaluated. Any other head is evaluated first.")
   (defn special-apply [call function-form argument-list state frame]
     (let [values-result (collection-values call argument-list)]
       (match-ref &values-result
@@ -3275,9 +3214,9 @@ function can be applied as source, `args` is the evaluated argument list.")
 
   (private special-eval)
   (hidden special-eval)
-  (doc special-eval "`(eval x)`: evaluate `x`, and when it answers with
-syntax, evaluate that syntax too. A symbol that names nothing but a builtin
-evaluates; one that names nothing at all stays as itself.")
+  (doc special-eval "runs `(eval x)` on the evaluated `value`: syntax is
+evaluated again. A symbol that names only a builtin evaluates; one that names
+nothing stays as it is.")
   (defn special-eval [value state frame]
     (match-ref value
       (CtValue.Syntax node)
@@ -3428,8 +3367,8 @@ evaluates; one that names nothing at all stays as itself.")
 
   (private run-special)
   (hidden run-special)
-  (doc run-special "runs one of the forms with their own argument rule. The
-opcodes are `CtSpecial`'s, and the two must agree.")
+  (doc run-special "runs the special form `opcode`. The opcodes are
+`CtSpecial`'s.")
   (defn run-special [opcode call raws values state frame]
     (cond
       (Int.= opcode (CtSpecial.apply-op))
@@ -3480,13 +3419,8 @@ opcodes are `CtSpecial`'s, and the two must agree.")
                       frame)
       (Result.Error (error-at call @"unknown compile-time special form"))))
 
-  (doc pop-arguments! "removes the top `n` values and answers them in the
-order they were pushed.
-
-The values MOVE off the stack rather than being copied off it: a compile-time
-value owns a syntax tree, so copying every argument of every call is the one
-thing a stack machine must not do. The result is filled back to front, which
-is the order they pop in.")
+  (doc pop-arguments! "removes the top `n` values of `stack` and returns them in
+the order they were pushed. They are moved, not copied.")
   (defn pop-arguments! [stack n]
     (let-do [values (Array.allocate n)
              i (Int.dec n)]
@@ -3495,16 +3429,10 @@ is the order they pop in.")
         (set! i (Int.dec i)))
       values))
 
-  (doc run-code "runs one compiled body.
-
-`base` is the frame the body was defined in, which is what its inline caches
-are keyed by. A call frame is a child of it holding only parameters, and
-lowering already classified those, so resolving a free name from the call
-frame and from the defining frame cannot differ.
-
-The loop holds a value stack and a current frame; `EnterFrame`/`LeaveFrame`
-push and pop the frames that `let` opens. Two instructions leave the loop and
-come back: a call, and the `Raw` escape to the tree walker.")
+  (doc run-code "runs the compiled body `code-id` in `frame`. `base` is the
+frame the body was defined in, which its inline caches are keyed by. Calls,
+macro tests and some special forms run other code by calling back into the
+evaluator.")
   (defn run-code [code-id state frame base]
     (let-do [stack (the (Array CtValue) [])
              saved (the (Array FrameId) [])
@@ -3828,9 +3756,8 @@ come back: a call, and the `Raw` escape to the tree walker.")
                   @"compile-time code ended without a value"
                   (SurfaceSpan.anywhere)))))))
 
-  (doc eval-proto-template "evaluates a lowered macro body and converts the
-result to syntax. `base` is the frame the macro was defined in, which is what
-the body's inline caches are keyed by.")
+  (doc eval-proto-template "evaluates the body of the macro prototype `proto`
+and returns its result as syntax. `base` is the frame the macro was defined in.")
   (defn eval-proto-template [proto anchor state frame base]
     (match (run-code
         @(CtProto.code (Box.peek (Array.unsafe-nth &*ct-protos* proto)))
@@ -3840,6 +3767,9 @@ the body's inline caches are keyed by.")
       (Result.Success value) (syntax-from-value anchor &value)
       (Result.Error error) (Result.Error error)))
 
+  (doc eval-template "evaluates the macro body `body` and returns its result as
+syntax. A collection of syntax is turned into an array. Any other value, such as
+a closure, is an error: a macro must return code.")
   (defn eval-template [body state frame]
     (match (eval-node body state frame)
       (Result.Success value) (syntax-from-value body &value)

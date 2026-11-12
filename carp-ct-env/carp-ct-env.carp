@@ -1,58 +1,47 @@
-(doc FrameId "is a stable index into a compile-time environment's frame store.")
+(doc FrameId "identifies a frame in a compile-time environment. `index` is
+its position in the store.")
 (deftype FrameId [index Int])
 
-(doc CellId "is a stable index into a compile-time environment's cell store.")
+(doc CellId "identifies a cell in a compile-time environment. `index` is its
+position in the store.")
 (deftype CellId [index Int])
 
-(doc CtEnvLookup "is the result of resolving one name. Ambiguity is explicit
-so callers never depend on import order.")
+(doc CtEnvLookup "is the result of looking up a name. `Missing` means the name
+is not bound. `Found` holds the cell it is bound to. `Ambiguous` means two
+imports of the same frame bind it to different cells, so the result never
+depends on import order.")
 (deftype CtEnvLookup
   (Missing [])
   (Found [CellId])
   (Ambiguous []))
 
-(doc CtEnvBinding "maps a name in one frame to a mutable cell.")
+(doc CtEnvBinding "binds `name` to `cell` in a frame.")
 (deftype CtEnvBinding [name String
                        cell CellId])
 
-(doc CtEnvFrame "is one lexical compile-time scope. Parent and import
-relationships use stable IDs, so extending an environment does not copy
-bindings or values.
-
-A frame that grows past `index-threshold` builds a name index and keeps it
-up to date. Call frames and `let` frames hold a handful of bindings and scan
-them; a module frame holding all of Core would otherwise be scanned, name by
-name, by every reference that has to walk out to it. The index is absent until
-the frame outgrows a scan, so the frames created per call cost nothing for
-it.")
+(doc CtEnvFrame "is a compile-time scope. `parent` is the enclosing frame, if
+any. `imports` are the frames imported into it. `bindings` are its bindings,
+oldest first. `index` maps each name to its latest cell once the frame has more
+than `index-threshold` bindings.")
 (deftype CtEnvFrame
   [parent (Maybe FrameId)
    imports (Array FrameId)
    bindings (Array CtEnvBinding)
    index (Maybe (Map String CellId))])
 
-;; the source of binding-epoch stamps. One counter for the process, never
-;; reset: see the note on `CtEnvStore`.
+(doc *ct-env-epoch* "is the counter epochs are taken from. All stores share
+it, and it is never reset.")
 (def *ct-env-epoch* 0)
 
-(doc CtEnvCell "holds one mutable compile-time value.")
+(doc CtEnvCell "holds a compile-time value in `value`.")
 (deftype (CtEnvCell a) [value (Box a)])
 
-(doc CtEnvStore "owns all frames and cells for one compile-time session.
-
-`epoch` stamps the changes that can alter what a name RESOLVES to: a new
-binding in a frame a body can see out to, or a new import. It does not count
-writes through `set!`, which change a value without moving a name, and it does
-not count local bindings, which a lowered body has already classified and
-never looks up by name. Callers cache resolutions against it.
-
-Stamps come from one process-wide counter rather than from a per-store one,
-because stores are COPIED: a warm session expands transient source against a
-snapshot copy, and two copies that diverge from one base would otherwise
-reach the same number with different bindings, letting a cache filled against
-one answer for the other. A global counter cannot collide. Two copies that
-never diverge share a stamp, which is correct — they hold the same frames and
-the same cells.")
+(doc CtEnvStore "holds the frames and cells of a compile-time environment.
+`frames` and `cells` are indexed by `FrameId` and `CellId`. `epoch` changes
+whenever a binding or an import is added that can change what a name resolves
+to, so callers can cache lookups against it. Bindings made with
+`define-local!` and writes to cells do not change it. All stores take epochs
+from one counter, so copies of a store that diverge never share an epoch.")
 (deftype (CtEnvStore a)
   [frames (Array CtEnvFrame)
    cells (Array (CtEnvCell a))
@@ -160,8 +149,8 @@ the entry.")
                               (CtEnvBinding.cell binding)))))
               (CtEnvFrame.set-index! stored (Maybe.Just names)))))))
 
-  (doc bind-cell! "adds a name in `frame` that refers to an existing cell.
-This is the primitive used for aliases and imports.")
+  (doc bind-cell! "binds `name` in `frame` to the existing cell `cell`.
+Returns false if the frame or the cell does not exist.")
   (defn bind-cell! [store frame name cell]
     (if (and (valid-frame? store frame) (valid-cell? store cell))
       (do (record-binding! store frame name cell) (bump! store) true)
@@ -174,8 +163,9 @@ This is the primitive used for aliases and imports.")
       (do (record-binding! store frame name cell) true)
       false))
 
-  (doc define! "allocates a cell and binds it in `frame`. A later definition
-of the same local name shadows the earlier binding.")
+  (doc define! "allocates a cell holding `value`, binds `name` to it in
+`frame` and returns the cell. A later definition of the same name shadows this
+one.")
   (defn define! [store frame name value]
     (let-do [cell (CellId.init (Array.length (CtEnvStore.cells store)))]
       (Array.push-back! (CtEnvStore.cells store)
@@ -183,11 +173,9 @@ of the same local name shadows the earlier binding.")
       (ignore (bind-cell! store frame name &cell))
       cell))
 
-  (doc define-local! "binds a name that no free reference can see: a
-parameter, a `let` binding, a loop variable. Lowering classifies these names
-where they are written, so binding one cannot change what any other name
-resolves to, and the epoch stays where it is. Binding them through `define!`
-instead would invalidate every cached resolution on every call.")
+  (doc define-local! "is `define!` without changing the epoch. It is for
+names that no cached lookup can refer to, such as parameters and `let`
+bindings.")
   (defn define-local! [store frame name value]
     (let-do [cell (CellId.init (Array.length (CtEnvStore.cells store)))]
       (Array.push-back! (CtEnvStore.cells store)
@@ -195,7 +183,9 @@ instead would invalidate every cached resolution on every call.")
       (ignore (bind-cell-local! store frame name &cell))
       cell))
 
-  (doc add-import! "adds an imported frame searched after lexical parents.")
+  (doc add-import! "imports `imported` into `frame`. A name is looked up in a
+frame's own bindings, then in its imports, then in its parent. Imports are not
+transitive. Returns false if either frame does not exist.")
   (defn add-import! [store frame imported]
     (if (and (valid-frame? store frame) (valid-frame? store imported))
       (do
@@ -207,11 +197,8 @@ instead would invalidate every cached resolution on every call.")
         true)
       false))
 
-  (doc local-bindings "the names bound directly in `frame`, innermost
-definition of each name last, paired with the cell that holds the value. A
-debugger asks this to show what is in scope where it stopped; nothing in the
-evaluator needs it, because evaluation looks names up rather than listing
-them.")
+  (doc local-bindings "returns the bindings made directly in `frame`, oldest
+first, including shadowed ones.")
   (defn local-bindings [store frame]
     (if (valid-frame? store frame)
       (Array.copy
@@ -226,7 +213,7 @@ them.")
         (Array.unsafe-nth (CtEnvStore.frames store) @(FrameId.index frame)))
       (the (Maybe FrameId) (Maybe.Nothing))))
 
-  (doc imports "returns the imported frames visible from `frame`.")
+  (doc imports "returns the frames imported directly into `frame`.")
   (defn imports [store frame]
     (if (valid-frame? store frame)
       (Array.copy
@@ -275,8 +262,8 @@ them.")
   (doc lookup-status "resolves a name while preserving ambiguity.")
   (defn lookup-status [store frame name] (lookup-cell-depth store frame name 0))
 
-  (doc lookup-cell "resolves a name through the current frame, imports, and
-lexical parents.")
+  (doc lookup-cell "looks up `name` from `frame`. Returns `Nothing` if the
+name is missing or ambiguous.")
   (defn lookup-cell [store frame name]
     (match (lookup-status store frame name)
       (CtEnvLookup.Found cell) (Maybe.Just cell)
@@ -288,9 +275,8 @@ lexical parents.")
   (doc cell-at "rebuilds a cell id from a cached index.")
   (defn cell-at [index] (CellId.init index))
 
-  (doc peek-cell "borrows the value in a cell. A caller that only needs to
-LOOK at a binding — to classify it, not to use it — borrows instead of
-copying, which for a compile-time value means not copying a syntax tree.")
+  (doc peek-cell "borrows the value in a cell. Unlike `read-cell`, it does
+not check that the cell exists.")
   (defn peek-cell [store cell]
     (Box.peek
       (CtEnvCell.value
