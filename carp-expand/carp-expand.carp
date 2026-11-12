@@ -61,6 +61,10 @@ compile-time snapshot produced while expanding it.")
 evaluated at compile time: elsewhere at the top level the form is compile-time
 code itself, and expanding both arms of a top-level `if` must not run either.")
 (def *expand-in-definition* false)
+(doc *expand-locals* "the runtime names bound around the form being expanded
+inside a definition: parameters and `let`, `fn` and `match` bindings. A local
+of the same name shadows a `defndynamic` function, as in the reference.")
+(def *expand-locals* (the (Array String) []))
 (def *expand-recovery-errors* (the (Array CtError) []))
 (deftype ObservedExpansion
   [result (Result SurfaceModule CtError)
@@ -390,6 +394,64 @@ code itself, and expanding both arms of a top-level `if` must not run either.")
     (or (= name "defn")
         (or (= name "defn-") (or (= name "def") (= name "def-")))))
 
+  (private pattern-names!)
+  (hidden pattern-names!)
+  (defn pattern-names! [pattern names]
+    (match-ref (SurfaceNode.form pattern)
+      (SurfaceForm.Symbol _)
+      (match (symbol-key pattern)
+        (Maybe.Just name) (unless (= &name "_") (Array.push-back! names name))
+        (Maybe.Nothing) ())
+      (SurfaceForm.List items)
+      ; a constructor pattern binds its arguments, not its head
+      (let [parts (semantic-items items)]
+        (for [i 1 (Array.length &parts)]
+          (pattern-names! (Box.peek (Array.unsafe-nth &parts i)) names)))
+      _
+      ()))
+
+  (private vector-names!)
+  (hidden vector-names!)
+  (defn vector-names! [node step names]
+    (match-ref (SurfaceNode.form node)
+      (SurfaceForm.Array items)
+        (let-do [parts (semantic-items items)
+                 i 0]
+          (while-do (Int.< i (Array.length &parts))
+            (pattern-names! (Box.peek (Array.unsafe-nth &parts i)) names)
+            (set! i (Int.+ i step))))
+      _ ()))
+
+  (private bound-names)
+  (hidden bound-names)
+  (doc bound-names "the runtime names a form binds for its body: the
+parameters of `defn` and `fn`, the names of `let`, the variables of each
+`match` pattern.")
+  (defn bound-names [name items]
+    (let-do [parts (semantic-items items)
+             n (Array.length &parts)
+             names (the (Array String) [])]
+      (cond
+        (and (or (= name "defn") (= name "defn-")) (Int.> n 2))
+          (vector-names! (Box.peek (Array.unsafe-nth &parts 2)) 1 &names)
+        (and (= name "fn") (Int.> n 1))
+          (vector-names! (Box.peek (Array.unsafe-nth &parts 1)) 1 &names)
+        (and (= name "let") (Int.> n 1))
+          (vector-names! (Box.peek (Array.unsafe-nth &parts 1)) 2 &names)
+        (or (= name "match") (= name "match-ref"))
+          (let-do [i 2]
+            (while-do (Int.< i n)
+              (pattern-names! (Box.peek (Array.unsafe-nth &parts i)) &names)
+              (set! i (Int.+ i 2))))
+        ())
+      names))
+
+  (private locally-bound?)
+  (hidden locally-bound?)
+  (defn locally-bound? [name]
+    (and (not (String.contains? name \.))
+         (Array.contains? &*expand-locals* name)))
+
   (private dynamic-function-call?)
   (hidden dynamic-function-call?)
   (doc dynamic-function-call? "whether a call in static code names a
@@ -567,17 +629,42 @@ a macro explicitly returns it.")
                       ;; `defndynamic` function named by its exact path.
                       (if (or (String.starts-with? &name "Dynamic.")
                               (and *expand-in-definition*
-                                   (dynamic-function-call? state scope &name)))
-                        (CtEval.eval-template node
-                                              state
-                                              (ExpandScope.frame scope))
+                                   (and (not (locally-bound? &name))
+                                        (dynamic-function-call? state
+                                                                scope
+                                                                &name))))
+                        ; inside a definition the result is code, and is
+                        ; expanded like a macro's; a top-level submission
+                        ; keeps it as a value
+                        (match (CtEval.eval-template node
+                                                     state
+                                                     (ExpandScope.frame scope))
+                          (Result.Success generated)
+                            (if *expand-in-definition*
+                              (let-do [next (SurfaceNode.copy &generated)
+                                       _ignored-anchor (Surface.reanchor! &next
+                                                                          (SurfaceNode.span node))]
+                                (expand-node &next
+                                             macros
+                                             state
+                                             modules
+                                             preludes
+                                             scope))
+                              (Result.Success generated))
+                          (Result.Error error) (Result.Error error))
                         (let-do [result (the
                                    (Result (Array (Box SurfaceNode)) CtError)
                                    (Result.Success []))
                                  n (Array.length items)
-                                 saved-in-definition *expand-in-definition*]
+                                 saved-in-definition *expand-in-definition*
+                                 saved-locals (Array.length &*expand-locals*)]
                           (when (runtime-definition-head? &name)
                             (set! *expand-in-definition* true))
+                          (when *expand-in-definition*
+                            (let [names (bound-names &name items)]
+                              (for [k 0 (Array.length &names)]
+                                (Array.push-back! &*expand-locals*
+                                                  @(Array.unsafe-nth &names k)))))
                           (for [i 0 n]
                             (match-ref &result
                               (Result.Success children)
@@ -596,6 +683,9 @@ a macro explicitly returns it.")
                               (Result.Error error)
                                 (set! result (Result.Error @error))))
                           (set! *expand-in-definition* saved-in-definition)
+                          (while (Int.> (Array.length &*expand-locals*)
+                                        saved-locals)
+                            (ignore (Array.pop-back! &*expand-locals*)))
                           (match result
                             (Result.Success children)
                               (Result.Success
