@@ -71,6 +71,12 @@ callbacks are available.
 Top-level compile-time function calls are resolved through the same frame
 store, evaluated for effect, and omitted from emitted runtime syntax.
 
+A call to a `defndynamic` function inside a runtime definition (`defn`, `def`)
+is evaluated at compile time and its result spliced in, as the reference does. Its head resolves by
+exact path only, as written or under the current module, never through a
+`use` or the `Dynamic` prelude, so `(reduce ...)` under `(use Array)` stays a
+runtime call.
+
 ## Verification
 
 The regular `Test` suite is checked with:
