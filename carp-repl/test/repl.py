@@ -129,6 +129,18 @@ class Terminal:
                 self.screen.feed(chunk)
                 self.buffer = re.sub(rb"\x1b\[[0-9;]*m", b"", self.buffer)
 
+    def open_writer(self, fifo, timeout=None):
+        deadline = time.monotonic() + (timeout or float(os.environ.get("REPL_TEST_TIMEOUT", "5")))
+        while True:
+            try:
+                return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"no reader opened {fifo}: {self.buffer!r}")
+            self.read_for(.02)
+
     def cursor_at(self, row, column):
         self.wait_screen(lambda: (self.screen.row, self.screen.column) == (row, column), f"cursor at {row},{column}")
 
@@ -790,7 +802,10 @@ class ReplTests(unittest.TestCase):
             terminal.send(b":edit 1\r")
             terminal.until("λ[1]> ".encode())
             terminal.send(b"\x01\x0b(blocked-edit)\r")
-            terminal.read_for(.15)
+            # the worker opens the fifo during expansion, after the checkpoint
+            # that records the pending edit. keep the writer open so the read
+            # blocks until the interrupt.
+            writer = terminal.open_writer(fifo)
             terminal.send(b"\x03")
             terminal.until(b"Use :reinit")
             terminal.until("λ> ".encode())
@@ -803,6 +818,7 @@ class ReplTests(unittest.TestCase):
             terminal.send(b":history\r")
             terminal.until(b"interrupted, stale")
             terminal.until("λ> ".encode())
+            os.close(writer)
             terminal.send(b":reinit\r")
             terminal.next_prompt()
             terminal.result(b"(Int.* retained 2)", b"42")
