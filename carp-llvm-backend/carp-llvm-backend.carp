@@ -1,34 +1,15 @@
-;; carp-llvm-backend — spike backend: lowers a BackendModule to LLVM IR
-;; through the carpentry-org/llvm bindings, leaving verification, JIT
-;; execution, and object emission to the caller.
-;;
-;; Scope (the examples/simple.carp and nominal tiers): concrete functions over
-;; Int, Bool, Long, Double, and Unit; if, let, do, set!, while, and break;
-;; direct global calls; concrete sum types with constructors and by-value
-;; match (nested patterns included); registered intrinsics (declared only —
-;; the JIT resolves them from the process, a linked build from an object).
-;; Every construct beyond that records an emission error naming itself rather
-;; than mis-lowering.
-;;
-;; Bool lowers to i8 to match the C backend's `bool`, so a mixed C/LLVM link
-;; agrees on scalar signatures; conditions compare against zero at branch
-;; sites.
-;;
-;; Sum types mirror the C backend's layout under the module's target data
-;; layout: `{ union-rep, i32 tag }` where union-rep preserves every payload
-;; byte with the union's required alignment, and a nullary
-;; variant is `{ i8 }` like the C backend's `unsigned char unused`. Variant
-;; access goes through memory — opaque-pointer typed GEPs overlay the active
-;; variant struct on the union area — so constructors spill to an alloca and
-;; matches read a pre-allocated entry-block spill slot. Layout parity with the
-;; host C compiler is asserted by the test against offsetof/sizeof probes.
-;;
-;; set!-targeted binders get entry-block alloca slots (found by a pre-scan of
-;; the body), so mem2reg can promote them; every other binder stays SSA.
-;;
-;; The helpers live at top level like the C backend's renderers: mutual
-;; recursion between defns inside a defmodule loses definitions during
-;; emission under the reference compiler, at top level it is reliable.
+; lowers a BackendModule to LLVM IR through the carpentry-org/llvm bindings.
+; verification, JIT execution and object emission are left to the caller.
+;
+; Bool lowers to i8, like the C backend's bool.
+;
+; sum types use the C backend's layout: `{ union, i32 tag }`, where the union
+; keeps every payload byte and its alignment. a type with one constructor has
+; no tag, and a nullary constructor is `{ i8 }`. a type with no constructors is
+; a foreign type and uses the layout the C compiler reports.
+;
+; the helpers are top-level definitions. under the reference compiler, mutual
+; recursion between definitions inside a defmodule loses definitions.
 
 (load "../carp-backend/carp-backend.carp")
 (load "../carp-types/core-instantiation.carp")
@@ -36,176 +17,234 @@
 (load "artifacts.carp")
 (LLVM.setup)
 (load "foreign-layout.carp")
-;; the JIT resolves registered intrinsics (a spike's `int_inc`) from the host
-;; process. macOS exposes an executable's symbols to that lookup as it is; on
-;; Linux only the dynamic symbol table is searched, so export them there too.
+; the JIT finds registered intrinsics in the host process. on linux it only
+; searches the dynamic symbol table, so the executable exports its symbols.
 (when (= (host-os) "linux") (add-cflag "-rdynamic"))
 
-;; emission errors collected across one emit-module run.
+(doc *llvm-backend-errors* "collects the emission errors of one `emit-module`
+run.")
 (def *llvm-backend-errors* (the (Array String) []))
 
-;; the SSA environment: parallel arrays of binder id and bound value,
-;; innermost last. Lookups scan backwards so shadowing resolves to the
-;; nearest binder.
+(doc *llvm-backend-env-ids* "holds the binder ids of the SSA environment,
+innermost last.")
 (def *llvm-backend-env-ids* (the (Array Int) []))
+(doc *llvm-backend-env-values* "holds the values bound to
+`*llvm-backend-env-ids*`.")
 (def *llvm-backend-env-values* (the (Array LLVMValue) []))
 
-;; alloca slots for set!-targeted binders, reset per function.
+(doc *llvm-slot-ids* "holds the binders of the current function that have a
+stack slot.")
 (def *llvm-slot-ids* (the (Array Int) []))
+(doc *llvm-slot-ptrs* "holds the stack slots of `*llvm-slot-ids*`.")
 (def *llvm-slot-ptrs* (the (Array LLVMValue) []))
 
-;; the pre-scan's pending slot requests for the function being defined.
+(doc *llvm-pending-ids* "holds the binders that need a stack slot in the
+function being defined.")
 (def *llvm-pending-ids* (the (Array Int) []))
+(doc *llvm-pending-types* "holds the types of `*llvm-pending-ids*`.")
 (def *llvm-pending-types* (the (Array MonoType) []))
 
-;; break targets, innermost while's exit block last.
+(doc *llvm-break-blocks* "holds the exit blocks of the enclosing loops,
+innermost last.")
 (def *llvm-break-blocks* (the (Array LLVMBasicBlock) []))
 
-;; the module's constructor declarations, cached for tag and layout lookups.
+(doc *llvm-backend-constructors* "holds the constructor declarations of the
+module being emitted.")
 (def *llvm-backend-constructors* (the (Array CoreConstructorDeclaration) []))
 
-;; the C-native symbols (templates, source templates, intrinsics) of the
-;; module being emitted — calls to them may need the pointer-only ABI wrapper.
+(doc *llvm-cnative-symbols* "holds the symbols of the module that are
+implemented in C: templates, source templates and intrinsics.")
 (def *llvm-cnative-symbols* (the (Array String) []))
 
-;; non-function header-backed intrinsics (registered C constants like
-;; CARP_INT_MAX or errno): referenced through a generated shim getter.
+(doc *llvm-value-intrinsics* "holds the registered C values that are not
+functions, such as `errno`. They are read through a getter in the C support.")
 (def *llvm-value-intrinsics* (the (Array String) []))
 
-;; LLVM-defined callables whose signatures move aggregates across the C ABI: they
-;; compile as pointer-only `_carpimpl` definitions (every parameter behind a
-;; pointer, result through an out-pointer) and the shim defines the real
-;; C-ABI symbol as an adapter — C callers (the templates) get clang's
-;; aggregate coercions, LLVM callers use the pointer protocol directly.
+(doc *llvm-cimpl-symbols* "holds the callables defined in LLVM that pass
+aggregates by value. They are defined as `_carpimpl` functions that take every
+argument and the result by pointer. The C support defines the C ABI symbol as an
+adapter.")
 (def *llvm-cimpl-symbols* (the (Array String) []))
 
-;; indirect-call signatures that move aggregates: each gets a C invoke helper
-;; in the shim performing the env-branched call with clang's ABI.
+(doc *llvm-invoke-keys* "holds the ABI keys of indirect calls that pass
+aggregates by value. The C support defines an invoke helper for each.")
 (def *llvm-invoke-keys* (the (Array String) []))
+(doc *llvm-invoke-sigs* "holds the signatures of `*llvm-invoke-keys*`.")
 (def *llvm-invoke-sigs* (the (Array MonoType) []))
 
-;; letrec self-capture fields of the closure construction being emitted.
+(doc *llvm-selffields* "holds the environment fields that capture the closure
+being built.")
 (def *llvm-selffields* (the (Array Int) []))
-;; let binders whose value is being emitted. A slot exists before its store,
-;; so having one does not make a binder bound.
+(doc *llvm-initializing-ids* "holds the let binders whose value is being
+emitted.")
 (def *llvm-initializing-ids* (the (Array Int) []))
 
-;; LLVM-defined callable symbols (functions and constructors): either kind
-;; needs the impl treatment when an aggregate-moving value crosses the C ABI.
+(doc *llvm-callable-symbols* "holds the functions and constructors that the
+module defines in LLVM.")
 (def *llvm-callable-symbols* (the (Array String) []))
 
-; Symbols already published by earlier modules in a persistent JIT. They are
-; declarations in the current cell module, never definitions.
+(doc *llvm-predefined-symbols* "holds the symbols that earlier modules of a JIT
+session published. The current module declares them and does not define them.")
 (def *llvm-predefined-symbols* (the (Array String) []))
 
-;; every symbol the module itself declares or defines, for spotting calls to
-;; preprocessor-provided C functions (register-type accessors ride the
-;; verbatim preamble and have no declarations).
+(doc *llvm-declared-symbols*
+  "holds every symbol the module declares or defines.")
 (def *llvm-declared-symbols* (the (Array String) []))
 
-;; preprocessor-provided C functions found at call sites: symbol + signature,
-;; so aggregate-moving calls get shim wrappers like any C-native callee.
+(doc *llvm-preproc-syms* "holds the C functions that calls use but the module
+does not declare, such as the accessors of registered types.")
 (def *llvm-preproc-syms* (the (Array String) []))
+(doc *llvm-preproc-sigs* "holds the signatures of `*llvm-preproc-syms*`.")
 (def *llvm-preproc-sigs* (the (Array MonoType) []))
 
-;; scope-dependent asm macros (`Unsafe.C.asm`): `#define <sym>() __asm__(...)`
-;; preamble lines whose expansions reference caller locals by name. Calls
-;; route through a generated shim thunk that rebinds those names.
+(doc *llvm-asm-syms* "holds the asm macros (`Unsafe.C.asm`) whose code names
+local variables. Calls to them go through a thunk in the C support.")
 (def *llvm-asm-syms* (the (Array String) []))
+(doc *llvm-asm-outs* "holds the output variable names of each of
+`*llvm-asm-syms*`.")
 (def *llvm-asm-outs* (the (Array (Array String)) []))
+(doc *llvm-asm-ins* "holds the input variable names of each of
+`*llvm-asm-syms*`.")
 (def *llvm-asm-ins* (the (Array (Array String)) []))
+(doc *llvm-asm-out-types* "holds the output types of each of `*llvm-asm-syms*`.")
 (def *llvm-asm-out-types* (the (Array (Array MonoType)) []))
+(doc *llvm-asm-in-types* "holds the input types of each of `*llvm-asm-syms*`.")
 (def *llvm-asm-in-types* (the (Array (Array MonoType)) []))
-;; per-call-site operand resolution, keyed by the GlobalCall's id
+(doc *llvm-asm-call-ids* "holds the ids of the calls to asm macros.")
 (def *llvm-asm-call-ids* (the (Array Int) []))
+(doc *llvm-asm-call-outs* "holds the binders used as outputs by each of
+`*llvm-asm-call-ids*`.")
 (def *llvm-asm-call-outs* (the (Array (Array Int)) []))
+(doc *llvm-asm-call-ins* "holds the binders used as inputs by each of
+`*llvm-asm-call-ids*`.")
 (def *llvm-asm-call-ins* (the (Array (Array Int)) []))
-;; closure constructions standing directly as a Let's value: their captures
-;; MOVE into the environment (the C backend's recursive-construction path
-;; renders `.fi = value` with no copier there)
+(doc *llvm-letbound-closures* "holds the ids of closure constructions that are
+the value of a let.")
 (def *llvm-letbound-closures* (the (Array Int) []))
-;; the prescan's lexical scope (innermost last), for name resolution
+(doc *llvm-asm-scope-names* "holds the names of the variables in scope during
+the pre-scan, innermost last.")
 (def *llvm-asm-scope-names* (the (Array String) []))
+(doc *llvm-asm-scope-ids* "holds the binder ids of `*llvm-asm-scope-names*`.")
 (def *llvm-asm-scope-ids* (the (Array Int) []))
+(doc *llvm-asm-scope-types* "holds the types of `*llvm-asm-scope-names*`.")
 (def *llvm-asm-scope-types* (the (Array MonoType) []))
 
+(doc *llvm-foreign-layouts* "holds the C type layouts of the module being
+emitted.")
 (def *llvm-foreign-layouts* (the (Array ForeignTypeLayout) []))
 
-;; entry-block spill slots for wrapper-call arguments and returns, keyed by
-;; the call expression's id, position (-1 = the return slot) and the slot
-;; type's ABI key. Synthesized calls such as drops share id -1, so a slot
-;; keyed by id and position alone would be reused at a larger type.
+(doc *llvm-argspill-pending-ids* "holds the call ids of the argument slots the
+current function needs. A slot is identified by the call id, the position (-1
+for the result) and the ABI key of its type.")
 (def *llvm-argspill-pending-ids* (the (Array Int) []))
+(doc *llvm-argspill-pending-pos* "holds the positions of
+`*llvm-argspill-pending-ids*`.")
 (def *llvm-argspill-pending-pos* (the (Array Int) []))
+(doc *llvm-argspill-pending-keys* "holds the ABI keys of
+`*llvm-argspill-pending-ids*`.")
 (def *llvm-argspill-pending-keys* (the (Array String) []))
+(doc *llvm-argspill-pending-types* "holds the types of
+`*llvm-argspill-pending-ids*`.")
 (def *llvm-argspill-pending-types* (the (Array MonoType) []))
+(doc *llvm-argspill-ids* "holds the call ids of the argument slots of the
+current function.")
 (def *llvm-argspill-ids* (the (Array Int) []))
+(doc *llvm-argspill-pos* "holds the positions of `*llvm-argspill-ids*`.")
 (def *llvm-argspill-pos* (the (Array Int) []))
+(doc *llvm-argspill-keys* "holds the ABI keys of `*llvm-argspill-ids*`.")
 (def *llvm-argspill-keys* (the (Array String) []))
+(doc *llvm-argspill-ptrs* "holds the slots of `*llvm-argspill-ids*`.")
 (def *llvm-argspill-ptrs* (the (Array LLVMValue) []))
 
-;; the module's closure functions, for construction sites and definitions.
+(doc *llvm-closures* "holds the closure functions of the module being emitted.")
 (def *llvm-closures* (the (Array ClosureFunction) []))
 
-;; type-key -> deleter/copier C symbols from the ownership plan, for managed
-;; captures and environment fields.
+(doc *llvm-delete-symbols* "maps type keys to the C symbols of their delete
+functions.")
 (def *llvm-delete-symbols* (the (Array (Pair String String)) []))
+(doc *llvm-copy-symbols* "maps type keys to the C symbols of their copy
+functions.")
 (def *llvm-copy-symbols* (the (Array (Pair String String)) []))
 
-;; sum-type layout cache (context-bound, reset per emit-module).
+(doc *llvm-sum-names* "holds the names of the sum types lowered in the current
+emission.")
 (def *llvm-sum-names* (the (Array String) []))
+(doc *llvm-sum-types* "holds the LLVM types of `*llvm-sum-names*`.")
 (def *llvm-sum-types* (the (Array LLVMType) []))
 
-;; the C symbols backing IR-side heap operations. The driver swaps these for
-;; the carp_llvm_* shim helpers so CARP_MALLOC/CARP_FREE (and LOG_MEMORY
-;; accounting) stay in the loop; the JIT tests keep libc malloc/free.
+(doc *llvm-malloc-symbol* "is the C function that allocates heap memory.")
 (def *llvm-malloc-symbol* @"malloc")
+(doc *llvm-free-symbol* "is the C function that frees heap memory.")
 (def *llvm-free-symbol* @"free")
 
-;; serial for uniquely naming interned string/pattern literal globals.
+(doc *llvm-strlit-counter* "numbers the globals of string and pattern literals.")
 (def *llvm-strlit-counter* (the (Array Int) [0]))
 
-;; the target data layout sizing sum types, as a zero-or-one-element array
-;; (handles have no default value to give a bare def).
+(doc *llvm-target-data* "holds the target data layout of the current emission,
+if there is one.")
 (def *llvm-target-data* (the (Array LLVMTargetData) []))
 
-; Per-emission DWARF state. The source map itself is owned by BackendModule;
-; these arrays only cache the DI nodes belonging to the module being emitted.
+(doc *llvm-line-map* "is the source map of the module being emitted.")
 (def *llvm-line-map* (BackendLineMap.empty))
+(doc *llvm-di-builders* "holds the debug info builder of the current emission,
+if there is one.")
 (def *llvm-di-builders* (the (Array LLVMDIBuilder) []))
+(doc *llvm-di-file-names* "holds the names of the files that have debug info.")
 (def *llvm-di-file-names* (the (Array String) []))
+(doc *llvm-di-files* "holds the debug info files of `*llvm-di-file-names*`.")
 (def *llvm-di-files* (the (Array LLVMMetadata) []))
+(doc *llvm-di-units* "holds the compile units of `*llvm-di-file-names*`.")
 (def *llvm-di-units* (the (Array LLVMMetadata) []))
+(doc *llvm-di-scopes* "holds the debug scope of the function being emitted, if
+there is one.")
 (def *llvm-di-scopes* (the (Array LLVMMetadata) []))
+(doc *llvm-di-lexical-file-names* "holds the files of the lexical scopes in
+`*llvm-di-lexical-scopes*`.")
 (def *llvm-di-lexical-file-names* (the (Array String) []))
+(doc *llvm-di-lexical-scopes* "holds the lexical debug scopes of the function
+being emitted.")
 (def *llvm-di-lexical-scopes* (the (Array LLVMMetadata) []))
 
-;; entry-block spill slots for by-value match scrutinees, keyed by the match
-;; expression's id and the spilled type's ABI key: the pre-scan requests them,
-;; emit-slots! allocates them. Synthesized expressions share id -1, so the id
-;; alone does not identify a slot.
+(doc *llvm-matchspill-pending-ids* "holds the match ids of the slots for
+by-value match subjects that the current function needs. A slot is identified by
+the match id and the ABI key of its type.")
 (def *llvm-matchspill-pending-ids* (the (Array Int) []))
+(doc *llvm-matchspill-pending-keys* "holds the ABI keys of
+`*llvm-matchspill-pending-ids*`.")
 (def *llvm-matchspill-pending-keys* (the (Array String) []))
+(doc *llvm-matchspill-pending-types* "holds the types of
+`*llvm-matchspill-pending-ids*`.")
 (def *llvm-matchspill-pending-types* (the (Array MonoType) []))
+(doc *llvm-matchspill-ids* "holds the match ids of the match subject slots of
+the current function.")
 (def *llvm-matchspill-ids* (the (Array Int) []))
+(doc *llvm-matchspill-keys* "holds the ABI keys of `*llvm-matchspill-ids*`.")
 (def *llvm-matchspill-keys* (the (Array String) []))
+(doc *llvm-matchspill-ptrs* "holds the slots of `*llvm-matchspill-ids*`.")
 (def *llvm-matchspill-ptrs* (the (Array LLVMValue) []))
 
+(doc llvm-cstr "returns `s` as a C string.")
 (hidden llvm-cstr)
 (defn llvm-cstr [s] (String.cstr s))
 
+(doc llvm-debug-enabled? "checks whether the current emission has debug info.")
 (hidden llvm-debug-enabled?)
 (defn llvm-debug-enabled? [] (BackendLineMap.enabled? &*llvm-line-map*))
 
+(doc llvm-debug-line "returns the source line of expression `id`, or 0.")
 (hidden llvm-debug-line)
 (defn llvm-debug-line [id] (BackendLineMap.line-of &*llvm-line-map* id))
 
+(doc llvm-debug-column "returns the source column of expression `id`.")
 (hidden llvm-debug-column)
 (defn llvm-debug-column [id] (BackendLineMap.column-of &*llvm-line-map* id))
 
+(doc llvm-debug-file-name "returns the source file of expression `id`, or the
+empty string.")
 (hidden llvm-debug-file-name)
 (defn llvm-debug-file-name [id] (BackendLineMap.file-of &*llvm-line-map* id))
 
+(doc llvm-debug-file-index "returns the index of the debug file `name`, or -1.")
 (hidden llvm-debug-file-index)
 (defn llvm-debug-file-index [name]
   (let-do [found -1]
@@ -214,6 +253,8 @@
         (set! found i)))
     found))
 
+(doc llvm-debug-file! "returns the index of the debug file `name`, and creates
+the file and its compile unit if they do not exist.")
 (hidden llvm-debug-file!)
 (defn llvm-debug-file! [name]
   (let-do [known (llvm-debug-file-index name)]
@@ -227,6 +268,8 @@
         (Array.push-back! &*llvm-di-units* unit)
         (Int.dec (Array.length &*llvm-di-file-names*))))))
 
+(doc llvm-debug-location "returns the debug location of expression `id`, if it
+has a source position.")
 (hidden llvm-debug-location)
 (defn llvm-debug-location [ctx id]
   (let-do [line (llvm-debug-line id)
@@ -260,6 +303,8 @@
             (LLVM.debug-location ctx line (llvm-debug-column id) scope))))
       (the (Maybe LLVMMetadata) (Maybe.Nothing)))))
 
+(doc llvm-debug-enter-function! "starts the debug scopes of the function `func`,
+named `symbol`, whose body is `body`.")
 (hidden llvm-debug-enter-function!)
 (defn llvm-debug-enter-function! [-ctx func symbol body]
   (do
@@ -287,6 +332,8 @@
             (LLVM.set-subprogram func scope)
             (set! *llvm-di-scopes* [scope])))))))
 
+(doc llvm-debug-set-builder! "sets the debug location of `builder` to that of
+`expression`, or clears it.")
 (hidden llvm-debug-set-builder!)
 (defn llvm-debug-set-builder! [ctx builder expression]
   (if (llvm-debug-enabled?)
@@ -295,6 +342,8 @@
       (Maybe.Nothing) (LLVM.clear-debug-location builder))
     (LLVM.clear-debug-location builder)))
 
+(doc llvm-debug-attach! "gives the instruction `value` the debug location of
+`expression`.")
 (hidden llvm-debug-attach!)
 (defn llvm-debug-attach! [ctx value expression]
   (when-do (and (llvm-debug-enabled?) (LLVM.instruction? value))
@@ -302,6 +351,8 @@
       (Maybe.Just location) (LLVM.set-instruction-debug-location value location)
       (Maybe.Nothing) ())))
 
+(doc llvm-debug-begin! "starts debug info for `mod` with the source map
+`line-map`.")
 (hidden llvm-debug-begin!)
 (defn llvm-debug-begin! [ctx mod line-map]
   (do
@@ -323,6 +374,7 @@
                               (llvm-cstr &@"Debug Info Version")
                               version)))))
 
+(doc llvm-debug-finish! "finalizes and frees the debug info builder.")
 (hidden llvm-debug-finish!)
 (defn llvm-debug-finish! []
   (when-do (Int.> (Array.length &*llvm-di-builders*) 0)
@@ -331,6 +383,7 @@
       (LLVM.di-builder-dispose dib)
       (set! *llvm-di-builders* []))))
 
+(doc llvm-predefined? "checks whether an earlier module published `symbol`.")
 (hidden llvm-predefined?)
 (defn llvm-predefined? [symbol]
   (let-do [found false]
@@ -339,29 +392,37 @@
         (set! found true)))
     found))
 
+(doc llvm-emit-error! "records the emission error `message`.")
 (hidden llvm-emit-error!)
 (defn llvm-emit-error! [message]
   (Array.push-back! &*llvm-backend-errors* message))
 
+(doc llvm-env-reset! "empties the SSA environment.")
 (hidden llvm-env-reset!)
 (defn llvm-env-reset! []
   (do (set! *llvm-backend-env-ids* []) (set! *llvm-backend-env-values* [])))
 
+(doc llvm-env-push! "binds binder `id` to `value` in the SSA environment.")
 (hidden llvm-env-push!)
 (defn llvm-env-push! [id value]
   (do
     (Array.push-back! &*llvm-backend-env-ids* id)
     (Array.push-back! &*llvm-backend-env-values* value)))
 
+(doc llvm-env-pop! "removes the innermost binding of the SSA environment.")
 (hidden llvm-env-pop!)
 (defn llvm-env-pop! []
   (do
     (ignore (Array.pop-back! &*llvm-backend-env-ids*))
     (ignore (Array.pop-back! &*llvm-backend-env-values*))))
 
+(doc llvm-dummy-value "returns an `i32` zero, used in place of a value after an
+error.")
 (hidden llvm-dummy-value)
 (defn llvm-dummy-value [ctx] (LLVM.const-int (LLVM.int32-type ctx) 0l 0))
 
+(doc llvm-env-lookup "returns the value of binder `id`. An unbound binder is an
+emission error that names `name`.")
 (hidden llvm-env-lookup)
 (defn llvm-env-lookup [ctx id name]
   (let-do [found (llvm-dummy-value ctx)
@@ -376,16 +437,20 @@
     (unless hit (llvm-emit-error! (fmt "unbound local %s in llvm backend" name)))
     found))
 
+(doc llvm-slot-reset! "removes the stack slots of the current function.")
 (hidden llvm-slot-reset!)
 (defn llvm-slot-reset! []
   (do (set! *llvm-slot-ids* []) (set! *llvm-slot-ptrs* [])))
 
+(doc llvm-slot-add! "records `pointer` as the stack slot of binder `id`.")
 (hidden llvm-slot-add!)
 (defn llvm-slot-add! [id pointer]
   (do
     (Array.push-back! &*llvm-slot-ids* id)
     (Array.push-back! &*llvm-slot-ptrs* pointer)))
 
+(doc llvm-slot-index
+  "returns the index of the stack slot of binder `id`, or -1.")
 (hidden llvm-slot-index)
 (defn llvm-slot-index [id]
   (let-do [found -1]
@@ -393,10 +458,13 @@
       (when (Int.= @(Array.unsafe-nth &*llvm-slot-ids* i) id) (set! found i)))
     found))
 
+(doc llvm-slot-ptr "returns the stack slot at `index`.")
 (hidden llvm-slot-ptr)
 (defn llvm-slot-ptr [index]
   (LLVM.dup (Array.unsafe-nth &*llvm-slot-ptrs* index)))
 
+(doc llvm-pending-reset! "clears the slot requests and slots of the current
+function.")
 (hidden llvm-pending-reset!)
 (defn llvm-pending-reset! []
   (do
@@ -421,6 +489,8 @@
     (set! *llvm-argspill-keys* [])
     (set! *llvm-argspill-ptrs* [])))
 
+(doc llvm-pending-add! "requests a stack slot of `type` for binder `id`. Unit
+values get no slot.")
 (hidden llvm-pending-add!)
 (defn llvm-pending-add! [id type]
   (let-do [known false]
@@ -431,6 +501,8 @@
       (Array.push-back! &*llvm-pending-ids* id)
       (Array.push-back! &*llvm-pending-types* type))))
 
+(doc llvm-matchspill-add! "requests a slot of `type` for the subject of match
+`id`.")
 (hidden llvm-matchspill-add!)
 (defn llvm-matchspill-add! [id type]
   (let-do [key (CAbi.type-key &type)
@@ -445,6 +517,8 @@
       (Array.push-back! &*llvm-matchspill-pending-keys* key)
       (Array.push-back! &*llvm-matchspill-pending-types* type))))
 
+(doc llvm-matchspill-index "returns the index of the slot of `type` for the
+subject of match `id`, or -1.")
 (hidden llvm-matchspill-index)
 (defn llvm-matchspill-index [id type]
   (let-do [key (CAbi.type-key type)
@@ -456,10 +530,13 @@
         (set! found i)))
     found))
 
+(doc llvm-matchspill-ptr "returns the match subject slot at `index`.")
 (hidden llvm-matchspill-ptr)
 (defn llvm-matchspill-ptr [index]
   (LLVM.dup (Array.unsafe-nth &*llvm-matchspill-ptrs* index)))
 
+(doc llvm-argspill-add! "requests a slot of `type` for argument `pos` of call
+`id`, or for its result if `pos` is -1. Unit values get no slot.")
 (hidden llvm-argspill-add!)
 (defn llvm-argspill-add! [id pos type]
   (let-do [key (CAbi.type-key &type)
@@ -476,6 +553,8 @@
       (Array.push-back! &*llvm-argspill-pending-keys* key)
       (Array.push-back! &*llvm-argspill-pending-types* type))))
 
+(doc llvm-argspill-index "returns the index of the slot of `type` for argument
+`pos` of call `id`, or -1.")
 (hidden llvm-argspill-index)
 (defn llvm-argspill-index [id pos type]
   (let-do [key (CAbi.type-key type)
@@ -488,13 +567,13 @@
         (set! found i)))
     found))
 
+(doc llvm-argspill-ptr "returns the argument slot at `index`.")
 (hidden llvm-argspill-ptr)
 (defn llvm-argspill-ptr [index]
   (LLVM.dup (Array.unsafe-nth &*llvm-argspill-ptrs* index)))
 
-(doc llvm-intercepted-builtin? "whether a call site is one the emitter
-lowers inline (builtins by id, closure constructions, the array-free
-sentinel) — such a call never becomes a symbol reference.")
+(doc llvm-intercepted-builtin? "checks whether the call of `reference`, named
+`symbol`, is lowered inline. Such a call is not a call to a symbol.")
 (hidden llvm-intercepted-builtin?)
 (defn llvm-intercepted-builtin? [reference symbol]
   (let [id @(CoreRef.id reference)]
@@ -526,8 +605,9 @@ sentinel) — such a call never becomes a symbol reference.")
                                                                                   (Int.= id
                                                                                          70)))))))))))))))))))))))
 
-(doc llvm-collect-call-boundaries!
-  "walks expressions recording native call boundaries and escaping aggregate callables.")
+(doc llvm-collect-call-boundaries! "records, in `expression`, the calls to C
+functions that the module does not declare, and the LLVM callables used as
+values whose signatures pass aggregates.")
 (hidden llvm-collect-call-boundaries!)
 (defn llvm-collect-call-boundaries! [expression]
   (match-ref expression
@@ -608,6 +688,8 @@ sentinel) — such a call never becomes a symbol reference.")
     _
     ()))
 
+(doc llvm-value-intrinsic? "checks whether `symbol` is a registered C value that
+is not a function.")
 (hidden llvm-value-intrinsic?)
 (defn llvm-value-intrinsic? [symbol]
   (let-do [found false]
@@ -616,6 +698,7 @@ sentinel) — such a call never becomes a symbol reference.")
         (set! found true)))
     found))
 
+(doc llvm-cimpl? "checks whether `symbol` is defined as a `_carpimpl` function.")
 (hidden llvm-cimpl?)
 (defn llvm-cimpl? [symbol]
   (let-do [found false]
@@ -624,13 +707,14 @@ sentinel) — such a call never becomes a symbol reference.")
         (set! found true)))
     found))
 
-(doc llvm-protocol-target "the pointer-protocol entry for a symbol: its
-`_carpimpl` when the function lives LLVM-side, else its shim `_carpabi`
-wrapper.")
+(doc llvm-protocol-target "returns the function that takes the arguments of
+`symbol` by pointer: its `_carpimpl` if it is defined in LLVM, and its
+`_carpabi` wrapper otherwise.")
 (hidden llvm-protocol-target)
 (defn llvm-protocol-target [symbol]
   (if (llvm-cimpl? symbol) (fmt "%s_carpimpl" symbol) (fmt "%s_carpabi" symbol)))
 
+(doc llvm-cnative? "checks whether `symbol` is implemented in C.")
 (hidden llvm-cnative?)
 (defn llvm-cnative? [symbol]
   (let-do [found false]
@@ -639,6 +723,7 @@ wrapper.")
         (set! found true)))
     found))
 
+(doc llvm-asm-index "returns the index of the asm macro `symbol`, or -1.")
 (hidden llvm-asm-index)
 (defn llvm-asm-index [symbol]
   (let-do [found -1]
@@ -647,8 +732,8 @@ wrapper.")
         (set! found i)))
     found))
 
-(doc llvm-asm-sections "splits an `__asm__` operand list on top-level `:`,
-outside string literals and parentheses.")
+(doc llvm-asm-sections "splits the asm operand list `text` at each `:` outside
+strings and parentheses.")
 (hidden llvm-asm-sections)
 (defn llvm-asm-sections [text]
   (let-do [sections (the (Array String) [])
@@ -676,8 +761,8 @@ outside string literals and parentheses.")
     (Array.push-back! &sections (String.byte-slice text start n))
     sections))
 
-(doc llvm-asm-operand-names "the parenthesized identifiers of one asm operand
-section, in order (`\"=r\" (dst), \"r\" (src)` yields dst, src).")
+(doc llvm-asm-operand-names "returns the names in parentheses in the asm operand
+section `section`, in order.")
 (hidden llvm-asm-operand-names)
 (defn llvm-asm-operand-names [section]
   (let-do [names (the (Array String) [])
@@ -714,9 +799,8 @@ section, in order (`\"=r\" (dst), \"r\" (src)` yields dst, src).")
         (set! i (Int.inc i))))
     names))
 
-(doc llvm-scan-asm-defines! "records every function-like `#define <sym>()
-__asm__(...)` preamble line: its symbol and its output and input operand
-names, so calls can be routed through a scope-rebinding shim thunk.")
+(doc llvm-scan-asm-defines! "records each asm macro without parameters in
+`includes`, with the names of its output and input operands.")
 (hidden llvm-scan-asm-defines!)
 (defn llvm-scan-asm-defines! [includes]
   (for [i 0 (Array.length includes)]
@@ -752,8 +836,8 @@ names, so calls can be routed through a scope-rebinding shim thunk.")
                                   (the (Array MonoType) []))
                 (Array.push-back! &*llvm-asm-in-types* (the (Array MonoType) []))))))))))
 
-(doc llvm-asm-scope-index "the innermost scope entry binding `name`, -1 when
-unbound.")
+(doc llvm-asm-scope-index "returns the index of the innermost variable named
+`name` in the pre-scan scope, or -1.")
 (hidden llvm-asm-scope-index)
 (defn llvm-asm-scope-index [name]
   (let-do [found -1
@@ -764,9 +848,9 @@ unbound.")
       (set! i (Int.dec i)))
     found))
 
-(doc llvm-asm-record-call! "resolves one asm-macro call site's operand names
-against the prescan scope, forces slots for the operands, and records the
-binder ids (and, once per symbol, the operand types for the shim thunk).")
+(doc llvm-asm-record-call! "records the binders that call `call-id` of asm macro
+`ai` uses as operands, and requests slots for them. An operand that is not in
+scope is an emission error.")
 (hidden llvm-asm-record-call!)
 (defn llvm-asm-record-call! [call-id ai]
   (let-do [out-ids (the (Array Int) [])
@@ -817,8 +901,8 @@ binder ids (and, once per symbol, the operand types for the shim thunk).")
           (Array.aset! &*llvm-asm-out-types* ai out-types)
           (Array.aset! &*llvm-asm-in-types* ai in-types))))))
 
-(doc llvm-lambda-type "the runtime Lambda struct `{ callback, env, delete,
-copy }` — every function value shares it.")
+(doc llvm-lambda-type "returns the LLVM type of a function value: `{ callback,
+env, delete, copy }`.")
 (hidden llvm-lambda-type)
 (defn llvm-lambda-type [ctx]
   (LLVM.struct-type ctx
@@ -828,6 +912,8 @@ copy }` — every function value shares it.")
                       (LLVM.pointer-type (LLVM.int8-type ctx) 0)]
                     false))
 
+(doc llvm-closure-index "returns the index of the closure function `symbol`, or
+-1.")
 (hidden llvm-closure-index)
 (defn llvm-closure-index [symbol]
   (let-do [found -1]
@@ -838,23 +924,23 @@ copy }` — every function value shares it.")
         (set! found i)))
     found))
 
-(doc llvm-named-fn "get-named-function with the name String kept alive
-across the call — `(llvm-cstr &(fmt ...))` hands LLVM a pointer into a
-temporary that can be freed first.")
+(doc llvm-named-fn "returns the function `name` of `mod`, or a null value.")
 (hidden llvm-named-fn)
 (defn llvm-named-fn [mod name] (LLVM.get-named-function mod (String.cstr name)))
 
+(doc llvm-add-fn "adds the function `name` of type `fnty` to `mod`.")
 (hidden llvm-add-fn)
 (defn llvm-add-fn [mod name fnty]
   (LLVM.add-function mod (String.cstr name) fnty))
 
+(doc llvm-add-global-named "adds the global `name` of type `ty` to `mod`.")
 (hidden llvm-add-global-named)
 (defn llvm-add-global-named [mod ty name]
   (LLVM.add-global mod ty (String.cstr name)))
 
-(doc llvm-runtime-global "declares storage published by an earlier JIT module
-on demand. Cached specializations need not repeat their global declarations.
-An unknown symbol remains an error instead of acquiring new storage.")
+(doc llvm-runtime-global "returns the global `name` of `mod`. A global that an
+earlier JIT module published is declared on first use. For an unknown name it
+returns a null value.")
 (hidden llvm-runtime-global)
 (defn llvm-runtime-global [mod name ty]
   (let [found (LLVM.get-named-global mod (String.cstr name))]
@@ -862,11 +948,13 @@ An unknown symbol remains an error instead of acquiring new storage.")
       (llvm-add-global-named mod ty name)
       found)))
 
+(doc llvm-struct-named "creates the named struct type `name`.")
 (hidden llvm-struct-named)
 (defn llvm-struct-named [ctx name]
   (LLVM.struct-create-named ctx (String.cstr name)))
 
-(doc llvm-runtime-fn "the named function, declared with `fnty` on first use.")
+(doc llvm-runtime-fn "returns the function `name` of `mod`, and declares it with
+type `fnty` if it does not exist.")
 (hidden llvm-runtime-fn)
 (defn llvm-runtime-fn [mod name fnty]
   (let [found (LLVM.get-named-function mod (llvm-cstr name))]
@@ -874,13 +962,13 @@ An unknown symbol remains an error instead of acquiring new storage.")
       (LLVM.add-function mod (llvm-cstr name) fnty)
       found)))
 
+(doc llvm-target-data "returns the target data layout of the current emission.")
 (hidden llvm-target-data)
 (defn llvm-target-data [] (LLVM.dup (Array.unsafe-nth &*llvm-target-data* 0)))
 
-(doc llvm-collect-set-targets! "walks a lowered body recording every set!
-target binder (with the assigned type) so its slot can be alloca'd in the
-entry block before emission, and every by-value match scrutinee so its spill
-slot can be alloca'd there too. Unit-typed set! targets get no slot.")
+(doc llvm-collect-set-targets! "requests the slots that `expression` needs: for
+`set!` targets, the operands of `ref` and of asm macros, the arguments of calls
+that pass aggregates by pointer, and by-value match subjects.")
 (hidden llvm-collect-set-targets!)
 (defn llvm-collect-set-targets! [expression]
   (match-ref expression
@@ -1017,9 +1105,8 @@ slot can be alloca'd there too. Unit-typed set! targets get no slot.")
     _
     ()))
 
-(doc llvm-monotype-of-coretype-with "a constructor field's concrete type:
-the declared CoreType with the instance's variable bindings substituted.")
-(hidden llvm-monotype-of-coretype-with)
+(doc llvm-lookup-field-variable "returns the type bound to the type variable
+`vname` in `bindings`. An unbound variable is an emission error.")
 (hidden llvm-lookup-field-variable)
 (defn llvm-lookup-field-variable [bindings vname]
   (let-do [result (the (Maybe MonoType) (Maybe.Nothing))]
@@ -1035,14 +1122,17 @@ the declared CoreType with the instance's variable bindings substituted.")
             (fmt "unbound type variable %s in llvm backend" vname))
           (Result.Success (Type.integer))))))
 
+(doc llvm-monotype-of-coretype-with "returns `type` with the type variables in
+`bindings` replaced.")
+(hidden llvm-monotype-of-coretype-with)
 (defn llvm-monotype-of-coretype-with [bindings type]
   (Result.from-success
     (CoreInstantiation.type-with type bindings &llvm-lookup-field-variable)
     (Type.integer)))
 
-(doc llvm-instance-bindings! "fills `bindings` with the variable bindings
-that specialize a constructor's declared result to the concrete `instance`.
-False when the shapes do not line up.")
+(doc llvm-instance-bindings! "adds to `bindings` the type variables of the
+result of `decl` bound to the types in `instance`. It returns false if they do
+not match.")
 (hidden llvm-instance-bindings!)
 (defn llvm-instance-bindings! [decl instance bindings]
   (match-ref (Box.peek (CoreConstructorDeclaration.result decl))
@@ -1064,12 +1154,16 @@ False when the shapes do not line up.")
         _ false)
     _ false))
 
+(doc llvm-sum-variant-of? "checks whether `decl` is a constructor of the type
+`name`.")
 (hidden llvm-sum-variant-of?)
 (defn llvm-sum-variant-of? [decl name]
   (match-ref (Box.peek (CoreConstructorDeclaration.result decl))
     (CoreType.Named result-name _) (String.= result-name name)
     _ false))
 
+(doc llvm-sum-cache-index "returns the index of the sum type with key `key` in
+the layout cache, or -1.")
 (hidden llvm-sum-cache-index)
 (defn llvm-sum-cache-index [key]
   (let-do [found -1]
@@ -1077,8 +1171,8 @@ False when the shapes do not line up.")
       (when (String.= (Array.unsafe-nth &*llvm-sum-names* i) key) (set! found i)))
     found))
 
-(doc llvm-array-type "the runtime Array struct `{ size_t len, size_t
-capacity, void* data }` — every (Array t) instance shares it.")
+(doc llvm-array-type "returns the LLVM type of an array: `{ len, capacity, data
+}`.")
 (hidden llvm-array-type)
 (defn llvm-array-type [ctx]
   (LLVM.struct-type ctx
@@ -1087,9 +1181,8 @@ capacity, void* data }` — every (Array t) instance shares it.")
                       (LLVM.pointer-type (LLVM.int8-type ctx) 0)]
                     false))
 
-(doc llvm-aggregate-monotype? "whether a type lowers to a struct, which C
-passes by its own ABI coercions — such a value must cross the LLVM/C boundary
-through a pointer-only wrapper.")
+(doc llvm-aggregate-monotype? "checks whether `type` lowers to a struct. C
+passes such values with its own ABI rules.")
 (hidden llvm-aggregate-monotype?)
 (defn llvm-aggregate-monotype? [type]
   (match-ref type
@@ -1115,6 +1208,8 @@ through a pointer-only wrapper.")
         true)
     _ false))
 
+(doc llvm-needs-wrapper? "checks whether `signature` takes or returns an
+aggregate.")
 (hidden llvm-needs-wrapper?)
 (defn llvm-needs-wrapper? [signature]
   (match-ref signature
@@ -1129,6 +1224,7 @@ through a pointer-only wrapper.")
 ;; llvm-lower-type <-> llvm-sum-type-for <-> llvm-build-sum-type <->
 ;; llvm-variant-struct are mutually recursive (a variant field can be another
 ;; sum type).
+(doc llvm-lower-type "returns the LLVM type of `type`.")
 (defn llvm-lower-type [ctx type]
   (match-ref type
     (MonoType.Integer) (LLVM.int32-type ctx)
@@ -1163,12 +1259,16 @@ through a pointer-only wrapper.")
         (llvm-emit-error! @"unsupported type form in llvm backend")
         (LLVM.int32-type ctx))))
 
+(doc llvm-sum-type-for "returns the LLVM type of the sum type `instance`, and
+builds it if it is not cached.")
 (defn llvm-sum-type-for [ctx instance]
   (let [cached (llvm-sum-cache-index &(CAbi.type-key instance))]
     (if (Int.>= cached 0)
       (LLVM.dup (Array.unsafe-nth &*llvm-sum-types* cached))
       (llvm-build-sum-type ctx instance))))
 
+(doc llvm-sum-variant-count "returns the number of constructors of the type
+`name`.")
 (hidden llvm-sum-variant-count)
 (defn llvm-sum-variant-count [name]
   (let-do [count 0]
@@ -1179,10 +1279,15 @@ through a pointer-only wrapper.")
         (set! count (Int.+ count 1))))
     count))
 
+(doc llvm-instance-name "returns the name of the named type `instance`, or the
+empty string.")
 (hidden llvm-instance-name)
 (defn llvm-instance-name [instance]
   (match-ref instance (MonoType.Named name _) (String.copy name) _ @""))
 
+(doc llvm-variant-struct "returns the LLVM struct of the fields of constructor
+`tag` of `instance`. Unit fields take no space, and a constructor without fields
+is `{ i8 }`.")
 (defn llvm-variant-struct [ctx instance tag]
   (let-do [fields (the (Array LLVMType) [])
            found false
@@ -1214,6 +1319,7 @@ through a pointer-only wrapper.")
       (Array.push-back! &fields (LLVM.int8-type ctx)))
     (LLVM.struct-type ctx &fields false)))
 
+(doc llvm-round-up "rounds `value` up to a multiple of `align`.")
 (hidden llvm-round-up)
 (defn llvm-round-up [value align]
   (Long.* (Long./ (Long.+ value (Long.- align 1l)) align) align))
@@ -1222,6 +1328,8 @@ through a pointer-only wrapper.")
 (register llvm-layout-vector (Fn [LLVMType Int] LLVMType) "LLVMVectorType")
 
 (hidden llvm-foreign-body!)
+(doc llvm-byte-storage-type "returns a struct of `size` bytes with alignment
+`align`.")
 (hidden llvm-byte-storage-type)
 (defn llvm-byte-storage-type [ctx size align]
   (let-do [storage (LLVM.struct-type ctx
@@ -1244,6 +1352,8 @@ through a pointer-only wrapper.")
           align)))
     storage))
 
+(doc llvm-foreign-body! "gives `outer` the size and alignment of the C type
+`instance`. A missing layout is an emission error.")
 (defn llvm-foreign-body! [ctx outer instance]
   (let [key (CAbi.type-key instance)
         index (ForeignLayouts.index &*llvm-foreign-layouts*
@@ -1259,10 +1369,10 @@ through a pointer-only wrapper.")
                                                         @(ForeignTypeLayout.alignment layout))]
                               false)))))
 
-(doc llvm-build-sum-type "builds the C-parity layout `{ union-rep, i32 tag }`.
-Union storage preserves every payload byte, including bytes that are padding
-in a different variant. Size and alignment come from all concrete variants.
-Single-variant products retain their field layout and omit the tag.")
+(doc llvm-build-sum-type "builds the LLVM type of the sum type `instance`: `{
+union, i32 tag }`. The union keeps every payload byte, with the size and
+alignment of the largest constructor. A type with one constructor has no tag. A
+type with no constructors gets the layout of its C type.")
 (defn llvm-build-sum-type [ctx instance]
   (let-do [key (CAbi.type-key instance)
            name (llvm-instance-name instance)
@@ -1312,10 +1422,9 @@ Single-variant products retain their field layout and omit the tag.")
                                 false))
         outer))))
 
-(doc llvm-ctor-index-for "the constructor a pattern names: by reference id
-first, else type-directed — an ambiguous bare pattern name (two sumtypes
-sharing a constructor name under `use`) is picked by the scrutinee's concrete
-type and the unqualified name, like the C backend's constructor-for-pattern.")
+(doc llvm-ctor-index-for "returns the index of the constructor that `reference`
+names, for a subject of type `instance`, or -1. A name that is not found by id
+is looked up among the constructors of `instance`.")
 (hidden llvm-ctor-index-for)
 (defn llvm-ctor-index-for [reference instance]
   (let-do [found -1]
@@ -1342,13 +1451,14 @@ type and the unqualified name, like the C backend's constructor-for-pattern.")
         (fmt "unknown constructor %s in llvm backend" (CoreRef.name reference))))
     found))
 
+(doc llvm-ctor-tag-at "returns the tag of the constructor at `index`.")
 (hidden llvm-ctor-tag-at)
 (defn llvm-ctor-tag-at [index]
   @(CoreConstructorDeclaration.tag
     (Array.unsafe-nth &*llvm-backend-constructors* index)))
 
-(doc llvm-ctor-field-monotype "the concrete type of one constructor field
-under the given instance.")
+(doc llvm-ctor-field-monotype "returns the type of field `field` of constructor
+`index` in `instance`.")
 (hidden llvm-ctor-field-monotype)
 (defn llvm-ctor-field-monotype [index instance field]
   (let-do [bindings (the (Array (Pair String MonoType)) [])]
@@ -1367,8 +1477,9 @@ under the given instance.")
         (llvm-emit-error! @"constructor instance mismatch in llvm backend")
         (Type.integer)))))
 
-(doc llvm-ctor-adjusted-index "the struct index of one constructor field
-after unit-member elision: the count of non-unit fields before it.")
+(doc llvm-ctor-adjusted-index "returns the struct index of field `field` of
+constructor `index` in `instance`. Unit fields take no space, so this is the
+number of non-unit fields before it.")
 (hidden llvm-ctor-adjusted-index)
 (defn llvm-ctor-adjusted-index [index instance field]
   (let-do [adjusted 0]
@@ -1377,8 +1488,8 @@ after unit-member elision: the count of non-unit fields before it.")
         (set! adjusted (Int.inc adjusted))))
     adjusted))
 
-(doc llvm-ctor-index-of-tag "the registry index of the constructor with
-`tag` for `instance`, -1 when absent.")
+(doc llvm-ctor-index-of-tag "returns the index of the constructor with tag `tag`
+of `instance`, or -1.")
 (hidden llvm-ctor-index-of-tag)
 (defn llvm-ctor-index-of-tag [instance tag]
   (let-do [found -1
@@ -1390,6 +1501,8 @@ after unit-member elision: the count of non-unit fields before it.")
           (set! found i))))
     found))
 
+(doc llvm-lower-function-type "returns the LLVM function type of `signature`.
+Unit parameters are left out.")
 (hidden llvm-lower-function-type)
 (defn llvm-lower-function-type [ctx signature]
   (match-ref signature
@@ -1412,9 +1525,9 @@ after unit-member elision: the count of non-unit fields before it.")
                             &(the (Array LLVMType) [])
                             false))))
 
-(doc llvm-impl-fn-type "the pointer-only shape of a `_carpimpl` definition:
-every parameter behind a pointer, a non-unit result through a trailing
-out-pointer, returning void.")
+(doc llvm-impl-fn-type "returns the type of a `_carpimpl` function of
+`signature`. Every non-unit argument is a pointer, a non-unit result is written
+through a last pointer, and it returns void.")
 (hidden llvm-impl-fn-type)
 (defn llvm-impl-fn-type [ctx signature]
   (match-ref signature
@@ -1429,32 +1542,36 @@ out-pointer, returning void.")
         (LLVM.function-type (LLVM.void-type ctx) &params false))
     _ (LLVM.function-type (LLVM.void-type ctx) &(the (Array LLVMType) []) false)))
 
+(doc llvm-returns-unit? "checks whether `signature` returns unit.")
 (hidden llvm-returns-unit?)
 (defn llvm-returns-unit? [signature]
   (match-ref signature
     (MonoType.Function _ ret) (unit-type? (Box.peek ret))
     _ false))
 
+(doc llvm-unsupported-name "returns the name of `expression` used in errors.")
 (hidden llvm-unsupported-name)
 (defn llvm-unsupported-name [expression]
   (match-ref expression
     (SpecializedExpr.Lambda _ _ _ _) @"lambda"
     _ @"expression"))
 
+(doc llvm-void-fn-type "returns the LLVM type of a function without parameters
+that returns void.")
 (hidden llvm-void-fn-type)
 (defn llvm-void-fn-type [ctx]
   (LLVM.function-type (LLVM.void-type ctx) &(the (Array LLVMType) []) false))
 
+(doc llvm-declare-abort! "declares the C function `abort` in `mod` if it is not
+declared.")
 (hidden llvm-declare-abort!)
 (defn llvm-declare-abort! [ctx mod]
   (when (LLVM.value-null? (LLVM.get-named-function mod (llvm-cstr &@"abort")))
     (ignore
       (LLVM.add-function mod (llvm-cstr &@"abort") (llvm-void-fn-type ctx)))))
 
-(doc llvm-emit-pattern-test "an i1 saying whether the value behind `ptr`
-matches `pattern`. Loads run unconditionally and are and-ed — reading an
-inactive variant's bytes is defined, and a false outer tag test makes the
-whole conjunction false regardless.")
+(doc llvm-emit-pattern-test "returns an `i1` that says whether the value at
+`ptr`, of type `instance`, matches `pattern`.")
 (hidden llvm-emit-pattern-test)
 (defn llvm-emit-pattern-test [ctx builder pattern ptr instance]
   (match-ref pattern
@@ -1512,11 +1629,10 @@ whole conjunction false regardless.")
                                       (llvm-cstr &@"and")))))
             test)))))
 
-(doc llvm-bind-pattern! "binds the pattern's binders to the matching pieces
-behind `ptr` (slot store for mutated binders, SSA push otherwise) and returns
-how many SSA pushes must be popped after the branch body. A by-value match
-loads the piece; a by-ref match binds the field pointer itself, the C
-backend's `int* f0 = &(...).member_0`.")
+(doc llvm-bind-pattern! "binds the binders of `pattern` to the parts of the
+value at `ptr`, of type `instance`. A binder with a slot is stored in it, others
+are pushed onto the SSA environment. If `by-ref` is true, binders get pointers
+to the parts instead of their values. It returns how many bindings were pushed.")
 (hidden llvm-bind-pattern!)
 (defn llvm-bind-pattern! [ctx builder pattern ptr instance by-ref]
   (match-ref pattern
@@ -1575,17 +1691,21 @@ backend's `int* f0 = &(...).member_0`.")
                                                  by-ref)))))
             pushed)))))
 
-(doc llvm-deref-monotype "the concrete type behind a reference-typed
-expression (or the expression's own type when it is not a reference).")
+(doc llvm-deref-monotype "returns the type that `expression` refers to, or its
+own type if it is not a reference.")
 (hidden llvm-deref-monotype)
 (defn llvm-deref-monotype [expression]
   (match (Specialize.expression-type expression)
     (MonoType.Reference inner _) (MonoType.copy (Box.peek &inner))
     other other))
 
+(doc llvm-invoke-key "returns the name part of the invoke helper for
+`signature`.")
 (hidden llvm-invoke-key)
 (defn llvm-invoke-key [signature] (CAbi.identifier &(CAbi.type-key signature)))
 
+(doc llvm-register-invoke! "records that the C support needs an invoke helper
+for `signature`.")
 (hidden llvm-register-invoke!)
 (defn llvm-register-invoke! [signature]
   (let-do [key (llvm-invoke-key signature)
@@ -1597,12 +1717,15 @@ expression (or the expression's own type when it is not a reference).")
       (Array.push-back! &*llvm-invoke-keys* (String.copy &key))
       (Array.push-back! &*llvm-invoke-sigs* (MonoType.copy signature)))))
 
+(doc llvm-match-scrutinee-ok? "checks whether `scrutinee` has a named type.")
 (hidden llvm-match-scrutinee-ok?)
 (defn llvm-match-scrutinee-ok? [scrutinee]
   (match (Specialize.expression-type scrutinee)
     (MonoType.Named _ _) true
     _ false))
 
+(doc llvm-closure-env-type "returns the LLVM struct of a closure environment
+with `captures`.")
 (hidden llvm-closure-env-type)
 (defn llvm-closure-env-type [ctx captures]
   (let-do [fields (the (Array LLVMType) [])]
@@ -1613,10 +1736,8 @@ expression (or the expression's own type when it is not a reference).")
                                                                              i))))))
     (LLVM.struct-type ctx &fields false)))
 
-(doc llvm-emit-ref-builtin "the `ref` builtin (id 5): the address of its
-operand. A slotted local or a global yields its storage directly (real
-aliasing); any other operand is spilled to this site's entry-block slot.")
-(hidden llvm-emit-ref-builtin)
+(doc llvm-spill-ref "stores the value of `operand` in the slot of call `id` and
+returns the slot.")
 (hidden llvm-spill-ref)
 (defn llvm-spill-ref [ctx builder mod func id operand]
   (let [sp (llvm-matchspill-index id &(Specialize.expression-type operand))]
@@ -1629,6 +1750,10 @@ aliasing); any other operand is spilled to this site's entry-block slot.")
         (ignore (LLVM.build-store builder value ptr))
         ptr))))
 
+(doc llvm-emit-ref-builtin "returns the address of the operand of a `ref` call.
+For a global or a local with a slot it is that storage. Any other operand is
+stored in a slot of call `id` first.")
+(hidden llvm-emit-ref-builtin)
 (defn llvm-emit-ref-builtin [ctx builder mod func id arguments]
   (let [operand (Box.peek (Array.unsafe-nth arguments 0))]
     (match-ref operand
@@ -1663,10 +1788,8 @@ aliasing); any other operand is spilled to this site's entry-block slot.")
           (llvm-spill-ref ctx builder mod func id operand))
       _ (llvm-spill-ref ctx builder mod func id operand))))
 
-(doc llvm-string-literal "a `String*` to static storage holding `text`,
-mirroring the C backend's `({ static String v = \"...\"; &v; })`: a private
-global pointer variable initialized with the interned literal data. The
-returned value is the address of that variable.")
+(doc llvm-string-literal "returns a pointer to a private global that holds a
+pointer to the string `text`, like a `String*` in C.")
 (hidden llvm-string-literal)
 (defn llvm-string-literal [ctx builder mod text]
   (let-do [serial @(Array.unsafe-nth &*llvm-strlit-counter* 0)
@@ -1684,6 +1807,7 @@ returned value is the address of that variable.")
     (LLVM.set-linkage holder LLVM.linkage-private)
     holder))
 
+(doc llvm-env-bound? "checks whether binder `id` has a value or a slot.")
 (hidden llvm-env-bound?)
 (defn llvm-env-bound? [id]
   (let-do [found (Int.>= (llvm-slot-index id) 0)]
@@ -1692,13 +1816,9 @@ returned value is the address of that variable.")
         (set! found true)))
     found))
 
-(doc llvm-capture-self? "whether a capture argument references a local with no
-binding yet — the only legal case is a letrec-style closure capturing the very
-binding under construction, which gets a weak self-reference stored after
-assembly (the C backend's `_carp_self` two-phase init).")
-(hidden llvm-capture-self?)
-;; Lifting wraps each capture in `ref` so the construction reads rather than
-;; moves the captured binder; the environment still stores the value.
+(doc llvm-capture-value "returns the captured value of `argument`, without the
+`ref` that lifting puts around it.")
+(hidden llvm-capture-value)
 (defn llvm-capture-value [argument]
   (match-ref argument
     (SpecializedExpr.GlobalCall _ _ reference _ _ arguments)
@@ -1708,6 +1828,9 @@ assembly (the C backend's `_carp_self` two-phase init).")
         argument)
     _ argument))
 
+(doc llvm-capture-self? "checks whether `argument` captures a local that has no
+value yet. That happens when a closure captures the binding it is assigned to.")
+(hidden llvm-capture-self?)
 (defn llvm-capture-self? [argument]
   (match-ref (llvm-capture-value argument)
     (SpecializedExpr.Reference _ _ reference)
@@ -1717,9 +1840,9 @@ assembly (the C backend's `_carp_self` two-phase init).")
              (not (llvm-env-bound? @(CoreRef.id reference)))))
     _ false))
 
-(doc llvm-emit-closure-construction "a `_carp_closure_N` site: malloc the
-environment, store the captured values, and assemble a Lambda over
-`_carp_lambda_N` and its environment delete/copy functions.")
+(doc llvm-emit-closure-construction "builds the function value of the closure
+`symbol` with the captured values `arguments`. The environment is allocated on
+the heap, and the value carries the environment's delete and copy functions.")
 (defn llvm-emit-closure-construction [ctx builder mod func id symbol arguments]
   (let-do [suffix (String.suffix symbol 14)
            lambda-symbol (String.concat
@@ -1881,15 +2004,8 @@ environment, store the captured values, and assemble a Lambda over
           (set! *llvm-selffields* [])
           value)))))
 
-(doc llvm-emit-indirect-call "a call through a Lambda value: branch on the
-environment pointer, calling the callback env-first when one is present and
-plain otherwise — the C backend's `env ? cb(env, args) : cb(args)`.")
-(doc llvm-emit-invoke-call "an aggregate-moving indirect call: spill the
-arguments, hand callback + environment + pointers to the shim's per-signature
-invoke helper, and read the result back — clang performs the actual call.")
-(doc llvm-callee-temp? "whether an indirect call's callee is a closure
-construction standing directly at the call — an owned temporary the call site
-must dispose after calling (the C backend's dispose-callee).")
+(doc llvm-callee-temp? "checks whether `callee` is a closure built at the call.
+The call must free it.")
 (hidden llvm-callee-temp?)
 (defn llvm-callee-temp? [callee]
   (match-ref callee
@@ -1897,9 +2013,8 @@ must dispose after calling (the C backend's dispose-callee).")
       (String.starts-with? symbol "_carp_closure_")
     _ false))
 
-(doc llvm-dispose-callee! "frees a temporary callee Lambda after its call:
-when its delete member is set, call it on the environment and free the
-environment, like the C backend's `if (_carp_call.delete) { ... }`.")
+(doc llvm-dispose-callee! "frees the environment of the function value `lam`,
+after calling its delete function, if it has one.")
 (hidden llvm-dispose-callee!)
 (defn llvm-dispose-callee! [ctx builder mod func lam]
   (let-do [ptr-ty (LLVM.pointer-type (LLVM.int8-type ctx) 0)
@@ -1929,6 +2044,9 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
     (ignore (LLVM.build-br builder done-block))
     (LLVM.position-at-end builder done-block)))
 
+(doc llvm-emit-invoke-call "calls `callee` with `arguments` through the invoke
+helper of `signature` in the C support. The arguments and the result pass
+through the slots of call `id`.")
 (defn llvm-emit-invoke-call [ctx builder mod func id signature callee arguments]
   (match-ref signature
     (MonoType.Function fargs fret)
@@ -1999,12 +2117,18 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
         (llvm-emit-error! @"invoke call without function type in llvm backend")
         (llvm-dummy-value ctx))))
 
+(doc llvm-emit-indirect-call "calls the function value `callee` with
+`arguments`. A signature that passes aggregates goes through the C support.
+Otherwise the callback gets the environment as first argument if there is one.")
 (defn llvm-emit-indirect-call [ctx builder mod func id callee arguments]
   (let [signature (Specialize.expression-type (Box.peek callee))]
     (if (llvm-needs-wrapper? &signature)
       (llvm-emit-invoke-call ctx builder mod func id &signature callee arguments)
       (llvm-emit-plain-indirect-call ctx builder mod func callee arguments))))
 
+(doc llvm-emit-plain-indirect-call "calls the function value `callee` with
+`arguments`, passing the environment first if there is one. Unit arguments pass
+nothing.")
 (defn llvm-emit-plain-indirect-call [ctx builder mod func callee arguments]
   (match (Specialize.expression-type (Box.peek callee))
     (MonoType.Function fargs fret)
@@ -2013,8 +2137,7 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
                env (LLVM.build-extract-value builder lam 1 (llvm-cstr &@"env"))
                argument-values (the (Array LLVMValue) [])
                n (Array.length arguments)]
-        ;; unit parameters are elided, like the callback's own definition: a
-        ;; unit argument still runs for its effects but passes nothing
+        ; a unit argument runs for its effects but passes nothing
         (for [i 0 n]
           (let [value (llvm-emit-expr ctx
                                       builder
@@ -2100,12 +2223,8 @@ environment, like the C backend's `if (_carp_call.delete) { ... }`.")
         (llvm-emit-error! @"indirect call without function type in llvm backend")
         (llvm-dummy-value ctx))))
 
-(doc llvm-delete-in-place! "calls the plan's deleter for `type` on the value
-stored at `place`, if the type is managed. The deleter is called the way
-`llvm-emit-global-call-dispatch` calls any global: through its pointer-protocol
-entry when it is an LLVM-side function with a C adapter, or C-native and moving
-an aggregate (the entry then takes the place itself); otherwise directly, with
-the value loaded.")
+(doc llvm-delete-in-place! "calls the delete function of `type` on the value at
+`place`, if the type has one.")
 (hidden llvm-delete-in-place!)
 (defn llvm-delete-in-place! [ctx builder mod type place]
   (match (CAbi.symbol-for-type &*llvm-delete-symbols* type)
@@ -2140,6 +2259,8 @@ the value loaded.")
     (Maybe.Nothing) ()))
 
 ;; llvm-emit-expr and the construct emitters below are mutually recursive.
+(doc llvm-emit-expr "emits `expression` into the function `func` and returns its
+value.")
 (defn llvm-emit-expr [ctx builder mod func expression]
   (let-do [_debug (llvm-debug-set-builder! ctx builder expression)
            value (match-ref expression
@@ -2680,10 +2801,9 @@ the value loaded.")
     (llvm-debug-attach! ctx value expression)
     value))
 
-(doc llvm-emit-wrapper-call "calls a C-native function whose signature moves
-aggregates: every argument is spilled to an entry-block slot and passed by
-pointer to the generated `<symbol>_carpabi` shim wrapper, which returns
-through an out-pointer. Pointer-only signatures are ABI-safe on every target.")
+(doc llvm-emit-wrapper-call "calls `symbol`, a function that takes every
+argument and the result by pointer. The arguments and the result pass through
+the slots of call `id`. Unit arguments pass nothing.")
 (defn llvm-emit-wrapper-call [ctx
                               builder
                               mod
@@ -2763,6 +2883,8 @@ through an out-pointer. Pointer-only signatures are ABI-safe on every target.")
         (llvm-emit-error! @"wrapper call without function type in llvm backend")
         (llvm-dummy-value ctx))))
 
+(doc llvm-emit-global-call "calls the global `symbol` with `arguments`. A call
+to an asm macro goes through its thunk.")
 (defn llvm-emit-global-call [ctx
                              builder
                              mod
@@ -2782,9 +2904,8 @@ through an out-pointer. Pointer-only signatures are ABI-safe on every target.")
                                     symbol
                                     arguments)))
 
-(doc llvm-emit-asm-call "calls the shim thunk for a scope-dependent asm macro:
-output operands pass their slot pointers, inputs pass loaded values, per the
-operand resolution the prescan recorded for this call site.")
+(doc llvm-emit-asm-call "calls the thunk of the asm macro `symbol` for call
+`id`. Outputs pass the addresses of their slots and inputs pass their values.")
 (hidden llvm-emit-asm-call)
 (defn llvm-emit-asm-call [ctx builder mod -func id symbol]
   (let-do [ci -1]
@@ -2850,6 +2971,9 @@ operand resolution the prescan recorded for this call site.")
                                (llvm-cstr &@"")))
             (llvm-dummy-value ctx)))))))
 
+(doc llvm-emit-global-call-dispatch "calls the global `symbol` with `arguments`.
+A `_carpimpl` function, or a C function that passes aggregates, is called
+through its pointer wrapper. Other functions are called directly.")
 (hidden llvm-emit-global-call-dispatch)
 (defn llvm-emit-global-call-dispatch [ctx
                                       builder
@@ -2881,6 +3005,9 @@ operand resolution the prescan recorded for this call site.")
                               arguments)
     (llvm-emit-plain-call ctx builder mod func callee-signature symbol arguments)))
 
+(doc llvm-emit-plain-call "calls the function `symbol` directly with
+`arguments`, and declares it with `callee-signature` if it is not declared. Unit
+arguments pass nothing.")
 (defn llvm-emit-plain-call [ctx
                             builder
                             mod
@@ -2918,8 +3045,8 @@ operand resolution the prescan recorded for this call site.")
                          &argument-values
                          (llvm-cstr &@"call"))))))
 
-(doc llvm-emit-array-allocate "the `allocate` builtins (ids 14/15): an Array
-with `n` elements of uninitialized malloc'd storage.")
+(doc llvm-emit-array-allocate "returns an array with as many uninitialized
+elements as the first of `arguments` says, of the element type of `result-type`.")
 (defn llvm-emit-array-allocate [ctx builder mod func result-type arguments]
   (let-do [n32 (llvm-emit-expr ctx
                                builder
@@ -2966,8 +3093,8 @@ with `n` elements of uninitialized malloc'd storage.")
           (LLVM.build-insert-value builder value n64 1 (llvm-cstr &@"acap")))
     (LLVM.build-insert-value builder value data 2 (llvm-cstr &@"abuilt"))))
 
-(doc llvm-emit-array-aset "the `aset-uninitialized!` builtins (ids 16/17):
-store `value` at index `idx` of the array behind the reference.")
+(doc llvm-emit-array-aset "stores a value at an index of the array behind a
+reference. It lowers `aset-uninitialized!` and `StaticArray.aset!`.")
 (defn llvm-emit-array-aset [ctx builder mod func arguments]
   (let-do [aref (llvm-emit-expr ctx
                                 builder
@@ -3007,9 +3134,8 @@ store `value` at index `idx` of the array behind the reference.")
                                           (llvm-cstr &@"aslot")))))
     (llvm-dummy-value ctx)))
 
-(doc llvm-emit-array-lit "an Array value: malloc the backing data, store the
-elements through a typed GEP, and build `{ len, capacity, data }`, mirroring
-the C backend's designated-initializer rendering.")
+(doc llvm-emit-array-lit
+  "returns a new array of `elements`, stored on the heap.")
 (defn llvm-emit-array-lit [ctx builder mod func type elements]
   (let-do [n (Array.length elements)
            element-monotype (match-ref (Box.peek type)
@@ -3080,10 +3206,9 @@ the C backend's designated-initializer rendering.")
                                      (llvm-cstr &@"acap")))
       (LLVM.build-insert-value builder value data 2 (llvm-cstr &@"abuilt")))))
 
-(doc llvm-emit-static-array-lit "a `$[...]` literal: static storage — a
-private global element array and a private global Array struct pointing at
-it — with the header fields and elements stored on each evaluation, yielding
-the pointer to the static Array (the C backend's `static Array` block).")
+(doc llvm-emit-static-array-lit "returns a static array of `elements`, stored in
+private globals. The elements are stored again each time it runs. If `type` is a
+reference, it returns a pointer to the array, otherwise the array value.")
 (defn llvm-emit-static-array-lit [ctx builder mod func type elements]
   ;; RefLift binds a function's literal by value (a `(StaticArray a)`) and
   ;; borrows the binding; a global's initializer keeps the borrowed form. The
@@ -3171,6 +3296,7 @@ the pointer to the static Array (the C backend's `static Array` block).")
                        (llvm-cstr &@"saval"))
       arr-global)))
 
+(doc llvm-emit-do "emits each of `elements` and returns the value of the last.")
 (defn llvm-emit-do [ctx builder mod func elements]
   (let-do [result (llvm-dummy-value ctx)
            n (Array.length elements)]
@@ -3183,6 +3309,7 @@ the pointer to the static Array (the C backend's `static Array` block).")
                             (Box.peek (Array.unsafe-nth elements i)))))
     result))
 
+(doc llvm-emit-if "emits an `if` with the result type `type`.")
 (defn llvm-emit-if [ctx builder mod func type condition then else]
   (let-do [condition-value (llvm-emit-expr ctx
                                            builder
@@ -3215,6 +3342,8 @@ the pointer to the static Array (the C backend's `static Array` block).")
             (LLVM.add-incoming phi &[then-value else-value] &[then-end else-end])
             phi))))))
 
+(doc llvm-emit-let "binds `binder` to `value` while emitting `body`, and returns
+the value of `body`.")
 (defn llvm-emit-let [ctx builder mod func binder value body]
   (let-do [_initializing (Array.push-back! &*llvm-initializing-ids*
                                            @(CoreRef.id binder))
@@ -3229,6 +3358,7 @@ the pointer to the static Array (the C backend's `static Array` block).")
       (when pushed (llvm-env-pop!))
       result)))
 
+(doc llvm-emit-while "emits a `while` loop. `break` leaves it.")
 (defn llvm-emit-while [ctx builder mod func condition body]
   (let-do [cond-block (LLVM.append-block ctx func (llvm-cstr &@"whilecond"))
            body-block (LLVM.append-block ctx func (llvm-cstr &@"whilebody"))
@@ -3257,6 +3387,9 @@ the pointer to the static Array (the C backend's `static Array` block).")
       (LLVM.position-at-end builder exit-block)
       (llvm-dummy-value ctx))))
 
+(doc llvm-emit-match "emits a match on `scrutinee` with `branches`. If
+`by-reference` is true, `scrutinee` is a reference and binders get pointers to
+the matched parts.")
 (defn llvm-emit-match [ctx
                        builder
                        mod
@@ -3318,9 +3451,9 @@ the pointer to the static Array (the C backend's `static Array` block).")
                             false
                             branches))))
 
-(doc llvm-emit-match-over "the shared match lowering over an addressable
-scrutinee: chained pattern tests, branch bodies joined by a phi, and the C
-backend's abort() when nothing matched.")
+(doc llvm-emit-match-over "emits the branches of a match on the value at `ptr`,
+of type `instance`. It calls `abort` if no branch matches. If `by-ref` is true,
+binders get pointers to the matched parts.")
 (defn llvm-emit-match-over [ctx
                             builder
                             mod
@@ -3377,6 +3510,8 @@ backend's abort() when nothing matched.")
         (LLVM.add-incoming phi &incoming-values &incoming-blocks)
         phi))))
 
+(doc llvm-declare-callable! "declares the function or constructor `symbol` in
+`mod`. One that passes aggregates is declared as its `_carpimpl` function.")
 (hidden llvm-declare-callable!)
 (defn llvm-declare-callable! [ctx mod symbol signature]
   (if (llvm-cimpl? symbol)
@@ -3391,6 +3526,7 @@ backend's abort() when nothing matched.")
                          (llvm-cstr symbol)
                          (llvm-lower-function-type ctx signature)))))
 
+(doc llvm-declare-one! "declares `declaration` in `mod`.")
 (hidden llvm-declare-one!)
 (defn llvm-declare-one! [ctx mod declaration]
   (match-ref declaration
@@ -3443,6 +3579,8 @@ backend's abort() when nothing matched.")
             "unsupported non-function source template %s in llvm backend"
             symbol)))))
 
+(doc llvm-emit-slots! "allocates the requested slots at the start of the current
+function.")
 (hidden llvm-emit-slots!)
 (defn llvm-emit-slots! [ctx builder]
   (do
@@ -3481,9 +3619,9 @@ backend's abort() when nothing matched.")
                                                                                 i))
                                              (llvm-cstr &@"abislot")))))))
 
-(doc llvm-define-impl-function! "defines a `_carpimpl` body: arguments load
-from the pointer parameters, and a non-unit result stores through the
-trailing out-pointer.")
+(doc llvm-define-impl-function! "defines the `_carpimpl` function of `symbol`.
+It reads its arguments through pointers and writes a non-unit result through the
+last pointer.")
 (hidden llvm-define-impl-function!)
 (defn llvm-define-impl-function! [ctx
                                   builder
@@ -3538,6 +3676,8 @@ trailing out-pointer.")
       (llvm-emit-error!
         (fmt "impl function %s without function type in llvm backend" symbol))))
 
+(doc llvm-define-function! "defines the function `symbol`, as its `_carpimpl`
+function if it passes aggregates.")
 (hidden llvm-define-function!)
 (defn llvm-define-function! [ctx builder mod symbol signature parameters body]
   (do
@@ -3561,6 +3701,8 @@ trailing out-pointer.")
                                    parameters
                                    body))))
 
+(doc llvm-define-plain-function! "defines the function `symbol`, which takes its
+arguments by value.")
 (hidden llvm-define-plain-function!)
 (defn llvm-define-plain-function! [ctx
                                    builder
@@ -3620,10 +3762,9 @@ trailing out-pointer.")
         (ignore (LLVM.build-ret-void builder))
         (ignore (LLVM.build-ret builder result))))))
 
-(doc llvm-define-constructor! "defines a constructor: zero an alloca of the
-sum type, store the tag, overlay the variant struct on the union area via a
-typed GEP to store the fields, and return the loaded whole value, through
-the out-pointer when the constructor crosses the C ABI.")
+(doc llvm-define-constructor! "defines the constructor `symbol`. It returns a
+value of the sum type with the constructor's tag and fields, through a pointer
+if it passes aggregates.")
 (hidden llvm-define-constructor!)
 (defn llvm-define-constructor! [ctx builder mod symbol signature decl]
   (let-do [impl (llvm-cimpl? symbol)
@@ -3696,6 +3837,9 @@ the out-pointer when the constructor crosses the C ABI.")
         (llvm-emit-error!
           (fmt "constructor %s without function type in llvm backend" symbol)))))
 
+(doc llvm-declare-closure! "declares the function of `closure` and its
+environment delete and copy functions. A closure that passes aggregates is
+declared as its `_carpimpl` function. Unit parameters are left out.")
 (hidden llvm-declare-closure!)
 (defn llvm-declare-closure! [ctx mod closure]
   (match-ref (Box.peek (ClosureFunction.signature closure))
@@ -3751,9 +3895,8 @@ the out-pointer when the constructor crosses the C ABI.")
                        (LLVM.function-type ptr-ty &[ptr-ty] false))))
     _ (llvm-emit-error! @"closure without function type in llvm backend")))
 
-(doc llvm-define-closure! "defines a lifted closure function: the leading
-parameter is the environment pointer, captures load from it (into slots when
-set!), and the declared parameters follow shifted by one.")
+(doc llvm-define-closure! "defines the function of `closure`. Its first
+parameter is the environment, from which the captured values are read.")
 (hidden llvm-define-closure!)
 (defn llvm-define-closure! [ctx builder mod closure]
   (let-do [symbol (ClosureFunction.symbol closure)
@@ -3768,9 +3911,9 @@ set!), and the declared parameters follow shifted by one.")
              (llvm-define-plain-closure! ctx builder mod closure))]
     value))
 
-(doc llvm-define-impl-closure! "defines an aggregate-moving closure impl-style:
-environment pointer first, arguments behind pointers, a non-unit result
-through the trailing out-pointer.")
+(doc llvm-define-impl-closure! "defines the `_carpimpl` function of `closure`.
+It takes the environment, then every non-unit argument by pointer, and writes a
+non-unit result through the last pointer.")
 (hidden llvm-define-impl-closure!)
 (defn llvm-define-impl-closure! [ctx builder mod closure]
   (match-ref (Box.peek (ClosureFunction.signature closure))
@@ -3831,6 +3974,8 @@ through the trailing out-pointer.")
                 (ignore (LLVM.build-ret-void builder)))))))
     _ ()))
 
+(doc llvm-define-plain-closure! "defines the function of `closure`, which takes
+the environment and then its arguments by value.")
 (hidden llvm-define-plain-closure!)
 (defn llvm-define-plain-closure! [ctx builder mod closure]
   (match-ref (Box.peek (ClosureFunction.signature closure))
@@ -3886,11 +4031,8 @@ through the trailing out-pointer.")
             (ignore (LLVM.build-ret builder result)))))
     _ ()))
 
-(doc llvm-define-closure-env-fns! "defines the environment delete and copy
-functions the constructed Lambda carries: delete runs each managed field's
-deleter, copy is a malloc plus field-wise moves with managed fields deep
-copied through their copiers.")
-(hidden llvm-define-closure-env-fns!)
+(doc llvm-copy-field! "copies the value of `type` at `source` to `destination`,
+through the copy function of `type` if it has one.")
 (hidden llvm-copy-field!)
 (defn llvm-copy-field! [ctx builder mod type source destination]
   (match (CAbi.symbol-for-type &*llvm-copy-symbols* type)
@@ -3936,6 +4078,10 @@ copied through their copiers.")
                                            (llvm-cstr &@"fieldvalue"))
                           (LLVM.dup destination)))))
 
+(doc llvm-define-closure-env-fns! "defines the environment delete and copy
+functions of `closure`. Delete frees each captured value that needs it. Copy
+allocates a new environment and copies each captured value.")
+(hidden llvm-define-closure-env-fns!)
 (defn llvm-define-closure-env-fns! [ctx builder mod closure]
   (let-do [symbol (ClosureFunction.symbol closure)
            captures (ClosureFunction.captures closure)
@@ -4051,13 +4197,14 @@ copied through their copiers.")
               (llvm-copy-field! ctx builder mod capture-type &srcp &dstp))))
         (ignore (LLVM.build-ret builder dst))))))
 
+(doc llvm-integer-root? "checks whether `expression` has type `Int`.")
 (hidden llvm-integer-root?)
 (defn llvm-integer-root? [expression]
   (match (Specialize.expression-type expression) (MonoType.Integer) true _ false))
 
-(doc llvm-define-global-inits! "defines the synthesized function that runs
-every global's initializer expression and stores the results, in declaration
-order — the LLVM backend's carp_init_globals.")
+(doc llvm-define-global-inits! "defines the function `symbol`, which runs the
+initializers of the globals in `declarations` in order. Each global not
+published earlier gets an initializer function of its own.")
 (hidden llvm-define-global-inits!)
 (defn llvm-define-global-inits! [ctx builder mod declarations symbol]
   (let-do [fnty (llvm-void-fn-type ctx)
@@ -4120,6 +4267,8 @@ order — the LLVM backend's carp_init_globals.")
                            (llvm-cstr &@""))))
       (ignore (LLVM.build-ret-void builder)))))
 
+(doc llvm-define-roots! "defines the function `symbol`. It calls `init-symbol`,
+runs `roots` and returns the value of the last root of type `Int`, or 0.")
 (hidden llvm-define-roots!)
 (defn llvm-define-roots! [ctx builder mod roots symbol init-symbol]
   (let-do [fnty (LLVM.function-type (LLVM.int32-type ctx)
@@ -4161,10 +4310,9 @@ order — the LLVM backend's carp_init_globals.")
             (when (llvm-integer-root? (Box.peek root)) (set! result value)))))
       (ignore (LLVM.build-ret builder result)))))
 
-(doc llvm-append-wrapper! "appends the pointer-only C wrapper for one
-C-native symbol whose signature moves aggregates: every parameter arrives by
-pointer and a non-void result leaves through `carp_out`, so the C compiler
-performs all aggregate ABI coercions on its side of the boundary.")
+(doc llvm-append-wrapper! "appends to `buffer` the C wrapper `<symbol>_carpabi`
+of the C function `symbol`. The wrapper takes every argument by pointer and
+writes a non-void result through `carp_out`.")
 (hidden llvm-append-wrapper!)
 (defn llvm-append-wrapper! [buffer entities symbol signature]
   (let-do [fragment (StringBuf.create)]
@@ -4202,10 +4350,9 @@ void %s_carpabi(%s) { *carp_out = %s(%s); }
                         &[(String.copy symbol)]
                         &(StringBuf.into-string fragment))))
 
-(doc llvm-append-asm-thunk! "appends the scope-rebinding thunk for one asm
-macro: locals named like the macro's operands are bound from the thunk's
-parameters (outputs by pointer, inputs by value), the macro expands against
-them, and outputs write back.")
+(doc llvm-append-asm-thunk! "appends to `buffer` the thunk of asm macro `ai`.
+The thunk binds the macro's operand names to its parameters, outputs by pointer
+and inputs by value, and runs the macro.")
 (hidden llvm-append-asm-thunk!)
 (defn llvm-append-asm-thunk! [buffer entities ai]
   (let-do [fragment (StringBuf.create)]
@@ -4272,9 +4419,8 @@ void carp_asmthunk_%s(%s) {
                         &(the (Array String) [])
                         &(StringBuf.into-string fragment))))
 
-(doc llvm-append-impl-adapter! "appends the C-ABI adapter for one `_carpimpl`
-callable: the real symbol, defined in C, forwards by pointer so templates
-and indirect calls get clang's aggregate coercions.")
+(doc llvm-append-impl-adapter! "appends to `buffer` the C function `symbol`,
+which calls the `_carpimpl` function of `symbol` with its arguments by pointer.")
 (hidden llvm-append-impl-adapter!)
 (defn llvm-append-impl-adapter! [buffer entities symbol signature]
   (let-do [fragment (StringBuf.create)]
@@ -4318,10 +4464,9 @@ void %s_carpimpl(%s);
                         &[(fmt "%s_carpimpl" symbol)]
                         &(StringBuf.into-string fragment))))
 
-(doc llvm-append-closure-adapter! "appends the C-ABI callback adapter for an
-aggregate-moving closure: the plain symbol, called by C template code and
-invoke helpers, forwards environment plus pointered arguments to the
-LLVM-side `_carpimpl`.")
+(doc llvm-append-closure-adapter! "appends to `buffer` the C function of the
+closure `symbol`, which calls its `_carpimpl` function with the environment and
+its arguments by pointer.")
 (hidden llvm-append-closure-adapter!)
 (defn llvm-append-closure-adapter! [buffer entities symbol signature]
   (let-do [fragment (StringBuf.create)]
@@ -4365,10 +4510,9 @@ void %s_carpimpl(%s);
                         &[(fmt "%s_carpimpl" symbol)]
                         &(StringBuf.into-string fragment))))
 
-(doc llvm-append-invoke-helper! "appends the C invoke helper for one
-aggregate-moving indirect-call signature: it performs the env-branched
-callback call with clang's ABI, reading arguments and writing the result
-through pointers.")
+(doc llvm-append-invoke-helper! "appends to `buffer` the C invoke helper of
+`signature`. It calls a callback, with the environment if there is one, and
+passes the arguments and the result through pointers.")
 (hidden llvm-append-invoke-helper!)
 (defn llvm-append-invoke-helper! [buffer entities key signature]
   (let-do [fragment (StringBuf.create)]
@@ -4414,20 +4558,22 @@ void carp_invoke_%s(%s) { if (env) { *carp_out = ((%s(*)(%s))cb)(%s); } else { *
                         &(the (Array String) [])
                         &(StringBuf.into-string fragment))))
 
+(doc LLVMBackend "lowers a backend module to LLVM IR and renders the C
+support it needs. Constructs it cannot lower are reported as emission
+errors.")
 (defmodule LLVMBackend
-  (doc roots-symbol "the name of the synthesized function holding the module's
-top-level expressions. It runs the global initializers first (see
-`init-symbol`) and returns the value of the last Int-typed top-level
-expression, or 0.")
+  (doc roots-symbol "returns the name of the roots function. It runs the global
+initializers and the top-level forms, and returns the value of the last
+top-level form of type `Int`, or 0.")
   (defn roots-symbol [] @"carp_llvm_roots")
 
-  (doc init-symbol "the name of the synthesized function that runs the global
-initializers — the LLVM backend's carp_init_globals. The roots function calls
-it first; a client JIT-calling individual functions must call it once itself.")
+  (doc init-symbol "returns the name of the function that runs the global
+initializers. The roots function calls it. A host that calls other functions
+directly must call it once first.")
   (defn init-symbol [] @"carp_llvm_init_globals")
 
-  (doc sum-layout "the `(size, tag-offset)` in bytes of a sum type's lowered
-layout under `td`, for parity checks against the C backend's struct.")
+  (doc sum-layout "returns the size and the tag offset, in bytes, of the sum
+type `name` of `backend`, under `td`.")
   (defn sum-layout [ctx td backend name]
     (do
       (set! *llvm-backend-constructors*
@@ -4442,13 +4588,6 @@ layout under `td`, for parity checks against the C backend's struct.")
           (Long.to-int (LLVM.abi-size-of-type td ty))
           (Long.to-int (LLVM.offset-of-element td ty 1))))))
 
-  (doc shim-translation-unit-with-known
-    "renders native templates and primitive definitions, with the required type
-and function declarations, into a C translation unit with no entry point.
-The host compiles and loads this beside LLVM code. Adapters apply the C ABI
-to aggregate calls; materialized supplies template symbols from earlier cells.")
-  (doc shim-emission-with-known
-    "renders the exact C support unit and its emitted template and ABI helper fragments.")
   (private shim-emission-with)
   (hidden shim-emission-with)
   (defn shim-emission-with [backend materialized runtime-imports]
@@ -4706,23 +4845,28 @@ void %s_carpvalue(%s* carp_out) { *carp_out = %s; }
               (CTranslationUnit.init (StringBuf.into-string buffer) entities)))
         (Result.Error error) (Result.Error error))))
 
+  (doc shim-emission-with-known "returns the C support of `backend`, without the
+templates in `materialized`.")
   (defn shim-emission-with-known [backend materialized]
     (shim-emission-with backend materialized false))
 
-  (doc session-support-emission
-    "renders generation-owned C support with explicit
-compiler annotations for runtime imports. Ordinary AOT output remains separate.")
+  (doc session-support-emission "returns the C support of `backend` for a JIT
+session, without the templates in `materialized`. Definitions that the host
+provides are marked as imports.")
   (defn session-support-emission [backend materialized]
     (shim-emission-with backend materialized true))
 
+  (doc shim-translation-unit-with-known "returns the C source of the support of
+`backend`, without the templates in `materialized`.")
   (defn shim-translation-unit-with-known [backend materialized]
     (match (shim-emission-with-known backend materialized)
       (Result.Success emission)
         (Result.Success @(CTranslationUnit.source &emission))
       (Result.Error error) (Result.Error error)))
 
-  (doc defined-symbols "returns every symbol this backend module publishes:
-functions, constructors, globals, closures, and closure environment helpers.")
+  (doc defined-symbols "returns the functions, constructors, globals and
+closures that `backend` defines, with their `_carpimpl` functions and
+environment helpers. The initializer and roots functions are not included.")
   (defn defined-symbols [backend]
     (let-do [symbols (the (Array String) [])
              declarations (BackendModule.declarations backend)]
@@ -4749,20 +4893,14 @@ functions, constructors, globals, closures, and closure environment helpers.")
             (Array.push-back! &symbols (fmt "%s_env_copy" symbol)))))
       symbols))
 
-  (doc use-carp-allocator! "routes IR-side heap operations through the shim's
-carp_llvm_malloc/free helpers (CARP_MALLOC/CARP_FREE, honoring LOG_MEMORY).
-Call once before emitting; builds that link no shim must not use it.")
+  (doc use-carp-allocator! "makes emitted code allocate and free heap memory
+through `carp_llvm_malloc` and `carp_llvm_free` from the C support. Call it
+before emitting, and only when the C support is linked.")
   (defn use-carp-allocator! []
     (do
       (set! *llvm-malloc-symbol* @"carp_llvm_malloc")
       (set! *llvm-free-symbol* @"carp_llvm_free")))
 
-  (doc emit-module "lowers `backend` into the LLVM module `mod`: declares every
-function, constructor, and intrinsic, defines the function and constructor
-bodies, and collects the top-level expressions into one function named by
-`roots-symbol`. Returns () or the collected emission errors. The scope is the
-simple and nominal example tiers; constructs beyond it are reported, never
-mis-lowered.")
   (private emit-module-with)
   (hidden emit-module-with)
   (defn emit-module-with [ctx
@@ -4974,10 +5112,10 @@ mis-lowered.")
           (llvm-debug-finish!)
           result))))
 
-  (doc emit-module-incremental "emits one module for a persistent JIT. Symbols
-already present in `predefined` remain external declarations, their globals
-retain storage and values, and the cell receives unique initializer and roots
-symbols.")
+  (doc emit-module-incremental "emits `backend` into `mod` as one cell of a JIT
+session. Symbols in `predefined` are declared, not defined, and keep their
+storage. `roots-name` and `init-name` name the cell's roots and initializer
+functions.")
   (defn emit-module-incremental [ctx
                                  builder
                                  mod
@@ -4997,8 +5135,8 @@ symbols.")
                       roots-name
                       init-name))
 
-  (doc emit-module-incremental-with-layouts
-    "emits a JIT cell using queried target C layouts.")
+  (doc emit-module-incremental-with-layouts "emits a cell as
+`emit-module-incremental` does, with the C type layouts `layouts`.")
   (defn emit-module-incremental-with-layouts [ctx
                                               builder
                                               mod
@@ -5019,6 +5157,8 @@ symbols.")
                       roots-name
                       init-name))
 
+  (doc emit-module "emits `backend` into the LLVM module `mod`, with the roots
+function `roots-symbol`. It returns the emission errors, if there are any.")
   (defn emit-module [ctx builder mod td backend]
     (emit-module-with ctx
                       builder
@@ -5031,7 +5171,8 @@ symbols.")
                       &(roots-symbol)
                       &(init-symbol)))
 
-  (doc emit-module-with-layouts "emits a module using queried target C layouts.")
+  (doc emit-module-with-layouts "emits a module as `emit-module` does, with the
+C type layouts `layouts`.")
   (defn emit-module-with-layouts [ctx builder mod td backend layouts]
     (emit-module-with ctx
                       builder
@@ -5045,7 +5186,6 @@ symbols.")
                       &(init-symbol))))
 
 (defmodule LLVMBackend
-  (doc shim-translation-unit
-    "Renders a standalone native shim with no earlier templates.")
+  (doc shim-translation-unit "returns the C source of the support of `backend`.")
   (defn shim-translation-unit [backend]
     (shim-translation-unit-with-known backend &(the (Array String) []))))

@@ -1,7 +1,12 @@
 (load "../carp-ct-eval/carp-ct-eval.carp")
 
-(doc ExpandMacro "is a source-order macro binding. The body stays as syntax
-until a call invokes `CtEval.eval-template` with call-site bindings.")
+(doc ExpandMacro "is a macro definition. `name` is its name and `parameters` its
+parameters. `body` is the body as written. `code` is the compiled body, which a
+call runs. `defining-frame` is the frame it was defined in, and `file` the file
+it was written in.")
+(doc MacroParameters "is the parameter list of a macro. `fixed` holds the names
+of the fixed parameters. `rest` is the name of the rest parameter, if there is
+one.")
 (deftype MacroParameters [fixed (Array String)
                           rest (Maybe String)])
 (deftype ExpandMacro
@@ -12,29 +17,31 @@ until a call invokes `CtEval.eval-template` with call-site bindings.")
    defining-frame FrameId
    file String])
 
-(doc ExpandScope "is the source-order compile-time scope active while one
-module body is expanded. `path` is a dotted module name, or the empty string
-at the root.")
+(doc ExpandScope "is the scope one module body is expanded in. `path` is the
+dotted module name, or the empty string at the root. `frame` is the module's
+frame. `imports` holds the frames of the modules it uses.")
 (deftype ExpandScope [path String
                       frame FrameId
                       imports (Array FrameId)])
 
+(doc ExpandDynamic "is a dynamic definition: `name` bound to `value`.")
 (deftype ExpandDynamic [name String
                         value (Box CtValue)])
 
+(doc ExpandModuleFrame "is the compile-time frame `frame` of the module `path`.")
 (deftype ExpandModuleFrame [path String
                             frame FrameId])
 
-(doc ExpandConfig "declares compiler-driver policy that is not inherent to
-macro expansion. Prelude modules are visible after explicit imports and before
-the root module.")
+(doc ExpandConfig "is driver configuration for expansion. `preludes` holds the
+modules that every module sees, after its own imports and before the root.")
 (deftype ExpandConfig [preludes (Array String)])
 
-(doc ExpandSnapshot "is a reusable compile-time environment after expanding a
-base module. Transient source expands against a copy, so compile-time effects
-and failures cannot mutate the warm base. It keeps the metadata `meta` reads
-and the forms `type` infers against, so a later cell sees what the base
-recorded.")
+(doc ExpandSnapshot "is the compile-time environment after expanding a base
+module, to expand later sources against. `scope` is the root scope. `macros`
+holds the macros. `state` is the compile-time state. `modules` holds the module
+frames. `config` is the configuration and `preludes` the prelude frames. `meta`
+holds the metadata that `meta` reads, and `typing-forms` the forms that `type`
+infers against. Expanding against it copies it and leaves it unchanged.")
 (deftype ExpandSnapshot
   [scope ExpandScope
    macros (Array ExpandMacro)
@@ -45,31 +52,44 @@ recorded.")
    meta (Array (Pair String (Box SurfaceNode)))
    typing-forms (Array (Box SurfaceNode))])
 
-(doc PreparedExpansion "is the expanded base module together with the warm
-compile-time snapshot produced while expanding it.")
+(doc PreparedExpansion "is an expanded module with the snapshot after expanding
+it. `module` is the expanded forms and `snapshot` the environment.")
 (deftype PreparedExpansion [module SurfaceModule
                             snapshot ExpandSnapshot])
 
+(doc MacroLookup "is the result of looking up a macro. `Missing` means there is
+none. `Found` holds the macro. `Ambiguous` means more than one imported module
+defines it.")
 (deftype MacroLookup
   (Missing [])
   (Found [ExpandMacro])
   (Ambiguous []))
 
+(doc *expand-recovering* "is whether expansion goes on after an error, for
+`observe-module-against`.")
 (def *expand-recovering* false)
-(doc *expand-in-definition* "is true while the body of a runtime definition
-(`defn`, `def`) is expanded. Only there is a call to a `defndynamic` function
-evaluated at compile time: elsewhere at the top level the form is compile-time
-code itself, and expanding both arms of a top-level `if` must not run either.")
+(doc *expand-in-definition* "is whether the body of a runtime definition, a
+`defn` or `def`, is being expanded. Only there is a call to a `defndynamic`
+function evaluated at compile time. At the top level the form is compile-time
+code itself, and expanding both branches of a top-level `if` must not run
+either.")
 (def *expand-in-definition* false)
-(doc *expand-locals* "the runtime names bound around the form being expanded
-inside a definition: parameters and `let`, `fn` and `match` bindings. A local
-of the same name shadows a `defndynamic` function, as in the reference.")
+(doc *expand-locals* "holds the runtime names bound around the form being
+expanded inside a definition: parameters and `let`, `fn` and `match` bindings.
+A local shadows a `defndynamic` function of the same name, as in the
+reference.")
 (def *expand-locals* (the (Array String) []))
+(doc *expand-recovery-errors* "holds the errors met while recovering.")
 (def *expand-recovery-errors* (the (Array CtError) []))
+(doc ObservedExpansion "is the result of `observe-module-against`. `result` is
+the expanded module or the first error. `errors` holds the errors met while
+recovering.")
 (deftype ObservedExpansion
   [result (Result SurfaceModule CtError)
    errors (Array CtError)])
 
+(doc MacroExpand "expands macros and runs compile-time definitions, in source
+order.")
 (defmodule MacroExpand
   (private editing-items)
   (hidden editing-items)
@@ -424,9 +444,9 @@ of the same name shadows a `defndynamic` function, as in the reference.")
 
   (private bound-names)
   (hidden bound-names)
-  (doc bound-names "the runtime names a form binds for its body: the
-parameters of `defn` and `fn`, the names of `let`, the variables of each
-`match` pattern.")
+  (doc bound-names "returns the runtime names that the form `name` with `items`
+binds for its body: the parameters of `defn` and `fn`, the names of `let`, and
+the variables of each `match` pattern.")
   (defn bound-names [name items]
     (let-do [parts (semantic-items items)
              n (Array.length &parts)
@@ -454,11 +474,11 @@ parameters of `defn` and `fn`, the names of `let`, the variables of each
 
   (private dynamic-function-call?)
   (hidden dynamic-function-call?)
-  (doc dynamic-function-call? "whether a call in static code names a
-`defndynamic` function. The reference evaluates such a call at compile time
-and splices the result. Like the reference, the head resolves by its exact
-path, as written or under the current module, never through a `use` or the
-`Dynamic` prelude, so `(reduce ...)` under `(use Array)` stays static.")
+  (doc dynamic-function-call? "checks whether the call head `name` in static
+code names a `defndynamic` function. The reference evaluates such a call at
+compile time and splices the result. The head resolves by its exact path, as
+written or under the current module, never through a `use` or the `Dynamic`
+prelude, as in the reference: under `(use Array)`, `(reduce ...)` stays static.")
   (defn dynamic-function-call? [state scope name]
     (let [segments (String.split-by name &[\.])
           n (Array.length &segments)]
@@ -505,10 +525,8 @@ path, as written or under the current module, never through a `use` or the
 
   (private expand-macro-template)
   (hidden expand-macro-template)
-  (doc expand-macro-template "evaluates a macro's body in the macro's own
-file, so a step inside it reports where the macro is written rather than
-where it was called, and under the call that invoked it, so a reader can see
-what asked for the expansion.")
+  (doc expand-macro-template "runs the body of `macro` for `call`. Steps inside
+it report the macro's own file, under the call.")
   (defn expand-macro-template [call macro state frame]
     (let-do [_entered (CtEval.enter-call! call state frame)
              _pushed (CtEval.push-step-file! (ExpandMacro.file macro))
@@ -567,9 +585,11 @@ what asked for the expansion.")
             (Maybe.Nothing) ())
           (Result.Success frame)))))
 
-  (doc expand-node "expands macro calls in one node, recursively. Quoted forms
-are intentionally opaque: code represented as data must not be expanded until
-a macro explicitly returns it.")
+  ; the doc of `expand-node` also declares it for the mutual recursion below,
+  ; under the reference compiler
+  (doc expand-node "expands the macro calls in `node`, recursively. Quoted forms
+are not expanded. While recovering, a node that fails becomes `Invalid`, and so
+does every node after the first error.")
   (defn expand-node-strict [node macros state modules preludes scope]
     (if (WorkBudget.consume! 1)
       (match-ref (SurfaceNode.form node)
@@ -623,10 +643,10 @@ a macro explicitly returns it.")
                                   (String.append "ambiguous imported macro: "
                                                  &name)))
                       (MacroLookup.Missing)
-                      ;; a `Dynamic.`-qualified call in static code is dynamic
-                      ;; by construction: the reference evaluates it at compile
-                      ;; time and splices the result. So does a call to a
-                      ;; `defndynamic` function named by its exact path.
+                      ; the reference evaluates a `Dynamic.`-qualified call in
+                      ; static code at compile time and splices the result, and
+                      ; so does a call to a `defndynamic` function named by its
+                      ; exact path
                       (if (or (String.starts-with? &name "Dynamic.")
                               (and *expand-in-definition*
                                    (and (not (locally-bound? &name))
@@ -634,8 +654,8 @@ a macro explicitly returns it.")
                                                                 scope
                                                                 &name))))
                         ; inside a definition the result is code, and is
-                        ; expanded like a macro's; a top-level submission
-                        ; keeps it as a value
+                        ; expanded like a macro's. a top-level submission keeps
+                        ; it as a value.
                         (match (CtEval.eval-template node
                                                      state
                                                      (ExpandScope.frame scope))
@@ -816,9 +836,9 @@ a macro explicitly returns it.")
 
   (private expand-node-1)
   (hidden expand-node-1)
-  (doc expand-node-1 "expands only an outermost macro call. The returned
-`Nothing` distinguishes a form with no outer macro from a macro whose result
-happens to render identically.")
+  (doc expand-node-1 "expands the outermost macro call of `node`. It returns
+`Nothing` if `node` is not a macro call, so that case differs from a call that
+expands to the same form.")
   (defn expand-node-1 [node macros state modules preludes scope]
     (if (WorkBudget.consume! 1)
       (match-ref (SurfaceNode.form node)
@@ -917,11 +937,10 @@ happens to render identically.")
                                                (ExpandScope.frame scope))
                         (Result.Success _) (Result.Success (Maybe.Nothing))
                         (Result.Error error) (Result.Error error))
-                      ;; a top-level call to a pure compile-time command with
-                      ;; literal arguments evaluates at load, like the
-                      ;; reference's REPL (e.g. commandCharAt bounds-errors on
-                      ;; `(String.char-at "" 1)`). Non-literal arguments fall
-                      ;; through and compile as a root.
+                      ; a top-level call to a pure compile-time command with
+                      ; literal arguments is evaluated now and dropped, as in
+                      ; the reference's REPL (`(String.char-at "" 1)` fails
+                      ; here). with other arguments it compiles as a root.
                       (cond
                         (and (CtEval.pure-string-command? &name)
                              (literal-arguments? node))
@@ -931,11 +950,10 @@ happens to render identically.")
                           (Result.Success _) (Result.Success (Maybe.Nothing))
                           (Result.Error error) (Result.Error error))
                         (named? head @"if")
-                        ;; the reference evaluates top-level forms in the REPL, so a
-                        ;; top-level `if` picks its branch at compile time when the
-                        ;; condition is evaluable (e.g. `(= target-arch "aarch64")`).
-                        ;; Conditions the evaluator cannot resolve fall through and
-                        ;; stay a runtime expression.
+                        ; a top-level `if` whose condition evaluates to a
+                        ; boolean literal, such as `(= target-arch "aarch64")`,
+                        ; is replaced by its branch. other conditions stay a
+                        ; runtime expression.
                         (match-ref (SurfaceNode.form node)
                           (SurfaceForm.List raw-items)
                             (let [items (semantic-items raw-items)
@@ -1261,14 +1279,10 @@ happens to render identically.")
   (hidden record-metadata-doc!)
   (private record-metadata-named!)
   (hidden record-metadata-named!)
-  (doc record-metadata! "records what a form annotates a binding with:
-`(meta-set! <name> \"key\" <value>)` and `(doc <name> \"text\")`. Both shapes
-arrive here, written directly or as what a macro expanded to — core's
-`docexample`, `private` and `hidden` are all `meta-set!` underneath — and
-expansion is the only pass that sees them in source order, which is what
-`meta` reading them back inside a later macro needs. The entry is recorded
-under the name as written and, inside a module, under its qualified name too,
-so a lookup finds it from inside the module and from outside.")
+  (doc record-metadata! "records the metadata that `node` sets, written or
+produced by a macro: `(meta-set! name \"key\" value)`, `(doc name \"text\")`,
+and `(private name)` or `(hidden name)` as a true flag. Entries are recorded
+under the name qualified by `scope`.")
   (defn record-metadata! [node scope]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.List raw-items)
@@ -1307,11 +1321,9 @@ so a lookup finds it from inside the module and from outside.")
         (record-metadata-named! name-node key value scope)
       _ ()))
 
-  (doc record-metadata-doc! "records a `doc` annotation the way core's `doc`
-macro would have built it: every string it was given, each followed by a
-newline. This compiler keeps `doc` opaque rather than expanding that macro, so
-the joining rule lives here instead — a doc string read back through `meta`
-has to be the one the reference stored.")
+  (doc record-metadata-doc! "records the strings of a `doc` form as the doc of
+its name, each followed by a newline. Items that are not string literals are
+skipped.")
   (defn record-metadata-doc! [items scope]
     (let-do [text (StringBuf.create)
              n (Array.length items)]
@@ -1344,11 +1356,8 @@ has to be the one the reference stored.")
 
   (private record-typing-form!)
   (hidden record-typing-form!)
-  (doc record-typing-form! "keeps a finished form for `type` to infer against,
-but only at the root: `expand-body` walks a module's body with the same code,
-and a definition recorded from inside `(defmodule Bag ...)` would stand beside
-the module that contains it, unqualified, as a second definition of the same
-name.")
+  (doc record-typing-form! "keeps `form` for `type` to infer against, if `scope`
+is the root. Forms inside modules are kept as part of their module.")
   (defn record-typing-form! [form scope]
     (when (String.empty? (ExpandScope.path scope))
       (CtEval.record-typing-form! form)))
@@ -1428,13 +1437,7 @@ name.")
              (named? (Box.peek (Array.unsafe-nth items 0)) @"deftype"))
       _ false))
 
-  ;; record a record deftype's fields under `__members_<Name>` so the `members`
-  ;; compile-time primitive (used by `derive`) can look them up. Fields are stored
-  ;; pairwise as `[[name type] ...]`, mirroring the reference `primitiveMembers`.
-  ;; the binding lives in the module that declares the type, so `T` and `A.T`
-  ;; are told apart the way their definitions are.
-  ;; a deftype's name is either a bare symbol `Name` or, for a generic type, a
-  ;; list `(Name v..)`; return `Name` in both cases.
+  ; returns `Name` for a deftype name `Name` or `(Name v..)`
   (private deftype-name)
   (hidden deftype-name)
   (defn deftype-name [node]
@@ -1461,6 +1464,9 @@ name.")
   (hidden register-source-expression!)
   (private register-source-expressions!)
   (hidden register-source-expressions!)
+  ; binds `__members_<Name>` to the fields of a record deftype, as
+  ; `[[name type] ...]`, in the module that declares the type. the `members`
+  ; primitive reads it.
   (defn register-deftype-members! [state form scope]
     (match-ref (SurfaceNode.form form)
       (SurfaceForm.List items)
@@ -1569,12 +1575,9 @@ name.")
 
   (private seed-transient-definition!)
   (hidden seed-transient-definition!)
-  (doc seed-transient-definition! "registers one transient compile-time
-definition — a defmacro, defndynamic, defdynamic or a deftype's members —
-into a one-step expansion's private environment, exactly the way full
-expansion registers it while walking a module in source order. Seeding is
-not a step: the form itself stays as written, and only the forms after it
-see the definition.")
+  (doc seed-transient-definition! "registers the definition `form`, a macro, a
+dynamic definition or a deftype's members, in the expansion environment. The
+form itself is not changed.")
   (defn seed-transient-definition! [form scope macros state]
     (cond
       (defmacro? form)
@@ -1612,12 +1615,10 @@ see the definition.")
           (Result.Success ()))
       (Result.Success ())))
 
-  (doc expand-module-1-against "performs one outermost macro-expansion step
-for each transient top-level form against a private copy of a warm snapshot.
-Transient compile-time definitions seed the private environment in source
-order, the way full expansion sees them, so a macro defined earlier in the
-same module expands the forms after it. Returns `Nothing` when no top-level
-form is a macro call.")
+  (doc expand-module-1-against "expands the outermost macro call of each
+top-level form of `module` by one step, against a copy of `snapshot`.
+Definitions earlier in `module` are seen by the forms after them. It returns
+`Nothing` if no top-level form is a macro call.")
   (sig expand-module-1-against
        (Fn
          [(Ref SurfaceModule) (Ref ExpandSnapshot)]
@@ -1717,12 +1718,11 @@ form is a macro call.")
 
   (private top-level-again?)
   (hidden top-level-again?)
-  (doc top-level-again? "whether what a top-level form expanded to is itself
-a top-level form to dispatch again: a `do`, whose forms are each top-level, or
-anything with a different head (a macro's result, or the branch a top-level
-`if` picked). The reference evaluates what a top-level form expands to at the
-top level, so `(when (= (host-os) \"linux\") (add-cflag ...))` runs the
-command. Macros that expand to each other never stop, as in the reference.")
+  (doc top-level-again? "checks whether `expanded`, what the top-level `form`
+expanded to, must be dispatched as top-level forms again: it is a `do`, or it
+has a different head. This lets `(when (= (host-os) \"linux\") (add-cflag ...))`
+run the command, as in the reference. Macros that expand to each other never
+stop, as in the reference.")
   (defn top-level-again? [form expanded]
     (let [head (head-name expanded)]
       (match-ref &head
@@ -1735,11 +1735,10 @@ command. Macros that expand to each other never stop, as in the reference.")
 
   (private dynamic-value-call?)
   (hidden dynamic-value-call?)
-  (doc dynamic-value-call? "whether a form calls a `Dynamic.` function
-rather than a macro. Runtime expansion evaluates such a call once and leaves
-its result as a value (`displayed-value`): the reference prints `(Dynamic.f)`'s
-result, it does not run it again, and doing so loops when two functions return
-calls to each other.")
+  (doc dynamic-value-call? "checks whether `form` calls a `Dynamic.` function
+rather than a macro. Runtime expansion evaluates such a call once and keeps its
+result as a value, with `displayed-value`, as the reference prints the result of
+`(Dynamic.f)` and does not run it again.")
   (defn dynamic-value-call? [form macros modules preludes scope]
     (match (head-name form)
       (Maybe.Just name)
@@ -1758,10 +1757,9 @@ calls to each other.")
 
   (private displayed-value)
   (hidden displayed-value)
-  (doc displayed-value "what a submitted `(Dynamic.f)` leaves for the runtime
-cell. Its result is a compile-time value, not code: a list or symbol becomes
-the string the reference REPL would print for it, while a literal already is
-its own runtime value.")
+  (doc displayed-value "returns what a submitted `(Dynamic.f)` leaves for the
+runtime cell, given its result `node`. A list or symbol becomes the string the
+reference REPL prints for it. A literal is kept as it is.")
   (defn displayed-value [node]
     (match-ref (SurfaceNode.form node)
       (SurfaceForm.List _)
@@ -1815,9 +1813,8 @@ its own runtime value.")
                                                state)
                         (Result.Success macro)
                           (do
-                            ;; macros are also environment citizens, so the
-                            ;; evaluator can expand one it meets mid-evaluation
-                            ;; (a macro invoked inside another macro's body).
+                            ; the evaluator can then expand the macro when it
+                            ; meets it inside another macro's body
                             (CtEval.register-compiled-macro! state
                                                              (ExpandScope.frame &current-scope)
                                                              (ExpandMacro.name &macro)
@@ -1828,13 +1825,11 @@ its own runtime value.")
                   (defndynamic? form)
                     (do
                       (register-source-expressions! state form &current-scope)
-                      ;; a dynamic function's body resolves bare names globally
-                      ;; (the reference cannot see unqualified module siblings
-                      ;; from dynamic code — probe: `(defndynamic bb [] (aa))`
-                      ;; next to `aa` errors, and `map` inside `Dynamic.Map`
-                      ;; means the generic map, not the sibling `Map.map`), so
-                      ;; the closure captures the root frame; registration still
-                      ;; targets the module scope for qualified access.
+                      ; a dynamic function resolves bare names at the root, as
+                      ; in the reference: `(defndynamic bb [] (aa))` next to
+                      ; `aa` fails, and `map` inside `Dynamic.Map` is the
+                      ; generic map. the module frame binds the unqualified
+                      ; name and the root the qualified one.
                       (match (parse-dynamic-definition form
                                                        &(CtEval.root state)
                                                        state)
@@ -1984,8 +1979,8 @@ its own runtime value.")
               (Result.Success expanded-forms))
             (Result.Error error)))))
 
-  (doc prepare-module-with "expands a base module once and retains its
-compile-time environment for subsequent transient expansions.")
+  (doc prepare-module-with "expands `module` with `config` and returns the
+result with its snapshot.")
   (defn prepare-module-with [module config]
     ;; one expansion is one compile-time session: the forms `type` infers
     ;; against, and the metadata `meta` reads back, belong to this run of it
@@ -2014,9 +2009,9 @@ compile-time environment for subsequent transient expansions.")
                                                     (FrameId.copy &snapshot-root)
                                                     (CtEnv.imports (CtState.environment &state)
                                                                    &snapshot-root))
-                   ;; build commands applied during compile-time evaluation
-                   ;; surface as top-level forms, so resolution collects them
-                   ;; exactly like written ones
+                   ; system includes added during compile-time evaluation
+                   ; become top-level forms, so resolution collects them like
+                   ; written ones
                    drained (CtEval.drain-pending-includes!)
                    all-forms forms]
             (for [di 0 (Array.length &drained)]
@@ -2035,8 +2030,7 @@ compile-time environment for subsequent transient expansions.")
                                                            (Array.copy &*ct-typing-forms*)))))
         (Result.Error error) (Result.Error error))))
 
-  (doc expand-module-with "expands source with explicit compiler-driver
-configuration.")
+  (doc expand-module-with "expands `module` with `config`.")
   (defn expand-module-with [module config]
     (let-do [result (match (prepare-module-with module config)
                (Result.Success prepared)
@@ -2047,9 +2041,6 @@ configuration.")
         (Maybe.Nothing) ())
       result))
 
-  (doc prepare-module-against "expands a module against a warm snapshot and
-returns the resulting snapshot. Callers may commit that snapshot atomically or
-discard it on failure.")
   (sig prepare-module-against
        (Fn
          [(Ref SurfaceModule) (Ref ExpandSnapshot)]
@@ -2081,9 +2072,9 @@ discard it on failure.")
                                                     (FrameId.copy &snapshot-root)
                                                     (CtEnv.imports (CtState.environment &state)
                                                                    &snapshot-root))
-                   ;; build commands applied during compile-time evaluation
-                   ;; surface as top-level forms, so resolution collects them
-                   ;; exactly like written ones
+                   ; system includes added during compile-time evaluation
+                   ; become top-level forms, so resolution collects them like
+                   ; written ones
                    drained (CtEval.drain-pending-includes!)
                    all-forms forms]
             (for [di 0 (Array.length &drained)]
@@ -2102,36 +2093,42 @@ discard it on failure.")
                                                            (Array.copy &*ct-typing-forms*)))))
         (Result.Error error) (Result.Error error))))
 
+  (doc prepare-module-against "expands `module` against a copy of `snapshot` and
+returns the result with the new snapshot. Compile-time effects also go to global
+state, such as metadata, typing forms and build flags. To discard them, take a
+`CtEval.checkpoint` first and restore it.")
   (defn prepare-module-against [module snapshot]
     (prepare-module-against-with-policy module snapshot false))
 
-  (doc prepare-submission-against "expands a native submission while retaining
-runtime roots, including calls that also have compile-time implementations.
-Declaration and macro processing still happens in source order.")
+  (doc prepare-submission-against "expands `module` as `prepare-module-against`
+does, but keeps top-level forms as runtime code. Top-level `eval`, `set!`,
+`Project.config` and string commands are not run, and a top-level `if` is not
+folded.")
   (defn prepare-submission-against [module snapshot]
     (prepare-module-against-with-policy module snapshot true))
 
-  (doc expand-module-against "expands a transient module against a warm
-snapshot. All mutations occur in a private copy and are discarded when the
-call returns.")
+  (doc expand-module-against "expands `module` against a copy of `snapshot`. It
+changes global compile-time state as `prepare-module-against` does.")
   (defn expand-module-against [module snapshot]
     (match (prepare-module-against module snapshot)
       (Result.Success prepared)
         (Result.Success @(PreparedExpansion.module &prepared))
       (Result.Error error) (Result.Error error)))
 
-  (doc expand-module "expands source in source order, including nested
-`defmodule` bodies. Macros and dynamic bindings are indexed by stable module
-frames; each macro retains its lexical defining frame. Compile-time
-definitions are omitted from returned module bodies.")
+  (doc expand-module "expands `module` in source order, nested modules included.
+Macro and dynamic definitions are left out of the result. Top-level `eval`,
+`set!`, `Project.config` and string commands with literal arguments run during
+expansion, a top-level `if` with a constant condition is replaced by its branch,
+and build commands are recorded instead of returned. System includes added
+during expansion are appended to the result.")
   (defn expand-module [module]
     (let [config (ExpandConfig.init [])] (expand-module-with module &config))))
 
 (defmodule MacroExpand
-  (doc observe-module-against "expands with the ordinary expander, retaining
-verified parents and expanded prefixes after a failure. Failed and unvisited
-nodes are Invalid; no subsequent compile-time evaluation is attempted. This
-recovered tree is for observations only and never enters a session commit.")
+  (doc observe-module-against "expands `module` against `snapshot` and goes on
+after an error. Nodes that fail, and nodes after the first error, become
+`Invalid`, and top-level forms after it are dropped. The result is for editing
+analysis, not for committing.")
   (defn observe-module-against [module snapshot]
     (let-do [saved *expand-recovering*
              saved-errors (Array.copy &*expand-recovery-errors*)

@@ -4,58 +4,71 @@
 (load "../carp-c-abi/carp-c-abi.carp")
 (load "git@github.com:carpentry-org/strbuf@0.3.0")
 
-;; `Double.str`/`Float.str` format with `%g` (6 significant digits), losing
-;; precision for literals like `Double.e`; the reference compiler emits the full
-;; value. Format with enough digits to round-trip (17 for double, 9 for float).
+(doc full-double-string "returns `x` with 17 significant digits, enough to read
+back the same double, as the reference prints double literals.")
 (deftemplate full-double-string
              (Fn [Double] String)
              "String $NAME(double x)"
              "$DECL { char b[32]; snprintf(b, sizeof(b), \"%.17g\", x); String s = CARP_MALLOC(strlen(b)+1); strcpy(s, b); return s; }")
 
-;; process-wide serial for hoisted array-literal temporaries. Global
-;; initializers all render into one C function, so their hoisted names must not
-;; restart per body.
+(doc *hoist-serial* "numbers the locals that hoisted array literals get. It is
+shared by all bodies, because every global initializer renders into one C
+function.")
 (def *hoist-serial* 20000000)
 
-(doc *backend-local-cell* "the downward id allocator for locals the backend
-synthesizes (cleanup, root, echo, and param temporaries). Seeded per module
-from one below the specialized module's lowest local id, so a synthesized
-temp can never collide with an existing binder — the retired hardcoded
-offsets could, once a program grew large enough.")
+(doc *backend-local-cell* "gives out the ids of the locals the backend makes,
+such as cleanup, drop, branch, root and echo temporaries. It counts down from
+below the module's lowest local id, so they never clash with a binder.")
 (def *backend-local-cell* (the (Array Int) [-1048577]))
 
-; Batch lowering uses a private counter because historical owner-local node IDs
-; may collide. A provenanced session can opt into deterministic lambda symbols
-; derived from its globally unique expression IDs and concrete signatures.
-(doc *lift-context* "the ownership context id of the body currently being
-lambda-lifted, stamped onto each `ClosureFunction` so its planned deletes can
-be matched back to the context they were planned in. -1 while lifting roots.")
+(doc *lift-context* "is the ownership context of the body being lambda-lifted,
+or -1 for the roots. Each `ClosureFunction` keeps it, so its planned deletes can
+be found.")
 (def *lift-context* -1)
+(doc *lift-owner-symbol* "is the symbol of the body being lambda-lifted, or
+`roots`. Stable lambda symbols include it.")
 (def *lift-owner-symbol* @"")
 
+(doc *stable-lambda-symbols* "is whether lifted lambdas get symbols from their
+expression id, owner and type instead of a counter. A session turns it on.")
 (def *stable-lambda-symbols* false)
+(doc *lambda-symbol-salt* "is put in the symbols of lifted lambdas, so cells of
+a JIT session can reuse expression ids.")
 (def *lambda-symbol-salt* (String.copy ""))
 
+(doc seed-backend-locals! "starts `*backend-local-cell*` below the lowest local
+id of `specialized`.")
 (defn seed-backend-locals! [specialized]
   (Array.aset! &*backend-local-cell*
                0
                (Int.dec (Specialize.min-local-id specialized))))
 
+(doc next-backend-local! "returns the next id for a local the backend makes.")
 (defn next-backend-local! []
   (let-do [value @(Array.unsafe-nth &*backend-local-cell* 0)]
     (Array.aset! &*backend-local-cell* 0 (Int.dec value))
     value))
 
+(doc full-float-string "returns `x` with 9 significant digits, enough to read
+back the same float.")
 (deftemplate full-float-string
              (Fn [Float] String)
              "String $NAME(float x)"
              "$DECL { char b[32]; snprintf(b, sizeof(b), \"%.9g\", (double)x); String s = CARP_MALLOC(strlen(b)+1); strcpy(s, b); return s; }")
 
+(doc BackendDependency "is a function a template calls. `symbol` is its C symbol
+and `signature` its type. `external` is whether a header declares it.")
 (deftype BackendDependency
   [symbol String
    signature (Box MonoType)
    external Bool])
 
+(doc BackendDeclaration "is one declaration of a backend module. Each
+constructor starts with the C symbol and the concrete type. `Function` holds the
+parameters and the body. `Global` holds the initializer. `Intrinsic` holds the
+header that declares it, if any. `Constructor` holds the constructor
+declaration. `Template` holds the template and the functions it calls.
+`SourceTemplate` holds the declared type, the C declaration and the C body.")
 (deftype BackendDeclaration
   (Function [String (Box MonoType) (Array CoreRef) (Box SpecializedExpr)])
   (Global [String (Box MonoType) (Box SpecializedExpr)])
@@ -64,9 +77,10 @@ be matched back to the context they were planned in. -1 while lifting roots.")
   (Template [String (Box MonoType) PrimitiveTemplate (Array BackendDependency)])
   (SourceTemplate [String (Box MonoType) (Box CoreType) String String]))
 
-(doc ClosureFunction "a lifted lambda that captures free variables: its callback
-is generated with a leading environment pointer, and the closure site populates
-an environment struct of the captured values.")
+(doc ClosureFunction "is a lifted lambda that captures values. `symbol` is its C
+symbol and `signature` its type. `captures` holds the captured locals with their
+types. `parameters` and `body` are its own. `context` is the ownership context
+it was lifted out of. Its callback takes an environment pointer first.")
 (deftype ClosureFunction
   [symbol String
    signature (Box MonoType)
@@ -75,55 +89,58 @@ an environment struct of the captured values.")
    body (Box SpecializedExpr)
    context Int])
 
-(doc LiftedModule "a module after lambda lifting: its bodies with the
-non-capturing callbacks appended, the capturing callbacks as closures, and for
-each body the ownership context it was planned in (-1 for one lifted out of
-the roots).")
+(doc LiftedModule "is a module after lambda lifting. `module` holds the bodies,
+with the non-capturing callbacks added. `closures` holds the capturing
+callbacks. `contexts` holds the ownership context of each body, or -1 for one
+lifted out of the roots.")
 (deftype LiftedModule
   [module SpecializationModule
    closures (Array ClosureFunction)
    contexts (Array Int)])
 
-(doc BackendLineMap "is the backend-neutral source location table. Its arrays
-are indexed by expression identity; an empty file or a non-positive line means
-the compiler generated that expression and no caller source owns it.")
+(doc BackendLineMap "is the source position of each expression, by expression
+id. `files`, `lines` and `columns` run parallel. An empty file or a line below 1
+means the compiler made the expression.")
 (deftype BackendLineMap
   [files (Array String)
    lines (Array Int)
    columns (Array Int)])
 
 (defmodule BackendLineMap
-  (doc empty "is a source map with no caller-owned locations.")
+  (doc empty "returns a map with no positions.")
   (defn empty [] (BackendLineMap.init [] [] []))
 
-  (doc enabled?
-    "whether the map carries a line table, including generated locations.")
+  (doc enabled? "checks whether `map` has a line table.")
   (defn enabled? [map] (Int.> (Array.length (BackendLineMap.lines map)) 0))
 
-  (doc line-of
-    "the line at an expression identity, or -1 outside the line table.")
+  (doc line-of "returns the line of expression `id`, or -1.")
   (defn line-of [map id]
     (let [lines (BackendLineMap.lines map)]
       (if (and (Int.>= id 0) (Int.< id (Array.length lines)))
         @(Array.unsafe-nth lines id)
         -1)))
 
-  (doc column-of
-    "the byte column at an expression identity, or 0 outside the column table.")
+  (doc column-of "returns the byte column of expression `id`, or 0.")
   (defn column-of [map id]
     (let [columns (BackendLineMap.columns map)]
       (if (and (Int.>= id 0) (Int.< id (Array.length columns)))
         @(Array.unsafe-nth columns id)
         0)))
 
-  (doc file-of
-    "the exact source file at an expression identity, or an empty string outside the file table.")
+  (doc file-of "returns the file of expression `id`, or the empty string.")
   (defn file-of [map id]
     (let [files (BackendLineMap.files map)]
       (if (and (Int.>= id 0) (Int.< id (Array.length files)))
         @(Array.unsafe-nth files id)
         @""))))
 
+(doc BackendModule "is a module ready for a backend. `declarations` holds its
+declarations and `roots` its top-level forms. `constructors`, `system-includes`
+and `type-declarations` come from the core module. `closure-functions` holds the
+capturing lambdas. `delete-symbols` and `copy-symbols` map type keys to the C
+symbols of their delete and copy functions. `line-map` holds source positions.
+`symbols` holds the specializations of its declarations, and `resident-symbols`
+those a session keeps.")
 (deftype BackendModule
   [declarations (Array BackendDeclaration)
    roots (Array (Box SpecializedExpr))
@@ -138,15 +155,13 @@ the compiler generated that expression and no caller source owns it.")
    resident-symbols (Array String)
    type-declarations (Array CoreTypeDeclaration)])
 
+(doc BackendError "is a backend error. `message` describes it.")
 (deftype BackendError [message String])
 
-(doc ScopeDelete "a delete the ownership plan schedules for one owner in a
-definition context: the owner binding, the deleter's C symbol, the concrete
-type deleted, and the site (expression id) the plan anchored it to. Local
-(let-bound) owners are cleaned up at their let scope, parameters at the
-function's exit, set! overwrites at the set site, and by-value match bindings
-at their branch's exit — the site disambiguates which node consumes each
-delete.")
+(doc ScopeDelete "is a delete the ownership plan schedules in a context.
+`binder` is the owner, `symbol` the C symbol of its delete and `type` its type.
+`site` is the expression the delete belongs to: a let scope, a function exit, a
+`set!` or a match branch exit. `context` is the ownership context.")
 (deftype ScopeDelete
   [binder CoreRef
    symbol String
@@ -154,36 +169,37 @@ delete.")
    site Int
    context Int])
 
-(doc BackendCleanup "owns resolved binding deletes and their context index for
-one lowering invocation. It carries no expression tree and is freed before
-backend materialization.")
+(doc BackendCleanup "is the deletes of one lowering run, resolved. `deletes`
+holds them and `contexts` groups them by context.")
 (deftype BackendCleanup [deletes (Array ScopeDelete)
                          contexts PositionBuckets])
 
-(doc EchoStr "how one concrete type renders for top-level result echo: the
-specialized str C symbol and whether it takes its argument by reference.")
+(doc EchoStr "is how a type renders for echo. `symbol` is its specialized `str`
+and `by-ref` whether it takes its argument by reference.")
 (deftype EchoStr [symbol String
                   by-ref Bool])
 
-(doc EchoPlan "the driver's plan for echoing top-level expression results into
-`main`, the way the reference compiles REPL echo: a table from concrete type
-key to its str rendering, the specialized `IO.println` symbol, and the String
-deleter for the rendered text.")
+(doc EchoPlan "is the plan for echoing top-level results in `main`, as the
+reference echoes REPL results. `strs` maps type keys to their `EchoStr`.
+`println-symbol` is the specialized `IO.println`. `string-delete` deletes the
+rendered text.")
 (deftype EchoPlan
   [strs (Array (Pair String EchoStr))
    println-symbol String
    string-delete String])
 
+(doc TemplateTypeBinding "binds the template type variable `name` to `type`.")
 (deftype TemplateTypeBinding [name String
                               type (Box MonoType)])
 
+(doc ResultDestination "is where a statement's value goes. `Return` returns a
+value of its type. `Assign` assigns it to the named C local of its type.")
 (deftype ResultDestination
   (Return [(Box MonoType)])
   (Assign [String (Box MonoType)]))
 
-(doc tail-expression-type "the type a statement-shaped expression actually
-yields, taken from its tail. Scope nodes' own type fields can carry a hoist or
-reflift wrapper's binding type, which would mislabel the result.")
+(doc tail-expression-type "returns the type of the value `expression` yields,
+from its tail.")
 (defn tail-expression-type [expression]
   (match-ref expression
     (SpecializedExpr.Let _ _ _ _ let-body)
@@ -206,6 +222,8 @@ reflift wrapper's binding type, which would mislabel the result.")
       (tail-expression-type (Box.peek annotated))
     _ (Specialize.expression-type expression)))
 
+(doc BackendLower "lowers a specialized module to a backend module: it lifts
+lambdas, hoists array literals and inserts the deletes ownership plans.")
 (defmodule BackendLower
   (private concrete?)
   (hidden concrete?)
@@ -240,9 +258,9 @@ reflift wrapper's binding type, which would mislabel the result.")
             (set! result (Maybe.Just @constructor)))))
       result))
 
-  (doc module "converts specialization output into concrete backend
-  declarations. It rejects residual type variables rather than delegating them
-  to a backend.")
+  (doc module "converts the specialized module `specialized` and its `closures`
+to backend declarations, with the delete and copy symbols. Leftover type
+variables are an error.")
   (defn module [specialized closures delete-symbols copy-symbols]
     (let-do [declarations (the (Array BackendDeclaration) [])
              symbols (the (Array Specialization) [])
@@ -431,11 +449,10 @@ reflift wrapper's binding type, which would mislabel the result.")
                                            counter))))
       result))
 
-  (doc hoist-collect
-    "rewrites a value expression, lifting each managed `(Array a)`
-literal into a fresh binding recorded in `cell` and replacing it with a reference
-to that binding. Recurses through value-transparent constructs (calls, the `ref`
-intrinsic, annotations); leaves statement-introducing nodes untouched.")
+  (doc hoist-collect "rewrites the value `expr`, moving each heap array literal
+into a new binding in `cell` and putting a reference to it in its place. It
+looks through calls, `ref` and annotations, and into static array literals.
+Forms that open a scope are hoisted with `hoist-node`.")
   (defn hoist-collect [expr cell counter]
     (match-ref expr
       (SpecializedExpr.ArrayLit id type elements)
@@ -494,15 +511,10 @@ intrinsic, annotations); leaves statement-introducing nodes untouched.")
 
   (private wrap-hoisted)
   (hidden wrap-hoisted)
-  ;; a hoisted array that `inner` passes BY VALUE to a call is moved: the callee
-  ;; owns it and deletes it, so freeing it here too is a double free. Only
-  ;; borrowed (or unused) hoists get a free.
+  (doc hoist-freed? "checks whether the hoisted binding at `index` of `cell`
+must be freed: neither `inner` nor another hoisted literal moves it.")
   (private hoist-freed?)
   (hidden hoist-freed?)
-  ;; a hoisted literal is freed only if NOTHING consumed it: neither the
-  ;; wrapped expression nor another hoisted literal's payload (nested array
-  ;; literals hoist inner-first, so an inner binding is consumed inside an
-  ;; OUTER binding's payload, not inside `inner`).
   (defn hoist-freed? [cell index binding inner]
     (if (Ownership.consumed? (Pair.a binding) inner)
       false
@@ -515,11 +527,10 @@ intrinsic, annotations); leaves statement-introducing nodes untouched.")
               (set! free false))))
         free)))
 
-  (doc wrap-hoisted
-    "wraps `inner` in a binding per hoisted array literal, freeing
-each after `inner` is evaluated unless `inner` moves it into a call: unit results
-become `(do inner frees...)`, other results are captured in a temporary so the
-frees run before the result is returned.")
+  (doc wrap-hoisted "wraps `inner` in the bindings of `cell`, and frees each one
+that `hoist-freed?` allows after `inner` runs. A unit result becomes `(do inner
+frees...)`; any other result is kept in a temporary while the frees run. The
+wrappers keep the id of `inner`, so planned deletes still find it.")
   (defn wrap-hoisted [cell inner counter]
     (if (Int.= 0 (Array.length cell))
       (SpecializedExpr.copy &inner)
@@ -619,10 +630,8 @@ frees run before the result is returned.")
                                                              counter))))))
       result))
 
-  (doc hoist-node "ANF-normalizes managed array literals out of value positions
-so they only appear as `let` values (which the backend can allocate). Handles
-each statement/tail context; while-loop conditions are left untouched since they
-re-evaluate each iteration.")
+  (doc hoist-node "moves heap array literals out of value positions in `expr`,
+so they only appear as `let` values, which the backend can allocate.")
   (defn hoist-node [expr counter]
     (match-ref expr
       (SpecializedExpr.Do id type elements)
@@ -724,12 +733,8 @@ re-evaluate each iteration.")
                  atomized (hoist-collect expr &cell counter)]
           (wrap-hoisted &cell atomized counter))))
 
-  (doc hoist-array-literals
-    "ANF entry point: lifts managed array literals out of
-value positions in one body so the backend can allocate and free them. The
-counter is process-wide, not per body: every global initializer renders into the
-same `carp_init_globals` function, so a per-body counter gives two globals'
-hoisted temporaries the same C name (issue seen in produces-output/globals).")
+  (doc hoist-array-literals "moves the heap array literals of one body out of
+value positions, so the backend can allocate and free them.")
   (defn hoist-array-literals [expr]
     (let-do [counter (the (Array Int) [*hoist-serial*])
              lifted (hoist-node expr &counter)]
@@ -788,12 +793,9 @@ hoisted temporaries the same C name (issue seen in produces-output/globals).")
                                                              closures))))))
       result))
 
-  (doc lift-in-expr
-    "lambda lifting: replaces each `(fn ...)` with a reference to a freshly
-generated top-level function. Non-capturing lambdas become a `Lambda` struct with
-no environment; capturing lambdas become a closure-construction call carrying the
-captured values, plus a `ClosureFunction` (collected in `closures`) rendered with
-a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
+  (doc lift-in-expr "replaces each lambda in `expr` with a reference to a new
+top-level function. A non-capturing lambda becomes a function value without an
+environment. A capturing one becomes a closure construction.")
   (defn lift-in-expr [expr counter lifted closures]
     (match-ref expr
       (SpecializedExpr.Lambda id type parameters body)
@@ -1001,11 +1003,9 @@ a leading environment pointer. Recurses everywhere so nested lambdas lift too.")
                                     (Box.init (CoreType.copy (Box.peek annotation))))
       _ (SpecializedExpr.copy expr)))
 
-  (doc lift-lambdas "lifts every lambda in the module's bodies and roots to a
-top-level function. Non-capturing callbacks are appended to the module's bodies
-(emitted through the normal path); capturing callbacks are returned separately as
-`ClosureFunction`s for environment-aware rendering. Every lifted callback keeps
-the ownership context of the body it came from.")
+  (doc lift-lambdas "lifts every lambda in the bodies and roots of
+`specialized`. Non-capturing callbacks are added to the bodies and capturing
+ones become closures.")
   (defn lift-lambdas [specialized]
     (let-do [counter (the (Array Int) [30000000])
              lifted (the (Array SpecializedBody) [])
@@ -1063,16 +1063,13 @@ the ownership context of the body it came from.")
         closures
         contexts)))
 
-  (doc use-stable-lambda-symbols!
-    "uses provenanced expression identities, owning specialization symbols,
-and concrete signatures for deterministic lifted-lambda symbols. Persistent
-sessions enable this; batch compilation keeps counter-based symbols.")
+  (doc use-stable-lambda-symbols! "makes lifted lambdas get symbols from their
+expression id, owner and type if `enabled` is true. A session turns it on.")
   (defn use-stable-lambda-symbols! [enabled]
     (set! *stable-lambda-symbols* enabled))
 
-  (doc use-lambda-symbol-salt! "names transient session lambdas within one
-cell's symbol namespace. Transactional cells can reuse expression IDs, so the
-JIT supplies a distinct salt before lowering each cell.")
+  (doc use-lambda-symbol-salt! "puts `salt` in the symbols of lifted lambdas. A
+JIT session sets one per cell, since cells can reuse expression ids.")
   (defn use-lambda-symbol-salt! [salt]
     (set! *lambda-symbol-salt* (String.copy salt)))
 
@@ -1082,19 +1079,17 @@ JIT supplies a distinct salt before lowering each cell.")
   (hidden map-recurse)
   (private rewrite-root)
   (hidden rewrite-root)
-  (doc array-managed-type?
-    "reports whether a concrete type is a heap `(Array a)`
-whose `data` allocation must be freed. `StaticArray` is stack-allocated and is
-not included.")
+  (doc array-managed-type? "checks whether `type` is a heap array, whose data
+must be freed. A static array is not.")
   (defn array-managed-type? [type]
     (match-ref type
       (MonoType.Named name arguments)
         (and (String.= name "Array") (Int.> (Array.length arguments) 0))
       _ false))
 
-  (doc array-free-symbol "the sentinel delete symbol for `(Array a)`. Array is a
-builtin with no runtime deleter function; the backend inlines this sentinel to a
-`CARP_FREE` of the array's data.")
+  (doc array-free-symbol "returns the delete symbol the backend uses for an
+array when it has no deleter. The backend renders it as freeing the array's
+data, not its elements.")
   (defn array-free-symbol [] (String.copy "__carp_array_free"))
 
   (sig insert-cleanup
@@ -1128,6 +1123,9 @@ builtin with no runtime deleter function; the backend inlines this sentinel to a
          [(Ref SpecializedExpr) (Ref CoreRef) (Ref MonoType) (Ref String)]
          SpecializedExpr))
 
+  (doc insert-nested-path-cleanup "puts a delete of `binder` on each exit of the
+nested `expr` that does not move it, as `insert-path-cleanup` does for forms
+with their own branches.")
   (defn insert-nested-path-cleanup [expr binder value-type symbol]
     (match-ref expr
       (SpecializedExpr.Match _ _ _ _ _)
@@ -1187,8 +1185,8 @@ builtin with no runtime deleter function; the backend inlines this sentinel to a
       _
       (SpecializedExpr.copy expr)))
 
-  (doc cleanup-after "evaluates an expression, deletes one still-owned
-binding, then yields the expression's result.")
+  (doc cleanup-after "evaluates `expr`, deletes `binder`, then yields the value
+of `expr`.")
   (defn cleanup-after [expr binder value-type symbol]
     (let [body-type (tail-expression-type &expr)
           delete-node (make-delete-node binder value-type symbol)]
@@ -1210,16 +1208,16 @@ binding, then yields the expression's result.")
                                                                                    (Box.init (MonoType.copy &body-type))
                                                                                    (CoreRef.copy &temp)))])))))))
 
-  (doc insert-delete-at-last-use "puts a scheduled delete directly after the
-declaration the binder is last needed by, instead of at scope exit. Only for
-binders `Ownership.delete-movable?` accepts: never a RefLift temporary, never
-conditionally moved, and nothing past the insertion point still refers to it.")
   (private insert-delete-at-last-use)
   (hidden insert-delete-at-last-use)
   (sig insert-delete-at-last-use
        (Fn
          [(Ref SpecializedExpr) (Ref CoreRef) (Ref MonoType) (Ref String)]
          SpecializedExpr))
+  (doc insert-delete-at-last-use "puts the delete of `binder` right after the
+form in `expr` that last uses it, instead of at scope exit. It is only used when
+`Ownership.delete-movable?` allows it and nothing after that form mentions the
+binder.")
   (defn insert-delete-at-last-use [expr binder value-type symbol]
     (match-ref expr
       (SpecializedExpr.Let id type inner-binder value body)
@@ -1252,10 +1250,8 @@ conditionally moved, and nothing past the insertion point still refers to it.")
       _
       (cleanup-after (SpecializedExpr.copy expr) binder value-type symbol)))
 
-  (doc insert-path-cleanup "inserts a delete on exactly the exits where
-`binder` has not been moved. Conditional tail expressions are rewritten
-branch-by-branch; an expression that never consumes the binder gets one
-ordinary scope-exit cleanup.")
+  (doc insert-path-cleanup "puts a delete of `binder` on each exit of `expr`
+that does not move it. Conditional forms are rewritten branch by branch.")
   (defn insert-path-cleanup [expr binder value-type symbol]
     (if (not (Ownership.consumed? binder expr))
       (cleanup-after (SpecializedExpr.copy expr) binder value-type symbol)
@@ -1414,9 +1410,8 @@ ordinary scope-exit cleanup.")
         _
         (SpecializedExpr.copy expr))))
 
-  (doc map-recurse "applies cleanup insertion to each element of an expression
-list without treating any element as discarded (used for positions like call
-arguments and array literals whose values are consumed, not dropped).")
+  (doc map-recurse "inserts cleanup into each element of `es`, where no
+element's value is discarded, such as call arguments.")
   (defn map-recurse [es body-deletes delete-symbols constructors]
     (let-do [result (the (Array (Box SpecializedExpr)) [])
              n (Array.length es)]
@@ -1827,10 +1822,8 @@ arguments and array literals whose values are consumed, not dropped).")
                                 (String.copy "ref")
                                 [(Box.init operand)]))
 
-  (doc echo-root "wraps a top-level expression so its result is rendered with
-its specialized str and printed, mirroring the reference's REPL echo compiled
-into `main`: bind the result, str it (by ref or value per the impl), println
-the text, delete the text, delete the result when owned.")
+  (doc echo-root "wraps the top-level form `root` so its result is rendered with
+its `str`, printed and deleted, as the reference echoes REPL results in `main`.")
   (private echo-root)
   (hidden echo-root)
   (defn echo-root [root root-type echo-str plan delete-symbols]
@@ -1901,9 +1894,8 @@ the text, delete the text, delete the result when owned.")
                                                                         (Box.init (MonoType.Unit))
                                                                         elements)))))))
 
-  (doc rewrite-root "wraps an ownerless top-level expression whose result is an
-owned value in a temporary binding plus its deleter, since a root expression
-always discards its result. Roots that produce unmanaged values are left as-is.")
+  (doc rewrite-root "wraps the top-level form `root` in a binding and a delete
+of its result, if the result is owned. A top-level result is always discarded.")
   (defn rewrite-root [root delete-symbols]
     (let [root-type (Specialize.expression-type root)]
       (match (match (CAbi.symbol-for-key delete-symbols
@@ -1946,13 +1938,11 @@ always discards its result. Roots that produce unmanaged values are left as-is."
                 (Maybe.Nothing) (rewrite-root root delete-symbols))
             (Maybe.Nothing) (rewrite-root root delete-symbols)))))
 
+  (doc rewrite-roots-array "lowers the top-level forms: it hoists their array
+literals, deletes their owned locals at their scopes, and echoes or deletes
+their results.")
   (private rewrite-roots-array)
   (hidden rewrite-roots-array)
-  (doc rewrite-roots-array "lowers the top-level expressions: their owned
-locals are cleaned up at their scopes, the way a definition's body and a
-lifted closure's are, before the root is rewritten for echo. A root scope is
-a scope like any other — without the cleanup pass, `(let [s @\"x\"] 0)` at the
-top level binds a value nothing ever frees.")
   (defn rewrite-roots-array [roots root-deletes delete-symbols echo constructors]
     (let-do [result (the (Array (Box SpecializedExpr)) [])
              n (Array.length roots)]
@@ -1973,8 +1963,7 @@ top level binds a value nothing ever frees.")
 
   (private roots-context-id)
   (hidden roots-context-id)
-  (doc roots-context-id "the context the plan numbered the top-level
-expressions under, which is the one `OwnershipContext.Roots` names.")
+  (doc roots-context-id "returns the ownership context of the top-level forms.")
   (defn roots-context-id [ownership]
     (let-do [found -1
              contexts (OwnershipPlan.contexts ownership)
@@ -1997,8 +1986,8 @@ expressions under, which is the one `OwnershipContext.Roots` names.")
 
   (private wrap-params)
   (hidden wrap-params)
-  (doc wrap-params "wraps a function body so its owned parameters are deleted at
-function exit on exactly the paths that do not consume them.")
+  (doc wrap-params "wraps a function `body` with the deletes `param-deletes` of
+its owned parameters, at exit, on the paths that do not move them.")
   (defn wrap-params [body param-deletes]
     (let-do [result body]
       (for [i 0 (Array.length param-deletes)]
@@ -2012,11 +2001,11 @@ function exit on exactly the paths that do not consume them.")
 
   (private rewrite-bodies!)
   (hidden rewrite-bodies!)
+  (doc rewrite-cleanup-body "hoists the array literals of `body` and inserts the
+deletes planned in `context`. Deletes of parameters at the body's root happen at
+exit, and the others at their sites. A negative context matches every delete.")
   (private rewrite-cleanup-body)
   (hidden rewrite-cleanup-body)
-  (doc rewrite-cleanup-body "shares cleanup insertion for ordinary and lifted
-bodies. Only deletes at the body root for an owned parameter are exit cleanup;
-other sites remain local. A negative context retains the legacy wildcard.")
   (defn rewrite-cleanup-body [body
                               parameters
                               cleanup
@@ -2041,13 +2030,9 @@ other sites remain local. A negative context retains the legacy wildcard.")
                         constructors)
         &param-deletes)))
 
-  (doc rewrite-bodies!
-    "rewrites body expressions and roots through a borrowed module.
-`body-contexts` names the ownership context each body was planned in. A lifted
-callback is matched only against the context of the body it came from: one
-generic body instantiated twice yields two callbacks whose locals share binder
-ids and sites but not types. The module remains in its caller-owned record;
-body records and unchanged metadata retain their storage.")
+  (doc rewrite-bodies! "inserts the planned deletes into the bodies and roots of
+`specialized`, in place. `body-contexts` holds the ownership context of each
+body. A lifted callback only matches deletes of the body it came from.")
   (defn rewrite-bodies! [specialized
                          body-contexts
                          ownership
@@ -2083,17 +2068,11 @@ body records and unchanged metadata retain their storage.")
                                          (SpecializationModule.constructors specialized))]
           (SpecializationModule.set-roots! specialized roots)))))
 
+  (doc rewrite-closures! "inserts the planned deletes into the bodies of
+`closures`, in place. Each closure only matches deletes of the context it was
+lifted out of, so two instances of one generic body do not share deletes.")
   (private rewrite-closures!)
   (hidden rewrite-closures!)
-  (doc rewrite-closures!
-    "rewrites only body expressions through a borrowed closure array.
-Applies ownership actions planned for nested lambda
-bodies after lambda lifting has moved capturing callbacks outside the ordinary
-specialized-body list. Each closure is matched only against the context it was
-lifted out of: one generic body instantiated twice yields two closures whose
-locals share binder ids and sites but not types, so a context-blind match picks
-an arbitrary instance's delete and frees a value through the wrong type's
-deleter.")
   (defn rewrite-closures! [closures cleanup delete-symbols constructors]
     (for [i 0 (Array.length closures)]
       (let [closure-fn (Array.unsafe-nth closures i)]
@@ -2107,11 +2086,10 @@ deleter.")
                                        delete-symbols
                                        constructors))))))
 
+  (doc prepare-cleanup "lifts the lambdas of `specialized` and inserts the
+deletes that `ownership` plans into its bodies, roots and closures.")
   (private prepare-cleanup)
   (hidden prepare-cleanup)
-  (doc prepare-cleanup "shares one resolved cleanup index across body, root
-and closure rewriting. The plan is released here before backend materialization;
-the rewritten owners transfer to the result.")
   (defn prepare-cleanup [specialized ownership delete-symbols echo]
     (if (Int.> (Array.length (OwnershipPlan.contexts ownership)) 0)
       (match (resolve-cleanup (OwnershipPlan.actions ownership) delete-symbols)
@@ -2131,9 +2109,9 @@ the rewritten owners transfer to the result.")
         (Result.Error error) (Result.Error error))
       (Result.Error (BackendError.init @"ownership plan has no root context"))))
 
-  (doc module-with-ownership-echoed "like module-with-ownership, additionally
-echoing each non-unit root result through the driver's echo plan (top-level
-REPL-echo semantics compiled into `main`).")
+  (doc module-with-ownership-echoed "lowers `specialized` as
+`module-with-ownership` does, and echoes each non-unit top-level result with
+`echo`.")
   (defn module-with-ownership-echoed [specialized
                                       ownership
                                       delete-symbols
@@ -2141,7 +2119,7 @@ REPL-echo semantics compiled into `main`).")
                                       echo]
     (do
       (seed-backend-locals! specialized)
-      ; The hoist stream also names lifted globals; keep it above user IDs.
+      ; keep hoisted names above the user's global ids
       (set! *hoist-serial*
             (Int.max 20000000 (Int.inc (Specialize.max-global-id specialized))))
       (match (prepare-cleanup specialized ownership delete-symbols echo)
@@ -2152,10 +2130,9 @@ REPL-echo semantics compiled into `main`).")
                   copy-symbols)
         (Result.Error error) (Result.Error error))))
 
-  (doc module-with-ownership "lowers a specialized module after the ownership
-phase has established its side table, rewriting each body to insert the concrete
-delete calls its plan schedules (resolved through `delete-symbols`, a table from
-concrete type key to deleter C symbol).")
+  (doc module-with-ownership "lowers `specialized` with the deletes that
+`ownership` plans inserted. `delete-symbols` and `copy-symbols` map type keys to
+C symbols.")
   (defn module-with-ownership [specialized ownership delete-symbols copy-symbols]
     (module-with-ownership-echoed specialized
                                   ownership

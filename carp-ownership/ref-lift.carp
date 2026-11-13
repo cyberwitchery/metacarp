@@ -1,12 +1,10 @@
 (load "../carp-specialize/carp-specialize.carp")
 
-(doc RefLift "lifts every `&rvalue` (a borrow whose operand is not an lvalue)
-into a fresh `let`-bound temporary that wraps the rest of its enclosing scope.
-A borrow that escapes into a later statement — as `deftest` does, threading a
-`State` accumulator through `(set! test &(assert-equal test ...))` — then keeps
-its referent alive for the whole scope, and the ownership phase schedules the
-temporary's delete like any other binding. Runs on the specialized module just
-before ownership so managed temporaries are freed correctly.")
+(doc RefLift "lifts each borrow of a value that is not a place, such as `&(f
+x)`, into a new `let`-bound temporary around the rest of its sequence. The
+temporary then lives as long as the sequence, and ownership deletes it like any
+binding. Static array literals are lifted the same way. Borrows in `while`
+conditions are not lifted. It runs on the specialized module before ownership.")
 
 (defmodule RefLift
   (private lvalue?)
@@ -21,15 +19,13 @@ before ownership so managed temporaries are freed correctly.")
 
   (private next-id!)
   (hidden next-id!)
-  ;; lifted temporaries are locals: ids count DOWN from the module's local
-  ;; watermark (the counter is seeded by `module`), mirroring the resolver's
-  ;; negative local id space.
+  ; lifted temporaries are locals: their ids count down from below the
+  ; module's lowest local id (slot 0, seeded by `module-with-source-map`)
   (defn next-id! [cell]
     (let-do [v @(Array.unsafe-nth cell 0)] (Array.aset! cell 0 (Int.dec v)) v))
 
-  ;; index 1 of the counter is a per-definition expression-id allocator: the
-  ;; ownership validator indexes a `seen` array by expression id, so new nodes
-  ;; must take small ids just past the definition's existing maximum.
+  ; slot 1 gives out expression ids for new nodes. ownership needs them
+  ; unique and non-negative within a context, and indexes an array by them.
   (private next-eid!)
   (hidden next-eid!)
   (defn next-eid! [cell]
@@ -210,8 +206,9 @@ before ownership so managed temporaries are freed correctly.")
                             (Box.init (MonoType.copy (Box.peek type)))
                             (Box.init (extract (Box.peek callee) cell counter))
                             (extract-array args cell counter))
-      ;; a `set!` statement in a scope-sequence: lift borrows out of its value so
-      ;; the temporary outlives the assignment target (the `deftest` accumulator).
+      ; a `set!` in a sequence: its temporaries live to the end of the
+      ; sequence, so the target can borrow from them (the `deftest`
+      ; accumulator)
       (SpecializedExpr.Set id type reference value)
       (SpecializedExpr.Set @id
                            (Box.init (MonoType.copy (Box.peek type)))
@@ -246,12 +243,10 @@ before ownership so managed temporaries are freed correctly.")
       (SpecializedExpr.ArrayLit @id
                                 (Box.init (MonoType.copy (Box.peek type)))
                                 (extract-array elements cell counter))
-      ;; a static array literal borrows storage that has to live as long as
-      ;; the borrow and be freed with it, like `&[...]`: the reference gives it
-      ;; a stack temporary in the statement's scope. Lifting it into one here
-      ;; gives each evaluation (every call, every recursion depth, every loop
-      ;; iteration) its own storage, and ownership then deletes its elements
-      ;; at scope exit. A global's initializer keeps static storage (slot 3).
+      ; a static array literal is lifted into a temporary, as `&[...]` is,
+      ; so each evaluation has its own storage and ownership deletes its
+      ; elements at scope exit. a global's initializer keeps static storage
+      ; (slot 3 is 0).
       (SpecializedExpr.StaticArrayLit id type elements)
       (let [extracted (extract-array elements cell counter)]
         (match-ref (Box.peek type)
@@ -296,12 +291,10 @@ before ownership so managed temporaries are freed correctly.")
       _
       (SpecializedExpr.copy expr)))
 
-  ;; a set!'s temporaries normally join the statement's scope, so a reference
-  ;; target may keep borrowing from them (the `deftest` accumulator,
-  ;; `(set! t &(assert-true t ...))`). A temporary that takes the old value of a
-  ;; value target, as in `(set! a (f &[a]))`, stays inside the set!'s value
-  ;; instead: ownership decides there whether the value consumes the target,
-  ;; and the new value cannot borrow from a temporary holding the old one.
+  ; a set!'s temporaries join the enclosing sequence, so a reference target
+  ; can borrow from them, as in `(set! t &(assert-true t ...))`. if one of
+  ; them takes the old value of a value target, as in `(set! a (f &[a]))`, all
+  ; of them stay inside the set!'s value instead.
   (defn extract-set-value [target value cell counter]
     (let-do [own (the (Array (Pair CoreRef SpecializedExpr)) [])
              value2 (extract value &own counter)
@@ -434,13 +427,9 @@ before ownership so managed temporaries are freed correctly.")
 
   (private module-ceiling)
   (hidden module-ceiling)
-  (doc module-ceiling "the largest expression id anywhere in the module.
-
-It walks the module in a function of its own rather than inside `module`,
-because two walks of the same array in one function are given the same name
-for that array''s data, and the second declaration of that name does not
-compile. That is a fault worth fixing where it lives; a caller can avoid
-tripping it by not asking one function to walk one array twice.")
+  (doc module-ceiling "returns the largest expression id in `bodies` and
+`roots`. Under the reference compiler, a function that walks one array twice
+does not compile, so this walk has its own function.")
   (defn module-ceiling [bodies roots]
     (let-do [ceiling 0]
       (for [i 0 (Array.length bodies)]
@@ -456,14 +445,9 @@ tripping it by not asking one function to walk one array twice.")
 
   (private lift-body)
   (hidden lift-body)
-  (doc lift-body "lifts one body's borrows, allocating ids for the temporaries
-it introduces.
-
-The ids start above this body's own maximum, which is enough for a validator
-that looks at one body at a time. It is not enough for a source map: that maps
-an id to where it was written, across the whole module, and an id invented
-here would otherwise name a line from some other definition. A build that
-wants a map says so, and then the ids start above every id in the module.")
+  (doc lift-body "lifts the borrows of the body `b`. New expression ids start
+above the body's own largest id. If `source-map` is true, they start above every
+id in the module instead, so no new id names another definition's node.")
   (defn lift-body [b counter source-map]
     (let-do [_ignored (Array.aset! counter
                                    1
@@ -481,9 +465,9 @@ wants a map says so, and then the ids start above every id in the module.")
                                          counter))
                             @(SpecializedBody.value b))))
 
-  (doc module-with-source-map
-    "rewrites every function body and root of a specialized module so
-borrows of non-lvalues are lifted to scope-lived temporaries.")
+  (doc module-with-source-map "lifts the borrows in every body and root of `m`.
+If `source-map` is true, new ids in bodies start above every id in the module.
+Roots always number new ids above the roots' largest id.")
   (defn module-with-source-map [m source-map]
     (let-do [counter (the (Array Int)
                           [(Int.dec (Specialize.min-local-id m)) 0 0 1])
@@ -491,18 +475,17 @@ borrows of non-lvalues are lifted to scope-lived temporaries.")
              new-roots (the (Array (Box SpecializedExpr)) [])
              bodies (SpecializationModule.bodies m)
              roots (SpecializationModule.roots m)]
-      ;; slot 2 is the module-wide ceiling: an id above everything written
-      ;; anywhere in the module, so a temporary cannot be mistaken for a form.
-      ;; slot 3 is 1 where static array literals get scope storage, 0 in a
-      ;; global's initializer.
+      ; slot 2 is one above every expression id in the module. slot 3 is 1
+      ; where static array literals get scope storage, 0 in a global's
+      ; initializer.
       (Array.aset! &counter 2 (Int.inc (module-ceiling bodies roots)))
       (for [i 0 (Array.length bodies)]
         (Array.push-back! &new-bodies
                           (lift-body (Array.unsafe-nth bodies i)
                                      &counter
                                      source-map)))
-      ;; all roots share one dense expression-id space, so fresh ids must be
-      ;; allocated above the maximum across EVERY root, not per root.
+      ; all roots share one id space, so new ids start above every root's.
+      ; this ignores `source-map`.
       (let-do [roots-max 0]
         (for [i 0 (Array.length roots)]
           (set! roots-max
@@ -523,6 +506,5 @@ borrows of non-lvalues are lifted to scope-lived temporaries.")
                                  @(SpecializationModule.system-includes m)
                                  @(SpecializationModule.type-declarations m))))
 
-  (doc module
-    "lifts borrowed temporaries with owner-local generated identities.")
+  (doc module "lifts the borrows of `m`, with new ids numbered per body.")
   (defn module [m] (module-with-source-map m false)))

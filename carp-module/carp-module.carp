@@ -1,19 +1,17 @@
 (load "../carp-surface/carp-surface.carp")
 
-(doc ModuleSource "is one source unit supplied to the module loader. The
-loader is pure with respect to filesystems and networks: a compiler driver,
-editor, or test can provide these sources from any backing store.")
-(doc ModuleSource "is one loadable source: `path` is the registry key a load
-directive names, `file` the filesystem location the text came from (equal to
-`path` for in-memory sources) — the loader pushes it on the compile-time
-load stack so `current-file`/`relative-to` resolve inside the right
-directory.")
+(doc ModuleSource "is a source the module loader can load. `path` is the
+name load directives use for it. `file` is the file the text came from, or
+`path` for a source held in memory. While the source is expanded,
+`current-file` and `relative-to` resolve against `file`. `text` is the source
+text.")
 (deftype ModuleSource [path String
                        file String
                        text String])
 
-(doc ModuleError "is a loading diagnostic. `span` is present for errors tied
-to a load form; parse and missing-source errors have no source span yet.")
+(doc ModuleError "is an error from loading modules. `message` describes it.
+`path` is the path that was being loaded. `span` is the source location of the
+error. The loader does not set it.")
 (deftype ModuleError [message String
                       path String
                       span (Maybe SurfaceSpan)])
@@ -55,10 +53,9 @@ to a load form; parse and missing-source errors have no source span yet.")
             (set! result (Maybe.Just @source)))))
       result))
 
-  (doc file-load-target "the registry key of `(load ref file)`: a file of a
-git checkout, named by the reference and the file, so each file of one
-checkout is a source of its own. A git reference has no space in it. The
-reference ignores the file for a local load, and so does this.")
+  (doc file-load-target "returns the registry key for `(load path file)`. If
+`path` is a git reference (it contains `@`), the key is `path` and `file`
+separated by a space. Otherwise `file` is ignored and the key is `path`.")
   (defn file-load-target [path file]
     (if (Int.> (String.index-of path \@) -1)
       (String.concat &[@path @" " @file])
@@ -74,8 +71,8 @@ reference ignores the file for a local load, and so does this.")
                 target (Box.peek (Array.unsafe-nth items 1))]
             (if (or (named? head @"load") (named? head @"load-once"))
               (match-ref (SurfaceNode.form target)
-                ;; drop a leading "core/": the core dir already is core, and this
-                ;; dedups against the same file loaded plainly (see main.carp).
+                ; a two-element `(load "core/X")` is keyed as `X`, the key
+                ; core files are loaded under
                 (SurfaceForm.StringLit path)
                 (if (Int.= 3 (Array.length items))
                   (match-ref (SurfaceNode.form (Box.peek (Array.unsafe-nth items
@@ -154,10 +151,9 @@ reference ignores the file for a local load, and so does this.")
           (Ref (Array String))
           (Ref (Array (Box SurfaceNode)))]
          (Result Unit ModuleError)))
-  ;; a file's identity is its canonical `file`, not the load spelling: the same
-  ;; source reached through different spellings (repo-relative vs ../-relative)
-  ;; is loaded once. `visited` and `output` are shared accumulators: recursion
-  ;; appends directly instead of repeatedly copying a partially loaded module.
+  ; loads `path` and everything it loads into `output`, each file once. files
+  ; are compared by their `file` strings as given, so each file needs one
+  ; canonical name. `visited` and `output` are shared by the whole load.
   (defn load-path! [sources path active visited output]
     (match (source-by-path sources path)
       (Maybe.Nothing)
@@ -171,93 +167,87 @@ reference ignores the file for a local load, and so does this.")
               (ModuleError.init @"recursive module load" @path (Maybe.Nothing)))
             (contains? visited file)
             (Result.Success ())
-            ;; parsed as the file it is: this builds one module out of every
-            ;; file, and afterwards a span is the only thing left that can say
-            ;; which file a form was written in
+            ; spans record `file` as their source, see `Surface.parse-in`
             (match (Surface.parse-in file (ModuleSource.text &source))
-              ;; the parser knows the line, the column and what it did not
-              ;; expect; a loader that answers "could not be parsed" throws
-              ;; away everything the reader needs
               (Result.Error parse-error)
-              (Result.Error
-                (ModuleError.init
-                  (String.concat
-                    &[(String.copy file)
-                      @": "
-                      (Parser.format-error &parse-error)])
-                  @path
-                  (Maybe.Nothing)))
+                (Result.Error
+                  (ModuleError.init
+                    (String.concat
+                      &[(String.copy file)
+                        @": "
+                        (Parser.format-error &parse-error)])
+                    @path
+                    (Maybe.Nothing)))
               (Result.Success module)
-              (let-do [push-marker (load-stack-marker "load-stack-push!"
-                                                      &(Maybe.Just @(ModuleSource.file &source)))
-                       result (the (Result Unit ModuleError) (Result.Success ()))
-                       next-active (Array.push-back @active (String.copy file))
-                       forms (SurfaceModule.forms &module)
-                       n (Array.length forms)]
-                (Array.push-back! output (Box.init push-marker))
-                (for [i 0 n]
-                  (match-ref &result
-                    (Result.Success _)
-                      (let [form (Box.peek (Array.unsafe-nth forms i))]
-                        (match (load-and-use-target form)
-                          (Maybe.Just module-name)
-                            (let [child-path (String.concat &[@&module-name
-                                                              @".carp"])]
-                              (match (the (Result Unit ModuleError)
-                                          (load-path! sources
-                                                      &child-path
-                                                      &next-active
-                                                      visited
-                                                      output))
-                                (Result.Success _)
-                                  (Array.push-back! output
-                                                    (Box.init (use-node form
-                                                                        &module-name)))
-                                (Result.Error error)
-                                  (set! result (Result.Error error))))
-                          (Maybe.Nothing)
-                            (match (load-target form)
-                              (Maybe.Just child-path)
+                (let-do [push-marker (load-stack-marker "load-stack-push!"
+                                                        &(Maybe.Just @(ModuleSource.file &source)))
+                         result (the (Result Unit ModuleError)
+                                     (Result.Success ()))
+                         next-active (Array.push-back @active (String.copy file))
+                         forms (SurfaceModule.forms &module)
+                         n (Array.length forms)]
+                  (Array.push-back! output (Box.init push-marker))
+                  (for [i 0 n]
+                    (match-ref &result
+                      (Result.Success _)
+                        (let [form (Box.peek (Array.unsafe-nth forms i))]
+                          (match (load-and-use-target form)
+                            (Maybe.Just module-name)
+                              (let [child-path (String.concat &[@&module-name
+                                                                @".carp"])]
                                 (match (the (Result Unit ModuleError)
                                             (load-path! sources
                                                         &child-path
                                                         &next-active
                                                         visited
                                                         output))
-                                  (Result.Success _) ()
+                                  (Result.Success _)
+                                    (Array.push-back! output
+                                                      (Box.init (use-node form
+                                                                          &module-name)))
                                   (Result.Error error)
-                                    (set! result (Result.Error error)))
-                              (Maybe.Nothing)
-                                (Array.push-back! output
-                                                  (Box.init (SurfaceNode.copy form))))))
-                    (Result.Error error) (set! result (Result.Error @error))))
-                (match result
-                  (Result.Success _)
-                    (do
-                      (Array.push-back! output
-                                        (Box.init
-                                          (load-stack-marker "load-stack-pop!"
-                                                             &(the (Maybe String)
-                                                                   (Maybe.Nothing)))))
-                      (Array.push-back! visited (String.copy file))
-                      (Result.Success ()))
-                  (Result.Error error) (Result.Error error))))))))
+                                    (set! result (Result.Error error))))
+                            (Maybe.Nothing)
+                              (match (load-target form)
+                                (Maybe.Just child-path)
+                                  (match (the (Result Unit ModuleError)
+                                              (load-path! sources
+                                                          &child-path
+                                                          &next-active
+                                                          visited
+                                                          output))
+                                    (Result.Success _) ()
+                                    (Result.Error error)
+                                      (set! result (Result.Error error)))
+                                (Maybe.Nothing)
+                                  (Array.push-back! output
+                                                    (Box.init (SurfaceNode.copy form))))))
+                      (Result.Error error) (set! result (Result.Error @error))))
+                  (match result
+                    (Result.Success _)
+                      (do
+                        (Array.push-back! output
+                                          (Box.init
+                                            (load-stack-marker "load-stack-pop!"
+                                                               &(the (Maybe String)
+                                                                     (Maybe.Nothing)))))
+                        (Array.push-back! visited (String.copy file))
+                        (Result.Success ()))
+                    (Result.Error error) (Result.Error error))))))))
 
-  (doc load "loads `root` from an in-memory source registry. Load directives
-are replaced by their transitive forms in source order, and a path is included
-at most once. This gives macro expansion one deterministic module stream.")
-  (doc compiler-prelude-forms
-    "generic `prefix`/`suffix` defns injected after a loaded module tree. The
-reference compiler resolves the bare `suffix`/`prefix` calls in Pattern by
-receiver type (String/Array); this compiler has no type-directed unqualified
-resolution, so it supplies slice-based generic versions. They depend on `slice`
-and `length`, which any Core-rooted load already provides.")
+  (doc compiler-prelude-forms "returns generic `prefix` and `suffix`
+definitions built on `slice` and `length`. The reference compiler resolves
+Pattern's bare `suffix` call by the type of its receiver. This compiler cannot,
+so it supplies these.")
   (defn compiler-prelude-forms []
     (match (Surface.parse "(defn prefix [xs a] (slice xs 0 a))
 (defn suffix [xs b] (slice xs b (length xs)))") (Result.Success m)
         @(SurfaceModule.forms &m) (Result.Error _)
         (the (Array (Box SurfaceNode)) [])))
 
+  (doc load "loads `root` from `sources`. Load directives are replaced by the
+forms of the files they load, in source order, and each file is included once.
+Fails on a missing source, a recursive load or a parse error.")
   (defn load [sources root]
     (let-do [active (the (Array String) [])
              visited (the (Array String) [])
@@ -267,10 +257,8 @@ and `length`, which any Core-rooted load already provides.")
         (Result.Success _) (Result.Success (SurfaceModule.init forms))
         (Result.Error error) (Result.Error error))))
 
-  (doc with-compiler-prelude
-    "appends the compiler prelude forms (see compiler-prelude-forms) to a module,
-returning a new module. Full-Core compile paths call this so Pattern's bare
-`suffix`/`prefix` resolve; the plain loader stays prelude-free.")
+  (doc with-compiler-prelude "returns `module` with the forms of
+`compiler-prelude-forms` appended. `load` does not add them.")
   (defn with-compiler-prelude [module]
     (let-do [forms @(SurfaceModule.forms module)
              prelude (compiler-prelude-forms)]

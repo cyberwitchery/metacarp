@@ -1,9 +1,16 @@
 (load "protocol.carp")
 (load "native.carp")
 
-(doc ReplLanguageWorker "serializes a backend on one compiler thread. One
-pending request replaces superseded work. Replies have separate bounded slots
-for analysis and explicit editing operations. A pipe wakes the editor.")
+(doc ReplLanguageWorker "runs language requests one at a time on a thread of
+its own. `mutex` and `condition` guard the state shared with the thread, which
+is `thread`. A byte on the pipe `wake-write` and `wake-read` signals a finished
+reply. `backend` answers a request. It gets a function that says whether the
+request was cancelled, and one that publishes an update. `pending` is the
+request waiting to run. A newer request replaces it. `analysis` and `editing`
+hold the latest finished reply of each kind. `document`, `revision` and
+`session` identify the source being worked on, and `latest-request` the newest
+editing request. `running` is whether a request runs now. `paused` is whether
+requests are put on hold. `alive` is false once the worker is closed.")
 (deftype ReplLanguageWorker
   [mutex (Ptr ReplNativeMutex)
    condition (Ptr ReplNativeCondition)
@@ -249,8 +256,9 @@ for analysis and explicit editing operations. A pipe wakes the editor.")
                                    writer)
                   (Result.Error (fmt "cannot start language worker (%d)" status))))))))))
 
-  (doc create "starts a worker with the compiler's 512 MiB stack reservation.
-Its backend and compiler state are accessed only by that worker or while paused.")
+  (doc create "starts a worker thread that answers requests with `backend`,
+with a 512 MiB stack. The backend's compiler state may only be used by that
+thread, or by others while the worker is paused.")
   (defn create [backend]
     (let-do [descriptors [0 0]
              status (ReplNative.pipe
@@ -280,7 +288,9 @@ Its backend and compiler state are accessed only by that worker or while paused.
               (ignore (ReplNative.close writer))
               (Result.Error @"cannot configure language-worker notifications")))))))
 
-  (doc submit! "replaces pending work and cancels work from superseded source.")
+  (doc submit! "queues `request` in place of any request that has not run yet.
+A request from an old session, or one sent while the worker is paused, is
+ignored. A request that runs for older source is cancelled.")
   (defn submit! [worker request]
     (let-do [state (Pointer.to-ref worker)]
       (lock! worker)
@@ -309,7 +319,7 @@ Its backend and compiler state are accessed only by that worker or while paused.
           (wake! worker)))
       (unlock! worker)))
 
-  (doc poll! "transfers a reply and drains coalesced wake notifications.")
+  (doc poll! "takes a finished reply, if there is one.")
   (defn poll! [worker]
     (let-do [state (Pointer.to-ref worker)
              byte 0b
@@ -336,15 +346,16 @@ Its backend and compiler state are accessed only by that worker or while paused.
       (unlock! worker)
       result))
 
-  (doc session "returns the session revision used to tag requests.")
+  (doc session "returns the revision of the worker's session. Requests must
+carry it.")
   (defn session [worker]
     (let-do [_lock (lock! worker)
              revision @(ReplLanguageWorker.session (Pointer.to-ref worker))]
       (unlock! worker)
       revision))
 
-  (doc pause!
-    "cancels and joins the current query before the host accesses compiler state.")
+  (doc pause! "drops the pending request and waits until the running one has
+stopped. Others may then use the compiler state until `resume!`.")
   (defn pause! [worker]
     (let-do [state (Pointer.to-ref worker)]
       (lock! worker)
@@ -357,7 +368,8 @@ Its backend and compiler state are accessed only by that worker or while paused.
                                      @(ReplLanguageWorker.mutex state))))
       (unlock! worker)))
 
-  (doc resume! "publishes a new session revision after host operations.")
+  (doc resume! "starts a new session revision and accepts requests again. The
+replies of the old revision are dropped.")
   (defn resume! [worker]
     (let-do [state (Pointer.to-ref worker)]
       (lock! worker)
@@ -371,16 +383,15 @@ Its backend and compiler state are accessed only by that worker or while paused.
         (ignore (Array.pop-back! (ReplLanguageWorker.editing state))))
       (unlock! worker)))
 
-  (doc client
-    "returns callbacks and a borrowed notification descriptor for the terminal.")
+  (doc client "returns a language client that talks to `worker` in this
+process.")
   (defn client [worker]
     (ReplLanguageClient.init (fn [request] (submit! worker request))
                              (fn [] (poll! worker))
                              (fn [] (session worker))
                              @(ReplLanguageWorker.wake-read (Pointer.to-ref worker))))
 
-  (doc close!
-    "stops the worker before releasing its callbacks and native resources.")
+  (doc close! "stops the worker thread and frees the worker.")
   (defn close! [worker]
     (let-do [state (Pointer.to-ref worker)
              mutex @(ReplLanguageWorker.mutex state)
